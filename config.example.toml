@@ -5,8 +5,9 @@ token = "ghp_your_token_here"
 # Organization or user that owns the repos
 owner = "your-org"
 
-# Repos to register runners for
-repos = ["repo1", "repo2"]
+# Repos to register runners for (optional).
+# If omitted, registers org-level runners available to all repos in the org.
+# repos = ["repo1", "repo2"]
 
 # Job discovery: polling (default) or webhook
 # Polling checks the GitHub API every interval — no inbound ports or certs needed.

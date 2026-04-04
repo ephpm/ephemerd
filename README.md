@@ -107,7 +107,7 @@ cat > /var/lib/ephemerd/config.toml << 'EOF'
 [github]
 token = "ghp_your_token_here"
 owner = "your-org"
-repos = ["repo1", "repo2"]
+# repos = ["repo1", "repo2"]  # optional — omit for org-level runners
 
 [runner]
 max_concurrent = 4
@@ -178,7 +178,7 @@ If `EPHEMERD_IMAGE` is not set, the base macOS VM boots as-is — all the tools 
 [github]
 token = "ghp_..."                     # PAT with repo + admin:org scope
 owner = "your-org"                    # org or user
-repos = ["repo1", "repo2"]           # repos to register runners for
+# repos = ["repo1", "repo2"]         # optional — omit for org-level runners
 poll_interval = "10s"                 # how often to check for jobs (default)
 
 # Optional: webhook mode (instant, requires TLS)

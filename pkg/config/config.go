@@ -148,9 +148,7 @@ func (c *Config) validate() error {
 	if c.GitHub.Owner == "" {
 		return fmt.Errorf("github.owner is required")
 	}
-	if len(c.GitHub.Repos) == 0 {
-		return fmt.Errorf("github.repos must have at least one entry")
-	}
+	// repos is optional — if empty, ephemerd registers org-level runners
 	return nil
 }
 

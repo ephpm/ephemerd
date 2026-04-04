@@ -45,8 +45,15 @@ func New(cfg Config) (*Client, error) {
 	}, nil
 }
 
-// RegisterJITRunner creates a just-in-time runner for a specific repo.
-// Returns the runner JIT config token that the Actions runner uses to register.
+// IsOrgLevel returns true when no repos are configured, meaning ephemerd
+// registers runners at the organization level (available to all repos).
+func (c *Client) IsOrgLevel() bool {
+	return len(c.cfg.Repos) == 0
+}
+
+// RegisterJITRunner creates a just-in-time runner.
+// If repos are configured, registers at the repo level.
+// If repos are empty, registers at the org level (available to all repos in the org).
 func (c *Client) RegisterJITRunner(ctx context.Context, repo string, name string, labels []string) (*gh.JITRunnerConfig, error) {
 	req := &gh.GenerateJITConfigRequest{
 		Name:          name,
@@ -54,25 +61,37 @@ func (c *Client) RegisterJITRunner(ctx context.Context, repo string, name string
 		Labels:        labels,
 	}
 
-	config, _, err := c.client.Actions.GenerateRepoJITConfig(ctx, c.cfg.Owner, repo, req)
-	if err != nil {
-		return nil, fmt.Errorf("generating JIT config for %s/%s: %w", c.cfg.Owner, repo, err)
-	}
+	var config *gh.JITRunnerConfig
+	var err error
 
-	c.cfg.Log.Info("registered JIT runner",
-		"repo", repo,
-		"name", name,
-		"labels", labels,
-	)
+	if c.IsOrgLevel() {
+		config, _, err = c.client.Actions.GenerateOrgJITConfig(ctx, c.cfg.Owner, req)
+		if err != nil {
+			return nil, fmt.Errorf("generating org JIT config for %s: %w", c.cfg.Owner, err)
+		}
+		c.cfg.Log.Info("registered org-level JIT runner", "name", name, "labels", labels)
+	} else {
+		config, _, err = c.client.Actions.GenerateRepoJITConfig(ctx, c.cfg.Owner, repo, req)
+		if err != nil {
+			return nil, fmt.Errorf("generating JIT config for %s/%s: %w", c.cfg.Owner, repo, err)
+		}
+		c.cfg.Log.Info("registered repo-level JIT runner", "repo", repo, "name", name, "labels", labels)
+	}
 
 	return config, nil
 }
 
 // RemoveRunner removes a self-hosted runner by ID.
+// Uses org-level or repo-level API depending on configuration.
 func (c *Client) RemoveRunner(ctx context.Context, repo string, runnerID int64) error {
-	_, err := c.client.Actions.RemoveRunner(ctx, c.cfg.Owner, repo, runnerID)
+	var err error
+	if c.IsOrgLevel() {
+		_, err = c.client.Actions.RemoveOrganizationRunner(ctx, c.cfg.Owner, runnerID)
+	} else {
+		_, err = c.client.Actions.RemoveRunner(ctx, c.cfg.Owner, repo, runnerID)
+	}
 	if err != nil {
-		return fmt.Errorf("removing runner %d from %s/%s: %w", runnerID, c.cfg.Owner, repo, err)
+		return fmt.Errorf("removing runner %d: %w", runnerID, err)
 	}
 	return nil
 }
@@ -256,44 +275,72 @@ func hasPrefix(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
 
-// PollJobs checks all configured repos for queued workflow jobs targeting
-// self-hosted runners. Returns job events for any newly queued jobs.
+// PollJobs checks for queued workflow jobs targeting self-hosted runners.
+// If repos are configured, polls those repos. Otherwise, polls all repos in the org.
 func (c *Client) PollJobs(ctx context.Context) ([]JobEvent, error) {
+	repos := c.cfg.Repos
+
+	// Org-level: discover repos with queued runs
+	if len(repos) == 0 {
+		return c.pollOrg(ctx)
+	}
+
 	var events []JobEvent
-
-	for _, repo := range c.cfg.Repos {
-		jobs, _, err := c.client.Actions.ListWorkflowJobs(ctx, c.cfg.Owner, repo, 0, &gh.ListWorkflowJobsOptions{
-			Filter: "latest",
-		})
+	for _, repo := range repos {
+		repoEvents, err := c.pollRepo(ctx, repo)
 		if err != nil {
-			// Try listing workflow runs and their jobs instead
-			runs, _, err := c.client.Actions.ListRepositoryWorkflowRuns(ctx, c.cfg.Owner, repo, &gh.ListWorkflowRunsOptions{
-				Status: "queued",
-			})
-			if err != nil {
-				c.cfg.Log.Warn("failed to poll repo", "repo", repo, "error", err)
-				continue
-			}
-
-			for _, run := range runs.WorkflowRuns {
-				runJobs, _, err := c.client.Actions.ListWorkflowJobs(ctx, c.cfg.Owner, repo, run.GetID(), nil)
-				if err != nil {
-					continue
-				}
-				for _, job := range runJobs.Jobs {
-					if job.GetStatus() == "queued" && isSelfHosted(job.Labels) {
-						events = append(events, JobEvent{
-							Action: "queued",
-							Repo:   repo,
-							Job:    job,
-						})
-					}
-				}
-			}
+			c.cfg.Log.Warn("failed to poll repo", "repo", repo, "error", err)
 			continue
 		}
+		events = append(events, repoEvents...)
+	}
+	return events, nil
+}
 
-		for _, job := range jobs.Jobs {
+// pollOrg discovers queued workflow runs across the entire org.
+func (c *Client) pollOrg(ctx context.Context) ([]JobEvent, error) {
+	var events []JobEvent
+
+	// List all repos in the org and check each for queued runs.
+	// TODO: GitHub doesn't have an org-level "list all queued jobs" API,
+	// so we list repos and poll each. This could be optimized with caching.
+	repos, _, err := c.client.Repositories.ListByOrg(ctx, c.cfg.Owner, &gh.RepositoryListByOrgOptions{
+		Type:        "all",
+		ListOptions: gh.ListOptions{PerPage: 100},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing org repos: %w", err)
+	}
+
+	for _, repo := range repos {
+		repoEvents, err := c.pollRepo(ctx, repo.GetName())
+		if err != nil {
+			c.cfg.Log.Debug("failed to poll repo", "repo", repo.GetName(), "error", err)
+			continue
+		}
+		events = append(events, repoEvents...)
+	}
+
+	return events, nil
+}
+
+// pollRepo checks a single repo for queued workflow jobs.
+func (c *Client) pollRepo(ctx context.Context, repo string) ([]JobEvent, error) {
+	var events []JobEvent
+
+	runs, _, err := c.client.Actions.ListRepositoryWorkflowRuns(ctx, c.cfg.Owner, repo, &gh.ListWorkflowRunsOptions{
+		Status: "queued",
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	for _, run := range runs.WorkflowRuns {
+		runJobs, _, err := c.client.Actions.ListWorkflowJobs(ctx, c.cfg.Owner, repo, run.GetID(), nil)
+		if err != nil {
+			continue
+		}
+		for _, job := range runJobs.Jobs {
 			if job.GetStatus() == "queued" && isSelfHosted(job.Labels) {
 				events = append(events, JobEvent{
 					Action: "queued",
@@ -390,6 +437,10 @@ func (c *Client) WebhookHandler(secret string) (http.Handler, <-chan JobEvent) {
 }
 
 func (c *Client) isTrackedRepo(repo string) bool {
+	// Org-level: accept all repos
+	if len(c.cfg.Repos) == 0 {
+		return true
+	}
 	for _, r := range c.cfg.Repos {
 		if r == repo {
 			return true
