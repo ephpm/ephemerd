@@ -85,15 +85,31 @@ OCI images aren't just for containers. ephemerd also uses them as a delivery mec
 Your PHP SDK pipeline builds `libphp.a` for darwin/arm64. Package it into an OCI image:
 
 ```dockerfile
+FROM alpine AS fetch
+ARG PHP_VERSION=8.5.2
+RUN wget -O /tmp/sdk.tar.gz \
+    https://github.com/ephpm/php-sdk/releases/download/v${PHP_VERSION}/php-sdk-${PHP_VERSION}-macos-aarch64.tar.gz && \
+    mkdir -p /sdk && tar xzf /tmp/sdk.tar.gz -C /sdk
+
 FROM scratch
-COPY php-sdk-8.5.2-macos-aarch64/ /php-sdk/
+COPY --from=fetch /sdk/ /php-sdk/
 ```
 
 ```bash
-docker buildx build --platform linux/arm64 -t ghcr.io/ephpm/php-sdk:8.5.2-macos -f Dockerfile.sdk --push .
+# Build for a specific PHP version
+docker buildx build --platform linux/arm64 \
+    --build-arg PHP_VERSION=8.5.2 \
+    -t ghcr.io/ephpm/php-sdk:8.5.2-macos \
+    -f Dockerfile.sdk --push .
+
+# New PHP version? Just change the arg
+docker buildx build --platform linux/arm64 \
+    --build-arg PHP_VERSION=8.4.7 \
+    -t ghcr.io/ephpm/php-sdk:8.4.7-macos \
+    -f Dockerfile.sdk --push .
 ```
 
-This image is tiny — just the SDK files, no OS, no runtime. It's a tarball with metadata.
+The final image is tiny — just the SDK files on a scratch base, no OS, no runtime. One Dockerfile handles every PHP version.
 
 **Example: using it in a macOS job**
 
