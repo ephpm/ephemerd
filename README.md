@@ -129,6 +129,52 @@ ephemerd starts containerd, begins polling GitHub for queued jobs, and provision
 runs-on: [self-hosted, linux, x64]
 ```
 
+## Choosing the Container Image
+
+By default, every job uses the `default_image` from your config. To use a different image for a specific job, set the `EPHEMERD_IMAGE` environment variable:
+
+```yaml
+jobs:
+  build-php:
+    runs-on: [self-hosted, linux, x64]
+    env:
+      EPHEMERD_IMAGE: ghcr.io/myorg/php-builder:latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make build
+
+  build-rust:
+    runs-on: [self-hosted, linux, arm64]
+    env:
+      EPHEMERD_IMAGE: ghcr.io/myorg/rust-builder:latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release
+```
+
+ephemerd reads the workflow YAML from the GitHub API when a job is queued and picks up the `EPHEMERD_IMAGE` value before creating the container. No special labels or runner registration needed.
+
+For macOS-native jobs, `EPHEMERD_IMAGE` selects the base VM snapshot:
+
+```yaml
+jobs:
+  build-ios:
+    runs-on: [self-hosted, macos, arm64]
+    env:
+      EPHEMERD_IMAGE: xcode15
+    steps:
+      - uses: actions/checkout@v4
+      - run: xcodebuild -scheme MyApp
+```
+
+The image name is resolved against ephemerd's config — either a full registry URL for OCI images or a name mapped to a local macOS disk snapshot.
+
+**Resolution order:**
+
+1. `EPHEMERD_IMAGE` env var in the workflow job
+2. `default_image` from ephemerd config
+3. Error if neither is set
+
 ## Configuration
 
 ```toml

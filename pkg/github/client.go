@@ -77,6 +77,185 @@ func (c *Client) RemoveRunner(ctx context.Context, repo string, runnerID int64) 
 	return nil
 }
 
+// FetchJobImage fetches the workflow run's job definition and looks for an
+// EPHEMERD_IMAGE environment variable. This requires an extra API call per job
+// but allows users to specify the container image directly in their workflow:
+//
+//	jobs:
+//	  build:
+//	    runs-on: [self-hosted, linux, x64]
+//	    env:
+//	      EPHEMERD_IMAGE: ghcr.io/myorg/custom-build:latest
+//
+// Returns empty string if no EPHEMERD_IMAGE is set.
+func (c *Client) FetchJobImage(ctx context.Context, repo string, runID int64, jobID int64) string {
+	// Fetch the workflow file content to read job-level env vars.
+	// The Jobs API doesn't expose env, so we fetch via the workflow run.
+	jobs, _, err := c.client.Actions.ListWorkflowJobs(ctx, c.cfg.Owner, repo, runID, nil)
+	if err != nil {
+		c.cfg.Log.Debug("failed to fetch workflow jobs for image lookup", "error", err)
+		return ""
+	}
+
+	for _, job := range jobs.Jobs {
+		if job.GetID() != jobID {
+			continue
+		}
+
+		// The Jobs API doesn't directly expose env vars from the workflow YAML.
+		// However, we can read them from the workflow file via the run's workflow path.
+		// For now, check if the job name encodes an image hint as a convention,
+		// or fetch the workflow YAML from the repo.
+		break
+	}
+
+	// Fetch the workflow YAML to read the job's env block
+	run, _, err := c.client.Actions.GetWorkflowRunByID(ctx, c.cfg.Owner, repo, runID)
+	if err != nil {
+		c.cfg.Log.Debug("failed to fetch workflow run for image lookup", "error", err)
+		return ""
+	}
+
+	// Get the workflow file from the repo at the run's head SHA
+	workflowPath := run.GetPath()
+	if workflowPath == "" {
+		return ""
+	}
+
+	fileContent, _, _, err := c.client.Repositories.GetContents(ctx, c.cfg.Owner, repo, workflowPath, &gh.RepositoryContentGetOptions{
+		Ref: run.GetHeadSHA(),
+	})
+	if err != nil || fileContent == nil {
+		c.cfg.Log.Debug("failed to fetch workflow file for image lookup", "path", workflowPath, "error", err)
+		return ""
+	}
+
+	content, err := fileContent.GetContent()
+	if err != nil {
+		return ""
+	}
+
+	// Parse the YAML to find the job's EPHEMERD_IMAGE env var.
+	// We do a lightweight parse — look for the job by name and extract env.
+	image := parseEphemerdImage(content, jobs.Jobs, jobID)
+	if image != "" {
+		c.cfg.Log.Info("job specifies custom image", "job_id", jobID, "image", image)
+	}
+
+	return image
+}
+
+// parseEphemerdImage extracts EPHEMERD_IMAGE from a workflow YAML for a specific job.
+// Uses simple string matching to avoid pulling in a full YAML parser dependency.
+func parseEphemerdImage(workflowContent string, jobs []*gh.WorkflowJob, targetJobID int64) string {
+	// Find the target job's name
+	var jobName string
+	for _, j := range jobs {
+		if j.GetID() == targetJobID {
+			jobName = j.GetName()
+			break
+		}
+	}
+	if jobName == "" {
+		return ""
+	}
+
+	// Simple line-by-line scan for EPHEMERD_IMAGE in env blocks.
+	// This is intentionally simple — a full YAML parser is overkill for
+	// extracting one env var, and we don't want the dependency.
+	lines := splitLines(workflowContent)
+	inJobs := false
+	inTargetJob := false
+	inEnv := false
+
+	for _, line := range lines {
+		trimmed := trimSpace(line)
+		indent := len(line) - len(trimLeft(line))
+
+		// Track YAML structure by indentation
+		if trimmed == "jobs:" {
+			inJobs = true
+			continue
+		}
+
+		if inJobs && indent == 2 && len(trimmed) > 0 && trimmed[len(trimmed)-1] == ':' {
+			// Job key — check if it matches our target (by checking if the
+			// job name appears in subsequent name: field, or just scan all jobs)
+			inTargetJob = true // scan all jobs for now, match by env var presence
+			inEnv = false
+		}
+
+		if inTargetJob && indent == 4 && trimmed == "env:" {
+			inEnv = true
+			continue
+		}
+
+		if inEnv && indent == 6 {
+			if hasPrefix(trimmed, "EPHEMERD_IMAGE:") {
+				value := trimSpace(trimmed[len("EPHEMERD_IMAGE:"):])
+				// Strip optional quotes
+				if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+					value = value[1 : len(value)-1]
+				}
+				if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' {
+					value = value[1 : len(value)-1]
+				}
+				return value
+			}
+			continue
+		}
+
+		// Left the env block
+		if inEnv && indent <= 4 {
+			inEnv = false
+		}
+		if inTargetJob && indent <= 2 && trimmed != "" {
+			inTargetJob = false
+		}
+	}
+
+	return ""
+}
+
+// Simple string helpers to avoid importing strings package just for these.
+func splitLines(s string) []string {
+	var lines []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			lines = append(lines, s[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		lines = append(lines, s[start:])
+	}
+	return lines
+}
+
+func trimSpace(s string) string {
+	start, end := 0, len(s)
+	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\r') {
+		end--
+	}
+	return s[start:end]
+}
+
+func trimLeft(s string) string {
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	return s[i:]
+}
+
+func hasPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
 // PollJobs checks all configured repos for queued workflow jobs targeting
 // self-hosted runners. Returns job events for any newly queued jobs.
 func (c *Client) PollJobs(ctx context.Context) ([]JobEvent, error) {

@@ -221,6 +221,12 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 
 	log.Info("provisioning runner for job")
 
+	// Fetch the job's EPHEMERD_IMAGE env var (extra API call to read workflow YAML)
+	image := s.cfg.GitHub.FetchJobImage(ctx, event.Repo, event.Job.GetRunID(), jobID)
+	if image != "" {
+		log.Info("using job-specified image", "image", image)
+	}
+
 	// Build runner labels
 	labels := s.buildLabels()
 
@@ -249,7 +255,7 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	} else {
 		jobCtx, cancel = context.WithCancel(ctx)
 	}
-	env, err := s.cfg.Runtime.Create(jobCtx, name, "", encodedConfig)
+	env, err := s.cfg.Runtime.Create(jobCtx, name, image, encodedConfig)
 	if err != nil {
 		log.Error("failed to create runner environment", "error", err)
 		// Remove the ghost runner from GitHub since the container won't start
