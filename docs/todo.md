@@ -12,12 +12,13 @@
 - [ ] On Windows: verify in-process containerd works with Hyper-V isolation
 - [ ] On Linux: verify overlayfs snapshotter is selected by default
 
-### Runner container image
-- [x] Create a Dockerfile for Linux runner image (ubuntu base + GitHub Actions runner binary)
-- [x] Create a Dockerfile for Windows runner image (servercore base + runner binary)
-- [x] Image entrypoint: configure runner with JIT config, start `run.sh` / `run.cmd`
-- [ ] Auto-download the latest GitHub Actions runner release on first run or cache miss
-- [ ] Publish images to ghcr.io/ephpm/ephemerd-runner (linux/amd64, linux/arm64, windows/amd64)
+### Embedded runner binary
+- [x] Embed GitHub Actions runner tarball via `go:embed` (downloaded at build time)
+- [x] Extract to `<dataDir>/runners/<version>/` on startup (cached after first run)
+- [x] Bind-mount runner directory read-only into job containers at `/actions-runner`
+- [x] Override container entrypoint to `run.sh --jitconfig <token>`
+- [x] Makefile `download-runner` target fetches correct platform tarball
+- [x] Version injected via ldflags at build time
 
 ### GitHub JIT runner flow
 - [x] Fix double base64 encoding of JIT config (was wrapping already-encoded value)
@@ -25,14 +26,13 @@
 - [x] Track runner ID for cleanup on failure
 - [x] Add backoff on JIT registration failure (rate limits, permissions)
 - [ ] Verify `GenerateRepoJITConfig` request fields match GitHub's actual API
-- [ ] Test the encoded JIT config is passed correctly to the runner binary inside the container
+- [ ] Auto-pull container image if not present locally
+- [ ] Remove ghost runner from GitHub if container fails to start after JIT registration
 - [ ] Confirm the runner registers, picks up the job, executes, and deregisters
-- [ ] Handle runner auto-removal on job completion (GitHub does this for ephemeral runners)
 
 ### End-to-end: single job
-- [ ] Write a test workflow in a repo that targets `[self-hosted, linux, x64]`
-- [ ] Start ephemerd on a Linux host with containerd available
-- [ ] Trigger the workflow, verify: webhook received → container created → job runs → container destroyed
+- [x] Write a test workflow in a repo that targets `[self-hosted, linux, x64]`
+- [ ] Start ephemerd on a Linux host, trigger workflow, verify full lifecycle
 - [ ] Verify clean state: no leftover containers/snapshots after job completion
 
 ## Phase 2: Production Hardening

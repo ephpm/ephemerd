@@ -73,10 +73,17 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 
 	r.cfg.Log.Info("creating runner environment", "id", id, "image", image)
 
-	// Get the image
+	// Get the image, pulling it if not present locally
 	img, err := r.client.GetImage(ctx, image)
 	if err != nil {
-		return nil, fmt.Errorf("getting image %s: %w", image, err)
+		r.cfg.Log.Info("image not found locally, pulling", "image", image)
+		if err := r.PullImage(ctx, image); err != nil {
+			return nil, fmt.Errorf("pulling image %s: %w", image, err)
+		}
+		img, err = r.client.GetImage(ctx, image)
+		if err != nil {
+			return nil, fmt.Errorf("getting image %s after pull: %w", image, err)
+		}
 	}
 
 	// Determine runner entrypoint based on OS

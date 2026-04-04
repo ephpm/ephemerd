@@ -136,10 +136,15 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	encodedConfig := jitConfig.GetEncodedJITConfig()
 
 	// Create the runner environment
+	runnerID := jitConfig.GetRunner().GetID()
 	jobCtx, cancel := context.WithCancel(ctx)
 	env, err := s.cfg.Runtime.Create(jobCtx, name, "", encodedConfig)
 	if err != nil {
 		log.Error("failed to create runner environment", "error", err)
+		// Remove the ghost runner from GitHub since the container won't start
+		if rmErr := s.cfg.GitHub.RemoveRunner(ctx, event.Repo, runnerID); rmErr != nil {
+			log.Warn("failed to remove ghost runner", "runner_id", runnerID, "error", rmErr)
+		}
 		cancel()
 		<-s.sem
 		return
@@ -150,7 +155,7 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	s.running[jobID] = &runningJob{
 		env:      env,
 		repo:     event.Repo,
-		runnerID: jitConfig.GetRunner().GetID(),
+		runnerID: runnerID,
 		cancel:   cancel,
 	}
 	s.mu.Unlock()
