@@ -76,6 +76,60 @@ graph LR
     I --> M[macOS Host — containerd in Virtualization.framework VM]
 ```
 
+### OCI Images as Artifact Cache
+
+OCI images aren't just for containers. ephemerd also uses them as a delivery mechanism for pre-built artifacts on macOS VM jobs. You package your build outputs into a scratch OCI image, push it to a registry, and ephemerd unpacks the layers into the VM before your job runs. This lets you chain build pipelines — build once, use everywhere.
+
+**Example: packaging a darwin libphp.a**
+
+Your PHP SDK pipeline builds `libphp.a` for darwin/arm64. Package it into an OCI image:
+
+```dockerfile
+FROM scratch
+COPY php-sdk-8.5.2-macos-aarch64/ /php-sdk/
+```
+
+```bash
+docker buildx build --platform linux/arm64 -t ghcr.io/ephpm/php-sdk:8.5.2-macos -f Dockerfile.sdk --push .
+```
+
+This image is tiny — just the SDK files, no OS, no runtime. It's a tarball with metadata.
+
+**Example: using it in a macOS job**
+
+Your ePHPm release pipeline needs that `libphp.a` to build the final binary on macOS. Set `EPHEMERD_IMAGE` and ephemerd pulls the OCI image, unpacks it into the VM, and your job finds the files ready to go:
+
+```yaml
+jobs:
+  build-macos:
+    runs-on: [self-hosted, macos, arm64]
+    env:
+      EPHEMERD_IMAGE: ghcr.io/ephpm/php-sdk:8.5.2-macos
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ephpm
+        run: |
+          export PHP_SDK_PATH=/ephemerd-artifacts/php-sdk
+          cargo build --release
+```
+
+ephemerd handles the rest:
+
+1. Boots an ephemeral macOS VM (clone-on-write from base snapshot)
+2. Pulls `ghcr.io/ephpm/php-sdk:8.5.2-macos` via containerd
+3. Unpacks the OCI layers into `/ephemerd-artifacts/` inside the VM
+4. Starts the GitHub runner — the job finds `libphp.a` waiting at `/ephemerd-artifacts/php-sdk/`
+5. Job completes, VM is destroyed
+
+```mermaid
+graph LR
+    B1[PHP SDK Build] -->|push| R[ghcr.io/ephpm/php-sdk:8.5.2-macos]
+    R -->|ephemerd pulls + unpacks| VM[macOS VM]
+    VM -->|libphp.a ready| B2[ePHPm Release Build]
+```
+
+No downloading during the job. No recompiling PHP. The artifact is cached in the registry and unpacked in seconds. This same pattern works for any pre-built dependency — Rust toolchains, native libraries, test fixtures.
+
 ### Dual-Purpose Hosts
 
 A single machine can serve multiple job types:
