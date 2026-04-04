@@ -157,6 +157,55 @@ Two options for receiving jobs:
 
 Start with polling for simplicity. Enable webhooks by adding TLS cert/key to config.
 
+### GitLab Integration
+
+ephemerd supports GitLab CI alongside GitHub Actions. The isolation layer (containerd, VMs, networking, firewall) is CI-system-agnostic — only the job discovery and runner registration differ.
+
+**Architecture: Custom Executor**
+
+GitLab runners support a [custom executor](https://docs.gitlab.com/runner/executors/custom.html) that calls user-defined scripts for each phase of job execution. ephemerd embeds the `gitlab-runner` binary and configures it to use a custom executor that delegates container lifecycle back to ephemerd.
+
+The flow:
+
+1. ephemerd starts with `[gitlab]` config present
+2. Extracts the embedded `gitlab-runner` binary
+3. Generates a `config.toml` for gitlab-runner with the custom executor pointing to ephemerd's own binary as the handler
+4. Launches `gitlab-runner run` in a goroutine — it polls GitLab for jobs
+5. When a job arrives, gitlab-runner calls ephemerd's custom executor scripts:
+   - **`prepare`** — ephemerd creates an OCI container via containerd (same as GitHub path)
+   - **`run`** — ephemerd executes the job step inside the container
+   - **`cleanup`** — ephemerd destroys the container and cleans up networking
+
+This gives us the same isolation model as GitHub — ephemeral containers per job, Hyper-V on Windows, Linux VMs on macOS — with GitLab handling job discovery and artifact upload.
+
+**Config:**
+
+```toml
+[gitlab]
+url = "https://gitlab.com"       # GitLab instance URL
+token = "glrt-your-runner-token"  # runner authentication token
+tags = ["ephemerd", "linux"]      # runner tags for job matching
+concurrent = 4                    # max parallel jobs (mirrors runner.max_concurrent)
+```
+
+GitHub and GitLab can run simultaneously on the same ephemerd instance — they share the containerd runtime, VM infrastructure, and networking stack. Jobs are isolated from each other regardless of which CI system dispatched them.
+
+**What this reuses from GitHub:**
+
+- Embedded containerd (in-process)
+- Container creation, networking, firewall rules
+- Linux VM on macOS/Windows for cross-OS jobs
+- macOS VM per-job for native jobs
+- Runner image management (same OCI images)
+- Graceful shutdown and orphan cleanup
+
+**What's GitLab-specific:**
+
+- `gitlab-runner` binary embedding and lifecycle management
+- Custom executor script generation (`prepare`/`run`/`cleanup`)
+- Runner registration with GitLab instance
+- GitLab-specific runner tags and configuration
+
 ### Image Management
 
 Pre-built OCI images per platform with common build tools, stored in any container registry:
