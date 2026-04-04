@@ -33,6 +33,10 @@ func main() {
 
 	root.AddCommand(
 		serveCmd(),
+		statusCmd(),
+		drainCmd(),
+		imagesCmd(),
+		configCheckCmd(),
 		ctrctlCmd(),
 	)
 
@@ -63,7 +67,7 @@ func serve(ctx context.Context, configFile string) error {
 
 	// Load configuration
 	if configFile == "" {
-		configFile = filepath(configDir, "config.toml")
+		configFile = joinPath(configDir, "config.toml")
 	}
 
 	cfg, err := config.Load(configFile)
@@ -113,7 +117,7 @@ func serve(ctx context.Context, configFile string) error {
 		DefaultImage: cfg.Runner.DefaultImage,
 		RunnerDir:    rm.Dir(),
 		RunnerMount:  rm.ContainerDir(),
-		LogDir:       filepath(configDir, "logs"),
+		LogDir:       joinPath(configDir, "logs"),
 		Network:      net,
 		Log:          log,
 	})
@@ -175,7 +179,7 @@ func ctrctlCmd() *cobra.Command {
 	return cmd
 }
 
-func filepath(parts ...string) string {
+func joinPath(parts ...string) string {
 	result := parts[0]
 	for _, p := range parts[1:] {
 		result = result + string(os.PathSeparator) + p
