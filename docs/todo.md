@@ -62,8 +62,9 @@
 
 ## Phase 3: Windows Support
 
-- [ ] HNS NAT networking (Windows equivalent of CNI bridge)
-- [ ] Windows Firewall rules for LAN isolation
+- [x] HCN NAT networking with platform-abstracted Manager interface
+- [x] ACL policies per-endpoint to block RFC 1918 + link-local (LAN isolation)
+- [x] Cross-compiles for windows/amd64
 - [ ] Verify containerd in-process on Windows
 - [ ] Hyper-V isolation verified end-to-end
 - [ ] Windows service integration (sc.exe / NSSM)

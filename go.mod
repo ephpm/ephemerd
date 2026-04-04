@@ -4,6 +4,7 @@ go 1.24.3
 
 require (
 	github.com/BurntSushi/toml v1.6.0
+	github.com/Microsoft/hcsshim v0.14.0-rc.1
 	github.com/containerd/containerd/v2 v2.2.2
 	github.com/containerd/go-cni v1.1.13
 	github.com/google/go-github/v72 v72.0.0
@@ -14,7 +15,6 @@ require (
 require (
 	dario.cat/mergo v1.0.2 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
-	github.com/Microsoft/hcsshim v0.14.0-rc.1 // indirect
 	github.com/StackExchange/wmi v0.0.0-20190523213315-cbe66965904d // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
