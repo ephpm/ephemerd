@@ -9,34 +9,148 @@ jobs:
     steps:
       - name: System info
         run: |
-          echo "Hello from ephemerd!"
+          echo "=== Basic info ==="
           echo "Hostname: $(hostname)"
           echo "User: $(whoami)"
+          echo "PID: $$"
           uname -a
           cat /etc/os-release || true
 
-      - name: Check runner
+      - name: Check runner mount
         run: |
-          echo "Runner name: $RUNNER_NAME"
-          echo "Runner workspace: $RUNNER_WORKSPACE"
-          ls -la /actions-runner/ | head -20
+          echo "=== Runner binary (should be read-only mount) ==="
+          ls -la /actions-runner/ | head -10
+          echo ""
+          echo "Attempt to write to runner mount (should fail):"
+          touch /actions-runner/pwned 2>&1 && echo "FAIL: runner mount is writable" || echo "PASS: runner mount is read-only"
 
-      - name: Network check
+      # --- Network isolation tests ---
+
+      - name: Internet access (should work)
         run: |
+          echo "=== Outbound internet ==="
+          curl -sI --max-time 10 https://github.com | head -5 || echo "FAIL: no internet"
+          echo ""
           echo "DNS resolution:"
-          nslookup github.com || true
+          nslookup github.com || host github.com || echo "FAIL: DNS broken"
+
+      - name: LAN isolation (should all fail)
+        run: |
+          echo "=== RFC 1918 ranges (should be blocked) ==="
+          for target in 192.168.1.1 192.168.0.1 10.0.0.1 172.16.0.1; do
+            curl -s --connect-timeout 3 http://$target > /dev/null 2>&1 \
+              && echo "FAIL: reached $target" \
+              || echo "PASS: $target blocked"
+          done
+
           echo ""
-          echo "Internet access:"
-          curl -sI https://github.com | head -5 || true
+          echo "=== Link-local / cloud metadata (should be blocked) ==="
+          curl -s --connect-timeout 3 http://169.254.169.254/latest/meta-data/ > /dev/null 2>&1 \
+            && echo "FAIL: metadata endpoint accessible" \
+            || echo "PASS: metadata endpoint blocked"
+
+      - name: Port scan host (should find nothing)
+        run: |
+          echo "=== Scan gateway for open ports ==="
+          gateway=$(ip route | grep default | awk '{print $3}' || echo "10.88.0.1")
+          for port in 22 80 443 2375 2376 8080; do
+            timeout 2 bash -c "echo >/dev/tcp/$gateway/$port" 2>/dev/null \
+              && echo "FAIL: gateway port $port open" \
+              || echo "PASS: gateway port $port closed/blocked"
+          done
+
+      # --- Container escape tests ---
+
+      - name: Filesystem escape attempts
+        run: |
+          echo "=== Host filesystem access ==="
+
+          echo "Read host /etc/shadow (should fail):"
+          cat /host/etc/shadow 2>&1 | head -3 || echo "PASS: /host not mounted"
+
           echo ""
-          echo "LAN isolation (should fail):"
-          curl -s --connect-timeout 3 http://192.168.1.1 && echo "FAIL: LAN accessible" || echo "PASS: LAN blocked"
+          echo "Read host root via /proc/1/root (should fail):"
+          ls /proc/1/root/etc/ 2>&1 | head -3 || echo "PASS: /proc/1/root not accessible"
+
+          echo ""
+          echo "Read host mounts:"
+          cat /proc/1/mountinfo 2>&1 | head -5 || echo "PASS: host mountinfo not readable"
+
+          echo ""
+          echo "Check if /var/run/docker.sock is mounted (should not be):"
+          ls -la /var/run/docker.sock 2>&1 || echo "PASS: docker socket not mounted"
+
+      - name: Privilege escalation attempts
+        run: |
+          echo "=== Capabilities ==="
+          cat /proc/self/status | grep -i cap || true
+
+          echo ""
+          echo "=== Try mounting proc (should fail or be no-op) ==="
+          mkdir -p /tmp/testmount
+          mount -t proc proc /tmp/testmount 2>&1 || echo "PASS: cannot mount proc"
+
+          echo ""
+          echo "=== Try mounting sysfs ==="
+          mount -t sysfs sysfs /tmp/testmount 2>&1 || echo "PASS: cannot mount sysfs"
+
+          echo ""
+          echo "=== Try loading a kernel module ==="
+          modprobe dummy 2>&1 || echo "PASS: cannot load kernel modules"
+
+          echo ""
+          echo "=== Try setting hostname (namespace escape indicator) ==="
+          hostname pwned 2>&1 || echo "PASS: cannot change hostname"
+
+          echo ""
+          echo "=== Check if we're really in a container ==="
+          echo "Cgroup: $(cat /proc/1/cgroup 2>/dev/null | head -3)"
+          echo "PID 1: $(cat /proc/1/cmdline 2>/dev/null | tr '\0' ' ')"
+
+      - name: Process namespace isolation
+        run: |
+          echo "=== Can we see host processes? ==="
+          echo "Total visible processes: $(ps aux 2>/dev/null | wc -l || echo 'ps not available')"
+          ps aux 2>/dev/null | head -20 || echo "PASS: ps not available"
+
+          echo ""
+          echo "=== Try killing PID 1 (should fail) ==="
+          kill -0 1 2>&1 && echo "PID 1 exists (expected in container)" || echo "PASS: cannot signal PID 1"
+          kill -9 1 2>&1 && echo "FAIL: killed PID 1" || echo "PASS: cannot kill PID 1"
+
+      - name: Device access
+        run: |
+          echo "=== Device access ==="
+          echo "Devices visible:"
+          ls /dev/ 2>/dev/null | head -20 || true
+
+          echo ""
+          echo "Try reading /dev/mem (should fail):"
+          dd if=/dev/mem bs=1 count=1 2>&1 || echo "PASS: /dev/mem not accessible"
+
+          echo ""
+          echo "Try reading /dev/sda (should fail):"
+          dd if=/dev/sda bs=1 count=1 2>&1 || echo "PASS: /dev/sda not accessible"
+
+      # --- Functional tests ---
 
       - uses: actions/checkout@v4
 
       - name: Verify checkout
         run: |
-          echo "Repo checked out:"
+          echo "=== Repo checkout ==="
           ls -la
-          echo ""
           head -5 go.mod
+          echo ""
+          echo "Git info:"
+          git log --oneline -3
+
+      - name: Summary
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "  ephemerd e2e test complete"
+          echo "=========================================="
+          echo ""
+          echo "If you see FAIL on any isolation test above,"
+          echo "there is a container escape vector to investigate."
