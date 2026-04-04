@@ -1,0 +1,42 @@
+name: Test ephemerd runner
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-linux:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: System info
+        run: |
+          echo "Hello from ephemerd!"
+          echo "Hostname: $(hostname)"
+          echo "User: $(whoami)"
+          uname -a
+          cat /etc/os-release || true
+
+      - name: Check runner
+        run: |
+          echo "Runner name: $RUNNER_NAME"
+          echo "Runner workspace: $RUNNER_WORKSPACE"
+          ls -la /actions-runner/ | head -20
+
+      - name: Network check
+        run: |
+          echo "DNS resolution:"
+          nslookup github.com || true
+          echo ""
+          echo "Internet access:"
+          curl -sI https://github.com | head -5 || true
+          echo ""
+          echo "LAN isolation (should fail):"
+          curl -s --connect-timeout 3 http://192.168.1.1 && echo "FAIL: LAN accessible" || echo "PASS: LAN blocked"
+
+      - uses: actions/checkout@v4
+
+      - name: Verify checkout
+        run: |
+          echo "Repo checked out:"
+          ls -la
+          echo ""
+          head -5 go.mod

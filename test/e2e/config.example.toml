@@ -1,0 +1,21 @@
+# E2E test configuration for ephemerd.
+# Copy this to config.toml and fill in your GitHub token.
+#
+# Generate a PAT at: https://github.com/settings/tokens
+# Required scopes: repo, admin:org (for runner registration)
+
+[github]
+token = "ghp_YOUR_TOKEN_HERE"
+owner = "ephpm"
+repos = ["ephemerd"]
+poll_interval = "10s"
+
+[runner]
+default_image = "docker.io/library/ubuntu:22.04"
+max_concurrent = 2
+job_timeout = "30m"
+shutdown_timeout = "2m"
+
+[log]
+level = "debug"
+format = "text"

@@ -1,21 +1,15 @@
-# Test workflow for ephemerd self-hosted runners.
-# Copy this to .github/workflows/ in your test repository.
-name: Test ephemerd runner
-
-on:
-  push:
-    branches: [main]
-  workflow_dispatch:
-
-jobs:
-  test:
-    runs-on: [self-hosted, linux, x64]
-    steps:
-      - run: echo "Hello from ephemerd!"
-      - run: uname -a
-      - run: whoami
-      - run: cat /etc/os-release
-      - run: echo "Runner name = $RUNNER_NAME"
-      - uses: actions/checkout@v4
-      - run: echo "Checkout successful, listing files:"
-      - run: ls -la
+# This file has moved to .github/workflows/test-runner.yml
+# It runs automatically when triggered via workflow_dispatch on GitHub.
+#
+# To test:
+#   1. Build: make build
+#   2. Copy test/e2e/config.example.toml to config.toml, add your GitHub PAT
+#   3. Start: sudo ./ephemerd serve --config config.toml
+#   4. Go to GitHub > Actions > "Test ephemerd runner" > Run workflow
+#   5. Watch ephemerd logs for the full lifecycle:
+#      - Poll detects queued job
+#      - JIT runner registered
+#      - Container created from ubuntu:22.04
+#      - Runner binary bind-mounted and started
+#      - Job executes (system info, network check, checkout)
+#      - Container destroyed on completion
