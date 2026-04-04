@@ -76,51 +76,6 @@ graph LR
     I --> M[macOS Host — containerd in Virtualization.framework VM]
 ```
 
-This is the key advantage of ephemerd on macOS: you don't need macOS VMs for most CI work. If your jobs run on Linux, build a standard OCI image with your tools pre-installed and it runs on your Mac Mini the same way it runs on a Linux server — just ARM64 on Apple Silicon.
-
-For example, say you build PHP from source in one project and want to use the compiled `libphp.a` in another project's CI. Build an OCI image with your artifacts baked in:
-
-```dockerfile
-FROM ubuntu:24.04
-
-# Install build tools
-RUN apt-get update && apt-get install -y \
-    build-essential cmake autoconf automake git curl pkg-config
-
-# Install Rust toolchain
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-# Pull in pre-built libphp from your PHP SDK release (ARM64 binary)
-ADD https://github.com/myorg/php-sdk/releases/download/v8.5.2/php-sdk-8.5.2-linux-aarch64.tar.gz /tmp/php-sdk.tar.gz
-RUN mkdir -p /usr/local/php-sdk && \
-    tar xzf /tmp/php-sdk.tar.gz -C /usr/local/php-sdk && \
-    rm /tmp/php-sdk.tar.gz
-
-# Set environment so downstream builds find the SDK
-ENV PHP_SDK_PATH=/usr/local/php-sdk
-```
-
-```bash
-# Build for ARM64 (runs natively on Apple Silicon or ARM64 Linux)
-docker buildx build --platform linux/arm64 -t ghcr.io/myorg/ephpm-builder:latest --push .
-```
-
-Now any job that uses this image has `libphp.a`, Rust, and build tools ready to go — no downloading or compiling during the job. The image is cached by containerd, so subsequent jobs start in seconds:
-
-```yaml
-jobs:
-  build:
-    runs-on: [self-hosted, linux, arm64]
-    container:
-      image: ghcr.io/myorg/ephpm-builder:latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: cargo build --release   # libphp.a and Rust are already there
-```
-
-This works identically on an ARM64 Linux server and on a Mac Mini running ephemerd — same image, same container, same build.
-
 ### Dual-Purpose Hosts
 
 A single machine can serve multiple job types:
