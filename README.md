@@ -128,32 +128,34 @@ ephemerd starts containerd, begins polling GitHub for queued jobs, and provision
 runs-on: [self-hosted, linux, x64]
 ```
 
-## Choosing the Container Image
+## Choosing the Image
 
-By default, every job uses the `default_image` from your config. To use a different image for a specific job, set the `EPHEMERD_IMAGE` environment variable:
+### Linux and Windows jobs (OCI containers)
+
+Use the standard `container:` key in your workflow. ephemerd's containerd pulls the image and runs the job inside it:
 
 ```yaml
 jobs:
   build-php:
     runs-on: [self-hosted, linux, x64]
-    env:
-      EPHEMERD_IMAGE: ghcr.io/myorg/php-builder:latest
+    container:
+      image: ghcr.io/myorg/php-builder:latest
     steps:
       - uses: actions/checkout@v4
       - run: make build
 
-  build-rust:
-    runs-on: [self-hosted, linux, arm64]
-    env:
-      EPHEMERD_IMAGE: ghcr.io/myorg/rust-builder:latest
+  build-windows:
+    runs-on: [self-hosted, windows, x64]
+    container:
+      image: ghcr.io/myorg/windows-build:latest
     steps:
       - uses: actions/checkout@v4
-      - run: cargo build --release
+      - run: nmake
 ```
 
-ephemerd reads the workflow YAML from the GitHub API when a job is queued and picks up the `EPHEMERD_IMAGE` value before creating the container. No special labels or runner registration needed.
+### macOS jobs (VMs)
 
-For macOS-native jobs, `EPHEMERD_IMAGE` selects the base VM snapshot:
+macOS jobs run in ephemeral VMs, not containers. The `container:` key doesn't work on macOS runners. Instead, set `EPHEMERD_IMAGE` in the job's env to select which VM snapshot to boot:
 
 ```yaml
 jobs:
@@ -166,12 +168,9 @@ jobs:
       - run: xcodebuild -scheme MyApp
 ```
 
-The image name is resolved against ephemerd's config — either a full registry URL for OCI images or a name mapped to a local macOS disk snapshot.
+ephemerd reads the workflow YAML from the GitHub API when a job is queued and picks up `EPHEMERD_IMAGE` before creating the VM. The value maps to a snapshot configured in ephemerd's `[vm.macos]` section.
 
-**Resolution:**
-
-- Container jobs (Linux/Windows): `EPHEMERD_IMAGE` is required — the job must specify its image
-- macOS VM jobs: `EPHEMERD_IMAGE` selects a specific snapshot; if not set, the base VM boots as-is
+If `EPHEMERD_IMAGE` is not set, the base macOS VM boots as-is — all the tools provisioned into the snapshot are already there.
 
 ## Configuration
 
