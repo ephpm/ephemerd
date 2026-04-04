@@ -8,9 +8,16 @@ owner = "your-org"
 # Repos to register runners for
 repos = ["repo1", "repo2"]
 
-# Webhook listener
-webhook_port = 8080
-webhook_secret = "your_webhook_secret"
+# Job discovery: polling (default) or webhook
+# Polling checks the GitHub API every interval — no inbound ports or certs needed.
+# Set tls_cert + tls_key to enable webhook mode instead (instant delivery).
+poll_interval = "10s"
+
+# Webhook mode (optional): listen for GitHub webhook events over TLS
+# webhook_port = 8080
+# webhook_secret = "your_webhook_secret"
+# tls_cert = "/etc/ephemerd/tls.crt"
+# tls_key = "/etc/ephemerd/tls.key"
 
 [runner]
 # Default container image for runner environments

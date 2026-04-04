@@ -77,6 +77,57 @@ func (c *Client) RemoveRunner(ctx context.Context, repo string, runnerID int64) 
 	return nil
 }
 
+// PollJobs checks all configured repos for queued workflow jobs targeting
+// self-hosted runners. Returns job events for any newly queued jobs.
+func (c *Client) PollJobs(ctx context.Context) ([]JobEvent, error) {
+	var events []JobEvent
+
+	for _, repo := range c.cfg.Repos {
+		jobs, _, err := c.client.Actions.ListWorkflowJobs(ctx, c.cfg.Owner, repo, 0, &gh.ListWorkflowJobsOptions{
+			Filter: "latest",
+		})
+		if err != nil {
+			// Try listing workflow runs and their jobs instead
+			runs, _, err := c.client.Actions.ListRepositoryWorkflowRuns(ctx, c.cfg.Owner, repo, &gh.ListWorkflowRunsOptions{
+				Status: "queued",
+			})
+			if err != nil {
+				c.cfg.Log.Warn("failed to poll repo", "repo", repo, "error", err)
+				continue
+			}
+
+			for _, run := range runs.WorkflowRuns {
+				runJobs, _, err := c.client.Actions.ListWorkflowJobs(ctx, c.cfg.Owner, repo, run.GetID(), nil)
+				if err != nil {
+					continue
+				}
+				for _, job := range runJobs.Jobs {
+					if job.GetStatus() == "queued" && isSelfHosted(job.Labels) {
+						events = append(events, JobEvent{
+							Action: "queued",
+							Repo:   repo,
+							Job:    job,
+						})
+					}
+				}
+			}
+			continue
+		}
+
+		for _, job := range jobs.Jobs {
+			if job.GetStatus() == "queued" && isSelfHosted(job.Labels) {
+				events = append(events, JobEvent{
+					Action: "queued",
+					Repo:   repo,
+					Job:    job,
+				})
+			}
+		}
+	}
+
+	return events, nil
+}
+
 // WebhookHandler returns an http.Handler that processes workflow_job webhook events.
 // Events are sent to the returned channel.
 func (c *Client) WebhookHandler(secret string) (http.Handler, <-chan JobEvent) {

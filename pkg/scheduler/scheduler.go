@@ -20,8 +20,11 @@ type Config struct {
 	GitHub          *github.Client
 	MaxConcurrent   int
 	Labels          []string
-	WebhookPort     int
-	WebhookSecret   string
+	PollInterval    time.Duration // if >0, use polling mode (default)
+	WebhookPort     int           // webhook mode: listen port
+	WebhookSecret   string        // webhook mode: signature secret
+	TLSCert         string        // webhook mode: TLS certificate
+	TLSKey          string        // webhook mode: TLS private key
 	JobTimeout      time.Duration
 	ShutdownTimeout time.Duration
 	Log             *slog.Logger
@@ -67,28 +70,66 @@ func New(cfg Config) *Scheduler {
 	}
 }
 
-// Run starts the scheduler. It listens for GitHub webhook events
-// and manages runner environment lifecycle.
+// Run starts the scheduler. It discovers jobs via polling (default) or
+// webhooks (when TLS certs are configured), and manages runner lifecycle.
 func (s *Scheduler) Run(ctx context.Context) error {
-	handler, events := s.cfg.GitHub.WebhookHandler(s.cfg.WebhookSecret)
+	events := make(chan github.JobEvent, 32)
 
-	// Start webhook server
+	// Start health server (always available)
 	mux := http.NewServeMux()
-	mux.Handle("/webhook", handler)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 
-	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.cfg.WebhookPort),
-		Handler: mux,
-	}
+	// Determine job discovery mode
+	useWebhook := s.cfg.TLSCert != "" && s.cfg.TLSKey != ""
 
-	// Start HTTP server in background
-	go func() {
-		s.cfg.Log.Info("webhook server listening", "port", s.cfg.WebhookPort)
-		if err := server.ListenAndServe(); err != http.ErrServerClosed {
-			s.cfg.Log.Error("webhook server error", "error", err)
+	if useWebhook {
+		// Webhook mode: listen for GitHub push events over TLS
+		handler, webhookEvents := s.cfg.GitHub.WebhookHandler(s.cfg.WebhookSecret)
+		mux.Handle("/webhook", handler)
+
+		// Forward webhook events to the unified channel
+		go func() {
+			for ev := range webhookEvents {
+				events <- ev
+			}
+		}()
+
+		server := &http.Server{
+			Addr:    fmt.Sprintf(":%d", s.cfg.WebhookPort),
+			Handler: mux,
 		}
-	}()
+
+		go func() {
+			s.cfg.Log.Info("webhook server listening (TLS)", "port", s.cfg.WebhookPort)
+			if err := server.ListenAndServeTLS(s.cfg.TLSCert, s.cfg.TLSKey); err != http.ErrServerClosed {
+				s.cfg.Log.Error("webhook server error", "error", err)
+			}
+		}()
+
+		defer server.Shutdown(context.Background())
+	} else {
+		// Polling mode: periodically check GitHub API for queued jobs
+		interval := s.cfg.PollInterval
+		if interval <= 0 {
+			interval = 10 * time.Second
+		}
+
+		// Health endpoint on HTTP (no TLS needed in polling mode)
+		server := &http.Server{
+			Addr:    fmt.Sprintf(":%d", s.cfg.WebhookPort),
+			Handler: mux,
+		}
+		go func() {
+			s.cfg.Log.Info("health server listening", "port", s.cfg.WebhookPort)
+			if err := server.ListenAndServe(); err != http.ErrServerClosed {
+				s.cfg.Log.Error("health server error", "error", err)
+			}
+		}()
+		defer server.Shutdown(context.Background())
+
+		s.cfg.Log.Info("polling mode enabled", "interval", interval)
+		go s.pollLoop(ctx, interval, events)
+	}
 
 	// Periodically clean up the seen-jobs dedup map
 	cleanupTicker := time.NewTicker(5 * time.Minute)
@@ -103,7 +144,6 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			s.cfg.Log.Info("shutting down scheduler")
 			s.drain()
-			server.Shutdown(context.Background())
 			return nil
 
 		case event := <-events:
@@ -114,6 +154,36 @@ func (s *Scheduler) Run(ctx context.Context) error {
 				go s.handleCompleted(ctx, event)
 			}
 		}
+	}
+}
+
+// pollLoop periodically checks GitHub for queued jobs and sends them as events.
+func (s *Scheduler) pollLoop(ctx context.Context, interval time.Duration, events chan<- github.JobEvent) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Poll immediately on start
+	s.poll(ctx, events)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.poll(ctx, events)
+		}
+	}
+}
+
+func (s *Scheduler) poll(ctx context.Context, events chan<- github.JobEvent) {
+	jobs, err := s.cfg.GitHub.PollJobs(ctx)
+	if err != nil {
+		s.cfg.Log.Warn("poll failed", "error", err)
+		return
+	}
+
+	for _, job := range jobs {
+		events <- job
 	}
 }
 

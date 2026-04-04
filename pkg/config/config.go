@@ -30,9 +30,12 @@ type GitHubConfig struct {
 	Owner string   `toml:"owner"`
 	Repos []string `toml:"repos"`
 
-	// Webhook listener for workflow_job events
+	// Job discovery: polling (default) or webhook
+	PollInterval  string `toml:"poll_interval"`  // polling interval (default "10s", set to "0" to disable)
 	WebhookPort   int    `toml:"webhook_port"`
 	WebhookSecret string `toml:"webhook_secret"`
+	TLSCert       string `toml:"tls_cert"` // path to TLS certificate, enables webhook mode
+	TLSKey        string `toml:"tls_key"`  // path to TLS private key
 }
 
 type RunnerConfig struct {
@@ -41,6 +44,18 @@ type RunnerConfig struct {
 	ExtraLabels     []string `toml:"extra_labels"`
 	JobTimeout      string   `toml:"job_timeout"`
 	ShutdownTimeout string   `toml:"shutdown_timeout"`
+}
+
+// ParsedPollInterval returns the poll interval as a time.Duration.
+func (g *GitHubConfig) ParsedPollInterval() time.Duration {
+	if g.PollInterval == "" {
+		return 10 * time.Second
+	}
+	d, err := time.ParseDuration(g.PollInterval)
+	if err != nil {
+		return 10 * time.Second
+	}
+	return d
 }
 
 // ParsedJobTimeout returns the job timeout as a time.Duration.
