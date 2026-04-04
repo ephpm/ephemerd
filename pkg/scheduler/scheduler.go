@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ephpm/ephemerd/pkg/artifacts"
 	"github.com/ephpm/ephemerd/pkg/github"
 	"github.com/ephpm/ephemerd/pkg/runtime"
 )
@@ -18,6 +19,8 @@ import (
 type Config struct {
 	Runtime         *runtime.Runtime
 	GitHub          *github.Client
+	Artifacts       *artifacts.Extractor // OCI image layer extractor for macOS VM jobs (nil if not available)
+	DataDir         string               // ephemerd data directory (used for artifact extraction paths)
 	MaxConcurrent   int
 	Labels          []string
 	PollInterval    time.Duration // if >0, use polling mode (default)
@@ -46,10 +49,11 @@ type Scheduler struct {
 const seenTTL = 10 * time.Minute
 
 type runningJob struct {
-	env      *runtime.RunnerEnv
-	repo     string
-	runnerID int64
-	cancel   context.CancelFunc
+	env          *runtime.RunnerEnv
+	repo         string
+	runnerID     int64
+	cancel       context.CancelFunc
+	artifactsDir string // non-empty if OCI artifacts were extracted for this job
 }
 
 // New creates a scheduler.
@@ -227,6 +231,22 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 		log.Info("using job-specified image", "image", image)
 	}
 
+	// For macOS VM jobs with an OCI image specified, extract artifact layers
+	// into the shared data directory so they're available inside the VM via virtio-fs.
+	var artifactsDir string
+	if image != "" && s.cfg.Artifacts != nil && goruntime.GOOS == "darwin" {
+		artifactsDir = artifacts.ArtifactsDir(s.cfg.DataDir, fmt.Sprintf("%d", jobID))
+		log.Info("extracting OCI artifacts for macOS VM job", "image", image, "dest", artifactsDir)
+		if err := s.cfg.Artifacts.Extract(ctx, image, artifactsDir); err != nil {
+			log.Error("failed to extract OCI artifacts", "image", image, "error", err)
+			artifacts.Cleanup(artifactsDir, s.cfg.Log)
+			artifactsDir = ""
+			// Non-fatal: the job can still run without pre-extracted artifacts
+		} else {
+			log.Info("OCI artifacts ready for macOS VM", "dest", artifactsDir)
+		}
+	}
+
 	// Build runner labels
 	labels := s.buildLabels()
 
@@ -237,6 +257,9 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	jitConfig, err := s.cfg.GitHub.RegisterJITRunner(ctx, event.Repo, name, labels)
 	if err != nil {
 		log.Error("failed to register JIT runner", "error", err)
+		if artifactsDir != "" {
+			artifacts.Cleanup(artifactsDir, s.cfg.Log)
+		}
 		time.Sleep(5 * time.Second) // back off to avoid tight retry loops on rate limits
 		<-s.sem
 		return
@@ -262,6 +285,9 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 		if rmErr := s.cfg.GitHub.RemoveRunner(ctx, event.Repo, runnerID); rmErr != nil {
 			log.Warn("failed to remove ghost runner", "runner_id", runnerID, "error", rmErr)
 		}
+		if artifactsDir != "" {
+			artifacts.Cleanup(artifactsDir, s.cfg.Log)
+		}
 		cancel()
 		<-s.sem
 		return
@@ -270,10 +296,11 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	// Track the running job
 	s.mu.Lock()
 	s.running[jobID] = &runningJob{
-		env:      env,
-		repo:     event.Repo,
-		runnerID: runnerID,
-		cancel:   cancel,
+		env:          env,
+		repo:         event.Repo,
+		runnerID:     runnerID,
+		cancel:       cancel,
+		artifactsDir: artifactsDir,
 	}
 	s.mu.Unlock()
 
@@ -302,10 +329,14 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 
 		// Always clean up — whether normal exit, crash, OOM, or timeout
 		s.mu.Lock()
-		if _, exists := s.running[jobID]; exists {
+		rj, exists := s.running[jobID]
+		if exists {
 			delete(s.running, jobID)
 			s.mu.Unlock()
 			_ = s.cfg.Runtime.Destroy(context.Background(), env)
+			if rj.artifactsDir != "" {
+				artifacts.Cleanup(rj.artifactsDir, s.cfg.Log)
+			}
 		} else {
 			s.mu.Unlock()
 		}
@@ -333,6 +364,9 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event github.JobEvent) 
 
 	job.cancel()
 	_ = s.cfg.Runtime.Destroy(context.Background(), job.env)
+	if job.artifactsDir != "" {
+		artifacts.Cleanup(job.artifactsDir, s.cfg.Log)
+	}
 }
 
 // drain stops accepting new jobs and waits for running jobs to finish.
@@ -389,6 +423,9 @@ func (s *Scheduler) destroyAll() {
 		s.cfg.Log.Info("destroying runner on shutdown", "job_id", id)
 		job.cancel()
 		_ = s.cfg.Runtime.Destroy(context.Background(), job.env)
+		if job.artifactsDir != "" {
+			artifacts.Cleanup(job.artifactsDir, s.cfg.Log)
+		}
 	}
 }
 
@@ -399,11 +436,11 @@ func (s *Scheduler) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	status := map[string]any{
-		"status":        "ok",
-		"active_jobs":   activeJobs,
+		"status":         "ok",
+		"active_jobs":    activeJobs,
 		"max_concurrent": s.cfg.MaxConcurrent,
-		"draining":      draining,
-		"uptime":        time.Since(s.startTime).String(),
+		"draining":       draining,
+		"uptime":         time.Since(s.startTime).String(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
