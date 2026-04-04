@@ -281,12 +281,20 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 
 		exitCode, err := s.cfg.Runtime.Wait(jobCtx, env)
 		if err != nil {
-			log.Warn("runner exited with error", "error", err)
+			if jobCtx.Err() != nil {
+				log.Warn("runner killed (timeout or shutdown)", "error", err)
+			} else {
+				log.Error("runner crashed", "error", err)
+			}
+		} else if exitCode == 137 {
+			log.Warn("runner killed by OOM or signal", "exit_code", exitCode)
+		} else if exitCode != 0 {
+			log.Warn("runner exited with failure", "exit_code", exitCode)
 		} else {
 			log.Info("runner exited", "exit_code", exitCode)
 		}
 
-		// Clean up if not already handled by completed event
+		// Always clean up — whether normal exit, crash, OOM, or timeout
 		s.mu.Lock()
 		if _, exists := s.running[jobID]; exists {
 			delete(s.running, jobID)

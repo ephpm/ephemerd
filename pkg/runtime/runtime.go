@@ -156,6 +156,11 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		opts = append(opts, withRunnerMount(r.cfg.RunnerDir, r.cfg.RunnerMount))
 	}
 
+	// Mount host DNS config so containers can resolve names
+	if goruntime.GOOS != "windows" {
+		opts = append(opts, withDNSMount())
+	}
+
 	// Add Hyper-V isolation on Windows
 	if goruntime.GOOS == "windows" {
 		opts = append(opts, withHyperVIsolation())
@@ -268,6 +273,22 @@ func (r *Runtime) Wait(ctx context.Context, env *RunnerEnv) (uint32, error) {
 		return status.ExitCode(), status.Error()
 	case <-ctx.Done():
 		return 1, ctx.Err()
+	}
+}
+
+// withDNSMount bind-mounts the host's resolv.conf into the container for DNS resolution.
+func withDNSMount() oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
+		if s.Mounts == nil {
+			s.Mounts = []ocispec.Mount{}
+		}
+		s.Mounts = append(s.Mounts, ocispec.Mount{
+			Destination: "/etc/resolv.conf",
+			Type:        "bind",
+			Source:      "/etc/resolv.conf",
+			Options:     []string{"rbind", "ro"},
+		})
+		return nil
 	}
 }
 
