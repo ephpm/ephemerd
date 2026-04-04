@@ -12,12 +12,36 @@ import (
 type Config struct {
 	GitHub     GitHubConfig     `toml:"github"`
 	Containerd ContainerdConfig `toml:"containerd"`
+	VM         VMConfig         `toml:"vm"`
 	Runner     RunnerConfig     `toml:"runner"`
 	Log        LogConfig        `toml:"log"`
 }
 
 type ContainerdConfig struct {
 	// Reserved for future containerd-specific settings (e.g. snapshotter overrides)
+}
+
+// VMConfig configures virtual machines for cross-OS job execution.
+type VMConfig struct {
+	Linux LinuxVMToml `toml:"linux"`
+	MacOS MacOSVMToml `toml:"macos"`
+}
+
+// LinuxVMToml configures the long-running Linux VM for Linux jobs
+// on Windows (Hyper-V) and macOS (Virtualization.framework) hosts.
+type LinuxVMToml struct {
+	Enabled    bool   `toml:"enabled"`     // enable Linux VM for cross-OS Linux jobs
+	CPUs       uint   `toml:"cpus"`        // virtual CPUs (default: 2)
+	MemoryMB   uint64 `toml:"memory_mb"`   // memory in MB (default: 2048)
+	DiskSizeGB uint64 `toml:"disk_size_gb"` // sparse disk size in GB (default: 50)
+}
+
+// MacOSVMToml configures per-job macOS VMs on macOS hosts.
+type MacOSVMToml struct {
+	Enabled   bool   `toml:"enabled"`    // enable macOS-native jobs
+	BaseImage string `toml:"base_image"` // path to provisioned macOS disk image
+	CPUs      uint   `toml:"cpus"`       // CPUs per VM (default: 4)
+	MemoryMB  uint64 `toml:"memory_mb"`  // memory per VM in MB (default: 8192)
 }
 
 type GitHubConfig struct {

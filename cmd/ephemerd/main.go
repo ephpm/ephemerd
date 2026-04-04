@@ -78,17 +78,16 @@ func serve(ctx context.Context, configFile string) error {
 	log := cfg.Logger()
 	log.Info("starting ephemerd", "version", version, "data_dir", configDir)
 
-	// Start embedded containerd
-	ctrd, err := containerd.New(containerd.Config{
-		DataDir: configDir,
-		Log:     log,
-	})
+	// Start container runtime.
+	// On Linux/Windows: embedded containerd runs in-process.
+	// On macOS: boot a Linux VM via Virtualization.framework, containerd runs inside it.
+	ctrdClient, cleanup, err := startContainerRuntime(configDir, log)
 	if err != nil {
-		return fmt.Errorf("starting containerd: %w", err)
+		return fmt.Errorf("starting container runtime: %w", err)
 	}
-	defer ctrd.Stop()
+	defer cleanup()
 
-	log.Info("containerd started")
+	log.Info("container runtime ready")
 
 	// Extract embedded GitHub Actions runner
 	rm := runner.New(configDir, log)
@@ -113,7 +112,7 @@ func serve(ctx context.Context, configFile string) error {
 
 	// Create runtime (container lifecycle manager)
 	rt, err := runtime.New(runtime.Config{
-		Client:       ctrd.Client(),
+		Client:       ctrdClient,
 		DefaultImage: cfg.Runner.DefaultImage,
 		RunnerDir:    rm.Dir(),
 		RunnerMount:  rm.ContainerDir(),
