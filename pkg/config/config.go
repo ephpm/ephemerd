@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -35,10 +36,29 @@ type GitHubConfig struct {
 }
 
 type RunnerConfig struct {
-	DefaultImage  string   `toml:"default_image"`
-	MaxConcurrent int      `toml:"max_concurrent"`
-	ExtraLabels   []string `toml:"extra_labels"`
-	JobTimeout    string   `toml:"job_timeout"`
+	DefaultImage    string   `toml:"default_image"`
+	MaxConcurrent   int      `toml:"max_concurrent"`
+	ExtraLabels     []string `toml:"extra_labels"`
+	JobTimeout      string   `toml:"job_timeout"`
+	ShutdownTimeout string   `toml:"shutdown_timeout"`
+}
+
+// ParsedJobTimeout returns the job timeout as a time.Duration.
+func (r *RunnerConfig) ParsedJobTimeout() time.Duration {
+	d, err := time.ParseDuration(r.JobTimeout)
+	if err != nil {
+		return 2 * time.Hour
+	}
+	return d
+}
+
+// ParsedShutdownTimeout returns the shutdown timeout as a time.Duration.
+func (r *RunnerConfig) ParsedShutdownTimeout() time.Duration {
+	d, err := time.ParseDuration(r.ShutdownTimeout)
+	if err != nil {
+		return 5 * time.Minute
+	}
+	return d
 }
 
 type LogConfig struct {
@@ -49,8 +69,9 @@ type LogConfig struct {
 func Load(path string) (*Config, error) {
 	cfg := &Config{
 		Runner: RunnerConfig{
-			MaxConcurrent: 4,
-			JobTimeout:    "2h",
+			MaxConcurrent:   4,
+			JobTimeout:      "2h",
+			ShutdownTimeout: "5m",
 		},
 		GitHub: GitHubConfig{
 			WebhookPort: 8080,

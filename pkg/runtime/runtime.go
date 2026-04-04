@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	goruntime "runtime"
 
 	"github.com/containerd/containerd/v2/client"
@@ -11,6 +13,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/ephpm/ephemerd/pkg/networking"
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -22,6 +25,8 @@ type Config struct {
 	DefaultImage string
 	RunnerDir    string // host path to extracted runner binary
 	RunnerMount  string // container path to mount runner at
+	LogDir       string // directory for per-job container logs
+	Network      *networking.Manager
 	Log          *slog.Logger
 }
 
@@ -34,6 +39,7 @@ type Runtime struct {
 // RunnerEnv represents a running runner environment.
 type RunnerEnv struct {
 	ID        string
+	Netns     string // network namespace path (Linux only)
 	Container client.Container
 	Task      client.Task
 }
@@ -44,6 +50,49 @@ func New(cfg Config) (*Runtime, error) {
 		cfg:    cfg,
 		client: cfg.Client,
 	}, nil
+}
+
+// CleanOrphans removes any leftover containers from a previous ephemerd run.
+// This should be called on startup before the scheduler starts accepting jobs.
+func (r *Runtime) CleanOrphans(ctx context.Context) error {
+	ctx = namespaces.WithNamespace(ctx, namespace)
+
+	containers, err := r.client.Containers(ctx)
+	if err != nil {
+		return fmt.Errorf("listing containers: %w", err)
+	}
+
+	if len(containers) == 0 {
+		return nil
+	}
+
+	r.cfg.Log.Info("cleaning orphan containers", "count", len(containers))
+
+	for _, c := range containers {
+		id := c.ID()
+		log := r.cfg.Log.With("id", id)
+
+		// Try to kill and delete the task
+		task, err := c.Task(ctx, nil)
+		if err == nil {
+			status, err := task.Status(ctx)
+			if err == nil && status.Status == client.Running {
+				log.Debug("killing orphan task")
+				task.Kill(ctx, 9)
+				task.Wait(ctx)
+			}
+			task.Delete(ctx)
+		}
+
+		// Delete container and snapshot
+		if err := c.Delete(ctx, client.WithSnapshotCleanup); err != nil {
+			log.Warn("failed to delete orphan container", "error", err)
+		} else {
+			log.Info("orphan container removed")
+		}
+	}
+
+	return nil
 }
 
 // PullImage ensures the runner image is available locally.
@@ -121,14 +170,38 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		return nil, fmt.Errorf("creating container %s: %w", id, err)
 	}
 
-	// Create and start the task
-	task, err := container.NewTask(ctx, cio.NewCreator(cio.WithStdio))
+	// Create and start the task with per-job log capture
+	var creator cio.Creator
+	if r.cfg.LogDir != "" {
+		os.MkdirAll(r.cfg.LogDir, 0o755)
+		logPath := filepath.Join(r.cfg.LogDir, id+".log")
+		creator = cio.LogFile(logPath)
+		r.cfg.Log.Debug("container logs", "id", id, "path", logPath)
+	} else {
+		creator = cio.NewCreator(cio.WithStdio)
+	}
+	task, err := container.NewTask(ctx, creator)
 	if err != nil {
 		container.Delete(ctx)
 		return nil, fmt.Errorf("creating task for %s: %w", id, err)
 	}
 
+	// Attach CNI networking before starting the task
+	var netns string
+	if r.cfg.Network != nil && goruntime.GOOS != "windows" {
+		pid := task.Pid()
+		netns = fmt.Sprintf("/proc/%d/ns/net", pid)
+		if _, err := r.cfg.Network.Setup(ctx, id, netns); err != nil {
+			task.Delete(ctx)
+			container.Delete(ctx)
+			return nil, fmt.Errorf("setting up network for %s: %w", id, err)
+		}
+	}
+
 	if err := task.Start(ctx); err != nil {
+		if r.cfg.Network != nil && netns != "" {
+			r.cfg.Network.Teardown(ctx, id, netns)
+		}
 		task.Delete(ctx)
 		container.Delete(ctx)
 		return nil, fmt.Errorf("starting task for %s: %w", id, err)
@@ -138,6 +211,7 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 
 	return &RunnerEnv{
 		ID:        id,
+		Netns:     netns,
 		Container: container,
 		Task:      task,
 	}, nil
@@ -161,6 +235,13 @@ func (r *Runtime) Destroy(ctx context.Context, env *RunnerEnv) error {
 	// Delete task
 	if _, err := env.Task.Delete(ctx); err != nil {
 		r.cfg.Log.Warn("failed to delete task", "id", env.ID, "error", err)
+	}
+
+	// Teardown CNI networking
+	if r.cfg.Network != nil && env.Netns != "" {
+		if err := r.cfg.Network.Teardown(ctx, env.ID, env.Netns); err != nil {
+			r.cfg.Log.Warn("failed to teardown network", "id", env.ID, "error", err)
+		}
 	}
 
 	// Delete container and snapshot

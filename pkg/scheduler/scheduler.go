@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -15,24 +16,31 @@ import (
 
 // Config for the scheduler.
 type Config struct {
-	Runtime       *runtime.Runtime
-	GitHub        *github.Client
-	MaxConcurrent int
-	Labels        []string
-	WebhookPort   int
-	WebhookSecret string
-	Log           *slog.Logger
+	Runtime         *runtime.Runtime
+	GitHub          *github.Client
+	MaxConcurrent   int
+	Labels          []string
+	WebhookPort     int
+	WebhookSecret   string
+	JobTimeout      time.Duration
+	ShutdownTimeout time.Duration
+	Log             *slog.Logger
 }
 
 // Scheduler ties GitHub job events to container lifecycle.
 // When a workflow_job is queued, it provisions a runner environment.
 // When the job completes, it destroys the environment.
 type Scheduler struct {
-	cfg     Config
-	running map[int64]*runningJob
-	mu      sync.Mutex
-	sem     chan struct{} // concurrency limiter
+	cfg       Config
+	running   map[int64]*runningJob
+	seen      map[int64]time.Time // recently handled job IDs for dedup
+	mu        sync.Mutex
+	sem       chan struct{} // concurrency limiter
+	draining  bool         // true when shutting down, rejects new jobs
+	startTime time.Time
 }
+
+const seenTTL = 10 * time.Minute
 
 type runningJob struct {
 	env      *runtime.RunnerEnv
@@ -51,9 +59,11 @@ func New(cfg Config) *Scheduler {
 	}
 
 	return &Scheduler{
-		cfg:     cfg,
-		running: make(map[int64]*runningJob),
-		sem:     make(chan struct{}, cfg.MaxConcurrent),
+		cfg:       cfg,
+		running:   make(map[int64]*runningJob),
+		seen:      make(map[int64]time.Time),
+		sem:       make(chan struct{}, cfg.MaxConcurrent),
+		startTime: time.Now(),
 	}
 }
 
@@ -65,10 +75,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	// Start webhook server
 	mux := http.NewServeMux()
 	mux.Handle("/webhook", handler)
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
-	})
+	mux.HandleFunc("/healthz", s.handleHealthz)
 
 	server := &http.Server{
 		Addr:    fmt.Sprintf(":%d", s.cfg.WebhookPort),
@@ -83,12 +90,19 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		}
 	}()
 
+	// Periodically clean up the seen-jobs dedup map
+	cleanupTicker := time.NewTicker(5 * time.Minute)
+	defer cleanupTicker.Stop()
+
 	// Process events
 	for {
 		select {
+		case <-cleanupTicker.C:
+			s.cleanSeen()
+
 		case <-ctx.Done():
 			s.cfg.Log.Info("shutting down scheduler")
-			s.destroyAll()
+			s.drain()
 			server.Shutdown(context.Background())
 			return nil
 
@@ -106,6 +120,27 @@ func (s *Scheduler) Run(ctx context.Context) error {
 func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	jobID := event.Job.GetID()
 	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo)
+
+	// Dedup: skip if we've already seen this job recently
+	s.mu.Lock()
+	if _, exists := s.running[jobID]; exists {
+		s.mu.Unlock()
+		log.Debug("ignoring duplicate queued event, job already running")
+		return
+	}
+	if t, seen := s.seen[jobID]; seen && time.Since(t) < seenTTL {
+		s.mu.Unlock()
+		log.Debug("ignoring duplicate queued event, job recently handled")
+		return
+	}
+	s.seen[jobID] = time.Now()
+
+	if s.draining {
+		s.mu.Unlock()
+		log.Info("rejecting job, scheduler is draining")
+		return
+	}
+	s.mu.Unlock()
 
 	// Acquire concurrency slot
 	select {
@@ -135,9 +170,15 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	// the runner binary expects it as-is.
 	encodedConfig := jitConfig.GetEncodedJITConfig()
 
-	// Create the runner environment
+	// Create the runner environment with job timeout
 	runnerID := jitConfig.GetRunner().GetID()
-	jobCtx, cancel := context.WithCancel(ctx)
+	var jobCtx context.Context
+	var cancel context.CancelFunc
+	if s.cfg.JobTimeout > 0 {
+		jobCtx, cancel = context.WithTimeout(ctx, s.cfg.JobTimeout)
+	} else {
+		jobCtx, cancel = context.WithCancel(ctx)
+	}
 	env, err := s.cfg.Runtime.Create(jobCtx, name, "", encodedConfig)
 	if err != nil {
 		log.Error("failed to create runner environment", "error", err)
@@ -210,6 +251,47 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event github.JobEvent) 
 	s.cfg.Runtime.Destroy(context.Background(), job.env)
 }
 
+// drain stops accepting new jobs and waits for running jobs to finish.
+// If jobs don't finish within ShutdownTimeout, they are force-killed.
+func (s *Scheduler) drain() {
+	s.mu.Lock()
+	s.draining = true
+	count := len(s.running)
+	s.mu.Unlock()
+
+	if count == 0 {
+		return
+	}
+
+	timeout := s.cfg.ShutdownTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+
+	s.cfg.Log.Info("waiting for running jobs to finish", "count", count, "timeout", timeout)
+
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-deadline:
+			s.cfg.Log.Warn("shutdown timeout reached, force-killing remaining jobs")
+			s.destroyAll()
+			return
+		case <-ticker.C:
+			s.mu.Lock()
+			remaining := len(s.running)
+			s.mu.Unlock()
+			if remaining == 0 {
+				s.cfg.Log.Info("all jobs finished cleanly")
+				return
+			}
+		}
+	}
+}
+
 func (s *Scheduler) destroyAll() {
 	s.mu.Lock()
 	jobs := make(map[int64]*runningJob, len(s.running))
@@ -223,6 +305,34 @@ func (s *Scheduler) destroyAll() {
 		s.cfg.Log.Info("destroying runner on shutdown", "job_id", id)
 		job.cancel()
 		s.cfg.Runtime.Destroy(context.Background(), job.env)
+	}
+}
+
+func (s *Scheduler) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	activeJobs := len(s.running)
+	draining := s.draining
+	s.mu.Unlock()
+
+	status := map[string]any{
+		"status":        "ok",
+		"active_jobs":   activeJobs,
+		"max_concurrent": s.cfg.MaxConcurrent,
+		"draining":      draining,
+		"uptime":        time.Since(s.startTime).String(),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
+}
+
+func (s *Scheduler) cleanSeen() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, t := range s.seen {
+		if time.Since(t) > seenTTL {
+			delete(s.seen, id)
+		}
 	}
 }
 

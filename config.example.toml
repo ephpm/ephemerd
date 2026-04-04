@@ -25,6 +25,9 @@ extra_labels = []
 # Max time a job can run before forced teardown
 job_timeout = "2h"
 
+# Time to wait for running jobs during graceful shutdown
+shutdown_timeout = "5m"
+
 [log]
 # Log level: debug, info, warn, error
 level = "info"

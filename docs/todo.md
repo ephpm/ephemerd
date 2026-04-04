@@ -40,25 +40,26 @@
 ### Webhook server
 - [ ] TLS support (or document reverse proxy setup with nginx/caddy)
 - [ ] Webhook signature verification tested against real GitHub payloads
-- [ ] Handle webhook replay / duplicate delivery (idempotency by job ID)
+- [x] Handle webhook replay / duplicate delivery (idempotency by job ID with TTL)
 - [ ] Rate limiting on incoming webhooks
-- [ ] Health endpoint for monitoring (`/healthz`)
+- [x] Health endpoint for monitoring (`/healthz` returns JSON: active jobs, uptime, draining status)
 
 ### Scheduler robustness
-- [ ] Job timeout enforcement (kill container after configured timeout)
+- [x] Job timeout enforcement (context.WithTimeout from parsed config duration)
 - [ ] Handle container crash/OOM — clean up and report failure
-- [ ] Handle ephemerd restart — detect and clean up orphaned containers from previous run
-- [ ] Graceful shutdown: wait for running jobs to finish (with timeout) before exiting
+- [x] Handle ephemerd restart — detect and clean up orphaned containers from previous run
+- [x] Graceful shutdown: drain mode, wait for running jobs with configurable timeout, then force-kill
 - [ ] Metrics: active jobs, total jobs, container startup time, job duration
 
 ### Networking
-- [ ] Container networking setup for Linux (CNI or containerd default bridge)
+- [x] Container networking setup for Linux (CNI bridge with NAT via go-cni)
+- [x] Firewall rules: deny RFC 1918 + link-local ranges to isolate homelab
+- [x] Outbound internet access from containers (ipMasq on bridge)
 - [ ] Container networking for Windows (NAT mode with Hyper-V isolation)
-- [ ] Outbound internet access from containers (for package downloads, git clone, etc.)
-- [ ] DNS resolution inside containers
+- [ ] DNS resolution inside containers (mount resolv.conf)
 
 ### Logging
-- [ ] Stream container stdout/stderr to ephemerd logs (debug level)
+- [x] Per-job container log capture to `<dataDir>/logs/<id>.log`
 - [ ] Structured logging with job ID context on all log lines
 - [ ] Log rotation or integration with journald/Windows Event Log
 

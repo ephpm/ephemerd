@@ -10,6 +10,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/config"
 	"github.com/ephpm/ephemerd/pkg/containerd"
 	"github.com/ephpm/ephemerd/pkg/github"
+	"github.com/ephpm/ephemerd/pkg/networking"
 	"github.com/ephpm/ephemerd/pkg/runner"
 	"github.com/ephpm/ephemerd/pkg/runtime"
 	"github.com/ephpm/ephemerd/pkg/scheduler"
@@ -91,16 +92,38 @@ func serve(ctx context.Context, configFile string) error {
 		return fmt.Errorf("extracting runner: %w", err)
 	}
 
+	// Initialize container networking
+	net, err := networking.New(networking.Config{
+		DataDir: configDir,
+		Log:     log,
+	})
+	if err != nil {
+		return fmt.Errorf("initializing networking: %w", err)
+	}
+
+	// Install firewall rules to block container access to private networks
+	if err := net.InstallFirewallRules(); err != nil {
+		log.Warn("failed to install firewall rules (containers may access LAN)", "error", err)
+	}
+	defer net.RemoveFirewallRules()
+
 	// Create runtime (container lifecycle manager)
 	rt, err := runtime.New(runtime.Config{
 		Client:       ctrd.Client(),
 		DefaultImage: cfg.Runner.DefaultImage,
 		RunnerDir:    rm.Dir(),
 		RunnerMount:  rm.ContainerDir(),
+		LogDir:       filepath(configDir, "logs"),
+		Network:      net,
 		Log:          log,
 	})
 	if err != nil {
 		return fmt.Errorf("creating runtime: %w", err)
+	}
+
+	// Clean up orphan containers from any previous crash
+	if err := rt.CleanOrphans(ctx); err != nil {
+		log.Warn("failed to clean orphan containers", "error", err)
 	}
 
 	// Create GitHub client
@@ -116,13 +139,15 @@ func serve(ctx context.Context, configFile string) error {
 
 	// Start scheduler (ties GitHub jobs to container lifecycle)
 	sched := scheduler.New(scheduler.Config{
-		Runtime:       rt,
-		GitHub:        gh,
-		MaxConcurrent: cfg.Runner.MaxConcurrent,
-		Labels:        cfg.Runner.ExtraLabels,
-		WebhookPort:   cfg.GitHub.WebhookPort,
-		WebhookSecret: cfg.GitHub.WebhookSecret,
-		Log:           log,
+		Runtime:         rt,
+		GitHub:          gh,
+		MaxConcurrent:   cfg.Runner.MaxConcurrent,
+		Labels:          cfg.Runner.ExtraLabels,
+		WebhookPort:     cfg.GitHub.WebhookPort,
+		WebhookSecret:   cfg.GitHub.WebhookSecret,
+		JobTimeout:      cfg.Runner.ParsedJobTimeout(),
+		ShutdownTimeout: cfg.Runner.ParsedShutdownTimeout(),
+		Log:             log,
 	})
 
 	log.Info("ephemerd ready", "repos", cfg.GitHub.Repos, "max_concurrent", cfg.Runner.MaxConcurrent)
