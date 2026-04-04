@@ -1,0 +1,33 @@
+[github]
+# Authentication: personal access token with repo + admin:org scope
+token = "ghp_your_token_here"
+
+# Organization or user that owns the repos
+owner = "your-org"
+
+# Repos to register runners for
+repos = ["repo1", "repo2"]
+
+# Webhook listener
+webhook_port = 8080
+webhook_secret = "your_webhook_secret"
+
+[runner]
+# Default container image for runner environments
+default_image = "ghcr.io/ephpm/ephemerd-build:latest"
+
+# Max concurrent jobs
+max_concurrent = 4
+
+# Extra labels applied to all runners (in addition to self-hosted, os, arch)
+extra_labels = []
+
+# Max time a job can run before forced teardown
+job_timeout = "2h"
+
+[log]
+# Log level: debug, info, warn, error
+level = "info"
+
+# Log format: text or json
+format = "text"

@@ -1,0 +1,4 @@
+/ephemerd
+/ephemerd.exe
+config.toml
+*.log
