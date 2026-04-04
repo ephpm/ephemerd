@@ -1,0 +1,21 @@
+# Test workflow for ephemerd self-hosted runners.
+# Copy this to .github/workflows/ in your test repository.
+name: Test ephemerd runner
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - run: echo "Hello from ephemerd!"
+      - run: uname -a
+      - run: whoami
+      - run: cat /etc/os-release
+      - run: echo "Runner name = $RUNNER_NAME"
+      - uses: actions/checkout@v4
+      - run: echo "Checkout successful, listing files:"
+      - run: ls -la

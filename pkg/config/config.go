@@ -9,9 +9,14 @@ import (
 )
 
 type Config struct {
-	GitHub GitHubConfig `toml:"github"`
-	Runner RunnerConfig `toml:"runner"`
-	Log    LogConfig    `toml:"log"`
+	GitHub     GitHubConfig     `toml:"github"`
+	Containerd ContainerdConfig `toml:"containerd"`
+	Runner     RunnerConfig     `toml:"runner"`
+	Log        LogConfig        `toml:"log"`
+}
+
+type ContainerdConfig struct {
+	// Reserved for future containerd-specific settings (e.g. snapshotter overrides)
 }
 
 type GitHubConfig struct {

@@ -10,6 +10,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/config"
 	"github.com/ephpm/ephemerd/pkg/containerd"
 	"github.com/ephpm/ephemerd/pkg/github"
+	"github.com/ephpm/ephemerd/pkg/runner"
 	"github.com/ephpm/ephemerd/pkg/runtime"
 	"github.com/ephpm/ephemerd/pkg/scheduler"
 	"github.com/spf13/cobra"
@@ -84,10 +85,18 @@ func serve(ctx context.Context, configFile string) error {
 
 	log.Info("containerd started")
 
+	// Extract embedded GitHub Actions runner
+	rm := runner.New(configDir, log)
+	if err := rm.Extract(); err != nil {
+		return fmt.Errorf("extracting runner: %w", err)
+	}
+
 	// Create runtime (container lifecycle manager)
 	rt, err := runtime.New(runtime.Config{
 		Client:       ctrd.Client(),
 		DefaultImage: cfg.Runner.DefaultImage,
+		RunnerDir:    rm.Dir(),
+		RunnerMount:  rm.ContainerDir(),
 		Log:          log,
 	})
 	if err != nil {
@@ -111,6 +120,8 @@ func serve(ctx context.Context, configFile string) error {
 		GitHub:        gh,
 		MaxConcurrent: cfg.Runner.MaxConcurrent,
 		Labels:        cfg.Runner.ExtraLabels,
+		WebhookPort:   cfg.GitHub.WebhookPort,
+		WebhookSecret: cfg.GitHub.WebhookSecret,
 		Log:           log,
 	})
 

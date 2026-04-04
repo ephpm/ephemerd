@@ -2,12 +2,12 @@ package scheduler
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net/http"
 	goruntime "runtime"
 	"sync"
+	"time"
 
 	"github.com/ephpm/ephemerd/pkg/github"
 	"github.com/ephpm/ephemerd/pkg/runtime"
@@ -35,9 +35,10 @@ type Scheduler struct {
 }
 
 type runningJob struct {
-	env    *runtime.RunnerEnv
-	repo   string
-	cancel context.CancelFunc
+	env      *runtime.RunnerEnv
+	repo     string
+	runnerID int64
+	cancel   context.CancelFunc
 }
 
 // New creates a scheduler.
@@ -125,12 +126,14 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	jitConfig, err := s.cfg.GitHub.RegisterJITRunner(ctx, event.Repo, name, labels)
 	if err != nil {
 		log.Error("failed to register JIT runner", "error", err)
+		time.Sleep(5 * time.Second) // back off to avoid tight retry loops on rate limits
 		<-s.sem
 		return
 	}
 
-	// Encode the JIT config for the runner
-	encodedConfig := base64.StdEncoding.EncodeToString([]byte(jitConfig.GetEncodedJITConfig()))
+	// The GitHub API returns the JIT config already base64-encoded;
+	// the runner binary expects it as-is.
+	encodedConfig := jitConfig.GetEncodedJITConfig()
 
 	// Create the runner environment
 	jobCtx, cancel := context.WithCancel(ctx)
@@ -145,9 +148,10 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	// Track the running job
 	s.mu.Lock()
 	s.running[jobID] = &runningJob{
-		env:    env,
-		repo:   event.Repo,
-		cancel: cancel,
+		env:      env,
+		repo:     event.Repo,
+		runnerID: jitConfig.GetRunner().GetID(),
+		cancel:   cancel,
 	}
 	s.mu.Unlock()
 

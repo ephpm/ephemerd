@@ -3,28 +3,31 @@
 ## Phase 1: Core Runtime (get a single job running)
 
 ### Embedded containerd server
-- [ ] Import containerd server packages (`github.com/containerd/containerd/v2/cmd/containerd/command` or equivalent)
-- [ ] Start containerd in-process in a goroutine (k3s/rke2 pattern)
-- [ ] Generate containerd config TOML at startup (root dir, state dir, snapshotter)
-- [ ] Replace the current client-connect-to-socket approach with in-process server
-- [ ] Verify containerd starts and is healthy before accepting jobs
-- [ ] On Windows: configure containerd for Windows containers + Hyper-V isolation
-- [ ] On Linux: configure overlayfs snapshotter (or native if overlayfs unavailable)
-- [ ] Graceful shutdown: stop containerd cleanly when ephemerd exits
+- [x] Import containerd server packages (`ctdserver` and `srvconfig`)
+- [x] Start containerd in-process via `ctdserver.New()` + `ServeGRPC()`/`ServeTTRPC()` in goroutines
+- [x] Build server config programmatically (root dir, state dir, socket path)
+- [x] Connect client to in-process server via socket with health check retry loop
+- [x] Verify containerd starts and is healthy before accepting jobs
+- [x] Graceful shutdown: `srv.Stop()` cleans up in-process server
+- [ ] On Windows: verify in-process containerd works with Hyper-V isolation
+- [ ] On Linux: verify overlayfs snapshotter is selected by default
 
 ### Runner container image
-- [ ] Create a Dockerfile for Linux runner image (ubuntu base + GitHub Actions runner binary)
-- [ ] Create a Dockerfile for Windows runner image (servercore base + runner binary)
+- [x] Create a Dockerfile for Linux runner image (ubuntu base + GitHub Actions runner binary)
+- [x] Create a Dockerfile for Windows runner image (servercore base + runner binary)
+- [x] Image entrypoint: configure runner with JIT config, start `run.sh` / `run.cmd`
 - [ ] Auto-download the latest GitHub Actions runner release on first run or cache miss
-- [ ] Image entrypoint: configure runner with JIT config, start `run.sh` / `run.cmd`
 - [ ] Publish images to ghcr.io/ephpm/ephemerd-runner (linux/amd64, linux/arm64, windows/amd64)
 
 ### GitHub JIT runner flow
+- [x] Fix double base64 encoding of JIT config (was wrapping already-encoded value)
+- [x] Wire webhook port and secret from config to scheduler
+- [x] Track runner ID for cleanup on failure
+- [x] Add backoff on JIT registration failure (rate limits, permissions)
 - [ ] Verify `GenerateRepoJITConfig` request fields match GitHub's actual API
 - [ ] Test the encoded JIT config is passed correctly to the runner binary inside the container
 - [ ] Confirm the runner registers, picks up the job, executes, and deregisters
 - [ ] Handle runner auto-removal on job completion (GitHub does this for ephemeral runners)
-- [ ] Handle case where JIT runner registration fails (rate limits, permissions)
 
 ### End-to-end: single job
 - [ ] Write a test workflow in a repo that targets `[self-hosted, linux, x64]`

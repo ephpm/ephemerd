@@ -20,6 +20,8 @@ const namespace = "ephemerd"
 type Config struct {
 	Client       *client.Client
 	DefaultImage string
+	RunnerDir    string // host path to extracted runner binary
+	RunnerMount  string // container path to mount runner at
 	Log          *slog.Logger
 }
 
@@ -77,14 +79,25 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		return nil, fmt.Errorf("getting image %s: %w", image, err)
 	}
 
+	// Determine runner entrypoint based on OS
+	entrypoint := "/actions-runner/run.sh"
+	if goruntime.GOOS == "windows" {
+		entrypoint = `C:\actions-runner\run.cmd`
+	}
+
 	// Build container spec
 	opts := []oci.SpecOpts{
 		oci.WithImageConfig(img),
 		oci.WithEnv([]string{
-			// The runner uses this JIT config to register with GitHub
-			"ACTIONS_RUNNER_INPUT_JITCONFIG=" + jitConfig,
 			"RUNNER_ALLOW_RUNASROOT=1",
 		}),
+		// Override entrypoint to run the injected runner with JIT config
+		oci.WithProcessArgs(entrypoint, "--jitconfig", jitConfig),
+	}
+
+	// Bind-mount the runner directory into the container
+	if r.cfg.RunnerDir != "" && r.cfg.RunnerMount != "" {
+		opts = append(opts, withRunnerMount(r.cfg.RunnerDir, r.cfg.RunnerMount))
 	}
 
 	// Add Hyper-V isolation on Windows
@@ -167,6 +180,22 @@ func (r *Runtime) Wait(ctx context.Context, env *RunnerEnv) (uint32, error) {
 		return status.ExitCode(), status.Error()
 	case <-ctx.Done():
 		return 1, ctx.Err()
+	}
+}
+
+// withRunnerMount bind-mounts the host runner directory into the container as read-only.
+func withRunnerMount(hostDir, containerDir string) oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
+		if s.Mounts == nil {
+			s.Mounts = []ocispec.Mount{}
+		}
+		s.Mounts = append(s.Mounts, ocispec.Mount{
+			Destination: containerDir,
+			Type:        "bind",
+			Source:      hostDir,
+			Options:     []string{"rbind", "ro"},
+		})
+		return nil
 	}
 }
 

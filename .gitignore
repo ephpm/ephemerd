@@ -2,3 +2,6 @@
 /ephemerd.exe
 config.toml
 *.log
+
+# Embedded runner tarballs (downloaded at build time)
+pkg/runner/embed/actions-runner-*

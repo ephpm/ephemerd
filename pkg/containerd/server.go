@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,8 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/client"
+	srvconfig "github.com/containerd/containerd/v2/cmd/containerd/server/config"
+	ctdserver "github.com/containerd/containerd/v2/cmd/containerd/server"
 )
 
 // Config for the embedded containerd instance.
@@ -19,18 +22,19 @@ type Config struct {
 	Log     *slog.Logger
 }
 
-// Server manages the embedded containerd lifecycle.
+// Server manages the in-process containerd lifecycle.
 type Server struct {
 	cfg    Config
+	srv    *ctdserver.Server
 	client *client.Client
 	cancel context.CancelFunc
 	done   chan struct{}
 }
 
-// New creates and starts an embedded containerd server.
+// New creates and starts an embedded containerd server in-process.
 //
-// containerd is started in-process following the k3s/rke2 model.
-// The containerd state and image store live under the data directory.
+// containerd runs as a Go library in a goroutine, following the k3s/rke2
+// model. No external containerd binary is needed.
 func New(cfg Config) (*Server, error) {
 	s := &Server{
 		cfg:  cfg,
@@ -53,16 +57,24 @@ func (s *Server) Client() *client.Client {
 	return s.client
 }
 
-// Stop gracefully shuts down the embedded containerd.
+// Stop gracefully shuts down the embedded containerd server.
 func (s *Server) Stop() {
 	s.cfg.Log.Info("stopping containerd")
+
 	if s.client != nil {
 		s.client.Close()
 	}
+
+	if s.srv != nil {
+		s.srv.Stop()
+	}
+
 	if s.cancel != nil {
 		s.cancel()
 	}
+
 	<-s.done
+	s.cfg.Log.Info("containerd stopped")
 }
 
 // SocketPath returns the containerd socket path for the given data directory.
@@ -94,46 +106,90 @@ func (s *Server) start() error {
 	s.cancel = cancel
 
 	socket := SocketPath(s.cfg.DataDir)
+	rootDir := filepath.Join(s.cfg.DataDir, "containerd", "root")
+	stateDir := filepath.Join(s.cfg.DataDir, "containerd", "state")
 
-	// TODO: Replace this with in-process containerd server startup.
-	// For now, this is a placeholder that connects to an existing containerd
-	// or starts the embedded one. The real implementation will import
-	// containerd's server packages directly (like k3s does with
-	// github.com/containerd/containerd/v2/cmd/containerd/command).
-	//
-	// The in-process approach:
-	//   1. Build a containerd server.Config
-	//   2. Create a containerd server.Server
-	//   3. Start it in a goroutine
-	//   4. Connect a client to the in-process socket
-	//
-	// For the initial iteration, we start containerd as a subprocess
-	// so the GitHub + runner integration can be developed in parallel.
+	// Remove stale socket from a previous run
+	if goruntime.GOOS != "windows" {
+		os.Remove(socket)
+	}
+
+	// Build containerd server config
+	cfg := &srvconfig.Config{
+		Version: 2,
+		Root:    rootDir,
+		State:   stateDir,
+	}
+	cfg.GRPC.Address = socket
+
+	// Create the in-process containerd server
+	srv, err := ctdserver.New(ctx, cfg)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("creating containerd server: %w", err)
+	}
+	s.srv = srv
+
+	// Create gRPC listener and serve in background
+	l, err := net.Listen("unix", socket)
+	if err != nil {
+		srv.Stop()
+		cancel()
+		return fmt.Errorf("listening on %s: %w", socket, err)
+	}
 
 	go func() {
 		defer close(s.done)
-		<-ctx.Done()
+		if err := srv.ServeGRPC(l); err != nil {
+			select {
+			case <-ctx.Done():
+			default:
+				s.cfg.Log.Error("containerd gRPC server error", "error", err)
+			}
+		}
 	}()
 
-	// Wait briefly then connect client
-	var err error
+	// Also serve tTRPC for container task/event APIs
+	ttrpcSocket := socket + ".ttrpc"
+	if goruntime.GOOS != "windows" {
+		os.Remove(ttrpcSocket)
+	}
+	tl, err := net.Listen("unix", ttrpcSocket)
+	if err != nil {
+		s.cfg.Log.Warn("failed to start tTRPC listener, some features may not work", "error", err)
+	} else {
+		go func() {
+			if err := srv.ServeTTRPC(tl); err != nil {
+				select {
+				case <-ctx.Done():
+				default:
+					s.cfg.Log.Error("containerd tTRPC server error", "error", err)
+				}
+			}
+		}()
+	}
+
+	s.cfg.Log.Info("containerd server started in-process", "socket", socket)
+
+	// Connect client to the in-process server
 	for i := range 30 {
 		s.client, err = client.New(socket)
 		if err == nil {
-			// Verify connection
 			_, err = s.client.Version(ctx)
 			if err == nil {
+				s.cfg.Log.Info("containerd ready")
 				return nil
 			}
 		}
 		if i == 0 {
-			s.cfg.Log.Debug("waiting for containerd socket", "path", socket)
+			s.cfg.Log.Debug("waiting for containerd to be ready", "socket", socket)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 
+	srv.Stop()
 	cancel()
-	return fmt.Errorf("connecting to containerd at %s: %w", socket, err)
+	return fmt.Errorf("timed out connecting to containerd at %s: %w", socket, err)
 }
 
 // ExecCtr runs the ctr CLI against ephemerd's containerd instance.
