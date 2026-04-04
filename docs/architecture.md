@@ -98,11 +98,33 @@ macOS cannot run OCI containers natively — there are no namespaces, cgroups, o
 4. OCI images are pulled and cached by containerd inside the VM
 5. Per-job containers run inside the VM, isolated from both the VM and the macOS host
 
-**OCI image unpacking into the VM:**
+**OCI images — same format everywhere:**
 
-When a job is queued, ephemerd uses containerd (inside the VM) to pull the OCI image if not cached, create a container from it, and run the job — identical to what happens on a native Linux host. The VM is transparent to the job.
+An OCI (Open Container Initiative) image is a portable, layered filesystem archive. It's what `docker build` produces — a stack of tarballs, each layer adding files on top of the previous one. A Dockerfile like:
+
+```dockerfile
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y build-essential cmake
+COPY libphp.a /usr/local/lib/
+```
+
+Produces an OCI image with three layers: the Ubuntu base, the build tools, and libphp. This image is pushed to a container registry (Docker Hub, ghcr.io, etc.) and pulled by containerd on any host.
+
+**How the image gets into the macOS Linux VM:**
+
+1. The Linux VM boots with containerd running inside it
+2. containerd inside the VM pulls the OCI image from the registry (or uses its local cache)
+3. containerd unpacks the image layers into a snapshot — each layer's tarball is extracted and stacked using overlayfs, creating the final root filesystem
+4. A container is created from that snapshot with the job's entrypoint (the GitHub Actions runner)
+5. The container runs, the job executes, and when it's done the container and snapshot are deleted
+
+This is identical to what happens on a native Linux host. The VM is invisible to the job — the container sees a normal Linux filesystem with all the tools from the image layers already in place. containerd handles all the OCI image pulling, layer unpacking, and snapshot management.
 
 Pre-built tools (libphp, Rust toolchain, etc.) are baked into OCI images via standard Dockerfiles. The same image that runs on a Linux x86_64 host runs on a Mac's Linux VM — just ARM64 if the Mac is Apple Silicon.
+
+**macOS-native jobs use a different model:**
+
+macOS VMs don't use OCI images — they use a provisioned macOS disk snapshot. The base image is created once (install Xcode, Homebrew, etc.), and each job gets an APFS clone-on-write copy. This is instant (no data copied until the job writes to disk) and the clone is deleted when the job completes. See the macOS VM section below.
 
 **Why this works for homelab:**
 
@@ -111,9 +133,17 @@ Pre-built tools (libphp, Rust toolchain, etc.) are baked into OCI images via sta
 - Virtualization.framework is hardware-accelerated on Apple Silicon — near-native performance
 - The Linux VM is lightweight (~256MB RAM base) and boots in seconds
 
-**What this does NOT support:**
+**macOS-native jobs (Xcode, Swift, code signing):**
 
-- macOS-native jobs (Xcode, Swift, iOS simulator, code signing) — these require a macOS VM, which is a different image format (IPSW/disk snapshot) and a different provisioning workflow. This is out of scope for the initial release. If needed, users can provision macOS VMs separately using Tart or similar tools.
+For jobs that require macOS itself (not just Linux on a Mac), ephemerd boots an ephemeral macOS VM per job using Virtualization.framework:
+
+1. You provision a base macOS disk image once — install Xcode, Homebrew, whatever you need
+2. When a macOS-labeled job arrives, ephemerd creates an APFS clone-on-write copy of the base image (instant, no data copied)
+3. A macOS VM boots from the clone (~30s, Xcode and all tools already installed)
+4. The GitHub/GitLab runner inside the VM picks up the job
+5. When the job completes, the VM is stopped and the clone is deleted
+
+This is a different image format than OCI (disk snapshot vs container layers) but the lifecycle is the same: create → run → destroy. Configure with `[vm.macos]` in the config.
 
 ### Dual-purpose hosts
 
@@ -124,7 +154,7 @@ Because Windows can run Hyper-V Linux VMs and macOS can run Virtualization.frame
 | Linux x86_64 | containerd (direct) | — |
 | Linux arm64 | containerd (direct) | — |
 | Windows x86_64 | containerd in Hyper-V Linux VM | Hyper-V Windows containers |
-| macOS arm64 | containerd in Virtualization.framework Linux VM | — (future: macOS VMs) |
+| macOS arm64 | containerd in Virtualization.framework Linux VM | Ephemeral macOS VMs (clone-on-write) |
 
 A Windows box and a Mac Mini together cover every combination: linux/amd64, linux/arm64, windows/amd64.
 
