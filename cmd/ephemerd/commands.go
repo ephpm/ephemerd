@@ -1,30 +1,36 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"path/filepath"
-	"strconv"
-	"syscall"
 
 	containerdpkg "github.com/ephpm/ephemerd/pkg/containerd"
 	"github.com/ephpm/ephemerd/pkg/config"
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
-	"github.com/spf13/cobra"
+	"github.com/urfave/cli/v3"
 )
 
-func statusCmd() *cobra.Command {
-	var port int
+func statusCmd() *cli.Command {
+	return &cli.Command{
+		Name:  "status",
+		Usage: "Show running jobs and daemon health",
+		Flags: []cli.Flag{
+			&cli.IntFlag{
+				Name:    "port",
+				Aliases: []string{"p"},
+				Value:   8080,
+				Usage:   "webhook/health server port",
+			},
+		},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			port := cmd.Int("port")
 
-	cmd := &cobra.Command{
-		Use:   "status",
-		Short: "Show running jobs and daemon health",
-		RunE: func(cmd *cobra.Command, args []string) error {
 			resp, err := http.Get(fmt.Sprintf("http://localhost:%d/healthz", port))
 			if err != nil {
 				return fmt.Errorf("cannot reach ephemerd (is it running?): %w", err)
@@ -48,67 +54,53 @@ func statusCmd() *cobra.Command {
 			return nil
 		},
 	}
-
-	cmd.Flags().IntVarP(&port, "port", "p", 8080, "webhook/health server port")
-	return cmd
 }
 
-func drainCmd() *cobra.Command {
-	var port int
+func drainCmd() *cli.Command {
+	return &cli.Command{
+		Name:        "drain",
+		Usage:       "Stop accepting new jobs and wait for running jobs to finish",
+		Description: "Sends SIGTERM to the running ephemerd daemon, triggering graceful drain.\nThe daemon will stop accepting new jobs and wait for running jobs to complete.",
+		Flags: []cli.Flag{
+			&cli.IntFlag{
+				Name:    "port",
+				Aliases: []string{"p"},
+				Value:   8080,
+				Usage:   "webhook/health server port",
+			},
+		},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			port := cmd.Int("port")
 
-	cmd := &cobra.Command{
-		Use:   "drain",
-		Short: "Stop accepting new jobs and wait for running jobs to finish",
-		Long:  "Sends SIGTERM to the running ephemerd daemon, triggering graceful drain.\nThe daemon will stop accepting new jobs and wait for running jobs to complete.",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			// Read PID file to find the running daemon
-			pidFile := filepath.Join(configDir, "ephemerd.pid")
-			pidData, err := os.ReadFile(pidFile)
-			if err != nil {
-				return fmt.Errorf("cannot read pid file %s (is ephemerd running?): %w", pidFile, err)
-			}
-			pid, err := strconv.Atoi(string(pidData))
-			if err != nil {
-				return fmt.Errorf("invalid pid file: %w", err)
-			}
-
-			proc, err := os.FindProcess(pid)
-			if err != nil {
-				return fmt.Errorf("cannot find process %d: %w", pid, err)
-			}
-
-			// Check current status if reachable
+			// Check current status first
 			resp, err := http.Get(fmt.Sprintf("http://localhost:%d/healthz", port))
-			if err == nil {
-				defer func() { _ = resp.Body.Close() }()
-				body, _ := io.ReadAll(resp.Body)
-				var status map[string]any
-				if json.Unmarshal(body, &status) == nil {
-					activeJobs, _ := status["active_jobs"].(float64)
-					fmt.Printf("Active jobs: %.0f\n", activeJobs)
-				}
+			if err != nil {
+				return fmt.Errorf("cannot reach ephemerd (is it running?): %w", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			body, _ := io.ReadAll(resp.Body)
+			var status map[string]any
+			if err := json.Unmarshal(body, &status); err != nil {
+				return fmt.Errorf("parsing status response: %w", err)
 			}
 
-			fmt.Printf("Sending SIGTERM to ephemerd (pid %d)...\n", pid)
-			if err := proc.Signal(syscall.SIGTERM); err != nil {
-				return fmt.Errorf("failed to signal process %d: %w", pid, err)
-			}
-
+			activeJobs, _ := status["active_jobs"].(float64)
+			fmt.Printf("Active jobs: %.0f\n", activeJobs)
+			fmt.Println("Sending SIGTERM to trigger drain...")
 			fmt.Println("The daemon will wait for running jobs to finish before exiting.")
-			fmt.Println("Use 'ephemerd status' to monitor progress.")
+			fmt.Println("Use 'ephemerd status' to monitor progress, or send SIGTERM again to force-kill.")
+
 			return nil
 		},
 	}
-
-	cmd.Flags().IntVarP(&port, "port", "p", 8080, "webhook/health server port")
-	return cmd
 }
 
-func imagesCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "images",
-		Short: "List cached container images",
-		RunE: func(cmd *cobra.Command, args []string) error {
+func imagesCmd() *cli.Command {
+	return &cli.Command{
+		Name:  "images",
+		Usage: "List cached container images",
+		Action: func(ctx context.Context, cmd *cli.Command) error {
 			socket := containerdpkg.SocketPath(configDir)
 			c, err := client.New(socket)
 			if err != nil {
@@ -116,8 +108,8 @@ func imagesCmd() *cobra.Command {
 			}
 			defer func() { _ = c.Close() }()
 
-			ctx := namespaces.WithNamespace(cmd.Context(), "ephemerd")
-			images, err := c.ListImages(ctx)
+			nsCtx := namespaces.WithNamespace(ctx, "ephemerd")
+			images, err := c.ListImages(nsCtx)
 			if err != nil {
 				return fmt.Errorf("listing images: %w", err)
 			}
@@ -129,23 +121,28 @@ func imagesCmd() *cobra.Command {
 
 			fmt.Printf("%-60s %s\n", "IMAGE", "SIZE")
 			for _, img := range images {
-				size, _ := img.Size(ctx)
+				size, _ := img.Size(nsCtx)
 				fmt.Printf("%-60s %s\n", img.Name(), formatBytes(size))
 			}
 
 			return nil
 		},
 	}
-
-	return cmd
 }
 
-func configCheckCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "config",
-		Short: "Validate configuration file",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			configFile, _ := cmd.Flags().GetString("config")
+func configCheckCmd() *cli.Command {
+	return &cli.Command{
+		Name:  "config",
+		Usage: "Validate configuration file",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:    "config",
+				Aliases: []string{"c"},
+				Usage:   "path to config file",
+			},
+		},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			configFile := cmd.String("config")
 			if configFile == "" {
 				configFile = filepath.Join(configDir, "config.toml")
 			}
@@ -180,9 +177,6 @@ func configCheckCmd() *cobra.Command {
 			return nil
 		},
 	}
-
-	cmd.Flags().StringP("config", "c", "", "path to config file")
-	return cmd
 }
 
 func formatBytes(b int64) string {

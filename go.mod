@@ -4,18 +4,18 @@ go 1.24.3
 
 require (
 	github.com/BurntSushi/toml v1.6.0
+	github.com/Code-Hex/vz/v3 v3.7.1
 	github.com/Microsoft/hcsshim v0.14.0-rc.1
 	github.com/containerd/containerd/v2 v2.2.2
 	github.com/containerd/go-cni v1.1.13
 	github.com/google/go-github/v72 v72.0.0
 	github.com/opencontainers/runtime-spec v1.3.0
-	github.com/spf13/cobra v1.10.2
+	github.com/urfave/cli/v3 v3.8.0
 )
 
 require (
 	dario.cat/mergo v1.0.2 // indirect
 	github.com/Code-Hex/go-infinity-channel v1.0.0 // indirect
-	github.com/Code-Hex/vz/v3 v3.7.1 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/StackExchange/wmi v0.0.0-20190523213315-cbe66965904d // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
@@ -52,7 +52,6 @@ require (
 	github.com/google/go-querystring v1.1.0 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus v1.1.0 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.1.0 // indirect
-	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/klauspost/compress v1.18.1 // indirect
 	github.com/moby/locker v1.0.1 // indirect
 	github.com/moby/sys/mountinfo v0.7.2 // indirect
@@ -73,7 +72,6 @@ require (
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/sasha-s/go-deadlock v0.3.5 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
-	github.com/spf13/pflag v1.0.9 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.60.0 // indirect
