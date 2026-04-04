@@ -22,7 +22,6 @@ const namespace = "ephemerd"
 // Config for the container runtime.
 type Config struct {
 	Client       *client.Client
-	DefaultImage string
 	RunnerDir    string // host path to extracted runner binary
 	RunnerMount  string // container path to mount runner at
 	LogDir       string // directory for per-job container logs
@@ -117,7 +116,7 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 	ctx = namespaces.WithNamespace(ctx, namespace)
 
 	if image == "" {
-		image = r.cfg.DefaultImage
+		return nil, fmt.Errorf("no image specified for job %s — set EPHEMERD_IMAGE in your workflow env", id)
 	}
 
 	r.cfg.Log.Info("creating runner environment", "id", id, "image", image)

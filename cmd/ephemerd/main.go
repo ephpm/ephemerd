@@ -113,7 +113,6 @@ func serve(ctx context.Context, configFile string) error {
 	// Create runtime (container lifecycle manager)
 	rt, err := runtime.New(runtime.Config{
 		Client:       ctrdClient,
-		DefaultImage: cfg.Runner.DefaultImage,
 		RunnerDir:    rm.Dir(),
 		RunnerMount:  rm.ContainerDir(),
 		LogDir:       joinPath(configDir, "logs"),

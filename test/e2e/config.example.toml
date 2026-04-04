@@ -11,7 +11,6 @@ repos = ["ephemerd"]
 poll_interval = "10s"
 
 [runner]
-default_image = "docker.io/library/ubuntu:22.04"
 max_concurrent = 2
 job_timeout = "30m"
 shutdown_timeout = "2m"

@@ -20,8 +20,8 @@ poll_interval = "10s"
 # tls_key = "/etc/ephemerd/tls.key"
 
 [runner]
-# Default container image for runner environments
-default_image = "ghcr.io/ephpm/ephemerd-build:latest"
+# Container image is set per-job via EPHEMERD_IMAGE env var in workflow YAML.
+# No default image — jobs must specify their own.
 
 # Max concurrent jobs
 max_concurrent = 4

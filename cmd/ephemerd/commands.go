@@ -138,7 +138,6 @@ func configCheckCmd() *cobra.Command {
 			fmt.Printf("  GitHub owner:    %s\n", cfg.GitHub.Owner)
 			fmt.Printf("  Repos:           %v\n", cfg.GitHub.Repos)
 			fmt.Printf("  Max concurrent:  %d\n", cfg.Runner.MaxConcurrent)
-			fmt.Printf("  Default image:   %s\n", cfg.Runner.DefaultImage)
 			fmt.Printf("  Job timeout:     %s\n", cfg.Runner.JobTimeout)
 			fmt.Printf("  Poll interval:   %s\n", cfg.GitHub.PollInterval)
 			fmt.Printf("  Log level:       %s\n", cfg.Log.Level)

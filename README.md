@@ -110,7 +110,6 @@ owner = "your-org"
 repos = ["repo1", "repo2"]
 
 [runner]
-default_image = "ghcr.io/ephpm/ephemerd-build:latest"
 max_concurrent = 4
 EOF
 ```
@@ -169,11 +168,10 @@ jobs:
 
 The image name is resolved against ephemerd's config — either a full registry URL for OCI images or a name mapped to a local macOS disk snapshot.
 
-**Resolution order:**
+**Resolution:**
 
-1. `EPHEMERD_IMAGE` env var in the workflow job
-2. `default_image` from ephemerd config
-3. Error if neither is set
+- Container jobs (Linux/Windows): `EPHEMERD_IMAGE` is required — the job must specify its image
+- macOS VM jobs: `EPHEMERD_IMAGE` selects a specific snapshot; if not set, the base VM boots as-is
 
 ## Configuration
 
@@ -191,7 +189,7 @@ poll_interval = "10s"                 # how often to check for jobs (default)
 # tls_key = "/etc/ephemerd/tls.key"
 
 [runner]
-default_image = "ghcr.io/ephpm/ephemerd-build:latest"
+# Image is set per-job via EPHEMERD_IMAGE env var in workflow YAML
 max_concurrent = 4                    # parallel jobs
 extra_labels = []                     # additional runner labels
 job_timeout = "2h"                    # kill jobs after this
