@@ -20,9 +20,12 @@ poll_interval = "10s"
 # tls_cert = "/etc/ephemerd/tls.crt"
 # tls_key = "/etc/ephemerd/tls.key"
 
+[network]
+# Container subnet. Ephemerd auto-picks a free subnet if this conflicts with
+# an existing network (e.g. Podman, Docker). You don't need to change this.
+# subnet = "10.88.0.0/16"
+
 [runner]
-# Container image is set per-job via EPHEMERD_IMAGE env var in workflow YAML.
-# No default image — jobs must specify their own.
 
 # Max concurrent jobs
 max_concurrent = 4

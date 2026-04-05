@@ -20,7 +20,7 @@ type Config struct {
 
 // NetworkConfig configures container networking.
 type NetworkConfig struct {
-	Subnet string `toml:"subnet"` // container subnet (default: "10.89.0.0/16")
+	Subnet string `toml:"subnet"` // container subnet (auto-selected if empty)
 }
 
 type ContainerdConfig struct {
