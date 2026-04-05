@@ -150,6 +150,7 @@ func (s *Server) start() error {
 		State:   stateDir,
 	}
 	cfg.GRPC.Address = socket
+	cfg.TTRPC.Address = socket + ".ttrpc"
 
 	// Create the in-process containerd server
 	srv, err := ctdserver.New(ctx, cfg)

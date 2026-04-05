@@ -44,7 +44,7 @@ func statusCmd() *cli.Command {
 			if err != nil {
 				return err
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			resp, err := cc.Status(ctx, &apiv1.StatusRequest{})
 			if err != nil {
@@ -91,7 +91,7 @@ func drainCmd() *cli.Command {
 			// Check current status via gRPC if reachable
 			cc, conn, grpcErr := controlClient(ctx)
 			if grpcErr == nil {
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 				resp, err := cc.Status(ctx, &apiv1.StatusRequest{})
 				if err == nil {
 					fmt.Printf("Active jobs: %d\n", resp.ActiveJobs)
@@ -120,7 +120,7 @@ func jobsCmd() *cli.Command {
 			if err != nil {
 				return err
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			// If a job ID argument is given, show that job's details
 			if cmd.Args().Len() > 0 {
@@ -202,7 +202,7 @@ func jobKillCmd() *cli.Command {
 			if err != nil {
 				return err
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			if _, err := cc.KillJob(ctx, &apiv1.KillJobRequest{Id: jobID}); err != nil {
 				return fmt.Errorf("kill job: %w", err)
@@ -233,7 +233,7 @@ func jobLogsCmd() *cli.Command {
 			if err != nil {
 				return err
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			stream, err := cc.GetJobLogs(ctx, &apiv1.GetJobLogsRequest{Id: jobID})
 			if err != nil {
@@ -248,7 +248,9 @@ func jobLogsCmd() *cli.Command {
 				if err != nil {
 					return fmt.Errorf("reading logs: %w", err)
 				}
-				os.Stdout.Write(chunk.Data)
+				if _, err := os.Stdout.Write(chunk.Data); err != nil {
+					return fmt.Errorf("writing logs: %w", err)
+				}
 			}
 		},
 	}

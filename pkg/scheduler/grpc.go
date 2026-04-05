@@ -32,8 +32,8 @@ func SocketPath(dataDir string) string {
 func (s *Scheduler) startControlServer() (func(), error) {
 	socketPath := SocketPath(s.cfg.DataDir)
 
-	// Remove stale socket from previous run
-	os.Remove(socketPath)
+	// Remove stale socket from previous run (best-effort, may not exist)
+	_ = os.Remove(socketPath)
 
 	lis, err := net.Listen("unix", socketPath)
 	if err != nil {
@@ -56,7 +56,7 @@ func (s *Scheduler) startControlServer() (func(), error) {
 
 	cleanup := func() {
 		srv.GracefulStop()
-		os.Remove(socketPath)
+		_ = os.Remove(socketPath)
 	}
 	return cleanup, nil
 }
@@ -130,7 +130,7 @@ func (c *controlServer) GetJobLogs(req *apiv1.GetJobLogsRequest, stream grpc.Ser
 	if err != nil {
 		return status.Errorf(codes.NotFound, "log file not found: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	buf := make([]byte, 32*1024)
 	for {
