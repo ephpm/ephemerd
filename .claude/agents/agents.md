@@ -1,3 +1,7 @@
+---
+name: ephemerd-engineer
+---
+
 # Ephemerd
 
 Ephemeral GitHub Actions runner daemon. Single Go binary that manages isolated, disposable CI/CD environments — each job gets a fresh environment destroyed on completion.
