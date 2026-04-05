@@ -12,6 +12,7 @@ import (
 	"net/http"
 
 	gh "github.com/google/go-github/v72/github"
+	"gopkg.in/yaml.v3"
 )
 
 // Config for the GitHub client.
@@ -164,10 +165,18 @@ func (c *Client) FetchJobImage(ctx context.Context, repo string, runID int64, jo
 	return image
 }
 
+// workflowSchema is the subset of a GitHub Actions workflow YAML we need to parse.
+type workflowSchema struct {
+	Jobs map[string]workflowJob `yaml:"jobs"`
+}
+
+type workflowJob struct {
+	Name string            `yaml:"name"`
+	Env  map[string]string `yaml:"env"`
+}
+
 // parseEphemerdImage extracts EPHEMERD_IMAGE from a workflow YAML for a specific job.
-// Uses simple string matching to avoid pulling in a full YAML parser dependency.
 func parseEphemerdImage(workflowContent string, jobs []*gh.WorkflowJob, targetJobID int64) string {
-	// Find the target job's name
 	var jobName string
 	for _, j := range jobs {
 		if j.GetID() == targetJobID {
@@ -179,138 +188,22 @@ func parseEphemerdImage(workflowContent string, jobs []*gh.WorkflowJob, targetJo
 		return ""
 	}
 
-	// Simple line-by-line scan for EPHEMERD_IMAGE in env blocks.
-	// This is intentionally simple — a full YAML parser is overkill for
-	// extracting one env var, and we don't want the dependency.
-	//
-	// Strategy: scan each job block for a name: field. If name matches jobName,
-	// or if the job key itself matches jobName (when no name: field), look for
-	// EPHEMERD_IMAGE in that job's env block.
-	lines := splitLines(workflowContent)
-	inJobs := false
-
-	// First pass: collect per-job data (key, name, EPHEMERD_IMAGE)
-	type jobBlock struct {
-		key   string // the YAML key (e.g. "build")
-		name  string // from name: field, or empty
-		image string // EPHEMERD_IMAGE value, or empty
-	}
-	var blocks []jobBlock
-	var current *jobBlock
-	inEnv := false
-
-	for _, line := range lines {
-		trimmed := trimSpace(line)
-		indent := len(line) - len(trimLeft(line))
-
-		if trimmed == "jobs:" {
-			inJobs = true
-			continue
-		}
-
-		if inJobs && indent == 2 && len(trimmed) > 0 && trimmed[len(trimmed)-1] == ':' {
-			// New job key
-			if current != nil {
-				blocks = append(blocks, *current)
-			}
-			key := trimmed[:len(trimmed)-1]
-			current = &jobBlock{key: key}
-			inEnv = false
-			continue
-		}
-
-		if current == nil {
-			continue
-		}
-
-		// Detect leaving the job block
-		if inJobs && indent <= 2 && trimmed != "" && (indent < 2 || trimmed[len(trimmed)-1] != ':') {
-			// Left jobs section entirely
-			break
-		}
-
-		if indent == 4 && hasPrefix(trimmed, "name:") {
-			current.name = stripQuotes(trimSpace(trimmed[5:]))
-		}
-
-		if indent == 4 && trimmed == "env:" {
-			inEnv = true
-			continue
-		}
-
-		if inEnv && indent == 6 {
-			if hasPrefix(trimmed, "EPHEMERD_IMAGE:") {
-				current.image = stripQuotes(trimSpace(trimmed[len("EPHEMERD_IMAGE:"):]))
-			}
-			continue
-		}
-
-		if inEnv && indent <= 4 {
-			inEnv = false
-		}
-	}
-	if current != nil {
-		blocks = append(blocks, *current)
+	var wf workflowSchema
+	if err := yaml.Unmarshal([]byte(workflowContent), &wf); err != nil {
+		return ""
 	}
 
-	// Match: name field takes precedence, fall back to key
-	for _, b := range blocks {
-		displayName := b.name
-		if displayName == "" {
-			displayName = b.key
+	for key, job := range wf.Jobs {
+		name := job.Name
+		if name == "" {
+			name = key
 		}
-		if displayName == jobName && b.image != "" {
-			return b.image
+		if name == jobName {
+			return job.Env["EPHEMERD_IMAGE"]
 		}
 	}
 
 	return ""
-}
-
-// Simple string helpers to avoid importing strings package just for these.
-func splitLines(s string) []string {
-	var lines []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' {
-			lines = append(lines, s[start:i])
-			start = i + 1
-		}
-	}
-	if start < len(s) {
-		lines = append(lines, s[start:])
-	}
-	return lines
-}
-
-func trimSpace(s string) string {
-	start, end := 0, len(s)
-	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r') {
-		start++
-	}
-	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\r') {
-		end--
-	}
-	return s[start:end]
-}
-
-func trimLeft(s string) string {
-	i := 0
-	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
-		i++
-	}
-	return s[i:]
-}
-
-func hasPrefix(s, prefix string) bool {
-	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
-}
-
-func stripQuotes(s string) string {
-	if len(s) >= 2 && ((s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'')) {
-		return s[1 : len(s)-1]
-	}
-	return s
 }
 
 // PollJobs checks for queued workflow jobs targeting self-hosted runners.

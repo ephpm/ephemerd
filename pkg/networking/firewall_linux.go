@@ -7,6 +7,8 @@ import (
 	"os/exec"
 )
 
+const chainName = "EPHEMERD-FORWARD"
+
 var deniedRanges = []string{
 	"10.0.0.0/8",
 	"172.16.0.0/12",
@@ -14,78 +16,90 @@ var deniedRanges = []string{
 	"169.254.0.0/16",
 }
 
+func iptables(args ...string) error {
+	out, err := exec.Command("iptables", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s: %s", err, out)
+	}
+	return nil
+}
+
 func (l *linuxNetworking) installFirewallRules() error {
-	// Allow container-to-container traffic within the ephemerd subnet.
-	// This must come before the broad 10.0.0.0/8 deny rule which is a
-	// superset of the container subnet.
-	allowRule := []string{
-		"-t", "filter",
-		"-A", "FORWARD",
-		"-s", DefaultSubnet,
-		"-d", DefaultSubnet,
-		"-j", "ACCEPT",
-	}
-	checkAllow := make([]string, len(allowRule))
-	copy(checkAllow, allowRule)
-	checkAllow[2] = "-C"
-	if err := exec.Command("iptables", checkAllow...).Run(); err != nil {
-		l.cfg.Log.Info("adding firewall rule", "action", "allow", "src", DefaultSubnet, "dst", DefaultSubnet)
-		if err := exec.Command("iptables", allowRule...).Run(); err != nil {
-			return fmt.Errorf("adding iptables allow rule for container subnet: %w", err)
+	// Create our own chain to avoid interference from CNI/Netavark
+	_ = iptables("-N", chainName)
+
+	// Flush in case of leftovers from a previous run
+	_ = iptables("-F", chainName)
+
+	// Jump to our chain from FORWARD — insert at position 1 so we go first
+	if err := iptables("-C", "FORWARD", "-s", l.cfg.subnet(), "-j", chainName); err != nil {
+		l.cfg.Log.Info("adding jump to EPHEMERD-FORWARD chain")
+		if err := iptables("-I", "FORWARD", "1", "-s", l.cfg.subnet(), "-j", chainName); err != nil {
+			return fmt.Errorf("inserting jump rule: %w", err)
 		}
 	}
 
+	// Also catch return traffic
+	if err := iptables("-C", "FORWARD", "-d", l.cfg.subnet(), "-j", chainName); err != nil {
+		if err := iptables("-I", "FORWARD", "1", "-d", l.cfg.subnet(), "-j", chainName); err != nil {
+			return fmt.Errorf("inserting return jump rule: %w", err)
+		}
+	}
+
+	// Rules inside our chain (evaluated in order, top to bottom):
+
+	// 1. Allow return traffic
+	l.cfg.Log.Info("adding firewall rule", "rule", "allow return traffic")
+	if err := iptables("-A", chainName, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"); err != nil {
+		return fmt.Errorf("adding return traffic rule: %w", err)
+	}
+
+	// 2. Allow container-to-container
+	l.cfg.Log.Info("adding firewall rule", "rule", "allow container-to-container")
+	if err := iptables("-A", chainName, "-s", l.cfg.subnet(), "-d", l.cfg.subnet(), "-j", "ACCEPT"); err != nil {
+		return fmt.Errorf("adding container-to-container rule: %w", err)
+	}
+
+	// 3. Allow DNS to any destination
+	for _, proto := range []string{"udp", "tcp"} {
+		l.cfg.Log.Info("adding firewall rule", "rule", "allow DNS "+proto)
+		if err := iptables("-A", chainName, "-p", proto, "--dport", "53", "-j", "ACCEPT"); err != nil {
+			return fmt.Errorf("adding DNS rule (%s): %w", proto, err)
+		}
+	}
+
+	// 4. Deny private ranges
 	for _, cidr := range deniedRanges {
-		rule := []string{
-			"-t", "filter",
-			"-A", "FORWARD",
-			"-s", DefaultSubnet,
-			"-d", cidr,
-			"-j", "REJECT",
-			"--reject-with", "icmp-net-unreachable",
-		}
-
-		checkRule := make([]string, len(rule))
-		copy(checkRule, rule)
-		checkRule[2] = "-C"
-		if err := exec.Command("iptables", checkRule...).Run(); err == nil {
-			continue
-		}
-
-		l.cfg.Log.Info("adding firewall rule", "action", "deny", "src", DefaultSubnet, "dst", cidr)
-		if err := exec.Command("iptables", rule...).Run(); err != nil {
-			return fmt.Errorf("adding iptables rule for %s: %w", cidr, err)
+		l.cfg.Log.Info("adding firewall rule", "rule", "deny "+cidr)
+		if err := iptables("-A", chainName, "-d", cidr, "-j", "REJECT", "--reject-with", "icmp-net-unreachable"); err != nil {
+			return fmt.Errorf("adding deny rule for %s: %w", cidr, err)
 		}
 	}
 
-	l.cfg.Log.Info("firewall rules installed", "denied_ranges", deniedRanges)
+	// 5. Allow everything else (internet)
+	l.cfg.Log.Info("adding firewall rule", "rule", "allow outbound")
+	if err := iptables("-A", chainName, "-j", "ACCEPT"); err != nil {
+		return fmt.Errorf("adding outbound rule: %w", err)
+	}
+
+	l.cfg.Log.Info("firewall rules installed")
 	return nil
 }
 
 func (l *linuxNetworking) removeFirewallRules() {
-	for _, cidr := range deniedRanges {
-		rule := []string{
-			"-t", "filter",
-			"-D", "FORWARD",
-			"-s", DefaultSubnet,
-			"-d", cidr,
-			"-j", "REJECT",
-			"--reject-with", "icmp-net-unreachable",
-		}
-
-		if err := exec.Command("iptables", rule...).Run(); err != nil {
-			l.cfg.Log.Debug("failed to remove firewall rule", "dst", cidr, "error", err)
-		}
+	// Remove jump rules from FORWARD
+	if err := iptables("-D", "FORWARD", "-s", l.cfg.subnet(), "-j", chainName); err != nil {
+		l.cfg.Log.Debug("failed to remove forward jump rule", "error", err)
+	}
+	if err := iptables("-D", "FORWARD", "-d", l.cfg.subnet(), "-j", chainName); err != nil {
+		l.cfg.Log.Debug("failed to remove return jump rule", "error", err)
 	}
 
-	// Remove the container subnet allow rule
-	if err := exec.Command("iptables",
-		"-t", "filter",
-		"-D", "FORWARD",
-		"-s", DefaultSubnet,
-		"-d", DefaultSubnet,
-		"-j", "ACCEPT",
-	).Run(); err != nil {
-		l.cfg.Log.Debug("failed to remove container subnet allow rule", "error", err)
+	// Flush and delete our chain
+	if err := iptables("-F", chainName); err != nil {
+		l.cfg.Log.Debug("failed to flush chain", "error", err)
+	}
+	if err := iptables("-X", chainName); err != nil {
+		l.cfg.Log.Debug("failed to delete chain", "error", err)
 	}
 }

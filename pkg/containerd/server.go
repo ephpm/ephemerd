@@ -12,8 +12,13 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/client"
-	srvconfig "github.com/containerd/containerd/v2/cmd/containerd/server/config"
 	ctdserver "github.com/containerd/containerd/v2/cmd/containerd/server"
+	srvconfig "github.com/containerd/containerd/v2/cmd/containerd/server/config"
+
+	// Blank import registers all containerd plugins (services, snapshotters,
+	// runtimes, etc.) with the global registry. Without this, ctdserver.New()
+	// starts an empty server with no gRPC services registered.
+	_ "github.com/containerd/containerd/v2/cmd/containerd/builtins"
 )
 
 // Config for the embedded containerd instance.
@@ -24,11 +29,12 @@ type Config struct {
 
 // Server manages the in-process containerd lifecycle.
 type Server struct {
-	cfg    Config
-	srv    *ctdserver.Server
-	client *client.Client
-	cancel context.CancelFunc
-	done   chan struct{}
+	cfg          Config
+	srv          *ctdserver.Server
+	client       *client.Client
+	cancel       context.CancelFunc
+	done         chan struct{}
+	shimCleanup  func()
 }
 
 // New creates and starts an embedded containerd server in-process.
@@ -41,11 +47,29 @@ func New(cfg Config) (*Server, error) {
 		done: make(chan struct{}),
 	}
 
+	// Extract shim and runc binaries next to the ephemerd binary.
+	// Also add that directory to PATH so the shim can find runc.
+	shimCleanup, err := extractShims()
+	if err != nil {
+		return nil, fmt.Errorf("extracting shim binaries: %w", err)
+	}
+	s.shimCleanup = shimCleanup
+
+	self, err := os.Executable()
+	if err == nil {
+		shimDir := filepath.Dir(self)
+		if err := os.Setenv("PATH", shimDir+":"+os.Getenv("PATH")); err != nil {
+			return nil, fmt.Errorf("setting PATH: %w", err)
+		}
+	}
+
 	if err := s.setup(); err != nil {
+		shimCleanup()
 		return nil, fmt.Errorf("setup: %w", err)
 	}
 
 	if err := s.start(); err != nil {
+		shimCleanup()
 		return nil, fmt.Errorf("start: %w", err)
 	}
 
@@ -74,6 +98,11 @@ func (s *Server) Stop() {
 	}
 
 	<-s.done
+
+	if s.shimCleanup != nil {
+		s.shimCleanup()
+	}
+
 	s.cfg.Log.Info("containerd stopped")
 }
 

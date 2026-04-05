@@ -21,6 +21,19 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
+      - name: Download embedded dependencies
+        run: |
+          mkdir -p pkg/runner/embed pkg/cni/embed pkg/containerd/embed
+          curl -fsSL -o pkg/runner/embed/actions-runner-linux-x64-${{ env.RUNNER_VERSION }}.tar.gz \
+            "https://github.com/actions/runner/releases/download/v${{ env.RUNNER_VERSION }}/actions-runner-linux-x64-${{ env.RUNNER_VERSION }}.tar.gz"
+          curl -fsSL -o pkg/cni/embed/cni-plugins-linux-amd64-v1.6.2.tgz \
+            "https://github.com/containernetworking/plugins/releases/download/v1.6.2/cni-plugins-linux-amd64-v1.6.2.tgz"
+          curl -fsSL "https://github.com/containerd/containerd/releases/download/v2.2.2/containerd-2.2.2-linux-amd64.tar.gz" \
+            | tar -xzf - -C pkg/containerd/embed --strip-components=1 bin/containerd-shim-runc-v2
+          curl -fsSL -o pkg/containerd/embed/runc \
+            "https://github.com/opencontainers/runc/releases/download/v1.3.4/runc.amd64"
+          chmod +x pkg/containerd/embed/runc
+
       - name: Go vet
         run: go vet ./...
 
@@ -33,15 +46,10 @@ jobs:
         run: golangci-lint run ./...
 
       - name: Test
-        run: go test -race -count=1 ./...
-
-      - name: Download runner tarball
-        run: make download-runner
+        run: go test -count=1 ./...
 
       - name: Build
-        run: |
-          go build -ldflags "-X main.version=${{ github.sha }}" \
-            -o ephemerd ./cmd/ephemerd/
+        run: go build -ldflags "-X main.version=${{ github.sha }}" -o ephemerd ./cmd/ephemerd/
 
   # build-matrix:
   #   name: Build

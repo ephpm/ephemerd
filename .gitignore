@@ -3,6 +3,8 @@
 config.toml
 *.log
 
-# Embedded tarballs (downloaded at build time)
+# Embedded binaries (downloaded at build time)
 pkg/runner/embed/actions-runner-*
 pkg/cni/embed/cni-plugins-*
+pkg/containerd/embed/containerd-shim-runc-v2
+pkg/containerd/embed/runc

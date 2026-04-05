@@ -12,9 +12,15 @@ import (
 type Config struct {
 	GitHub     GitHubConfig     `toml:"github"`
 	Containerd ContainerdConfig `toml:"containerd"`
+	Network    NetworkConfig    `toml:"network"`
 	VM         VMConfig         `toml:"vm"`
 	Runner     RunnerConfig     `toml:"runner"`
 	Log        LogConfig        `toml:"log"`
+}
+
+// NetworkConfig configures container networking.
+type NetworkConfig struct {
+	Subnet string `toml:"subnet"` // container subnet (default: "10.89.0.0/16")
 }
 
 type ContainerdConfig struct {
