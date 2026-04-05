@@ -397,7 +397,9 @@ func isRoutableDNS(ip string) bool {
 	case "172":
 		// 172.16.0.0/12
 		second := 0
-		fmt.Sscanf(parts[1], "%d", &second)
+		if _, err := fmt.Sscanf(parts[1], "%d", &second); err != nil {
+			return true // can't parse, assume routable
+		}
 		return second < 16 || second > 31
 	case "192":
 		return parts[1] != "168"

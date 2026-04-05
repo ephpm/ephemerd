@@ -58,7 +58,9 @@ func New(cfg Config) (*Server, error) {
 	self, err := os.Executable()
 	if err == nil {
 		shimDir := filepath.Dir(self)
-		os.Setenv("PATH", shimDir+":"+os.Getenv("PATH"))
+		if err := os.Setenv("PATH", shimDir+":"+os.Getenv("PATH")); err != nil {
+			return nil, fmt.Errorf("setting PATH: %w", err)
+		}
 	}
 
 	if err := s.setup(); err != nil {

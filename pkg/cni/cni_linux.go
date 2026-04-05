@@ -47,7 +47,9 @@ func (m *Manager) Extract() error {
 
 	m.log.Info("extracting embedded CNI plugins", "version", Version, "dir", dir)
 
-	os.RemoveAll(dir)
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("cleaning CNI dir: %w", err)
+	}
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("creating CNI dir: %w", err)
@@ -62,10 +64,10 @@ func (m *Manager) Extract() error {
 	if err != nil {
 		return fmt.Errorf("opening embedded CNI plugins: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	if err := extractTarGz(f, dir); err != nil {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir)
 		return fmt.Errorf("extracting CNI plugins: %w", err)
 	}
 
@@ -99,7 +101,7 @@ func extractTarGz(r io.Reader, dest string) error {
 	if err != nil {
 		return fmt.Errorf("gzip reader: %w", err)
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }()
 
 	tr := tar.NewReader(gz)
 	for {
