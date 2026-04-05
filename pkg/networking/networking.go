@@ -15,6 +15,7 @@ const DefaultSubnet = "10.88.0.0/16"
 type Config struct {
 	DataDir   string
 	Subnet    string // container subnet (auto-selected if empty)
+	MTU       int    // bridge MTU (auto-detected from host if 0)
 	CNIBinDir string // path to CNI plugin binaries (Linux only, ignored elsewhere)
 	Log       *slog.Logger
 }
@@ -100,6 +101,7 @@ type platformNetworking interface {
 	teardown(ctx context.Context, id string, netns string) error
 	installFirewallRules() error
 	removeFirewallRules()
+	cleanup()
 }
 
 // New creates and initializes the networking manager for the current platform.
@@ -130,7 +132,9 @@ func (m *Manager) InstallFirewallRules() error {
 	return m.platform.installFirewallRules()
 }
 
-// RemoveFirewallRules cleans up firewall rules on shutdown.
-func (m *Manager) RemoveFirewallRules() {
+// Cleanup removes all networking state: firewall rules, bridge interface,
+// CNI config, IP allocations, and DNS files. Called on shutdown.
+func (m *Manager) Cleanup() {
 	m.platform.removeFirewallRules()
+	m.platform.cleanup()
 }

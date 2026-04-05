@@ -122,6 +122,7 @@ func serve(ctx context.Context, configFile string) error {
 	net, err := networking.New(networking.Config{
 		DataDir:   configDir,
 		Subnet:    cfg.Network.Subnet,
+		MTU:       cfg.Network.MTU,
 		CNIBinDir: cm.Dir(),
 		Log:       log,
 	})
@@ -133,7 +134,7 @@ func serve(ctx context.Context, configFile string) error {
 	if err := net.InstallFirewallRules(); err != nil {
 		log.Warn("failed to install firewall rules (containers may access LAN)", "error", err)
 	}
-	defer net.RemoveFirewallRules()
+	defer net.Cleanup()
 
 	// Create runtime (container lifecycle manager)
 	rt, err := runtime.New(runtime.Config{

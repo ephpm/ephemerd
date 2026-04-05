@@ -21,6 +21,7 @@ type Config struct {
 // NetworkConfig configures container networking.
 type NetworkConfig struct {
 	Subnet string `toml:"subnet"` // container subnet (auto-selected if empty)
+	MTU    int    `toml:"mtu"`    // bridge MTU (auto-detected from host if 0)
 }
 
 type ContainerdConfig struct {

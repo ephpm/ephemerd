@@ -191,3 +191,5 @@ func (w *windowsNetworking) installFirewallRules() error {
 func (w *windowsNetworking) removeFirewallRules() {
 	// ACL policies are removed when endpoints are deleted
 }
+
+func (w *windowsNetworking) cleanup() {}

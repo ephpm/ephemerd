@@ -83,54 +83,50 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
 
-	// Determine job discovery mode
-	useWebhook := s.cfg.TLSCert != "" && s.cfg.TLSKey != ""
+	// Determine job discovery mode: webhook if secret is set, polling otherwise
+	useWebhook := s.cfg.WebhookSecret != ""
+	useTLS := s.cfg.TLSCert != "" && s.cfg.TLSKey != ""
 
 	if useWebhook {
-		// Webhook mode: listen for GitHub push events over TLS
 		handler, webhookEvents := s.cfg.GitHub.WebhookHandler(s.cfg.WebhookSecret)
 		mux.Handle("/webhook", handler)
 
-		// Forward webhook events to the unified channel
 		go func() {
 			for ev := range webhookEvents {
 				events <- ev
 			}
 		}()
+	}
 
-		server := &http.Server{
-			Addr:    fmt.Sprintf(":%d", s.cfg.WebhookPort),
-			Handler: mux,
-		}
+	server := &http.Server{
+		Addr:    fmt.Sprintf(":%d", s.cfg.WebhookPort),
+		Handler: mux,
+	}
 
-		go func() {
+	go func() {
+		if useTLS {
 			s.cfg.Log.Info("webhook server listening (TLS)", "port", s.cfg.WebhookPort)
 			if err := server.ListenAndServeTLS(s.cfg.TLSCert, s.cfg.TLSKey); err != http.ErrServerClosed {
 				s.cfg.Log.Error("webhook server error", "error", err)
 			}
-		}()
+		} else {
+			if useWebhook {
+				s.cfg.Log.Info("webhook server listening (HTTP, use TLS termination proxy for production)", "port", s.cfg.WebhookPort)
+			} else {
+				s.cfg.Log.Info("health server listening", "port", s.cfg.WebhookPort)
+			}
+			if err := server.ListenAndServe(); err != http.ErrServerClosed {
+				s.cfg.Log.Error("server error", "error", err)
+			}
+		}
+	}()
+	defer func() { _ = server.Shutdown(context.Background()) }()
 
-		defer func() { _ = server.Shutdown(context.Background()) }()
-	} else {
-		// Polling mode: periodically check GitHub API for queued jobs
+	if !useWebhook {
 		interval := s.cfg.PollInterval
 		if interval <= 0 {
 			interval = 10 * time.Second
 		}
-
-		// Health endpoint on HTTP (no TLS needed in polling mode)
-		server := &http.Server{
-			Addr:    fmt.Sprintf(":%d", s.cfg.WebhookPort),
-			Handler: mux,
-		}
-		go func() {
-			s.cfg.Log.Info("health server listening", "port", s.cfg.WebhookPort)
-			if err := server.ListenAndServe(); err != http.ErrServerClosed {
-				s.cfg.Log.Error("health server error", "error", err)
-			}
-		}()
-		defer func() { _ = server.Shutdown(context.Background()) }()
-
 		s.cfg.Log.Info("polling mode enabled", "interval", interval)
 		go s.pollLoop(ctx, interval, events)
 	}
