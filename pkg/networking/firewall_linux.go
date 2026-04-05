@@ -102,4 +102,13 @@ func (l *linuxNetworking) removeFirewallRules() {
 	if err := iptables("-X", chainName); err != nil {
 		l.cfg.Log.Debug("failed to delete chain", "error", err)
 	}
+
+	// Delete the bridge interface so it doesn't conflict on next startup
+	// (the subnet may change between runs)
+	out, err := exec.Command("ip", "link", "delete", defaultBridgeName).CombinedOutput()
+	if err != nil {
+		l.cfg.Log.Debug("failed to delete bridge", "bridge", defaultBridgeName, "error", fmt.Sprintf("%s: %s", err, out))
+	} else {
+		l.cfg.Log.Info("bridge deleted", "bridge", defaultBridgeName)
+	}
 }
