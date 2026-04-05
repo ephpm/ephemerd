@@ -40,6 +40,7 @@ func main() {
 		},
 		Commands: []*cli.Command{
 			serveCmd(),
+			runCmd(),
 			statusCmd(),
 			drainCmd(),
 			jobsCmd(),
