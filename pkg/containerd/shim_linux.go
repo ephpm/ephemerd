@@ -41,7 +41,14 @@ func extractShims() (func(), error) {
 		}
 	}
 
-	// Don't delete shim binaries on shutdown — they're needed for orphan
-	// cleanup on restart (containerd calls the shim to delete dead containers).
-	return func() {}, nil
+	return func() {
+		self, err := os.Executable()
+		if err != nil {
+			return
+		}
+		dir := filepath.Dir(self)
+		for _, name := range shimBinaries {
+			os.Remove(filepath.Join(dir, name))
+		}
+	}, nil
 }
