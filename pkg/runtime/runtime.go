@@ -13,6 +13,7 @@ import (
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
@@ -59,39 +60,46 @@ func New(cfg Config) (*Runtime, error) {
 	}, nil
 }
 
-// CleanOrphans removes any leftover containers from a previous ephemerd run.
-// This should be called on startup before the scheduler starts accepting jobs.
+// CleanOrphans removes any leftover containers and snapshots from a previous
+// ephemerd run. This should be called on startup before the scheduler starts
+// accepting jobs.
 func (r *Runtime) CleanOrphans(ctx context.Context) error {
 	ctx = namespaces.WithNamespace(ctx, namespace)
 
+	// Clean orphan containers (and their associated snapshots)
 	containers, err := r.client.Containers(ctx)
 	if err != nil {
 		return fmt.Errorf("listing containers: %w", err)
 	}
 
-	if len(containers) == 0 {
-		return nil
+	if len(containers) > 0 {
+		r.cfg.Log.Info("cleaning orphan containers", "count", len(containers))
 	}
-
-	r.cfg.Log.Info("cleaning orphan containers", "count", len(containers))
 
 	for _, c := range containers {
 		id := c.ID()
 		log := r.cfg.Log.With("id", id)
 
-		// Try to kill and delete the task
+		// Try to kill and delete the task in any state
 		task, err := c.Task(ctx, nil)
 		if err == nil {
-			status, err := task.Status(ctx)
-			if err == nil && status.Status == client.Running {
-				log.Debug("killing orphan task")
-				_ = task.Kill(ctx, 9)
-				exitCh, err := task.Wait(ctx)
-				if err == nil {
-					<-exitCh
+			st, err := task.Status(ctx)
+			if err == nil {
+				log.Debug("orphan task state", "status", st.Status)
+				if st.Status == client.Running {
+					if err := task.Kill(ctx, 9); err != nil {
+						log.Debug("failed to kill orphan task", "error", err)
+					}
+					exitCh, err := task.Wait(ctx)
+					if err == nil {
+						<-exitCh
+					}
 				}
 			}
-			_, _ = task.Delete(ctx)
+			// WithProcessKill forces deletion even if task is in created state
+			if _, err := task.Delete(ctx, client.WithProcessKill); err != nil {
+				log.Debug("failed to delete orphan task", "error", err)
+			}
 		}
 
 		// Delete container and snapshot
@@ -102,7 +110,33 @@ func (r *Runtime) CleanOrphans(ctx context.Context) error {
 		}
 	}
 
-	return nil
+	// Clean orphan snapshots that no longer have a container pointing to them.
+	// This catches snapshots left behind when a container create partially failed.
+	snapshotter := r.client.SnapshotService("overlayfs")
+	if snapshotter == nil {
+		return nil
+	}
+
+	containerIDs := make(map[string]bool, len(containers))
+	for _, c := range containers {
+		containerIDs[c.ID()+"-snapshot"] = true
+	}
+
+	return snapshotter.Walk(ctx, func(snapCtx context.Context, info snapshots.Info) error {
+		// Only clean ephemerd snapshots (they all end with -snapshot)
+		if !strings.HasSuffix(info.Name, "-snapshot") {
+			return nil
+		}
+		// Skip if we already handled it via container delete above
+		if containerIDs[info.Name] {
+			return nil
+		}
+		r.cfg.Log.Info("removing orphan snapshot", "name", info.Name)
+		if err := snapshotter.Remove(ctx, info.Name); err != nil {
+			r.cfg.Log.Warn("failed to remove orphan snapshot", "name", info.Name, "error", err)
+		}
+		return nil
+	})
 }
 
 // PullImage ensures the runner image is available locally.
@@ -200,19 +234,40 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		opts = append(opts, withHyperVIsolation())
 	}
 
+	snapshotName := id + "-snapshot"
+
+	// Clean up stale snapshot from a previous failed attempt
+	snapshotter := r.client.SnapshotService("overlayfs")
+	if snapshotter != nil {
+		if _, err := snapshotter.Stat(ctx, snapshotName); err == nil {
+			r.cfg.Log.Info("removing stale snapshot before create", "name", snapshotName)
+			if err := snapshotter.Remove(ctx, snapshotName); err != nil {
+				r.cfg.Log.Warn("failed to remove stale snapshot", "name", snapshotName, "error", err)
+			}
+		}
+	}
+
 	container, err := r.client.NewContainer(ctx, id,
 		client.WithImage(img),
-		client.WithNewSnapshot(id+"-snapshot", img),
+		client.WithNewSnapshot(snapshotName, img),
 		client.WithNewSpec(opts...),
 	)
 	if err != nil {
+		// Clean up snapshot if container creation partially succeeded
+		if snapshotter != nil {
+			if rmErr := snapshotter.Remove(ctx, snapshotName); rmErr != nil {
+				r.cfg.Log.Debug("snapshot cleanup after failed create", "error", rmErr)
+			}
+		}
 		return nil, fmt.Errorf("creating container %s: %w", id, err)
 	}
 
 	// Create and start the task with per-job log capture
 	var creator cio.Creator
 	if r.cfg.LogDir != "" {
-		_ = os.MkdirAll(r.cfg.LogDir, 0o755)
+		if err := os.MkdirAll(r.cfg.LogDir, 0o755); err != nil {
+			return nil, fmt.Errorf("creating log dir: %w", err)
+		}
 		logPath := filepath.Join(r.cfg.LogDir, id+".log")
 		creator = cio.LogFile(logPath)
 		r.cfg.Log.Debug("container logs", "id", id, "path", logPath)
@@ -221,7 +276,9 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 	}
 	task, err := container.NewTask(ctx, creator)
 	if err != nil {
-		_ = container.Delete(ctx)
+		if delErr := container.Delete(ctx, client.WithSnapshotCleanup); delErr != nil {
+			r.cfg.Log.Debug("container cleanup after failed task create", "error", delErr)
+		}
 		return nil, fmt.Errorf("creating task for %s: %w", id, err)
 	}
 
@@ -231,18 +288,28 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		pid := task.Pid()
 		netns = fmt.Sprintf("/proc/%d/ns/net", pid)
 		if _, err := r.cfg.Network.Setup(ctx, id, netns); err != nil {
-			_, _ = task.Delete(ctx)
-			_ = container.Delete(ctx)
+			if _, delErr := task.Delete(ctx, client.WithProcessKill); delErr != nil {
+				r.cfg.Log.Debug("task cleanup after failed network setup", "error", delErr)
+			}
+			if delErr := container.Delete(ctx, client.WithSnapshotCleanup); delErr != nil {
+				r.cfg.Log.Debug("container cleanup after failed network setup", "error", delErr)
+			}
 			return nil, fmt.Errorf("setting up network for %s: %w", id, err)
 		}
 	}
 
 	if err := task.Start(ctx); err != nil {
 		if r.cfg.Network != nil && netns != "" {
-			_ = r.cfg.Network.Teardown(ctx, id, netns)
+			if tearErr := r.cfg.Network.Teardown(ctx, id, netns); tearErr != nil {
+				r.cfg.Log.Debug("network teardown after failed start", "error", tearErr)
+			}
 		}
-		_, _ = task.Delete(ctx)
-		_ = container.Delete(ctx)
+		if _, delErr := task.Delete(ctx, client.WithProcessKill); delErr != nil {
+			r.cfg.Log.Debug("task cleanup after failed start", "error", delErr)
+		}
+		if delErr := container.Delete(ctx, client.WithSnapshotCleanup); delErr != nil {
+			r.cfg.Log.Debug("container cleanup after failed start", "error", delErr)
+		}
 		return nil, fmt.Errorf("starting task for %s: %w", id, err)
 	}
 

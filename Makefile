@@ -31,7 +31,7 @@ LDFLAGS := -ldflags "\
 	-X github.com/ephpm/ephemerd/pkg/runner.Version=$(RUNNER_VERSION) \
 	-X github.com/ephpm/ephemerd/pkg/cni.Version=$(CNI_VERSION)"
 
-.PHONY: build clean test lint download-runner download-cni download-shim
+.PHONY: build clean test lint download-runner download-cni download-shim generate
 
 build: download-runner download-cni download-shim
 	go build $(LDFLAGS) -o $(BINARY) ./cmd/ephemerd/
@@ -78,3 +78,8 @@ test:
 
 lint:
 	golangci-lint run ./...
+
+generate:
+	protoc --go_out=. --go_opt=paths=source_relative \
+		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
+		api/v1/ephemerd.proto

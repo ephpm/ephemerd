@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package ephemerd.v1;
+
+option go_package = "github.com/ephpm/ephemerd/api/v1;apiv1";
+
+service Control {
+  rpc Status(StatusRequest) returns (StatusResponse);
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+  rpc GetJob(GetJobRequest) returns (Job);
+  rpc KillJob(KillJobRequest) returns (KillJobResponse);
+  rpc GetJobLogs(GetJobLogsRequest) returns (stream LogChunk);
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  string status = 1;
+  int32 active_jobs = 2;
+  int32 max_concurrent = 3;
+  bool draining = 4;
+  string uptime = 5;
+}
+
+message ListJobsRequest {}
+
+message ListJobsResponse {
+  repeated Job jobs = 1;
+}
+
+message GetJobRequest {
+  int64 id = 1;
+}
+
+message Job {
+  int64 id = 1;
+  string name = 2;
+  string repo = 3;
+  string image = 4;
+  int64 runner_id = 5;
+  string status = 6;
+  uint32 pid = 7;
+  string started_at = 8; // RFC3339
+  string uptime = 9;
+}
+
+message KillJobRequest {
+  int64 id = 1;
+}
+
+message KillJobResponse {}
+
+message GetJobLogsRequest {
+  int64 id = 1;
+  bool follow = 2;
+}
+
+message LogChunk {
+  bytes data = 1;
+}

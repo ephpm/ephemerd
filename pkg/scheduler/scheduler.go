@@ -51,10 +51,14 @@ const seenTTL = 10 * time.Minute
 type runningJob struct {
 	env          *runtime.RunnerEnv
 	repo         string
+	image        string
 	runnerID     int64
 	cancel       context.CancelFunc
 	artifactsDir string // non-empty if OCI artifacts were extracted for this job
+	startedAt    time.Time
 }
+
+
 
 // New creates a scheduler.
 func New(cfg Config) *Scheduler {
@@ -79,7 +83,14 @@ func New(cfg Config) *Scheduler {
 func (s *Scheduler) Run(ctx context.Context) error {
 	events := make(chan github.JobEvent, 32)
 
-	// Start health server (always available)
+	// Start gRPC control server on unix socket
+	grpcCleanup, err := s.startControlServer()
+	if err != nil {
+		return fmt.Errorf("starting control server: %w", err)
+	}
+	defer grpcCleanup()
+
+	// Start health/webhook HTTP server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
 
@@ -217,10 +228,18 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	}
 	s.mu.Unlock()
 
+	// On provisioning failure, remove from seen so the next poll retries
+	unsee := func() {
+		s.mu.Lock()
+		delete(s.seen, jobID)
+		s.mu.Unlock()
+	}
+
 	// Acquire concurrency slot
 	select {
 	case s.sem <- struct{}{}:
 	case <-ctx.Done():
+		unsee()
 		return
 	}
 
@@ -261,6 +280,7 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 		if artifactsDir != "" {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
+		unsee()
 		time.Sleep(5 * time.Second) // back off to avoid tight retry loops on rate limits
 		<-s.sem
 		return
@@ -289,6 +309,7 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 		if artifactsDir != "" {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
+		unsee()
 		cancel()
 		<-s.sem
 		return
@@ -299,9 +320,11 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	s.running[jobID] = &runningJob{
 		env:          env,
 		repo:         event.Repo,
+		image:        image,
 		runnerID:     runnerID,
 		cancel:       cancel,
 		artifactsDir: artifactsDir,
+		startedAt:    time.Now(),
 	}
 	s.mu.Unlock()
 
@@ -447,6 +470,7 @@ func (s *Scheduler) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(status)
 }
+
 
 func (s *Scheduler) cleanSeen() {
 	s.mu.Lock()
