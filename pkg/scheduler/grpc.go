@@ -130,20 +130,20 @@ func (c *controlServer) GetJobLogs(req *apiv1.GetJobLogsRequest, stream grpc.Ser
 	if err != nil {
 		return status.Errorf(codes.NotFound, "log file not found: %v", err)
 	}
-	defer func() { _ = f.Close() }()
-
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := f.Read(buf)
 		if n > 0 {
 			if sendErr := stream.Send(&apiv1.LogChunk{Data: buf[:n]}); sendErr != nil {
+				f.Close()
 				return sendErr
 			}
 		}
 		if err == io.EOF {
-			return nil
+			return f.Close()
 		}
 		if err != nil {
+			f.Close()
 			return status.Errorf(codes.Internal, "reading log: %v", err)
 		}
 	}

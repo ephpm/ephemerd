@@ -23,28 +23,46 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// controlClient dials the daemon's gRPC unix socket and returns a client.
-func controlClient(ctx context.Context) (apiv1.ControlClient, *grpc.ClientConn, error) {
+// controlConn holds a gRPC connection and its client for the daemon control socket.
+type controlConn struct {
+	apiv1.ControlClient
+	conn *grpc.ClientConn
+}
+
+// Close closes the underlying gRPC connection.
+func (c *controlConn) Close() error {
+	return c.conn.Close()
+}
+
+// dialControl connects to the daemon's gRPC unix socket.
+func dialControl(ctx context.Context) (*controlConn, error) {
 	sock := scheduler.SocketPath(configDir)
 	conn, err := grpc.NewClient("unix:"+sock,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("cannot connect to ephemerd at %s (is it running?): %w", sock, err)
+		return nil, fmt.Errorf("cannot connect to ephemerd at %s (is it running?): %w", sock, err)
 	}
-	return apiv1.NewControlClient(conn), conn, nil
+	return &controlConn{
+		ControlClient: apiv1.NewControlClient(conn),
+		conn:          conn,
+	}, nil
 }
 
 func statusCmd() *cli.Command {
 	return &cli.Command{
 		Name:  "status",
 		Usage: "Show running jobs and daemon health",
-		Action: func(ctx context.Context, cmd *cli.Command) error {
-			cc, conn, err := controlClient(ctx)
+		Action: func(ctx context.Context, cmd *cli.Command) (retErr error) {
+			cc, err := dialControl(ctx)
 			if err != nil {
 				return err
 			}
-			defer func() { _ = conn.Close() }()
+			defer func() {
+				if err := cc.Close(); err != nil && retErr == nil {
+					retErr = fmt.Errorf("closing connection: %w", err)
+				}
+			}()
 
 			resp, err := cc.Status(ctx, &apiv1.StatusRequest{})
 			if err != nil {
@@ -89,12 +107,14 @@ func drainCmd() *cli.Command {
 			}
 
 			// Check current status via gRPC if reachable
-			cc, conn, grpcErr := controlClient(ctx)
-			if grpcErr == nil {
-				defer func() { _ = conn.Close() }()
+			cc, dialErr := dialControl(ctx)
+			if dialErr == nil {
 				resp, err := cc.Status(ctx, &apiv1.StatusRequest{})
 				if err == nil {
 					fmt.Printf("Active jobs: %d\n", resp.ActiveJobs)
+				}
+				if err := cc.Close(); err != nil {
+					return fmt.Errorf("closing connection: %w", err)
 				}
 			}
 
@@ -115,12 +135,16 @@ func jobsCmd() *cli.Command {
 		Name:      "jobs",
 		Usage:     "List and manage running jobs",
 		ArgsUsage: "[job-id]",
-		Action: func(ctx context.Context, cmd *cli.Command) error {
-			cc, conn, err := controlClient(ctx)
+		Action: func(ctx context.Context, cmd *cli.Command) (retErr error) {
+			cc, err := dialControl(ctx)
 			if err != nil {
 				return err
 			}
-			defer func() { _ = conn.Close() }()
+			defer func() {
+				if err := cc.Close(); err != nil && retErr == nil {
+					retErr = fmt.Errorf("closing connection: %w", err)
+				}
+			}()
 
 			// If a job ID argument is given, show that job's details
 			if cmd.Args().Len() > 0 {
@@ -188,7 +212,7 @@ func jobKillCmd() *cli.Command {
 		Name:      "kill",
 		Usage:     "Kill a running job",
 		ArgsUsage: "<job-id>",
-		Action: func(ctx context.Context, cmd *cli.Command) error {
+		Action: func(ctx context.Context, cmd *cli.Command) (retErr error) {
 			if cmd.Args().Len() == 0 {
 				return fmt.Errorf("job ID required")
 			}
@@ -198,11 +222,15 @@ func jobKillCmd() *cli.Command {
 				return fmt.Errorf("invalid job id: %w", err)
 			}
 
-			cc, conn, err := controlClient(ctx)
+			cc, err := dialControl(ctx)
 			if err != nil {
 				return err
 			}
-			defer func() { _ = conn.Close() }()
+			defer func() {
+				if err := cc.Close(); err != nil && retErr == nil {
+					retErr = fmt.Errorf("closing connection: %w", err)
+				}
+			}()
 
 			if _, err := cc.KillJob(ctx, &apiv1.KillJobRequest{Id: jobID}); err != nil {
 				return fmt.Errorf("kill job: %w", err)
@@ -219,7 +247,7 @@ func jobLogsCmd() *cli.Command {
 		Name:      "logs",
 		Usage:     "Show logs for a running job",
 		ArgsUsage: "<job-id>",
-		Action: func(ctx context.Context, cmd *cli.Command) error {
+		Action: func(ctx context.Context, cmd *cli.Command) (retErr error) {
 			if cmd.Args().Len() == 0 {
 				return fmt.Errorf("job ID required")
 			}
@@ -229,11 +257,15 @@ func jobLogsCmd() *cli.Command {
 				return fmt.Errorf("invalid job id: %w", err)
 			}
 
-			cc, conn, err := controlClient(ctx)
+			cc, err := dialControl(ctx)
 			if err != nil {
 				return err
 			}
-			defer func() { _ = conn.Close() }()
+			defer func() {
+				if err := cc.Close(); err != nil && retErr == nil {
+					retErr = fmt.Errorf("closing connection: %w", err)
+				}
+			}()
 
 			stream, err := cc.GetJobLogs(ctx, &apiv1.GetJobLogsRequest{Id: jobID})
 			if err != nil {
@@ -260,13 +292,17 @@ func imagesCmd() *cli.Command {
 	return &cli.Command{
 		Name:  "images",
 		Usage: "List cached container images",
-		Action: func(ctx context.Context, cmd *cli.Command) error {
+		Action: func(ctx context.Context, cmd *cli.Command) (retErr error) {
 			socket := containerdpkg.SocketPath(configDir)
 			c, err := client.New(socket)
 			if err != nil {
 				return fmt.Errorf("connecting to containerd at %s: %w", socket, err)
 			}
-			defer func() { _ = c.Close() }()
+			defer func() {
+				if err := c.Close(); err != nil && retErr == nil {
+					retErr = fmt.Errorf("closing containerd client: %w", err)
+				}
+			}()
 
 			nsCtx := namespaces.WithNamespace(ctx, "ephemerd")
 			images, err := c.ListImages(nsCtx)
