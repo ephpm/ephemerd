@@ -16,7 +16,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/runner"
 	"github.com/ephpm/ephemerd/pkg/runtime"
 	"github.com/ephpm/ephemerd/pkg/scheduler"
-	"github.com/spf13/cobra"
+	"github.com/urfave/cli/v3"
 )
 
 var (
@@ -25,42 +25,48 @@ var (
 )
 
 func main() {
-	root := &cobra.Command{
-		Use:     "ephemerd",
-		Short:   "Ephemeral GitHub Actions runner daemon",
+	app := &cli.Command{
+		Name:    "ephemerd",
+		Usage:   "Ephemeral GitHub Actions runner daemon",
 		Version: version,
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:        "data-dir",
+				Value:       defaultDataDir(),
+				Usage:       "data directory for ephemerd state",
+				Destination: &configDir,
+			},
+		},
+		Commands: []*cli.Command{
+			serveCmd(),
+			statusCmd(),
+			drainCmd(),
+			imagesCmd(),
+			configCheckCmd(),
+			ctrctlCmd(),
+		},
 	}
 
-	root.PersistentFlags().StringVar(&configDir, "data-dir", defaultDataDir(), "data directory for ephemerd state")
-
-	root.AddCommand(
-		serveCmd(),
-		statusCmd(),
-		drainCmd(),
-		imagesCmd(),
-		configCheckCmd(),
-		ctrctlCmd(),
-	)
-
-	if err := root.Execute(); err != nil {
+	if err := app.Run(context.Background(), os.Args); err != nil {
 		os.Exit(1)
 	}
 }
 
-func serveCmd() *cobra.Command {
-	var configFile string
-
-	cmd := &cobra.Command{
-		Use:   "serve",
-		Short: "Start the ephemerd daemon",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return serve(cmd.Context(), configFile)
+func serveCmd() *cli.Command {
+	return &cli.Command{
+		Name:  "serve",
+		Usage: "Start the ephemerd daemon",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:    "config",
+				Aliases: []string{"c"},
+				Usage:   "path to config file (default: <data-dir>/config.toml)",
+			},
+		},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			return serve(ctx, cmd.String("config"))
 		},
 	}
-
-	cmd.Flags().StringVarP(&configFile, "config", "c", "", "path to config file (default: <data-dir>/config.toml)")
-
-	return cmd
 }
 
 func serve(ctx context.Context, configFile string) error {
@@ -122,12 +128,12 @@ func serve(ctx context.Context, configFile string) error {
 
 	// Create runtime (container lifecycle manager)
 	rt, err := runtime.New(runtime.Config{
-		Client:       ctrdClient,
-		RunnerDir:    rm.Dir(),
-		RunnerMount:  rm.ContainerDir(),
-		LogDir:       joinPath(configDir, "logs"),
-		Network:      net,
-		Log:          log,
+		Client:      ctrdClient,
+		RunnerDir:   rm.Dir(),
+		RunnerMount: rm.ContainerDir(),
+		LogDir:      joinPath(configDir, "logs"),
+		Network:     net,
+		Log:         log,
 	})
 	if err != nil {
 		return fmt.Errorf("creating runtime: %w", err)
@@ -179,19 +185,17 @@ func serve(ctx context.Context, configFile string) error {
 
 // ctrctlCmd provides direct access to the embedded containerd for debugging.
 // Similar to rke2's "rke2 crictl" passthrough.
-func ctrctlCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:                "ctrctl",
-		Short:              "Access the embedded containerd (passthrough to ctr)",
-		Long:               "Runs ctr commands against ephemerd's embedded containerd instance.\nAll arguments after 'ctrctl' are passed directly to ctr.",
-		DisableFlagParsing: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
+func ctrctlCmd() *cli.Command {
+	return &cli.Command{
+		Name:            "ctrctl",
+		Usage:           "Access the embedded containerd (passthrough to ctr)",
+		Description:     "Runs ctr commands against ephemerd's embedded containerd instance.\nAll arguments after 'ctrctl' are passed directly to ctr.",
+		SkipFlagParsing: true,
+		Action: func(ctx context.Context, cmd *cli.Command) error {
 			socketPath := containerd.SocketPath(configDir)
-			return containerd.ExecCtr(socketPath, args)
+			return containerd.ExecCtr(socketPath, cmd.Args().Slice())
 		},
 	}
-
-	return cmd
 }
 
 func joinPath(parts ...string) string {
