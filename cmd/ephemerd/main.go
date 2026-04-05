@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/ephpm/ephemerd/pkg/artifacts"
+	"github.com/ephpm/ephemerd/pkg/cni"
 	"github.com/ephpm/ephemerd/pkg/config"
 	"github.com/ephpm/ephemerd/pkg/containerd"
 	"github.com/ephpm/ephemerd/pkg/github"
@@ -111,10 +112,17 @@ func serve(ctx context.Context, configFile string) error {
 		return fmt.Errorf("extracting runner: %w", err)
 	}
 
+	// Extract embedded CNI plugins
+	cm := cni.New(configDir, log)
+	if err := cm.Extract(); err != nil {
+		return fmt.Errorf("extracting CNI plugins: %w", err)
+	}
+
 	// Initialize container networking
 	net, err := networking.New(networking.Config{
-		DataDir: configDir,
-		Log:     log,
+		DataDir:   configDir,
+		CNIBinDir: cm.Dir(),
+		Log:       log,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing networking: %w", err)

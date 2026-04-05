@@ -10,8 +10,9 @@ const DefaultSubnet = "10.88.0.0/16"
 
 // Config for container networking.
 type Config struct {
-	DataDir string
-	Log     *slog.Logger
+	DataDir   string
+	CNIBinDir string // path to CNI plugin binaries (Linux only, ignored elsewhere)
+	Log       *slog.Logger
 }
 
 // Manager handles platform-specific container networking.

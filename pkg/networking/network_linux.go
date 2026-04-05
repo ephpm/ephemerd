@@ -44,10 +44,16 @@ func (l *linuxNetworking) init(cfg Config) error {
 		return fmt.Errorf("reading CNI config: %w", err)
 	}
 
-	network, err := cni.New(
+	opts := []cni.Opt{}
+	if cfg.CNIBinDir != "" {
+		opts = append(opts, cni.WithPluginDir([]string{cfg.CNIBinDir}))
+	}
+	opts = append(opts,
 		cni.WithConfListBytes(data),
 		cni.WithLoNetwork,
 	)
+
+	network, err := cni.New(opts...)
 	if err != nil {
 		return fmt.Errorf("initializing CNI: %w", err)
 	}

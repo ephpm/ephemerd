@@ -3,5 +3,6 @@
 config.toml
 *.log
 
-# Embedded runner tarballs (downloaded at build time)
+# Embedded tarballs (downloaded at build time)
 pkg/runner/embed/actions-runner-*
+pkg/cni/embed/cni-plugins-*
