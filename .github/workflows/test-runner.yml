@@ -6,6 +6,8 @@ on:
 jobs:
   test-linux:
     runs-on: [self-hosted, linux, x64]
+    env:
+      EPHEMERD_IMAGE: docker.io/library/ubuntu:24.04
     steps:
       - name: System info
         run: |
