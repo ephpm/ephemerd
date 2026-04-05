@@ -73,15 +73,19 @@ func (l *linuxNetworking) removeFirewallRules() {
 			"--reject-with", "icmp-net-unreachable",
 		}
 
-		_ = exec.Command("iptables", rule...).Run()
+		if err := exec.Command("iptables", rule...).Run(); err != nil {
+			l.cfg.Log.Debug("failed to remove firewall rule", "dst", cidr, "error", err)
+		}
 	}
 
 	// Remove the container subnet allow rule
-	_ = exec.Command("iptables",
+	if err := exec.Command("iptables",
 		"-t", "filter",
 		"-D", "FORWARD",
 		"-s", DefaultSubnet,
 		"-d", DefaultSubnet,
 		"-j", "ACCEPT",
-	).Run()
+	).Run(); err != nil {
+		l.cfg.Log.Debug("failed to remove container subnet allow rule", "error", err)
+	}
 }

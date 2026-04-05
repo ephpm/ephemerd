@@ -158,10 +158,12 @@ func extractTarGz(r io.Reader, dest string) error {
 				return fmt.Errorf("creating file %s: %w", target, err)
 			}
 			if _, err := io.Copy(f, tr); err != nil {
-				_ = f.Close()
+				f.Close()
 				return fmt.Errorf("writing file %s: %w", target, err)
 			}
-			_ = f.Close()
+			if err := f.Close(); err != nil {
+				return fmt.Errorf("closing file %s: %w", target, err)
+			}
 		case tar.TypeSymlink:
 			if err := os.Symlink(hdr.Linkname, target); err != nil {
 				return fmt.Errorf("creating symlink %s: %w", target, err)
