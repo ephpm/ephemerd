@@ -15,7 +15,7 @@ RUNNER_EMBED_DIR := pkg/runner/embed
 
 LDFLAGS := -ldflags "-X main.version=$(VERSION) -X github.com/ephpm/ephemerd/pkg/runner.Version=$(RUNNER_VERSION)"
 
-.PHONY: build clean test lint download-runner
+.PHONY: build clean test lint download-runner generate
 
 build: download-runner
 	go build $(LDFLAGS) -o $(BINARY) ./cmd/ephemerd/
@@ -37,3 +37,8 @@ test:
 
 lint:
 	golangci-lint run ./...
+
+generate:
+	protoc --go_out=. --go_opt=paths=source_relative \
+		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
+		api/v1/ephemerd.proto

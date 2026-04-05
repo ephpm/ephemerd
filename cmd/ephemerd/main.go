@@ -41,6 +41,7 @@ func main() {
 			serveCmd(),
 			statusCmd(),
 			drainCmd(),
+			jobsCmd(),
 			imagesCmd(),
 			configCheckCmd(),
 			ctrctlCmd(),
