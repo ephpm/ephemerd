@@ -121,6 +121,7 @@ func serve(ctx context.Context, configFile string) error {
 	// Initialize container networking
 	net, err := networking.New(networking.Config{
 		DataDir:   configDir,
+		Subnet:    cfg.Network.Subnet,
 		CNIBinDir: cm.Dir(),
 		Log:       log,
 	})

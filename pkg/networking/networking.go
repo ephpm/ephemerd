@@ -6,13 +6,23 @@ import (
 )
 
 // DefaultSubnet is the IP range for containers.
-const DefaultSubnet = "10.88.0.0/16"
+// Uses 10.89.0.0/16 to avoid conflicts with Podman's default 10.88.0.0/16.
+const DefaultSubnet = "10.89.0.0/16"
 
 // Config for container networking.
 type Config struct {
 	DataDir   string
+	Subnet    string // container subnet (uses DefaultSubnet if empty)
 	CNIBinDir string // path to CNI plugin binaries (Linux only, ignored elsewhere)
 	Log       *slog.Logger
+}
+
+// subnet returns the configured subnet or the default.
+func (c Config) subnet() string {
+	if c.Subnet != "" {
+		return c.Subnet
+	}
+	return DefaultSubnet
 }
 
 // Manager handles platform-specific container networking.

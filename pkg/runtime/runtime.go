@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	goruntime "runtime"
 
 	"github.com/containerd/containerd/v2/client"
@@ -17,7 +20,10 @@ import (
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-const namespace = "ephemerd"
+const (
+	namespace    = "ephemerd"
+	defaultImage = "ghcr.io/actions/actions-runner:latest"
+)
 
 // Config for the container runtime.
 type Config struct {
@@ -33,12 +39,14 @@ type Config struct {
 type Runtime struct {
 	cfg    Config
 	client *client.Client
+	pullMu sync.Mutex // serializes image pulls to avoid content store contention
 }
 
 // RunnerEnv represents a running runner environment.
 type RunnerEnv struct {
 	ID        string
 	Netns     string // network namespace path (Linux only)
+	RunnerDir string // per-job runner copy, cleaned up on destroy
 	Container client.Container
 	Task      client.Task
 }
@@ -98,8 +106,18 @@ func (r *Runtime) CleanOrphans(ctx context.Context) error {
 }
 
 // PullImage ensures the runner image is available locally.
+// Serialized with a mutex to avoid concurrent pulls contending on
+// the content store (which produces noisy lock errors).
 func (r *Runtime) PullImage(ctx context.Context, ref string) error {
+	r.pullMu.Lock()
+	defer r.pullMu.Unlock()
+
 	ctx = namespaces.WithNamespace(ctx, namespace)
+
+	// Check if another goroutine already pulled it while we waited
+	if _, err := r.client.GetImage(ctx, ref); err == nil {
+		return nil
+	}
 
 	r.cfg.Log.Info("pulling image", "ref", ref)
 
@@ -118,11 +136,15 @@ func (r *Runtime) PullImage(ctx context.Context, ref string) error {
 func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig string) (*RunnerEnv, error) {
 	ctx = namespaces.WithNamespace(ctx, namespace)
 
-	if image == "" {
-		return nil, fmt.Errorf("no image specified for job %s — set EPHEMERD_IMAGE in your workflow env", id)
+	// Use the official GitHub Actions runner image when no custom image is specified.
+	// The official image has the runner binary pre-installed at /home/runner/.
+	// Custom images get our embedded runner binary mounted in.
+	customImage := image != ""
+	if !customImage {
+		image = defaultImage
 	}
 
-	r.cfg.Log.Info("creating runner environment", "id", id, "image", image)
+	r.cfg.Log.Info("creating runner environment", "id", id, "image", image, "custom", customImage)
 
 	// Get the image, pulling it if not present locally
 	img, err := r.client.GetImage(ctx, image)
@@ -137,10 +159,15 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		}
 	}
 
-	// Determine runner entrypoint based on OS
-	entrypoint := "/actions-runner/run.sh"
+	// Runner paths differ: official image has runner at /home/runner,
+	// custom images get our embedded runner mounted at /actions-runner.
+	var entrypoint string
 	if goruntime.GOOS == "windows" {
 		entrypoint = `C:\actions-runner\run.cmd`
+	} else if customImage {
+		entrypoint = "/actions-runner/run.sh"
+	} else {
+		entrypoint = "/home/runner/run.sh"
 	}
 
 	// Build container spec
@@ -149,18 +176,23 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		oci.WithEnv([]string{
 			"RUNNER_ALLOW_RUNASROOT=1",
 		}),
-		// Override entrypoint to run the injected runner with JIT config
 		oci.WithProcessArgs(entrypoint, "--jitconfig", jitConfig),
 	}
 
-	// Bind-mount the runner directory into the container
-	if r.cfg.RunnerDir != "" && r.cfg.RunnerMount != "" {
-		opts = append(opts, withRunnerMount(r.cfg.RunnerDir, r.cfg.RunnerMount))
+	// Only mount our embedded runner for custom images — the official image
+	// already has the runner binary built in.
+	var jobRunnerDir string
+	if customImage && r.cfg.RunnerDir != "" && r.cfg.RunnerMount != "" {
+		jobRunnerDir = filepath.Join(filepath.Dir(r.cfg.RunnerDir), "job-"+id)
+		if err := copyDirHardlink(r.cfg.RunnerDir, jobRunnerDir); err != nil {
+			return nil, fmt.Errorf("copying runner dir for %s: %w", id, err)
+		}
+		opts = append(opts, withRunnerMount(jobRunnerDir, r.cfg.RunnerMount))
 	}
 
 	// Mount host DNS config so containers can resolve names
 	if goruntime.GOOS != "windows" {
-		opts = append(opts, withDNSMount())
+		opts = append(opts, withDNSMount(filepath.Dir(r.cfg.LogDir), id))
 	}
 
 	// Add Hyper-V isolation on Windows
@@ -219,6 +251,7 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 	return &RunnerEnv{
 		ID:        id,
 		Netns:     netns,
+		RunnerDir: jobRunnerDir,
 		Container: container,
 		Task:      task,
 	}, nil
@@ -259,6 +292,13 @@ func (r *Runtime) Destroy(ctx context.Context, env *RunnerEnv) error {
 		r.cfg.Log.Warn("failed to delete container", "id", env.ID, "error", err)
 	}
 
+	// Clean up per-job runner directory copy
+	if env.RunnerDir != "" {
+		if err := os.RemoveAll(env.RunnerDir); err != nil {
+			r.cfg.Log.Warn("failed to remove job runner dir", "id", env.ID, "path", env.RunnerDir, "error", err)
+		}
+	}
+
 	r.cfg.Log.Info("runner environment destroyed", "id", env.ID)
 	return nil
 }
@@ -281,23 +321,95 @@ func (r *Runtime) Wait(ctx context.Context, env *RunnerEnv) (uint32, error) {
 	}
 }
 
-// withDNSMount bind-mounts the host's resolv.conf into the container for DNS resolution.
-func withDNSMount() oci.SpecOpts {
+// withDNSMount creates a resolv.conf for the container.
+// We write a temporary file with the host's nameservers, filtering out
+// any private/unreachable IPs (e.g. WSL2's 10.255.255.254) and falling
+// back to public DNS if no usable nameservers are found.
+func withDNSMount(dataDir string, containerID string) oci.SpecOpts {
 	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
+		content := buildResolvConf()
+
+		dir := filepath.Join(dataDir, "dns")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("creating dns dir: %w", err)
+		}
+		src := filepath.Join(dir, containerID+".conf")
+		if err := os.WriteFile(src, []byte(content), 0o644); err != nil {
+			return fmt.Errorf("writing resolv.conf: %w", err)
+		}
+
 		if s.Mounts == nil {
 			s.Mounts = []ocispec.Mount{}
 		}
 		s.Mounts = append(s.Mounts, ocispec.Mount{
 			Destination: "/etc/resolv.conf",
 			Type:        "bind",
-			Source:      "/etc/resolv.conf",
+			Source:      src,
 			Options:     []string{"rbind", "ro"},
 		})
 		return nil
 	}
 }
 
-// withRunnerMount bind-mounts the host runner directory into the container as read-only.
+// buildResolvConf reads the host's resolv.conf and filters out private
+// nameservers that containers can't reach. Falls back to public DNS.
+func buildResolvConf() string {
+	hostConf, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil {
+		return "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+	}
+
+	var lines []string
+	hasNameserver := false
+	for _, line := range strings.Split(string(hostConf), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "nameserver") {
+			// Extract the IP and check if it's routable from containers
+			parts := strings.Fields(trimmed)
+			if len(parts) >= 2 && isRoutableDNS(parts[1]) {
+				lines = append(lines, trimmed)
+				hasNameserver = true
+			}
+		} else if strings.HasPrefix(trimmed, "search") || strings.HasPrefix(trimmed, "options") {
+			lines = append(lines, trimmed)
+		}
+	}
+
+	if !hasNameserver {
+		lines = append([]string{"nameserver 1.1.1.1", "nameserver 8.8.8.8"}, lines...)
+	}
+
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// isRoutableDNS checks if a DNS server IP is reachable from containers.
+// Private IPs (10.x, 172.16-31.x, 192.168.x, 169.254.x) are blocked
+// by our firewall rules, so we filter them out.
+func isRoutableDNS(ip string) bool {
+	parts := strings.Split(ip, ".")
+	if len(parts) != 4 {
+		return true // IPv6 or weird format, let it through
+	}
+	first := parts[0]
+	switch first {
+	case "10", "169":
+		return false
+	case "172":
+		// 172.16.0.0/12
+		second := 0
+		fmt.Sscanf(parts[1], "%d", &second)
+		return second < 16 || second > 31
+	case "192":
+		return parts[1] != "168"
+	case "127":
+		return false
+	}
+	return true
+}
+
+// withRunnerMount bind-mounts a per-job copy of the runner directory into the container.
+// The runner needs write access (e.g. run-helper.sh at startup) so we can't use
+// the shared extracted dir directly. The caller provides a job-specific copy.
 func withRunnerMount(hostDir, containerDir string) oci.SpecOpts {
 	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
 		if s.Mounts == nil {
@@ -307,10 +419,19 @@ func withRunnerMount(hostDir, containerDir string) oci.SpecOpts {
 			Destination: containerDir,
 			Type:        "bind",
 			Source:      hostDir,
-			Options:     []string{"rbind", "ro"},
+			Options:     []string{"rbind", "rw"},
 		})
 		return nil
 	}
+}
+
+// copyDirHardlink creates a copy of src at dst using hardlinks (cp -al).
+// This is instant and uses no extra disk space until files are modified.
+func copyDirHardlink(src, dst string) error {
+	if err := os.RemoveAll(dst); err != nil {
+		return err
+	}
+	return exec.Command("cp", "-al", src, dst).Run()
 }
 
 // withHyperVIsolation is a spec option that enables Hyper-V isolation on Windows.

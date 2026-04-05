@@ -186,7 +186,12 @@ func (s *Scheduler) poll(ctx context.Context, events chan<- github.JobEvent) {
 		return
 	}
 
+	if len(jobs) == 0 {
+		s.cfg.Log.Debug("poll: no queued jobs found")
+	}
+
 	for _, job := range jobs {
+		s.cfg.Log.Debug("poll: found queued job", "job_id", job.Job.GetID(), "repo", job.Repo)
 		events <- job
 	}
 }
