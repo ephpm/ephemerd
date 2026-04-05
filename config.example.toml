@@ -11,10 +11,12 @@ owner = "your-org"
 
 # Job discovery: polling (default) or webhook
 # Polling checks the GitHub API every interval — no inbound ports or certs needed.
-# Set tls_cert + tls_key to enable webhook mode instead (instant delivery).
+# Set webhook_secret to enable webhook mode instead (instant delivery, no API polling).
 poll_interval = "10s"
 
-# Webhook mode (optional): listen for GitHub webhook events over TLS
+# Webhook mode (optional): set webhook_secret to enable.
+# Works behind a TLS termination proxy like ngrok (plain HTTP).
+# Set tls_cert + tls_key for direct TLS without a proxy.
 # webhook_port = 8080
 # webhook_secret = "your_webhook_secret"
 # tls_cert = "/etc/ephemerd/tls.crt"
