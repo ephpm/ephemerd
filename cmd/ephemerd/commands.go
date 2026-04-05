@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
+	"strconv"
+	"syscall"
 
 	containerdpkg "github.com/ephpm/ephemerd/pkg/containerd"
 	"github.com/ephpm/ephemerd/pkg/config"
@@ -58,23 +61,41 @@ func drainCmd() *cobra.Command {
 		Short: "Stop accepting new jobs and wait for running jobs to finish",
 		Long:  "Sends SIGTERM to the running ephemerd daemon, triggering graceful drain.\nThe daemon will stop accepting new jobs and wait for running jobs to complete.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Check current status first
-			resp, err := http.Get(fmt.Sprintf("http://localhost:%d/healthz", port))
+			// Read PID file to find the running daemon
+			pidFile := filepath.Join(configDir, "ephemerd.pid")
+			pidData, err := os.ReadFile(pidFile)
 			if err != nil {
-				return fmt.Errorf("cannot reach ephemerd (is it running?): %w", err)
+				return fmt.Errorf("cannot read pid file %s (is ephemerd running?): %w", pidFile, err)
 			}
-			defer resp.Body.Close()
+			pid, err := strconv.Atoi(string(pidData))
+			if err != nil {
+				return fmt.Errorf("invalid pid file: %w", err)
+			}
 
-			body, _ := io.ReadAll(resp.Body)
-			var status map[string]any
-			json.Unmarshal(body, &status)
+			proc, err := os.FindProcess(pid)
+			if err != nil {
+				return fmt.Errorf("cannot find process %d: %w", pid, err)
+			}
 
-			activeJobs, _ := status["active_jobs"].(float64)
-			fmt.Printf("Active jobs: %.0f\n", activeJobs)
-			fmt.Println("Sending SIGTERM to trigger drain...")
+			// Check current status if reachable
+			resp, err := http.Get(fmt.Sprintf("http://localhost:%d/healthz", port))
+			if err == nil {
+				defer resp.Body.Close()
+				body, _ := io.ReadAll(resp.Body)
+				var status map[string]any
+				if json.Unmarshal(body, &status) == nil {
+					activeJobs, _ := status["active_jobs"].(float64)
+					fmt.Printf("Active jobs: %.0f\n", activeJobs)
+				}
+			}
+
+			fmt.Printf("Sending SIGTERM to ephemerd (pid %d)...\n", pid)
+			if err := proc.Signal(syscall.SIGTERM); err != nil {
+				return fmt.Errorf("failed to signal process %d: %w", pid, err)
+			}
+
 			fmt.Println("The daemon will wait for running jobs to finish before exiting.")
-			fmt.Println("Use 'ephemerd status' to monitor progress, or send SIGTERM again to force-kill.")
-
+			fmt.Println("Use 'ephemerd status' to monitor progress.")
 			return nil
 		},
 	}

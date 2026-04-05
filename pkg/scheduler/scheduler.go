@@ -106,7 +106,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			}
 		}()
 
-		defer server.Shutdown(context.Background())
+		defer func() { _ = server.Shutdown(context.Background()) }()
 	} else {
 		// Polling mode: periodically check GitHub API for queued jobs
 		interval := s.cfg.PollInterval
@@ -125,7 +125,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 				s.cfg.Log.Error("health server error", "error", err)
 			}
 		}()
-		defer server.Shutdown(context.Background())
+		defer func() { _ = server.Shutdown(context.Background()) }()
 
 		s.cfg.Log.Info("polling mode enabled", "interval", interval)
 		go s.pollLoop(ctx, interval, events)
@@ -305,7 +305,7 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 		if _, exists := s.running[jobID]; exists {
 			delete(s.running, jobID)
 			s.mu.Unlock()
-			s.cfg.Runtime.Destroy(context.Background(), env)
+			_ = s.cfg.Runtime.Destroy(context.Background(), env)
 		} else {
 			s.mu.Unlock()
 		}
@@ -332,7 +332,7 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event github.JobEvent) 
 	)
 
 	job.cancel()
-	s.cfg.Runtime.Destroy(context.Background(), job.env)
+	_ = s.cfg.Runtime.Destroy(context.Background(), job.env)
 }
 
 // drain stops accepting new jobs and waits for running jobs to finish.
@@ -388,7 +388,7 @@ func (s *Scheduler) destroyAll() {
 	for id, job := range jobs {
 		s.cfg.Log.Info("destroying runner on shutdown", "job_id", id)
 		job.cancel()
-		s.cfg.Runtime.Destroy(context.Background(), job.env)
+		_ = s.cfg.Runtime.Destroy(context.Background(), job.env)
 	}
 }
 
@@ -407,7 +407,7 @@ func (s *Scheduler) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
+	_ = json.NewEncoder(w).Encode(status)
 }
 
 func (s *Scheduler) cleanSeen() {

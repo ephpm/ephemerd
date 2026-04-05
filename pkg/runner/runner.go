@@ -69,7 +69,7 @@ func (m *Manager) Extract() error {
 	m.log.Info("extracting embedded runner", "version", Version, "dir", dir)
 
 	// Clean up any partial extraction
-	os.RemoveAll(dir)
+	_ = os.RemoveAll(dir)
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("creating runner dir: %w", err)
@@ -85,10 +85,10 @@ func (m *Manager) Extract() error {
 	if err != nil {
 		return fmt.Errorf("opening embedded runner: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	if err := extractTarGz(f, dir); err != nil {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir)
 		return fmt.Errorf("extracting runner: %w", err)
 	}
 
@@ -125,7 +125,7 @@ func extractTarGz(r io.Reader, dest string) error {
 	if err != nil {
 		return fmt.Errorf("gzip reader: %w", err)
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }()
 
 	tr := tar.NewReader(gz)
 	for {
@@ -158,7 +158,7 @@ func extractTarGz(r io.Reader, dest string) error {
 				return fmt.Errorf("creating file %s: %w", target, err)
 			}
 			if _, err := io.Copy(f, tr); err != nil {
-				f.Close()
+				_ = f.Close()
 				return fmt.Errorf("writing file %s: %w", target, err)
 			}
 			f.Close()

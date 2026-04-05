@@ -28,7 +28,7 @@ type windowsLinuxVM struct {
 // - A Linux VHDX image with containerd pre-installed must exist at <DataDir>/vm/linux/disk.vhdx
 //   The VM init system starts containerd listening on 0.0.0.0:<ContainerdPort>
 func StartLinuxVM(cfg LinuxVMConfig) (LinuxVM, error) {
-	cfg.setDefaults()
+	cfg.SetDefaults()
 
 	l := &windowsLinuxVM{
 		cfg:    cfg,

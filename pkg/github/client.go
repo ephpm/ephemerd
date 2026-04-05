@@ -182,54 +182,85 @@ func parseEphemerdImage(workflowContent string, jobs []*gh.WorkflowJob, targetJo
 	// Simple line-by-line scan for EPHEMERD_IMAGE in env blocks.
 	// This is intentionally simple — a full YAML parser is overkill for
 	// extracting one env var, and we don't want the dependency.
+	//
+	// Strategy: scan each job block for a name: field. If name matches jobName,
+	// or if the job key itself matches jobName (when no name: field), look for
+	// EPHEMERD_IMAGE in that job's env block.
 	lines := splitLines(workflowContent)
 	inJobs := false
-	inTargetJob := false
+
+	// First pass: collect per-job data (key, name, EPHEMERD_IMAGE)
+	type jobBlock struct {
+		key   string // the YAML key (e.g. "build")
+		name  string // from name: field, or empty
+		image string // EPHEMERD_IMAGE value, or empty
+	}
+	var blocks []jobBlock
+	var current *jobBlock
 	inEnv := false
 
 	for _, line := range lines {
 		trimmed := trimSpace(line)
 		indent := len(line) - len(trimLeft(line))
 
-		// Track YAML structure by indentation
 		if trimmed == "jobs:" {
 			inJobs = true
 			continue
 		}
 
 		if inJobs && indent == 2 && len(trimmed) > 0 && trimmed[len(trimmed)-1] == ':' {
-			// Job key — check if it matches our target (by checking if the
-			// job name appears in subsequent name: field, or just scan all jobs)
-			inTargetJob = true // scan all jobs for now, match by env var presence
+			// New job key
+			if current != nil {
+				blocks = append(blocks, *current)
+			}
+			key := trimmed[:len(trimmed)-1]
+			current = &jobBlock{key: key}
 			inEnv = false
+			continue
 		}
 
-		if inTargetJob && indent == 4 && trimmed == "env:" {
+		if current == nil {
+			continue
+		}
+
+		// Detect leaving the job block
+		if inJobs && indent <= 2 && trimmed != "" && (indent < 2 || trimmed[len(trimmed)-1] != ':') {
+			// Left jobs section entirely
+			break
+		}
+
+		if indent == 4 && hasPrefix(trimmed, "name:") {
+			current.name = stripQuotes(trimSpace(trimmed[5:]))
+		}
+
+		if indent == 4 && trimmed == "env:" {
 			inEnv = true
 			continue
 		}
 
 		if inEnv && indent == 6 {
 			if hasPrefix(trimmed, "EPHEMERD_IMAGE:") {
-				value := trimSpace(trimmed[len("EPHEMERD_IMAGE:"):])
-				// Strip optional quotes
-				if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
-					value = value[1 : len(value)-1]
-				}
-				if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' {
-					value = value[1 : len(value)-1]
-				}
-				return value
+				current.image = stripQuotes(trimSpace(trimmed[len("EPHEMERD_IMAGE:"):]))
 			}
 			continue
 		}
 
-		// Left the env block
 		if inEnv && indent <= 4 {
 			inEnv = false
 		}
-		if inTargetJob && indent <= 2 && trimmed != "" {
-			inTargetJob = false
+	}
+	if current != nil {
+		blocks = append(blocks, *current)
+	}
+
+	// Match: name field takes precedence, fall back to key
+	for _, b := range blocks {
+		displayName := b.name
+		if displayName == "" {
+			displayName = b.key
+		}
+		if displayName == jobName && b.image != "" {
+			return b.image
 		}
 	}
 
@@ -273,6 +304,13 @@ func trimLeft(s string) string {
 
 func hasPrefix(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+func stripQuotes(s string) string {
+	if len(s) >= 2 && ((s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'')) {
+		return s[1 : len(s)-1]
+	}
+	return s
 }
 
 // PollJobs checks for queued workflow jobs targeting self-hosted runners.

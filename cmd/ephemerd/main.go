@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/ephpm/ephemerd/pkg/config"
@@ -77,6 +78,14 @@ func serve(ctx context.Context, configFile string) error {
 
 	log := cfg.Logger()
 	log.Info("starting ephemerd", "version", version, "data_dir", configDir)
+
+	// Write PID file for drain command
+	pidFile := joinPath(configDir, "ephemerd.pid")
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+		log.Warn("failed to write pid file", "path", pidFile, "error", err)
+	} else {
+		defer os.Remove(pidFile)
+	}
 
 	// Start container runtime.
 	// On Linux/Windows: embedded containerd runs in-process.

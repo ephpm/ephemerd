@@ -41,7 +41,8 @@ type LinuxVMConfig struct {
 	Log *slog.Logger
 }
 
-func (c *LinuxVMConfig) setDefaults() {
+// SetDefaults applies default values for unconfigured fields.
+func (c *LinuxVMConfig) SetDefaults() {
 	if c.CPUs == 0 {
 		c.CPUs = 2
 	}
@@ -84,7 +85,8 @@ type MacOSVMConfig struct {
 	Log *slog.Logger
 }
 
-func (c *MacOSVMConfig) setDefaults() {
+// SetDefaults applies default values for unconfigured fields.
+func (c *MacOSVMConfig) SetDefaults() {
 	if c.CPUs == 0 {
 		c.CPUs = 4
 	}

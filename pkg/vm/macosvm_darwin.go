@@ -26,7 +26,7 @@ type darwinMacOSVM struct {
 
 // NewMacOSVM creates a new per-job macOS VM. Call Start() to boot it.
 func NewMacOSVM(cfg MacOSVMConfig, jobID string) (MacOSVM, error) {
-	cfg.setDefaults()
+	cfg.SetDefaults()
 
 	if cfg.BaseImage == "" {
 		return nil, fmt.Errorf("vm.macos.base_image is required for macOS-native jobs")

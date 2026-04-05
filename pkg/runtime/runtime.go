@@ -77,10 +77,13 @@ func (r *Runtime) CleanOrphans(ctx context.Context) error {
 			status, err := task.Status(ctx)
 			if err == nil && status.Status == client.Running {
 				log.Debug("killing orphan task")
-				task.Kill(ctx, 9)
-				task.Wait(ctx)
+				_ = task.Kill(ctx, 9)
+				exitCh, err := task.Wait(ctx)
+				if err == nil {
+					<-exitCh
+				}
 			}
-			task.Delete(ctx)
+			_, _ = task.Delete(ctx)
 		}
 
 		// Delete container and snapshot
@@ -177,7 +180,7 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 	// Create and start the task with per-job log capture
 	var creator cio.Creator
 	if r.cfg.LogDir != "" {
-		os.MkdirAll(r.cfg.LogDir, 0o755)
+		_ = os.MkdirAll(r.cfg.LogDir, 0o755)
 		logPath := filepath.Join(r.cfg.LogDir, id+".log")
 		creator = cio.LogFile(logPath)
 		r.cfg.Log.Debug("container logs", "id", id, "path", logPath)
@@ -186,7 +189,7 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 	}
 	task, err := container.NewTask(ctx, creator)
 	if err != nil {
-		container.Delete(ctx)
+		_ = container.Delete(ctx)
 		return nil, fmt.Errorf("creating task for %s: %w", id, err)
 	}
 
@@ -196,18 +199,18 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		pid := task.Pid()
 		netns = fmt.Sprintf("/proc/%d/ns/net", pid)
 		if _, err := r.cfg.Network.Setup(ctx, id, netns); err != nil {
-			task.Delete(ctx)
-			container.Delete(ctx)
+			_, _ = task.Delete(ctx)
+			_ = container.Delete(ctx)
 			return nil, fmt.Errorf("setting up network for %s: %w", id, err)
 		}
 	}
 
 	if err := task.Start(ctx); err != nil {
 		if r.cfg.Network != nil && netns != "" {
-			r.cfg.Network.Teardown(ctx, id, netns)
+			_ = r.cfg.Network.Teardown(ctx, id, netns)
 		}
-		task.Delete(ctx)
-		container.Delete(ctx)
+		_, _ = task.Delete(ctx)
+		_ = container.Delete(ctx)
 		return nil, fmt.Errorf("starting task for %s: %w", id, err)
 	}
 
@@ -233,7 +236,10 @@ func (r *Runtime) Destroy(ctx context.Context, env *RunnerEnv) error {
 		if err := env.Task.Kill(ctx, 9); err != nil {
 			r.cfg.Log.Warn("failed to kill task", "id", env.ID, "error", err)
 		}
-		env.Task.Wait(ctx)
+		exitCh, err := env.Task.Wait(ctx)
+		if err == nil {
+			<-exitCh
+		}
 	}
 
 	// Delete task

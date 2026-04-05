@@ -62,7 +62,7 @@ func (s *Server) Stop() {
 	s.cfg.Log.Info("stopping containerd")
 
 	if s.client != nil {
-		s.client.Close()
+		_ = s.client.Close()
 	}
 
 	if s.srv != nil {
@@ -111,7 +111,7 @@ func (s *Server) start() error {
 
 	// Remove stale socket from a previous run
 	if goruntime.GOOS != "windows" {
-		os.Remove(socket)
+		_ = os.Remove(socket)
 	}
 
 	// Build containerd server config
@@ -152,7 +152,7 @@ func (s *Server) start() error {
 	// Also serve tTRPC for container task/event APIs
 	ttrpcSocket := socket + ".ttrpc"
 	if goruntime.GOOS != "windows" {
-		os.Remove(ttrpcSocket)
+		_ = os.Remove(ttrpcSocket)
 	}
 	tl, err := net.Listen("unix", ttrpcSocket)
 	if err != nil {

@@ -25,7 +25,7 @@ type darwinLinuxVM struct {
 
 // StartLinuxVM boots a Linux VM on macOS and waits for containerd inside it.
 func StartLinuxVM(cfg LinuxVMConfig) (LinuxVM, error) {
-	cfg.setDefaults()
+	cfg.SetDefaults()
 
 	l := &darwinLinuxVM{
 		cfg:  cfg,
