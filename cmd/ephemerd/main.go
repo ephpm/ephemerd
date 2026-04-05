@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/ephpm/ephemerd/pkg/artifacts"
 	"github.com/ephpm/ephemerd/pkg/config"
 	"github.com/ephpm/ephemerd/pkg/containerd"
 	"github.com/ephpm/ephemerd/pkg/github"
@@ -84,7 +85,7 @@ func serve(ctx context.Context, configFile string) error {
 	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
 		log.Warn("failed to write pid file", "path", pidFile, "error", err)
 	} else {
-		defer os.Remove(pidFile)
+		defer func() { _ = os.Remove(pidFile) }()
 	}
 
 	// Start container runtime.
@@ -148,10 +149,17 @@ func serve(ctx context.Context, configFile string) error {
 		return fmt.Errorf("creating github client: %w", err)
 	}
 
+	// Create artifact extractor for macOS VM jobs. On macOS hosts, this
+	// allows EPHEMERD_IMAGE to pull OCI images and extract their layers
+	// into the shared data directory (available inside macOS VMs via virtio-fs).
+	artifactExtractor := artifacts.NewExtractor(ctrdClient, log)
+
 	// Start scheduler (ties GitHub jobs to container lifecycle)
 	sched := scheduler.New(scheduler.Config{
 		Runtime:         rt,
 		GitHub:          gh,
+		Artifacts:       artifactExtractor,
+		DataDir:         configDir,
 		MaxConcurrent:   cfg.Runner.MaxConcurrent,
 		Labels:          cfg.Runner.ExtraLabels,
 		PollInterval:    cfg.GitHub.ParsedPollInterval(),
