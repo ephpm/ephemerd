@@ -232,10 +232,18 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	}
 	s.mu.Unlock()
 
+	// On provisioning failure, remove from seen so the next poll retries
+	unsee := func() {
+		s.mu.Lock()
+		delete(s.seen, jobID)
+		s.mu.Unlock()
+	}
+
 	// Acquire concurrency slot
 	select {
 	case s.sem <- struct{}{}:
 	case <-ctx.Done():
+		unsee()
 		return
 	}
 
@@ -276,6 +284,7 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 		if artifactsDir != "" {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
+		unsee()
 		time.Sleep(5 * time.Second) // back off to avoid tight retry loops on rate limits
 		<-s.sem
 		return
@@ -304,6 +313,7 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 		if artifactsDir != "" {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
+		unsee()
 		cancel()
 		<-s.sem
 		return
