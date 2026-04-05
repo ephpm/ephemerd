@@ -21,6 +21,9 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
+      - name: Download embedded dependencies
+        run: make download-runner download-cni download-shim
+
       - name: Go vet
         run: go vet ./...
 
@@ -35,13 +38,8 @@ jobs:
       - name: Test
         run: go test -race -count=1 ./...
 
-      - name: Download runner tarball
-        run: make download-runner
-
       - name: Build
-        run: |
-          go build -ldflags "-X main.version=${{ github.sha }}" \
-            -o ephemerd ./cmd/ephemerd/
+        run: make build
 
   # build-matrix:
   #   name: Build
