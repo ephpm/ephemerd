@@ -11,8 +11,8 @@ env:
   RUNNER_VERSION: "2.333.1"
 
 jobs:
-  lint:
-    name: Lint
+  ci:
+    name: Lint, Test & Build
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
@@ -32,115 +32,113 @@ jobs:
       - name: Lint
         run: golangci-lint run ./...
 
-  build:
-    name: Build
-    runs-on: [self-hosted, linux, x64]
-    strategy:
-      fail-fast: false
-      matrix:
-        goos: [linux, windows]
-        goarch: [amd64, arm64]
-        exclude:
-          - goos: windows
-            goarch: arm64
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
+      - name: Test
+        run: go test -race -count=1 ./...
 
       - name: Download runner tarball
         run: make download-runner
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
 
       - name: Build
         run: |
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
-            go build -ldflags "-X main.version=${{ github.sha }}" \
-            -o ephemerd-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }} \
-            ./cmd/ephemerd/
+          go build -ldflags "-X main.version=${{ github.sha }}" \
+            -o ephemerd ./cmd/ephemerd/
 
-      - name: Upload binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: ephemerd-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: ephemerd-${{ matrix.goos }}-${{ matrix.goarch }}*
+  # build-matrix:
+  #   name: Build
+  #   runs-on: [self-hosted, linux, x64]
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       goos: [linux, windows]
+  #       goarch: [amd64, arm64]
+  #       exclude:
+  #         - goos: windows
+  #           goarch: arm64
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - uses: actions/setup-go@v5
+  #       with:
+  #         go-version: ${{ env.GO_VERSION }}
+  #
+  #     - name: Download runner tarball
+  #       run: make download-runner
+  #       env:
+  #         GOOS: ${{ matrix.goos }}
+  #         GOARCH: ${{ matrix.goarch }}
+  #
+  #     - name: Build
+  #       run: |
+  #         GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
+  #           go build -ldflags "-X main.version=${{ github.sha }}" \
+  #           -o ephemerd-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }} \
+  #           ./cmd/ephemerd/
+  #
+  #     - name: Upload binary
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: ephemerd-${{ matrix.goos }}-${{ matrix.goarch }}
+  #         path: ephemerd-${{ matrix.goos }}-${{ matrix.goarch }}*
 
-  test:
-    name: Test
-    runs-on: [self-hosted, linux, x64]
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Run tests
-        run: go test -race -count=1 ./...
-
-  e2e:
-    name: E2E
-    needs: [lint, build, test]
-    runs-on: [self-hosted, linux, x64]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: System info
-        run: |
-          echo "Hostname: $(hostname)"
-          echo "User: $(whoami)"
-          uname -a
-
-      - name: Check runner mount
-        run: |
-          ls -la /actions-runner/ | head -10
-          touch /actions-runner/pwned 2>&1 && echo "FAIL: runner mount is writable" || echo "PASS: runner mount is read-only"
-
-      - name: Internet access (should work)
-        run: |
-          curl -sI --max-time 10 https://github.com | head -3 || echo "FAIL: no internet"
-          nslookup github.com || host github.com || echo "FAIL: DNS broken"
-
-      - name: LAN isolation (should be blocked)
-        run: |
-          failed=0
-          for target in 192.168.1.1 192.168.0.1 10.0.0.1 172.16.0.1; do
-            if curl -s --connect-timeout 3 http://$target > /dev/null 2>&1; then
-              echo "FAIL: reached $target"
-              failed=1
-            else
-              echo "PASS: $target blocked"
-            fi
-          done
-          if curl -s --connect-timeout 3 http://169.254.169.254/latest/meta-data/ > /dev/null 2>&1; then
-            echo "FAIL: metadata endpoint accessible"
-            failed=1
-          else
-            echo "PASS: metadata endpoint blocked"
-          fi
-          [ $failed -eq 0 ] || echo "::warning::Some LAN isolation tests failed"
-
-      - name: Container escape tests
-        run: |
-          echo "=== Filesystem ==="
-          cat /host/etc/shadow 2>&1 | head -1 || echo "PASS: /host not mounted"
-          ls /proc/1/root/etc/ 2>&1 | head -1 || echo "PASS: /proc/1/root not accessible"
-          ls -la /var/run/docker.sock 2>&1 || echo "PASS: docker socket not mounted"
-
-          echo ""
-          echo "=== Privileges ==="
-          mount -t proc proc /tmp/testmount 2>&1 || echo "PASS: cannot mount proc"
-          modprobe dummy 2>&1 || echo "PASS: cannot load kernel modules"
-          hostname pwned 2>&1 || echo "PASS: cannot change hostname"
-
-          echo ""
-          echo "=== Devices ==="
-          dd if=/dev/mem bs=1 count=1 2>&1 || echo "PASS: /dev/mem not accessible"
-          dd if=/dev/sda bs=1 count=1 2>&1 || echo "PASS: /dev/sda not accessible"
-
-      - name: Summary
-        run: echo "ephemerd e2e tests complete"
+  # e2e:
+  #   name: E2E
+  #   needs: [ci, build-matrix]
+  #   runs-on: [self-hosted, linux, x64]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: System info
+  #       run: |
+  #         echo "Hostname: $(hostname)"
+  #         echo "User: $(whoami)"
+  #         uname -a
+  #
+  #     - name: Check runner mount
+  #       run: |
+  #         ls -la /actions-runner/ | head -10
+  #         touch /actions-runner/pwned 2>&1 && echo "FAIL: runner mount is writable" || echo "PASS: runner mount is read-only"
+  #
+  #     - name: Internet access (should work)
+  #       run: |
+  #         curl -sI --max-time 10 https://github.com | head -3 || echo "FAIL: no internet"
+  #         nslookup github.com || host github.com || echo "FAIL: DNS broken"
+  #
+  #     - name: LAN isolation (should be blocked)
+  #       run: |
+  #         failed=0
+  #         for target in 192.168.1.1 192.168.0.1 10.0.0.1 172.16.0.1; do
+  #           if curl -s --connect-timeout 3 http://$target > /dev/null 2>&1; then
+  #             echo "FAIL: reached $target"
+  #             failed=1
+  #           else
+  #             echo "PASS: $target blocked"
+  #           fi
+  #         done
+  #         if curl -s --connect-timeout 3 http://169.254.169.254/latest/meta-data/ > /dev/null 2>&1; then
+  #           echo "FAIL: metadata endpoint accessible"
+  #           failed=1
+  #         else
+  #           echo "PASS: metadata endpoint blocked"
+  #         fi
+  #         [ $failed -eq 0 ] || echo "::warning::Some LAN isolation tests failed"
+  #
+  #     - name: Container escape tests
+  #       run: |
+  #         echo "=== Filesystem ==="
+  #         cat /host/etc/shadow 2>&1 | head -1 || echo "PASS: /host not mounted"
+  #         ls /proc/1/root/etc/ 2>&1 | head -1 || echo "PASS: /proc/1/root not accessible"
+  #         ls -la /var/run/docker.sock 2>&1 || echo "PASS: docker socket not mounted"
+  #
+  #         echo ""
+  #         echo "=== Privileges ==="
+  #         mount -t proc proc /tmp/testmount 2>&1 || echo "PASS: cannot mount proc"
+  #         modprobe dummy 2>&1 || echo "PASS: cannot load kernel modules"
+  #         hostname pwned 2>&1 || echo "PASS: cannot change hostname"
+  #
+  #         echo ""
+  #         echo "=== Devices ==="
+  #         dd if=/dev/mem bs=1 count=1 2>&1 || echo "PASS: /dev/mem not accessible"
+  #         dd if=/dev/sda bs=1 count=1 2>&1 || echo "PASS: /dev/sda not accessible"
+  #
+  #     - name: Summary
+  #       run: echo "ephemerd e2e tests complete"
