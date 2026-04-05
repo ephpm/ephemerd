@@ -77,7 +77,7 @@ func (l *linuxNetworking) removeFirewallRules() {
 	}
 
 	// Remove the container subnet allow rule
-	exec.Command("iptables",
+	_ = exec.Command("iptables",
 		"-t", "filter",
 		"-D", "FORWARD",
 		"-s", DefaultSubnet,

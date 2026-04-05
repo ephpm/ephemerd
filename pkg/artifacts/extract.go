@@ -98,7 +98,7 @@ func (e *Extractor) extractLayer(ctx context.Context, store content.Store, layer
 	if err != nil {
 		return fmt.Errorf("opening layer content: %w", err)
 	}
-	defer ra.Close()
+	defer func() { _ = ra.Close() }()
 
 	// Convert ReaderAt to Reader for decompression.
 	reader := content.NewReader(ra)
@@ -108,7 +108,7 @@ func (e *Extractor) extractLayer(ctx context.Context, store content.Store, layer
 	if err != nil {
 		return fmt.Errorf("decompressing layer: %w", err)
 	}
-	defer ds.Close()
+	defer func() { _ = ds.Close() }()
 
 	// Apply the tar archive to the destination directory.
 	if _, err := archive.Apply(ctx, destDir, ds); err != nil {

@@ -85,7 +85,7 @@ func serve(ctx context.Context, configFile string) error {
 	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
 		log.Warn("failed to write pid file", "path", pidFile, "error", err)
 	} else {
-		defer os.Remove(pidFile)
+		defer func() { _ = os.Remove(pidFile) }()
 	}
 
 	// Start container runtime.

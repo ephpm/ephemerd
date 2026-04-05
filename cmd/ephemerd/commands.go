@@ -29,7 +29,7 @@ func statusCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("cannot reach ephemerd (is it running?): %w", err)
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 
 			body, err := io.ReadAll(resp.Body)
 			if err != nil {
@@ -80,7 +80,7 @@ func drainCmd() *cobra.Command {
 			// Check current status if reachable
 			resp, err := http.Get(fmt.Sprintf("http://localhost:%d/healthz", port))
 			if err == nil {
-				defer resp.Body.Close()
+				defer func() { _ = resp.Body.Close() }()
 				body, _ := io.ReadAll(resp.Body)
 				var status map[string]any
 				if json.Unmarshal(body, &status) == nil {
@@ -114,7 +114,7 @@ func imagesCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("connecting to containerd at %s: %w", socket, err)
 			}
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 
 			ctx := namespaces.WithNamespace(cmd.Context(), "ephemerd")
 			images, err := c.ListImages(ctx)
