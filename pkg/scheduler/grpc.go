@@ -132,19 +132,23 @@ func (c *controlServer) GetJobLogs(req *apiv1.GetJobLogsRequest, stream grpc.Ser
 	}
 	buf := make([]byte, 32*1024)
 	for {
-		n, err := f.Read(buf)
+		n, readErr := f.Read(buf)
 		if n > 0 {
 			if sendErr := stream.Send(&apiv1.LogChunk{Data: buf[:n]}); sendErr != nil {
-				f.Close()
+				if closeErr := f.Close(); closeErr != nil {
+					c.log.Debug("closing log file after send error", "error", closeErr)
+				}
 				return sendErr
 			}
 		}
-		if err == io.EOF {
+		if readErr == io.EOF {
 			return f.Close()
 		}
-		if err != nil {
-			f.Close()
-			return status.Errorf(codes.Internal, "reading log: %v", err)
+		if readErr != nil {
+			if closeErr := f.Close(); closeErr != nil {
+				c.log.Debug("closing log file after read error", "error", closeErr)
+			}
+			return status.Errorf(codes.Internal, "reading log: %v", readErr)
 		}
 	}
 }
