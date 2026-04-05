@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 
 	cni "github.com/containerd/go-cni"
@@ -78,6 +79,41 @@ func (l *linuxNetworking) teardown(ctx context.Context, id string, netns string)
 	return nil
 }
 
+func (l *linuxNetworking) cleanup() {
+	log := l.cfg.Log
+
+	// Remove CNI config
+	confDir := filepath.Join(l.cfg.DataDir, "cni", "conf")
+	if err := os.RemoveAll(confDir); err != nil {
+		log.Debug("failed to remove CNI config dir", "error", err)
+	}
+
+	// Remove CNI IP allocations (host-local state) but keep extracted plugins
+	cniDir := filepath.Join(l.cfg.DataDir, "cni")
+	entries, _ := os.ReadDir(cniDir)
+	for _, e := range entries {
+		if e.Name() == "bin" {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(cniDir, e.Name())); err != nil {
+			log.Debug("failed to remove CNI state", "name", e.Name(), "error", err)
+		}
+	}
+
+	// Remove DNS config files
+	dnsDir := filepath.Join(l.cfg.DataDir, "dns")
+	if err := os.RemoveAll(dnsDir); err != nil {
+		log.Debug("failed to remove DNS dir", "error", err)
+	}
+
+	// Delete bridge interface
+	if err := exec.Command("ip", "link", "del", defaultBridgeName).Run(); err != nil {
+		log.Debug("failed to delete bridge", "bridge", defaultBridgeName, "error", err)
+	}
+
+	log.Info("networking cleaned up")
+}
+
 func (l *linuxNetworking) writeConfig(path string) error {
 	subnet := l.cfg.subnet()
 	gateway := deriveGateway(subnet)
@@ -92,7 +128,7 @@ func (l *linuxNetworking) writeConfig(path string) error {
 				"isDefaultGateway": true,
 				"ipMasq":           true,
 				"hairpinMode":      true,
-				"mtu":              detectMTU(),
+				"mtu":              l.mtu(),
 				"ipam": map[string]any{
 					"type":   "host-local",
 					"ranges": [][]map[string]string{{{
@@ -114,6 +150,13 @@ func (l *linuxNetworking) writeConfig(path string) error {
 	}
 
 	return os.WriteFile(path, data, 0o644)
+}
+
+func (l *linuxNetworking) mtu() int {
+	if l.cfg.MTU > 0 {
+		return l.cfg.MTU
+	}
+	return detectMTU()
 }
 
 // detectMTU finds the MTU of the default network interface.

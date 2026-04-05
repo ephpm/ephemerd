@@ -47,3 +47,4 @@ func (d *darwinNetworking) installFirewallRules() error {
 }
 
 func (d *darwinNetworking) removeFirewallRules() {}
+func (d *darwinNetworking) cleanup()             {}

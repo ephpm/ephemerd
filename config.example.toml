@@ -25,6 +25,10 @@ poll_interval = "10s"
 # an existing network (e.g. Podman, Docker). You don't need to change this.
 # subnet = "10.88.0.0/16"
 
+# Bridge MTU. Auto-detected from the host's default interface.
+# Override if containers have connectivity issues on unusual networks.
+# mtu = 1500
+
 [runner]
 
 # Max concurrent jobs
