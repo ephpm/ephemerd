@@ -66,14 +66,18 @@ func serveCmd() *cli.Command {
 				Aliases: []string{"c"},
 				Usage:   "path to config file (default: <data-dir>/config.toml)",
 			},
+			&cli.UintFlag{
+				Name:  "containerd-tcp-port",
+				Usage: "also expose containerd on a TCP port (used by WSL host integration)",
+			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			return serve(ctx, cmd.String("config"))
+			return serve(ctx, cmd.String("config"), uint32(cmd.Uint("containerd-tcp-port")))
 		},
 	}
 }
 
-func serve(ctx context.Context, configFile string) error {
+func serve(ctx context.Context, configFile string, containerdTCPPort uint32) error {
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -106,7 +110,7 @@ func serve(ctx context.Context, configFile string) error {
 	// Start container runtime.
 	// On Linux/Windows: embedded containerd runs in-process.
 	// On macOS: boot a Linux VM via Virtualization.framework, containerd runs inside it.
-	ctrdClient, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled)
+	ctrdClient, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort)
 	if err != nil {
 		return fmt.Errorf("starting container runtime: %w", err)
 	}

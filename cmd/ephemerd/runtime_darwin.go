@@ -12,7 +12,7 @@ import (
 // startContainerRuntime boots a Linux VM via Virtualization.framework on macOS
 // and returns a containerd client connected to containerd inside the VM.
 // Linux jobs run as containers inside this VM.
-func startContainerRuntime(dataDir string, log *slog.Logger, _ bool) (*client.Client, func(), error) {
+func startContainerRuntime(dataDir string, log *slog.Logger, _ bool, _ uint32) (*client.Client, func(), error) {
 	log.Info("macOS detected — booting Linux VM for container runtime")
 
 	linuxVM, err := vm.StartLinuxVM(vm.LinuxVMConfig{

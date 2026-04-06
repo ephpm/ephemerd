@@ -15,7 +15,7 @@ import (
 //
 // Returns the native containerd client. The Linux VM client (if any) is
 // stored for the scheduler to use when routing Linux-labeled jobs.
-func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool) (*client.Client, func(), error) {
+func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool, _ uint32) (*client.Client, func(), error) {
 	// Start native containerd for Windows container jobs
 	ctrd, err := containerd.New(containerd.Config{
 		DataDir: dataDir,

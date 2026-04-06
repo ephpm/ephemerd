@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 // Config for the embedded containerd instance.
 type Config struct {
 	DataDir string
+	TCPPort uint32 // optional: also listen on TCP for remote access (e.g. from WSL host)
 	Log     *slog.Logger
 }
 
@@ -196,6 +198,26 @@ func (s *Server) start() error {
 				}
 			}
 		}()
+	}
+
+	// Optionally listen on TCP for remote containerd access (e.g. Windows host → WSL)
+	if s.cfg.TCPPort > 0 {
+		tcpAddr := fmt.Sprintf("0.0.0.0:%d", s.cfg.TCPPort)
+		tcpL, err := net.Listen("tcp", tcpAddr)
+		if err != nil {
+			s.cfg.Log.Error("failed to start TCP listener for containerd", "addr", tcpAddr, "error", err)
+		} else {
+			go func() {
+				if err := srv.ServeGRPC(tcpL); err != nil {
+					select {
+					case <-ctx.Done():
+					default:
+						s.cfg.Log.Error("containerd TCP gRPC server error", "error", err)
+					}
+				}
+			}()
+			s.cfg.Log.Info("containerd TCP listener started", "addr", tcpAddr)
+		}
 	}
 
 	s.cfg.Log.Info("containerd server started in-process", "socket", socket)

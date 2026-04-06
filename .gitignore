@@ -8,3 +8,5 @@ pkg/runner/embed/actions-runner-*
 pkg/cni/embed/cni-plugins-*
 pkg/containerd/embed/containerd-shim-runc-v2
 pkg/containerd/embed/runc
+pkg/vm/embed/ephemerd-linux
+pkg/vm/embed/alpine-minirootfs-*

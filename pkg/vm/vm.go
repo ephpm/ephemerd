@@ -4,7 +4,7 @@
 //
 //  1. Linux VM (long-running): On Windows and macOS hosts, a lightweight Linux VM
 //     runs containerd for Linux jobs. Same OCI images as native Linux.
-//     - Windows: Hyper-V Linux VM
+//     - Windows: WSL2 distro with embedded ephemerd binary (Hyper-V fallback for Server)
 //     - macOS: Virtualization.framework Linux VM
 //
 //  2. macOS VM (per-job): On macOS hosts, ephemeral macOS VMs run macOS-native

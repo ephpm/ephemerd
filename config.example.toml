@@ -51,6 +51,14 @@ job_timeout = "2h"
 # Time to wait for running jobs during graceful shutdown
 shutdown_timeout = "5m"
 
+[vm.linux]
+# Enable a Linux VM for running Linux jobs on Windows/macOS hosts.
+# On Windows: creates a WSL2 distro with an embedded ephemerd binary.
+# The distro is destroyed on shutdown. Requires WSL2 to be installed.
+# enabled = false
+# cpus = 2
+# memory_mb = 2048
+
 [log]
 # Log level: debug, info, warn, error
 level = "info"
