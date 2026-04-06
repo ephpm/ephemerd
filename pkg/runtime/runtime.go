@@ -272,9 +272,11 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		return nil, fmt.Errorf("creating container %s: %w", id, err)
 	}
 
-	// Create and start the task with per-job log capture
+	// Create and start the task with per-job log capture.
+	// On Windows, cio.LogFile uses file:// URIs which runhcs rejects
+	// (it only accepts binary:// scheme). Use stdio capture instead.
 	var creator cio.Creator
-	if r.cfg.LogDir != "" {
+	if r.cfg.LogDir != "" && goruntime.GOOS != "windows" {
 		if err := os.MkdirAll(r.cfg.LogDir, 0o755); err != nil {
 			return nil, fmt.Errorf("creating log dir: %w", err)
 		}
