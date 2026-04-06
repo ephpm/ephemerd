@@ -274,9 +274,12 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 
 	// Create and start the task with per-job log capture.
 	// On Windows, cio.LogFile uses file:// URIs which runhcs rejects
-	// (it only accepts binary:// scheme). Use stdio capture instead.
+	// (it only accepts binary:// scheme), and cio.WithStdio fails with
+	// Access Denied on named pipes. Use NullIO on Windows for now.
 	var creator cio.Creator
-	if r.cfg.LogDir != "" && goruntime.GOOS != "windows" {
+	if goruntime.GOOS == "windows" {
+		creator = cio.NullIO
+	} else if r.cfg.LogDir != "" {
 		if err := os.MkdirAll(r.cfg.LogDir, 0o755); err != nil {
 			return nil, fmt.Errorf("creating log dir: %w", err)
 		}
