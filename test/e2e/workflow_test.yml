@@ -1,0 +1,16 @@
+name: E2E Test
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Hello
+        run: echo "hello from ephemerd e2e"
+      - name: Check repo mount
+        run: test -f go.mod && echo "repo mounted OK"
+      - name: System info
+        run: uname -a
+      - name: Check DNS
+        run: cat /etc/resolv.conf
+      - name: Network test
+        run: nslookup github.com 1.1.1.1 || echo "DNS not available (OK for airgapped)"

@@ -31,7 +31,7 @@ LDFLAGS := -ldflags "\
 	-X github.com/ephpm/ephemerd/pkg/runner.Version=$(RUNNER_VERSION) \
 	-X github.com/ephpm/ephemerd/pkg/cni.Version=$(CNI_VERSION)"
 
-.PHONY: build clean test lint download-runner download-cni download-shim generate
+.PHONY: build clean test lint download-runner download-cni download-shim generate e2e-local
 
 build: download-runner download-cni download-shim
 	go build $(LDFLAGS) -o $(BINARY) ./cmd/ephemerd/
@@ -78,6 +78,9 @@ test:
 
 lint:
 	golangci-lint run ./...
+
+e2e-local: download-runner download-cni download-shim
+	sudo $(shell which go) test -v -tags e2e -count=1 -timeout 10m ./test/e2e/
 
 generate:
 	protoc --go_out=. --go_opt=paths=source_relative \

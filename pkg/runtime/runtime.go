@@ -210,6 +210,10 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		oci.WithEnv([]string{
 			"RUNNER_ALLOW_RUNASROOT=1",
 		}),
+		// Allow sudo inside the container. The default OCI spec sets
+		// NoNewPrivileges=true which blocks privilege escalation, but
+		// jobs need sudo for apt-get install and similar operations.
+		oci.WithNewPrivileges,
 		oci.WithProcessArgs(entrypoint, "--jitconfig", jitConfig),
 	}
 
