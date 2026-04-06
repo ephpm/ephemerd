@@ -12,6 +12,7 @@ import (
 
 	"github.com/ephpm/ephemerd/pkg/artifacts"
 	"github.com/ephpm/ephemerd/pkg/github"
+	"github.com/ephpm/ephemerd/pkg/names"
 	"github.com/ephpm/ephemerd/pkg/runtime"
 )
 
@@ -270,8 +271,8 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	// Build runner labels
 	labels := s.buildLabels()
 
-	// Generate a unique runner name
-	name := fmt.Sprintf("ephemerd-%s-%d", event.Repo, jobID)
+	// Generate a unique runner name (Docker-style: adjective_scientist)
+	name := fmt.Sprintf("ephemerd-%s-%s", event.Repo, names.Generate())
 
 	// Register a JIT runner with GitHub
 	jitConfig, err := s.cfg.GitHub.RegisterJITRunner(ctx, event.Repo, name, labels)
@@ -449,6 +450,14 @@ func (s *Scheduler) destroyAll() {
 		_ = s.cfg.Runtime.Destroy(context.Background(), job.env)
 		if job.artifactsDir != "" {
 			artifacts.Cleanup(job.artifactsDir, s.cfg.Log)
+		}
+		// Deregister the runner from GitHub to avoid ghosts
+		if job.runnerID > 0 {
+			if err := s.cfg.GitHub.RemoveRunner(context.Background(), job.repo, job.runnerID); err != nil {
+				s.cfg.Log.Warn("failed to deregister runner on shutdown", "job_id", id, "runner_id", job.runnerID, "error", err)
+			} else {
+				s.cfg.Log.Info("runner deregistered", "job_id", id, "runner_id", job.runnerID)
+			}
 		}
 	}
 }
