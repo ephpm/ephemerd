@@ -72,6 +72,7 @@ type GitHubConfig struct {
 type RunnerConfig struct {
 	MaxConcurrent   int      `toml:"max_concurrent"`
 	ExtraLabels     []string `toml:"extra_labels"`
+	DefaultImage    string   `toml:"default_image"`
 	JobTimeout      string   `toml:"job_timeout"`
 	ShutdownTimeout string   `toml:"shutdown_timeout"`
 }

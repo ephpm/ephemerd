@@ -36,6 +36,12 @@ poll_interval = "10s"
 # Max concurrent jobs
 max_concurrent = 4
 
+# Default container image for jobs that don't set EPHEMERD_IMAGE.
+# Leave blank to auto-detect:
+#   Linux  → ghcr.io/actions/actions-runner:latest
+#   Windows → mcr.microsoft.com/windows/servercore:ltsc20XX (matched to host OS)
+# default_image = ""
+
 # Extra labels applied to all runners (in addition to self-hosted, os, arch)
 extra_labels = []
 

@@ -22,8 +22,8 @@ import (
 )
 
 const (
-	namespace    = "ephemerd"
-	defaultImage = "ghcr.io/actions/actions-runner:latest"
+	namespace         = "ephemerd"
+	defaultImageLinux = "ghcr.io/actions/actions-runner:latest"
 )
 
 // Config for the container runtime.
@@ -31,6 +31,7 @@ type Config struct {
 	Client       *client.Client
 	RunnerDir    string // host path to extracted runner binary
 	RunnerMount  string // container path to mount runner at
+	DefaultImage string // override default container image (auto-detected if empty)
 	LogDir       string // directory for per-job container logs
 	Network      *networking.Manager
 	Log          *slog.Logger
@@ -170,12 +171,17 @@ func (r *Runtime) PullImage(ctx context.Context, ref string) error {
 func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig string) (*RunnerEnv, error) {
 	ctx = namespaces.WithNamespace(ctx, namespace)
 
-	// Use the official GitHub Actions runner image when no custom image is specified.
-	// The official image has the runner binary pre-installed at /home/runner/.
-	// Custom images get our embedded runner binary mounted in.
+	// Use a default image when no custom image is specified.
+	// If runner.default_image is set in config, use that.
+	// Otherwise: Linux uses the official GHA runner image,
+	// Windows auto-selects a Server Core image matching the host OS build.
 	customImage := image != ""
 	if !customImage {
-		image = defaultImage
+		if r.cfg.DefaultImage != "" {
+			image = r.cfg.DefaultImage
+		} else {
+			image = defaultImage()
+		}
 	}
 
 	r.cfg.Log.Info("creating runner environment", "id", id, "image", image, "custom", customImage)
