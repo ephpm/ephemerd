@@ -70,14 +70,18 @@ func serveCmd() *cli.Command {
 				Name:  "containerd-tcp-port",
 				Usage: "also expose containerd on a TCP port (used by WSL host integration)",
 			},
+			&cli.BoolFlag{
+				Name:  "containerd-only",
+				Usage: "only run containerd (no scheduler, GitHub polling, or runner extraction)",
+			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			return serve(ctx, cmd.String("config"), uint32(cmd.Uint("containerd-tcp-port")))
+			return serve(ctx, cmd.String("config"), uint32(cmd.Uint("containerd-tcp-port")), cmd.Bool("containerd-only"))
 		},
 	}
 }
 
-func serve(ctx context.Context, configFile string, containerdTCPPort uint32) error {
+func serve(ctx context.Context, configFile string, containerdTCPPort uint32, containerdOnly bool) error {
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -110,13 +114,21 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32) err
 	// Start container runtime.
 	// On Linux/Windows: embedded containerd runs in-process.
 	// On macOS: boot a Linux VM via Virtualization.framework, containerd runs inside it.
-	ctrdClient, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort)
+	ctrdClient, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, configFile)
 	if err != nil {
 		return fmt.Errorf("starting container runtime: %w", err)
 	}
 	defer cleanup()
 
 	log.Info("container runtime ready")
+
+	// In containerd-only mode, just keep containerd running until shutdown.
+	// Used by the WSL Linux VM — the Windows host handles scheduling.
+	if containerdOnly {
+		log.Info("containerd-only mode, waiting for shutdown signal")
+		<-ctx.Done()
+		return nil
+	}
 
 	// Extract embedded GitHub Actions runner
 	rm := runner.New(configDir, log)

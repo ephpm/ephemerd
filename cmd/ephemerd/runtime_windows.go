@@ -16,7 +16,7 @@ import (
 //
 // Returns the native containerd client. The Linux VM client becomes available
 // asynchronously once the WSL distro is ready.
-func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool, _ uint32) (*client.Client, func(), error) {
+func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool, _ uint32, configFile string) (*client.Client, func(), error) {
 	// Start native containerd for Windows container jobs
 	ctrd, err := containerd.New(containerd.Config{
 		DataDir: dataDir,
@@ -42,8 +42,9 @@ func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool
 		log.Info("starting Linux VM in background (WSL)")
 
 		lvm, err := vm.StartLinuxVM(vm.LinuxVMConfig{
-			DataDir: dataDir,
-			Log:     log,
+			DataDir:    dataDir,
+			ConfigFile: configFile,
+			Log:        log,
 		})
 		if err != nil {
 			log.Warn("Linux VM not started — Linux jobs will not be available on this host", "error", err)

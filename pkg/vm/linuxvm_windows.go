@@ -14,6 +14,9 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/defaults"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 const distroName = "ephemerd-linux"
@@ -203,6 +206,21 @@ func (l *wslLinuxVM) installEphemerd() error {
 		return fmt.Errorf("chmod: %w", err)
 	}
 
+	// Copy host config file into the distro so the inner ephemerd has GitHub/runner config
+	if l.cfg.ConfigFile != "" {
+		configData, err := os.ReadFile(l.cfg.ConfigFile)
+		if err != nil {
+			return fmt.Errorf("reading config file: %w", err)
+		}
+		if err := wslExec("-d", distroName, "--", "mkdir", "-p", "/var/lib/ephemerd"); err != nil {
+			return fmt.Errorf("creating config dir: %w", err)
+		}
+		configDst := fmt.Sprintf(`\\wsl$\%s\var\lib\ephemerd\config.toml`, distroName)
+		if err := os.WriteFile(configDst, configData, 0o644); err != nil {
+			return fmt.Errorf("writing config to WSL: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -217,6 +235,7 @@ func (l *wslLinuxVM) launch() error {
 		"/opt/ephemerd/ephemerd", "serve",
 		"--data-dir", "/var/lib/ephemerd",
 		"--containerd-tcp-port", fmt.Sprintf("%d", l.cfg.ContainerdPort),
+		"--containerd-only",
 	)
 
 	// Pipe stdout/stderr to our logger
@@ -279,7 +298,7 @@ func (l *wslLinuxVM) waitForContainerd() error {
 		default:
 		}
 
-		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		tcpConn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 		if err != nil {
 			lastErr = err
 			if i%10 == 0 && i > 0 {
@@ -288,9 +307,23 @@ func (l *wslLinuxVM) waitForContainerd() error {
 			time.Sleep(1 * time.Second)
 			continue
 		}
-		conn.Close()
+		tcpConn.Close()
 
-		l.client, err = client.New("tcp://"+addr)
+		// containerd's Windows dialer only supports named pipes, so we
+		// bypass it with a direct gRPC TCP connection.
+		grpcConn, err := grpc.NewClient(addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithDefaultCallOptions(
+				grpc.MaxCallRecvMsgSize(defaults.DefaultMaxRecvMsgSize),
+				grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize),
+			),
+		)
+		if err != nil {
+			lastErr = err
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		l.client, err = client.NewWithConn(grpcConn)
 		if err != nil {
 			lastErr = err
 			time.Sleep(500 * time.Millisecond)

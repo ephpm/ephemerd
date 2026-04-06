@@ -26,6 +26,10 @@ type LinuxVMConfig struct {
 	// DataDir is the ephemerd data directory. VM assets live under <DataDir>/vm/linux/.
 	DataDir string
 
+	// ConfigFile is the path to the host's config TOML file.
+	// Copied into the VM so the inner ephemerd has the same GitHub/runner config.
+	ConfigFile string
+
 	// CPUs is the number of virtual CPUs. Defaults to 2.
 	CPUs uint
 
