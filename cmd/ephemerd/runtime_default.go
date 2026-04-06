@@ -9,8 +9,8 @@ import (
 	"github.com/ephpm/ephemerd/pkg/containerd"
 )
 
-// startContainerRuntime starts an in-process containerd server on Linux/Windows.
-func startContainerRuntime(dataDir string, log *slog.Logger) (*client.Client, func(), error) {
+// startContainerRuntime starts an in-process containerd server on Linux.
+func startContainerRuntime(dataDir string, log *slog.Logger, _ bool) (*client.Client, func(), error) {
 	ctrd, err := containerd.New(containerd.Config{
 		DataDir: dataDir,
 		Log:     log,

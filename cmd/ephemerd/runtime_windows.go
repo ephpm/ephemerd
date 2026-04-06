@@ -11,11 +11,11 @@ import (
 )
 
 // startContainerRuntime starts containerd in-process for Windows jobs.
-// If Linux VM is configured, also boots a Hyper-V Linux VM for Linux jobs.
+// If Linux VM is enabled in config, also boots a Hyper-V Linux VM for Linux jobs.
 //
 // Returns the native containerd client. The Linux VM client (if any) is
 // stored for the scheduler to use when routing Linux-labeled jobs.
-func startContainerRuntime(dataDir string, log *slog.Logger) (*client.Client, func(), error) {
+func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool) (*client.Client, func(), error) {
 	// Start native containerd for Windows container jobs
 	ctrd, err := containerd.New(containerd.Config{
 		DataDir: dataDir,
@@ -26,6 +26,10 @@ func startContainerRuntime(dataDir string, log *slog.Logger) (*client.Client, fu
 	}
 
 	cleanup := func() { ctrd.Stop() }
+
+	if !linuxVMEnabled {
+		return ctrd.Client(), cleanup, nil
+	}
 
 	// Also try to start a Linux VM for cross-OS Linux jobs.
 	// This is optional — if it fails, Windows jobs still work.

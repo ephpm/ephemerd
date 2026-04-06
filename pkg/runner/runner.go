@@ -2,6 +2,7 @@ package runner
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"compress/gzip"
 	"embed"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+	"strings"
 )
 
 //go:embed all:embed
@@ -87,9 +89,17 @@ func (m *Manager) Extract() error {
 	}
 	defer func() { _ = f.Close() }()
 
-	if err := extractTarGz(f, dir); err != nil {
-		_ = os.RemoveAll(dir)
-		return fmt.Errorf("extracting runner: %w", err)
+	if strings.HasSuffix(tarballName, ".zip") {
+		// zip requires ReadAt + size; read into temp file
+		if err := extractZipFromReader(f, dir); err != nil {
+			_ = os.RemoveAll(dir)
+			return fmt.Errorf("extracting runner zip: %w", err)
+		}
+	} else {
+		if err := extractTarGz(f, dir); err != nil {
+			_ = os.RemoveAll(dir)
+			return fmt.Errorf("extracting runner: %w", err)
+		}
 	}
 
 	// Write marker so we skip extraction next time
@@ -101,8 +111,20 @@ func (m *Manager) Extract() error {
 	return nil
 }
 
-// findTarball locates the runner archive in the embedded filesystem.
+// findTarball locates the runner archive in the embedded filesystem for the current OS.
 func (m *Manager) findTarball() (string, error) {
+	// Runner archives are named: actions-runner-{os}-{arch}-{version}.{ext}
+	// os: linux, win, osx
+	var osPrefix string
+	switch goruntime.GOOS {
+	case "windows":
+		osPrefix = "actions-runner-win-"
+	case "darwin":
+		osPrefix = "actions-runner-osx-"
+	default:
+		osPrefix = "actions-runner-linux-"
+	}
+
 	entries, err := runnerFS.ReadDir("embed")
 	if err != nil {
 		return "", fmt.Errorf("reading embedded files: %w", err)
@@ -110,14 +132,80 @@ func (m *Manager) findTarball() (string, error) {
 
 	for _, e := range entries {
 		name := e.Name()
+		if strings.HasPrefix(name, osPrefix) {
+			return "embed/" + name, nil
+		}
+	}
+
+	// Fall back to first non-gitkeep file if no OS match
+	for _, e := range entries {
+		name := e.Name()
 		if name == ".gitkeep" {
 			continue
 		}
-		// Match actions-runner-{os}-{arch}-{version}.tar.gz or .zip
-		return filepath.Join("embed", name), nil
+		return "embed/" + name, nil
 	}
 
 	return "", fmt.Errorf("no runner archive found in embedded files (did you run 'make download-runner'?)")
+}
+
+func extractZipFromReader(r io.Reader, dest string) error {
+	// zip needs random access; write to a temp file first
+	tmp, err := os.CreateTemp("", "runner-*.zip")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+
+	size, err := io.Copy(tmp, r)
+	if err != nil {
+		return fmt.Errorf("writing temp file: %w", err)
+	}
+
+	zr, err := zip.NewReader(tmp, size)
+	if err != nil {
+		return fmt.Errorf("zip reader: %w", err)
+	}
+
+	for _, f := range zr.File {
+		target := filepath.Join(dest, f.Name)
+		if !filepath.IsLocal(f.Name) {
+			return fmt.Errorf("invalid path in archive: %s", f.Name)
+		}
+
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return fmt.Errorf("creating dir %s: %w", target, err)
+			}
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return fmt.Errorf("creating parent dir for %s: %w", target, err)
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			return fmt.Errorf("opening %s in zip: %w", f.Name, err)
+		}
+
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, f.Mode())
+		if err != nil {
+			rc.Close()
+			return fmt.Errorf("creating file %s: %w", target, err)
+		}
+
+		if _, err := io.Copy(out, rc); err != nil {
+			out.Close()
+			rc.Close()
+			return fmt.Errorf("writing file %s: %w", target, err)
+		}
+		out.Close()
+		rc.Close()
+	}
+
+	return nil
 }
 
 func extractTarGz(r io.Reader, dest string) error {

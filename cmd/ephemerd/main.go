@@ -51,6 +51,7 @@ func main() {
 	}
 
 	if err := app.Run(context.Background(), os.Args); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -89,6 +90,11 @@ func serve(ctx context.Context, configFile string) error {
 	log := cfg.Logger()
 	log.Info("starting ephemerd", "version", version, "data_dir", configDir)
 
+	// Ensure data directory exists
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		return fmt.Errorf("creating data directory %s: %w", configDir, err)
+	}
+
 	// Write PID file for drain command
 	pidFile := joinPath(configDir, "ephemerd.pid")
 	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
@@ -100,7 +106,7 @@ func serve(ctx context.Context, configFile string) error {
 	// Start container runtime.
 	// On Linux/Windows: embedded containerd runs in-process.
 	// On macOS: boot a Linux VM via Virtualization.framework, containerd runs inside it.
-	ctrdClient, cleanup, err := startContainerRuntime(configDir, log)
+	ctrdClient, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled)
 	if err != nil {
 		return fmt.Errorf("starting container runtime: %w", err)
 	}

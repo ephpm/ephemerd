@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,20 +46,20 @@ func New(cfg Config) (*Server, error) {
 		done: make(chan struct{}),
 	}
 
-	// Extract shim and runc binaries next to the ephemerd binary.
-	// Also add that directory to PATH so the shim can find runc.
-	shimCleanup, err := extractShims()
+	// Extract shim and runc binaries into the data directory.
+	// Add that directory to PATH so containerd and the shim can find runc.
+	shimDir, shimCleanup, err := extractShims(cfg.DataDir)
 	if err != nil {
 		return nil, fmt.Errorf("extracting shim binaries: %w", err)
 	}
 	s.shimCleanup = shimCleanup
 
-	self, err := os.Executable()
-	if err == nil {
-		shimDir := filepath.Dir(self)
-		if err := os.Setenv("PATH", shimDir+":"+os.Getenv("PATH")); err != nil {
-			return nil, fmt.Errorf("setting PATH: %w", err)
-		}
+	pathSep := ":"
+	if goruntime.GOOS == "windows" {
+		pathSep = ";"
+	}
+	if err := os.Setenv("PATH", shimDir+pathSep+os.Getenv("PATH")); err != nil {
+		return nil, fmt.Errorf("setting PATH: %w", err)
 	}
 
 	if err := s.setup(); err != nil {
@@ -161,7 +160,7 @@ func (s *Server) start() error {
 	s.srv = srv
 
 	// Create gRPC listener and serve in background
-	l, err := net.Listen("unix", socket)
+	l, err := listen(socket)
 	if err != nil {
 		srv.Stop()
 		cancel()
@@ -184,7 +183,7 @@ func (s *Server) start() error {
 	if goruntime.GOOS != "windows" {
 		_ = os.Remove(ttrpcSocket)
 	}
-	tl, err := net.Listen("unix", ttrpcSocket)
+	tl, err := listen(ttrpcSocket)
 	if err != nil {
 		s.cfg.Log.Warn("failed to start tTRPC listener, some features may not work", "error", err)
 	} else {
