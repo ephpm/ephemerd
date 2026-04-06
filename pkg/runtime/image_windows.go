@@ -2,11 +2,7 @@
 
 package runtime
 
-import (
-	"fmt"
-
-	"golang.org/x/sys/windows"
-)
+import "golang.org/x/sys/windows"
 
 // defaultImage picks a Windows Server Core image that matches the host OS.
 // Windows containers require the container OS version to match the host kernel.
@@ -26,6 +22,6 @@ func buildToTag(major, minor, build uint32) string {
 	case build >= 17763:
 		return "ltsc2019"
 	default:
-		return fmt.Sprintf("ltsc2025") // best guess for unknown future builds
+		return "ltsc2025" // best guess for unknown future builds
 	}
 }
