@@ -1,0 +1,48 @@
+name: Test Windows Runner
+
+on:
+  push:
+    branches: [feat/windows-support]
+  workflow_dispatch:
+
+jobs:
+  windows-smoke:
+    name: Windows Smoke Test
+    runs-on: [self-hosted, windows, x64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System info
+        run: |
+          Write-Host "Hostname: $env:COMPUTERNAME"
+          Write-Host "User: $env:USERNAME"
+          Write-Host "OS: $([System.Environment]::OSVersion)"
+          Write-Host "PowerShell: $($PSVersionTable.PSVersion)"
+          systeminfo | Select-String "OS Name","OS Version","System Type"
+
+      - name: Containerd check
+        run: |
+          if (Test-Path "\\.\pipe\ephemerd-containerd") {
+            Write-Host "PASS: containerd named pipe exists"
+          } else {
+            Write-Host "INFO: containerd pipe not visible from container"
+          }
+
+      - name: Runner mount check
+        run: |
+          if (Test-Path "C:\actions-runner") {
+            Write-Host "PASS: runner directory exists"
+            Get-ChildItem "C:\actions-runner" | Select-Object Name | Select-Object -First 10
+          }
+
+      - name: Network connectivity
+        run: |
+          try {
+            $response = Invoke-WebRequest -Uri "https://github.com" -UseBasicParsing -TimeoutSec 10
+            Write-Host "PASS: internet access works (status $($response.StatusCode))"
+          } catch {
+            Write-Host "FAIL: no internet access"
+          }
+
+      - name: Summary
+        run: Write-Host "Windows smoke test complete"
