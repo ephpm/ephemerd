@@ -223,12 +223,14 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		oci.WithProcessArgs(entrypoint, "--jitconfig", jitConfig),
 	}
 
-	// Only mount our embedded runner for custom images — the official image
-	// already has the runner binary built in.
+	// Mount the embedded runner binary into the container.
+	// On Linux with the official GHA image, the runner is pre-installed so no mount needed.
+	// On Windows, always mount because there's no Windows GHA runner image.
+	needsRunnerMount := (customImage || goruntime.GOOS == "windows") && r.cfg.RunnerDir != "" && r.cfg.RunnerMount != ""
 	var jobRunnerDir string
-	if customImage && r.cfg.RunnerDir != "" && r.cfg.RunnerMount != "" {
+	if needsRunnerMount {
 		jobRunnerDir = filepath.Join(filepath.Dir(r.cfg.RunnerDir), "job-"+id)
-		if err := copyDirHardlink(r.cfg.RunnerDir, jobRunnerDir); err != nil {
+		if err := copyDirForJob(r.cfg.RunnerDir, jobRunnerDir); err != nil {
 			return nil, fmt.Errorf("copying runner dir for %s: %w", id, err)
 		}
 		opts = append(opts, withRunnerMount(jobRunnerDir, r.cfg.RunnerMount))
@@ -247,7 +249,11 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 	snapshotName := id + "-snapshot"
 
 	// Clean up stale snapshot from a previous failed attempt
-	snapshotter := r.client.SnapshotService("overlayfs")
+	snapshotterName := "overlayfs"
+	if goruntime.GOOS == "windows" {
+		snapshotterName = "windows"
+	}
+	snapshotter := r.client.SnapshotService(snapshotterName)
 	if snapshotter != nil {
 		if _, err := snapshotter.Stat(ctx, snapshotName); err == nil {
 			r.cfg.Log.Info("removing stale snapshot before create", "name", snapshotName)
@@ -499,21 +505,34 @@ func withRunnerMount(hostDir, containerDir string) oci.SpecOpts {
 		if s.Mounts == nil {
 			s.Mounts = []ocispec.Mount{}
 		}
-		s.Mounts = append(s.Mounts, ocispec.Mount{
-			Destination: containerDir,
-			Type:        "bind",
-			Source:      hostDir,
-			Options:     []string{"rbind", "rw"},
-		})
+		if goruntime.GOOS == "windows" {
+			// Windows containers use mapped directories, not Linux bind mounts
+			s.Mounts = append(s.Mounts, ocispec.Mount{
+				Destination: containerDir,
+				Source:      hostDir,
+				Options:     []string{"rw"},
+			})
+		} else {
+			s.Mounts = append(s.Mounts, ocispec.Mount{
+				Destination: containerDir,
+				Type:        "bind",
+				Source:      hostDir,
+				Options:     []string{"rbind", "rw"},
+			})
+		}
 		return nil
 	}
 }
 
-// copyDirHardlink creates a copy of src at dst using hardlinks (cp -al).
-// This is instant and uses no extra disk space until files are modified.
-func copyDirHardlink(src, dst string) error {
+// copyDirForJob creates a writable copy of src at dst for a single job.
+// On Linux, uses hardlinks (cp -al) for instant, space-efficient copies.
+// On Windows, uses xcopy.
+func copyDirForJob(src, dst string) error {
 	if err := os.RemoveAll(dst); err != nil {
 		return err
+	}
+	if goruntime.GOOS == "windows" {
+		return exec.Command("xcopy", src, dst, "/E", "/I", "/Q", "/Y").Run()
 	}
 	return exec.Command("cp", "-al", src, dst).Run()
 }
