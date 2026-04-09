@@ -98,21 +98,13 @@ func (w *windowsNetworking) setup(ctx context.Context, id string, netns string) 
 		return nil, fmt.Errorf("creating HCN endpoint for %s: %w", id, err)
 	}
 
-	// Attach endpoint to the container's namespace
-	if netns != "" {
-		if err := created.NamespaceAttach(netns); err != nil {
-			created.Delete()
-			return nil, fmt.Errorf("attaching endpoint to namespace for %s: %w", id, err)
-		}
-	}
-
 	// Apply ACL policies to block private network access
 	if err := w.applyACLPolicies(created); err != nil {
 		w.cfg.Log.Warn("failed to apply ACL policies", "id", id, "error", err)
 	}
 
-	w.cfg.Log.Debug("HCN endpoint attached", "id", id, "endpoint", created.Id)
-	return &SetupResult{NetNS: netns}, nil
+	w.cfg.Log.Debug("HCN endpoint created", "id", id, "endpoint", created.Id)
+	return &SetupResult{NetNS: netns, EndpointID: created.Id}, nil
 }
 
 func (w *windowsNetworking) teardown(ctx context.Context, id string, netns string) error {

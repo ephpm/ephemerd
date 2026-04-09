@@ -253,6 +253,20 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		opts = append(opts, withHyperVIsolation())
 	}
 
+	// On Windows, create HCN endpoint before the container so we can
+	// add it to the OCI spec. runhcs reads the endpoint list from the
+	// spec and attaches the network during container creation.
+	var windowsEndpointID string
+	if goruntime.GOOS == "windows" && r.cfg.Network != nil {
+		result, err := r.cfg.Network.Setup(ctx, id, "")
+		if err != nil {
+			r.cfg.Log.Warn("failed to setup Windows network endpoint", "id", id, "error", err)
+		} else if result != nil {
+			windowsEndpointID = result.EndpointID
+			opts = append(opts, withWindowsNetwork(windowsEndpointID))
+		}
+	}
+
 	snapshotName := id + "-snapshot"
 
 	// Clean up stale snapshot from a previous failed attempt
@@ -375,10 +389,12 @@ func (r *Runtime) Destroy(ctx context.Context, env *RunnerEnv) error {
 		r.cfg.Log.Warn("failed to delete task", "id", env.ID, "error", err)
 	}
 
-	// Teardown CNI networking
-	if r.cfg.Network != nil && env.Netns != "" {
-		if err := r.cfg.Network.Teardown(ctx, env.ID, env.Netns); err != nil {
-			r.cfg.Log.Warn("failed to teardown network", "id", env.ID, "error", err)
+	// Teardown networking (CNI on Linux, HCN endpoint on Windows)
+	if r.cfg.Network != nil {
+		if env.Netns != "" || goruntime.GOOS == "windows" {
+			if err := r.cfg.Network.Teardown(ctx, env.ID, env.Netns); err != nil {
+				r.cfg.Log.Warn("failed to teardown network", "id", env.ID, "error", err)
+			}
 		}
 	}
 
@@ -551,6 +567,21 @@ func withHyperVIsolation() oci.SpecOpts {
 			s.Windows = &ocispec.Windows{}
 		}
 		s.Windows.HyperV = &ocispec.WindowsHyperV{}
+		return nil
+	}
+}
+
+// withWindowsNetwork adds an HCN endpoint to the container's OCI spec.
+// runhcs reads the endpoint list and attaches the network during container creation.
+func withWindowsNetwork(endpointID string) oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
+		if s.Windows == nil {
+			s.Windows = &ocispec.Windows{}
+		}
+		if s.Windows.Network == nil {
+			s.Windows.Network = &ocispec.WindowsNetwork{}
+		}
+		s.Windows.Network.EndpointList = append(s.Windows.Network.EndpointList, endpointID)
 		return nil
 	}
 }
