@@ -53,9 +53,10 @@ type MacOSVMToml struct {
 
 type GitHubConfig struct {
 	// Authentication: either a PAT or GitHub App
-	Token          string `toml:"token"`
-	AppID          int64  `toml:"app_id"`
-	PrivateKeyPath string `toml:"private_key_path"`
+	Token            string `toml:"token"`
+	AppID            int64  `toml:"app_id"`
+	InstallationID   int64  `toml:"installation_id"`
+	PrivateKeyPath   string `toml:"private_key_path"`
 
 	// Which org/user and repos to register runners for
 	Owner string   `toml:"owner"`
@@ -152,6 +153,14 @@ func Load(path string) (*Config, error) {
 func (c *Config) validate() error {
 	if c.GitHub.Token == "" && c.GitHub.AppID == 0 {
 		return fmt.Errorf("github.token or github.app_id is required")
+	}
+	if c.GitHub.AppID != 0 {
+		if c.GitHub.InstallationID == 0 {
+			return fmt.Errorf("github.installation_id is required when using github.app_id")
+		}
+		if c.GitHub.PrivateKeyPath == "" {
+			return fmt.Errorf("github.private_key_path is required when using github.app_id")
+		}
 	}
 	if c.GitHub.Owner == "" {
 		return fmt.Errorf("github.owner is required")

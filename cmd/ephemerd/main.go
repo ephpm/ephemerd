@@ -180,12 +180,26 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	}
 
 	// Create GitHub client
-	gh, err := github.New(github.Config{
+	ghCfg := github.Config{
 		Token: cfg.GitHub.Token,
 		Owner: cfg.GitHub.Owner,
 		Repos: cfg.GitHub.Repos,
 		Log:   log,
-	})
+	}
+	if cfg.GitHub.AppID != 0 {
+		appAuth, err := github.NewAppAuth(
+			cfg.GitHub.AppID,
+			cfg.GitHub.InstallationID,
+			cfg.GitHub.PrivateKeyPath,
+			log,
+		)
+		if err != nil {
+			return fmt.Errorf("initializing github app auth: %w", err)
+		}
+		defer appAuth.Stop()
+		ghCfg.AppAuth = appAuth
+	}
+	gh, err := github.New(ghCfg)
 	if err != nil {
 		return fmt.Errorf("creating github client: %w", err)
 	}

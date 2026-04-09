@@ -1,6 +1,12 @@
 [github]
-# Authentication: personal access token with repo + admin:org scope
-token = "ghp_your_token_here"
+# Authentication: personal access token OR GitHub App credentials.
+# Use one approach — if app_id is set, it takes priority over token.
+# token = "ghp_your_token_here"
+
+# GitHub App authentication (recommended):
+# app_id = 123456
+# installation_id = 789012
+# private_key_path = "/path/to/app.pem"
 
 # Organization or user that owns the repos
 owner = "your-org"
