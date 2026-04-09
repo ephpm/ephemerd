@@ -253,17 +253,18 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		opts = append(opts, withHyperVIsolation())
 	}
 
-	// On Windows, create HCN endpoint before the container so we can
-	// add it to the OCI spec. runhcs reads the endpoint list from the
-	// spec and attaches the network during container creation.
-	var windowsEndpointID string
+	// On Windows, create HCN endpoint + namespace before the container so
+	// we can add them to the OCI spec. Hyper-V isolated containers require
+	// a pre-created network namespace with the endpoint attached.
+	var windowsEndpointID, windowsNetNS string
 	if goruntime.GOOS == "windows" && r.cfg.Network != nil {
 		result, err := r.cfg.Network.Setup(ctx, id, "")
 		if err != nil {
 			r.cfg.Log.Warn("failed to setup Windows network endpoint", "id", id, "error", err)
 		} else if result != nil {
 			windowsEndpointID = result.EndpointID
-			opts = append(opts, withWindowsNetwork(windowsEndpointID))
+			windowsNetNS = result.NetNS
+			opts = append(opts, withWindowsNetwork(windowsNetNS, windowsEndpointID))
 		}
 	}
 
@@ -290,6 +291,12 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		client.WithNewSpec(opts...),
 	)
 	if err != nil {
+		// Clean up HCN endpoint + namespace on Windows
+		if windowsEndpointID != "" && r.cfg.Network != nil {
+			if tearErr := r.cfg.Network.Teardown(ctx, id, windowsNetNS); tearErr != nil {
+				r.cfg.Log.Debug("endpoint cleanup after failed container create", "error", tearErr)
+			}
+		}
 		// Clean up snapshot if container creation partially succeeded
 		if snapshotter != nil {
 			if rmErr := snapshotter.Remove(ctx, snapshotName); rmErr != nil {
@@ -318,6 +325,12 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 	}
 	task, err := container.NewTask(ctx, creator)
 	if err != nil {
+		// Clean up HCN endpoint + namespace on Windows
+		if windowsEndpointID != "" && r.cfg.Network != nil {
+			if tearErr := r.cfg.Network.Teardown(ctx, id, windowsNetNS); tearErr != nil {
+				r.cfg.Log.Debug("endpoint cleanup after failed task create", "error", tearErr)
+			}
+		}
 		if delErr := container.Delete(ctx, client.WithSnapshotCleanup); delErr != nil {
 			r.cfg.Log.Debug("container cleanup after failed task create", "error", delErr)
 		}
@@ -341,8 +354,12 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 	}
 
 	if err := task.Start(ctx); err != nil {
-		if r.cfg.Network != nil && netns != "" {
-			if tearErr := r.cfg.Network.Teardown(ctx, id, netns); tearErr != nil {
+		teardownNetNS := netns
+		if windowsNetNS != "" {
+			teardownNetNS = windowsNetNS
+		}
+		if r.cfg.Network != nil && (netns != "" || windowsEndpointID != "") {
+			if tearErr := r.cfg.Network.Teardown(ctx, id, teardownNetNS); tearErr != nil {
 				r.cfg.Log.Debug("network teardown after failed start", "error", tearErr)
 			}
 		}
@@ -357,9 +374,15 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 
 	r.cfg.Log.Info("runner environment started", "id", id)
 
+	// On Windows, use the HCN namespace ID for teardown
+	envNetns := netns
+	if windowsNetNS != "" {
+		envNetns = windowsNetNS
+	}
+
 	return &RunnerEnv{
 		ID:        id,
-		Netns:     netns,
+		Netns:     envNetns,
 		RunnerDir: jobRunnerDir,
 		Container: container,
 		Task:      task,
@@ -571,9 +594,10 @@ func withHyperVIsolation() oci.SpecOpts {
 	}
 }
 
-// withWindowsNetwork adds an HCN endpoint to the container's OCI spec.
-// runhcs reads the endpoint list and attaches the network during container creation.
-func withWindowsNetwork(endpointID string) oci.SpecOpts {
+// withWindowsNetwork configures networking for a Windows container.
+// Sets the NetworkNamespace (required for Hyper-V isolated containers)
+// and the EndpointList for runhcs to attach the network.
+func withWindowsNetwork(namespaceID, endpointID string) oci.SpecOpts {
 	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
 		if s.Windows == nil {
 			s.Windows = &ocispec.Windows{}
@@ -581,6 +605,7 @@ func withWindowsNetwork(endpointID string) oci.SpecOpts {
 		if s.Windows.Network == nil {
 			s.Windows.Network = &ocispec.WindowsNetwork{}
 		}
+		s.Windows.Network.NetworkNamespace = namespaceID
 		s.Windows.Network.EndpointList = append(s.Windows.Network.EndpointList, endpointID)
 		return nil
 	}
