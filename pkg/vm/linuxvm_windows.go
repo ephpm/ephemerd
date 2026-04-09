@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -19,6 +20,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+const wslCmdTimeout = 30 * time.Second
 
 const distroName = "ephemerd-linux"
 
@@ -100,22 +103,39 @@ func (l *wslLinuxVM) Stop() {
 }
 
 // destroy terminates and unregisters the WSL distro.
+// Uses timeouts to avoid hanging if WSL service is stuck.
 func (l *wslLinuxVM) destroy() {
-	_ = wslExec("--terminate", distroName)
-	_ = wslExec("--unregister", distroName)
+	if err := wslExecTimeout(wslCmdTimeout, "--terminate", distroName); err != nil {
+		l.cfg.Log.Warn("wsl --terminate failed or timed out", "error", err)
+	}
+	if err := wslExecTimeout(wslCmdTimeout, "--unregister", distroName); err != nil {
+		l.cfg.Log.Warn("wsl --unregister failed or timed out", "error", err)
+	}
 }
 
 // cleanupStaleDistro removes any leftover distro from a crash.
+// If WSL commands hang (stuck wslservice), it kills wslservice.exe
+// as a last resort — the OS auto-restarts it with a fresh state.
 func (l *wslLinuxVM) cleanupStaleDistro() {
-	out, err := wslOutput("--list", "--quiet")
+	out, err := wslOutputTimeout(wslCmdTimeout, "--list", "--quiet")
 	if err != nil {
-		return
+		l.cfg.Log.Warn("wsl --list timed out or failed, attempting wslservice restart", "error", err)
+		killWSLService(l.cfg.Log)
+		// Retry once after the restart
+		out, err = wslOutputTimeout(wslCmdTimeout, "--list", "--quiet")
+		if err != nil {
+			l.cfg.Log.Warn("wsl --list still failing after wslservice restart", "error", err)
+			return
+		}
 	}
 	for _, line := range strings.Split(out, "\n") {
 		if strings.TrimSpace(line) == distroName {
 			l.cfg.Log.Info("cleaning up stale WSL distro", "name", distroName)
-			_ = wslExec("--terminate", distroName)
-			_ = wslExec("--unregister", distroName)
+			if err := wslExecTimeout(wslCmdTimeout, "--terminate", distroName); err != nil {
+				l.cfg.Log.Warn("wsl --terminate timed out, killing wslservice", "error", err)
+				killWSLService(l.cfg.Log)
+			}
+			_ = wslExecTimeout(wslCmdTimeout, "--unregister", distroName)
 			return
 		}
 	}
@@ -351,6 +371,21 @@ func wslExec(args ...string) error {
 	return cmd.Run()
 }
 
+func wslExecTimeout(timeout time.Duration, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "wsl", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("wsl %s: timed out after %s", strings.Join(args, " "), timeout)
+		}
+		return err
+	}
+	return nil
+}
+
 func wslOutput(args ...string) (string, error) {
 	cmd := exec.Command("wsl", args...)
 	out, err := cmd.Output()
@@ -358,4 +393,30 @@ func wslOutput(args ...string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+func wslOutputTimeout(timeout time.Duration, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "wsl", args...)
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("wsl %s: timed out after %s", strings.Join(args, " "), timeout)
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// killWSLService force-kills wslservice.exe to unstick a hung WSL.
+// The OS auto-restarts the service with a fresh state.
+func killWSLService(log *slog.Logger) {
+	log.Warn("killing wslservice.exe to recover from stuck WSL")
+	cmd := exec.Command("taskkill", "/F", "/IM", "wslservice.exe")
+	if err := cmd.Run(); err != nil {
+		log.Warn("taskkill wslservice.exe failed (may not be running)", "error", err)
+	}
+	// Give the OS a moment to restart the service
+	time.Sleep(2 * time.Second)
 }
