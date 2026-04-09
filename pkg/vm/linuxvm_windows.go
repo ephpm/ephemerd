@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -255,19 +256,18 @@ func (l *wslLinuxVM) launch() error {
 		return fmt.Errorf("starting WSL ephemerd: %w", err)
 	}
 
-	// Forward output in background
-	go func() {
-		scanner := bufio.NewScanner(stdout)
+	// Forward output directly to stderr with explicit \r\n line endings.
+	// PowerShell's terminal needs \r to reset cursor to column 0; routing
+	// through slog drops the \r and produces stair-step output.
+	forward := func(r io.Reader) {
+		scanner := bufio.NewScanner(r)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 		for scanner.Scan() {
-			l.cfg.Log.Info("[wsl-linux] " + scanner.Text())
+			fmt.Fprintf(os.Stderr, "[wsl-linux] %s\r\n", scanner.Text())
 		}
-	}()
-	go func() {
-		scanner := bufio.NewScanner(stderr)
-		for scanner.Scan() {
-			l.cfg.Log.Warn("[wsl-linux] " + scanner.Text())
-		}
-	}()
+	}
+	go forward(stdout)
+	go forward(stderr)
 
 	// Wait for process exit in background
 	go func() {

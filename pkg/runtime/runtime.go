@@ -220,7 +220,14 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		// NoNewPrivileges=true which blocks privilege escalation, but
 		// jobs need sudo for apt-get install and similar operations.
 		oci.WithNewPrivileges,
-		oci.WithProcessArgs(entrypoint, "--jitconfig", jitConfig),
+	}
+	if goruntime.GOOS == "windows" {
+		// Wrap entrypoint in cmd.exe redirect so we can capture runner output
+		// to a file readable from the host (the runner dir is mounted in).
+		cmdLine := fmt.Sprintf(`%s --jitconfig %s > C:\actions-runner\runner.log 2>&1`, entrypoint, jitConfig)
+		opts = append(opts, oci.WithProcessArgs("cmd.exe", "/c", cmdLine))
+	} else {
+		opts = append(opts, oci.WithProcessArgs(entrypoint, "--jitconfig", jitConfig))
 	}
 
 	// Mount the embedded runner binary into the container.
