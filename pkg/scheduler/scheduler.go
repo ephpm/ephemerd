@@ -3,10 +3,12 @@ package scheduler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	goruntime "runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/github"
 	"github.com/ephpm/ephemerd/pkg/names"
 	"github.com/ephpm/ephemerd/pkg/runtime"
+	gh "github.com/google/go-github/v72/github"
 )
 
 // Config for the scheduler.
@@ -271,11 +274,10 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	// Build runner labels
 	labels := s.buildLabels()
 
-	// Generate a unique runner name (Docker-style: adjective_scientist)
-	name := fmt.Sprintf("ephemerd-%s-%s", event.Repo, names.Generate())
-
-	// Register a JIT runner with GitHub
-	jitConfig, err := s.cfg.GitHub.RegisterJITRunner(ctx, event.Repo, name, labels)
+	// Generate a unique runner name and register with GitHub.
+	// Retry with a new name on 409 conflict (stale runner from a previous crash).
+	const maxNameRetries = 3
+	name, jitConfig, err := s.registerRunner(ctx, event.Repo, labels, log, maxNameRetries)
 	if err != nil {
 		log.Error("failed to register JIT runner", "error", err)
 		if artifactsDir != "" {
@@ -513,4 +515,34 @@ func (s *Scheduler) buildLabels() []string {
 	labels = append(labels, s.cfg.Labels...)
 
 	return labels
+}
+
+// registerRunner generates a runner name and registers a JIT runner with GitHub,
+// retrying with a new name if the name already exists (409 conflict).
+func (s *Scheduler) registerRunner(ctx context.Context, repo string, labels []string, log *slog.Logger, maxRetries int) (string, *gh.JITRunnerConfig, error) {
+	var lastErr error
+	for attempt := range maxRetries {
+		name := fmt.Sprintf("ephemerd-%s-%s", repo, names.Generate())
+		jitConfig, err := s.cfg.GitHub.RegisterJITRunner(ctx, repo, name, labels)
+		if err == nil {
+			return name, jitConfig, nil
+		}
+		lastErr = err
+		if isConflict(err) && attempt < maxRetries-1 {
+			log.Warn("runner name conflict, retrying with new name", "name", name, "attempt", attempt+1)
+			continue
+		}
+		return "", nil, err
+	}
+	return "", nil, lastErr
+}
+
+// isConflict reports whether an error is a GitHub 409 Conflict (runner name already exists).
+func isConflict(err error) bool {
+	var ghErr *gh.ErrorResponse
+	if errors.As(err, &ghErr) {
+		return ghErr.Response.StatusCode == http.StatusConflict
+	}
+	// The error may be wrapped in a way errors.As can't unwrap — fall back to string match.
+	return strings.Contains(err.Error(), "409")
 }
