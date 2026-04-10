@@ -138,7 +138,7 @@ func downloadShimForArch(arch string) error {
 	if err != nil {
 		return fmt.Errorf("download shim: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download shim: HTTP %d", resp.StatusCode)
 	}
@@ -147,7 +147,7 @@ func downloadShimForArch(arch string) error {
 	if err != nil {
 		return fmt.Errorf("gzip shim: %w", err)
 	}
-	defer gr.Close()
+	defer func() { _ = gr.Close() }()
 
 	tr := tar.NewReader(gr)
 	for {
@@ -164,7 +164,7 @@ func downloadShimForArch(arch string) error {
 				return err
 			}
 			if _, err := io.Copy(f, tr); err != nil {
-				f.Close()
+				_ = f.Close()
 				return err
 			}
 			return f.Close()
@@ -202,7 +202,7 @@ func downloadFile(url, dest string) error {
 	if err != nil {
 		return fmt.Errorf("download %s: %w", dest, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download %s: HTTP %d", dest, resp.StatusCode)
 	}
@@ -212,7 +212,7 @@ func downloadFile(url, dest string) error {
 		return err
 	}
 	if _, err := io.Copy(f, resp.Body); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	return f.Close()

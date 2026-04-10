@@ -167,7 +167,7 @@ func (a *AppAuth) exchangeToken(jwt string) (string, time.Time, error) {
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("token exchange request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 201 {

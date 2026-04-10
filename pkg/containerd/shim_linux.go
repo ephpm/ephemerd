@@ -42,7 +42,7 @@ func extractShims(dataDir string) (string, func(), error) {
 
 	return dir, func() {
 		for _, name := range shimBinaries {
-			os.Remove(filepath.Join(dir, name))
+			_ = os.Remove(filepath.Join(dir, name))
 		}
 	}, nil
 }

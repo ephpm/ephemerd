@@ -37,7 +37,7 @@ func Windows() error {
 	matches, _ := filepath.Glob("pkg/runner/embed/actions-runner-linux-*.tar.gz")
 	for _, m := range matches {
 		fmt.Printf("  Removing %s (not needed in Windows binary)\n", m)
-		os.Remove(m)
+		_ = os.Remove(m)
 	}
 
 	output := "ephemerd.exe"

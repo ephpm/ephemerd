@@ -155,8 +155,8 @@ func extractZipFromReader(r io.Reader, dest string) error {
 	if err != nil {
 		return fmt.Errorf("creating temp file: %w", err)
 	}
-	defer os.Remove(tmp.Name())
-	defer tmp.Close()
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	defer func() { _ = tmp.Close() }()
 
 	size, err := io.Copy(tmp, r)
 	if err != nil {
@@ -169,42 +169,46 @@ func extractZipFromReader(r io.Reader, dest string) error {
 	}
 
 	for _, f := range zr.File {
-		target := filepath.Join(dest, f.Name)
-		if !filepath.IsLocal(f.Name) {
-			return fmt.Errorf("invalid path in archive: %s", f.Name)
+		if err := extractZipFile(f, dest); err != nil {
+			return err
 		}
-
-		if f.FileInfo().IsDir() {
-			if err := os.MkdirAll(target, 0o755); err != nil {
-				return fmt.Errorf("creating dir %s: %w", target, err)
-			}
-			continue
-		}
-
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return fmt.Errorf("creating parent dir for %s: %w", target, err)
-		}
-
-		rc, err := f.Open()
-		if err != nil {
-			return fmt.Errorf("opening %s in zip: %w", f.Name, err)
-		}
-
-		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, f.Mode())
-		if err != nil {
-			rc.Close()
-			return fmt.Errorf("creating file %s: %w", target, err)
-		}
-
-		if _, err := io.Copy(out, rc); err != nil {
-			out.Close()
-			rc.Close()
-			return fmt.Errorf("writing file %s: %w", target, err)
-		}
-		out.Close()
-		rc.Close()
 	}
 
+	return nil
+}
+
+func extractZipFile(f *zip.File, dest string) error {
+	target := filepath.Join(dest, f.Name)
+	if !filepath.IsLocal(f.Name) {
+		return fmt.Errorf("invalid path in archive: %s", f.Name)
+	}
+
+	if f.FileInfo().IsDir() {
+		if err := os.MkdirAll(target, 0o755); err != nil {
+			return fmt.Errorf("creating dir %s: %w", target, err)
+		}
+		return nil
+	}
+
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("creating parent dir for %s: %w", target, err)
+	}
+
+	rc, err := f.Open()
+	if err != nil {
+		return fmt.Errorf("opening %s in zip: %w", f.Name, err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, f.Mode())
+	if err != nil {
+		return fmt.Errorf("creating file %s: %w", target, err)
+	}
+	defer func() { _ = out.Close() }()
+
+	if _, err := io.Copy(out, rc); err != nil {
+		return fmt.Errorf("writing file %s: %w", target, err)
+	}
 	return nil
 }
 
