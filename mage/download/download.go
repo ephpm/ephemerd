@@ -2,6 +2,8 @@ package download
 
 import (
 	"archive/tar"
+	"bufio"
+	"bytes"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -107,13 +109,219 @@ func ShimLinux() error {
 	return downloadRuncForArch("amd64")
 }
 
-// Rootfs downloads the Alpine minirootfs for WSL2 Linux VM.
+// apkPkg describes a package to pre-install in the rootfs.
+type apkPkg struct {
+	name    string
+	version string
+	repo    string // "main" or "community"
+}
+
+// Packages to pre-install in the rootfs, pinned to Alpine 3.21.3.
+// These are the transitive dependencies of gcompat and iptables.
+// Update versions when bumping AlpineVersion.
+var rootfsPackages = []apkPkg{
+	{"musl-obstack", "1.2.3-r2", "main"},
+	{"libucontext", "1.3.2-r0", "main"},
+	{"gcompat", "1.1.0-r4", "main"},
+	{"libmnl", "1.0.5-r2", "main"},
+	{"libnftnl", "1.2.8-r0", "main"},
+	{"libxtables", "1.8.11-r1", "main"},
+	{"iptables", "1.8.11-r1", "main"},
+}
+
+// Rootfs builds a custom Alpine rootfs with gcompat and iptables pre-installed.
+// Downloads the stock Alpine minirootfs and APK packages from the CDN, then
+// combines them into a single tarball — no container runtime required.
 func Rootfs() error {
-	filename := fmt.Sprintf("alpine-minirootfs-%s-x86_64.tar.gz", AlpineVersion)
+	filename := fmt.Sprintf("ephemerd-rootfs-%s-x86_64.tar.gz", AlpineVersion)
 	dest := filepath.Join(vmEmbedDir, filename)
-	url := fmt.Sprintf("https://dl-cdn.alpinelinux.org/alpine/v%s/releases/x86_64/%s",
-		alpineMajorMinor(AlpineVersion), filename)
-	return downloadFile(url, dest)
+
+	if fileExists(dest) {
+		fmt.Printf("  %s already exists, skipping\n", dest)
+		return nil
+	}
+
+	if err := os.MkdirAll(vmEmbedDir, 0o755); err != nil {
+		return err
+	}
+
+	// Remove any old rootfs files to avoid embed conflicts
+	for _, pattern := range []string{"alpine-minirootfs-*.tar.gz", "ephemerd-rootfs-*.tar.gz"} {
+		oldFiles, _ := filepath.Glob(filepath.Join(vmEmbedDir, pattern))
+		for _, f := range oldFiles {
+			fmt.Printf("  Removing old rootfs: %s\n", f)
+			os.Remove(f)
+		}
+	}
+
+	// Download base Alpine minirootfs
+	baseURL := fmt.Sprintf("https://dl-cdn.alpinelinux.org/alpine/v%s/releases/x86_64/alpine-minirootfs-%s-x86_64.tar.gz",
+		alpineMajorMinor(AlpineVersion), AlpineVersion)
+	fmt.Printf("  Downloading base Alpine minirootfs...\n")
+	baseData, err := httpGetBytes(baseURL)
+	if err != nil {
+		return fmt.Errorf("downloading base rootfs: %w", err)
+	}
+
+	// Download APK packages
+	pkgData := make([][]byte, len(rootfsPackages))
+	for i, pkg := range rootfsPackages {
+		url := fmt.Sprintf("https://dl-cdn.alpinelinux.org/alpine/v%s/%s/x86_64/%s-%s.apk",
+			alpineMajorMinor(AlpineVersion), pkg.repo, pkg.name, pkg.version)
+		fmt.Printf("  Downloading %s-%s.apk...\n", pkg.name, pkg.version)
+		pkgData[i], err = httpGetBytes(url)
+		if err != nil {
+			return fmt.Errorf("downloading %s: %w", pkg.name, err)
+		}
+	}
+
+	// Build combined rootfs tarball
+	fmt.Printf("  Building combined rootfs...\n")
+	f, err := os.Create(dest)
+	if err != nil {
+		return fmt.Errorf("creating output file: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			os.Remove(dest)
+		}
+	}()
+
+	gw := gzip.NewWriter(f)
+	tw := tar.NewWriter(gw)
+
+	// Copy all entries from the base rootfs
+	baseGz, err := gzip.NewReader(bytes.NewReader(baseData))
+	if err != nil {
+		_ = f.Close()
+		return fmt.Errorf("reading base rootfs: %w", err)
+	}
+	baseTr := tar.NewReader(baseGz)
+	for {
+		hdr, terr := baseTr.Next()
+		if terr == io.EOF {
+			break
+		}
+		if terr != nil {
+			baseGz.Close()
+			_ = tw.Close()
+			_ = gw.Close()
+			_ = f.Close()
+			return fmt.Errorf("reading base rootfs tar: %w", terr)
+		}
+		if terr = tw.WriteHeader(hdr); terr != nil {
+			baseGz.Close()
+			_ = tw.Close()
+			_ = gw.Close()
+			_ = f.Close()
+			return fmt.Errorf("writing tar header: %w", terr)
+		}
+		if hdr.Size > 0 {
+			if _, terr = io.Copy(tw, baseTr); terr != nil {
+				baseGz.Close()
+				_ = tw.Close()
+				_ = gw.Close()
+				_ = f.Close()
+				return fmt.Errorf("writing tar data: %w", terr)
+			}
+		}
+	}
+	baseGz.Close()
+
+	// Append files from each APK package
+	for i, data := range pkgData {
+		if terr := appendAPKFiles(tw, data); terr != nil {
+			_ = tw.Close()
+			_ = gw.Close()
+			_ = f.Close()
+			return fmt.Errorf("extracting %s: %w", rootfsPackages[i].name, terr)
+		}
+	}
+
+	if err = tw.Close(); err != nil {
+		_ = gw.Close()
+		_ = f.Close()
+		return fmt.Errorf("closing tar: %w", err)
+	}
+	if err = gw.Close(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("closing gzip: %w", err)
+	}
+	if err = f.Close(); err != nil {
+		return fmt.Errorf("closing output file: %w", err)
+	}
+
+	fmt.Printf("  Created %s\n", dest)
+	return nil
+}
+
+// appendAPKFiles extracts data files from an APK package and appends them
+// to the tar writer. APK files are concatenated gzip streams: signature,
+// control (.PKGINFO etc.), and data (actual files). We process all streams
+// but skip metadata entries (names starting with "." but not "./").
+func appendAPKFiles(tw *tar.Writer, apkData []byte) error {
+	br := bufio.NewReader(bytes.NewReader(apkData))
+	gz, err := gzip.NewReader(br)
+	if err != nil {
+		return fmt.Errorf("reading apk gzip: %w", err)
+	}
+	defer gz.Close()
+	gz.Multistream(false)
+
+	for {
+		tr := tar.NewReader(gz)
+		for {
+			hdr, err := tr.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return fmt.Errorf("reading apk tar: %w", err)
+			}
+			// Skip APK metadata entries (.PKGINFO, .SIGN.*, .pre-install, etc.)
+			// Data entries start with "./" (filesystem paths like ./usr/lib/...)
+			if strings.HasPrefix(hdr.Name, ".") && !strings.HasPrefix(hdr.Name, "./") {
+				continue
+			}
+			if err := tw.WriteHeader(hdr); err != nil {
+				return fmt.Errorf("writing tar header: %w", err)
+			}
+			if hdr.Size > 0 {
+				if _, err := io.Copy(tw, tr); err != nil {
+					return fmt.Errorf("writing tar data: %w", err)
+				}
+			}
+		}
+
+		// Advance to next gzip stream; EOF means no more streams
+		if err := gz.Reset(br); err != nil {
+			break
+		}
+		gz.Multistream(false)
+	}
+
+	return nil
+}
+
+// httpGetBytes downloads a URL and returns its body as a byte slice.
+func httpGetBytes(url string) ([]byte, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+func alpineMajorMinor(version string) string {
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) >= 2 {
+		return parts[0] + "." + parts[1]
+	}
+	return version
 }
 
 func downloadShim() error {
@@ -247,10 +455,3 @@ func cniArch(goarch string) string {
 	return "amd64"
 }
 
-func alpineMajorMinor(version string) string {
-	parts := strings.SplitN(version, ".", 3)
-	if len(parts) >= 2 {
-		return parts[0] + "." + parts[1]
-	}
-	return version
-}
