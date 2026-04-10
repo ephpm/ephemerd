@@ -14,6 +14,7 @@ import (
 	"github.com/containerd/containerd/v2/client"
 	ctdserver "github.com/containerd/containerd/v2/cmd/containerd/server"
 	srvconfig "github.com/containerd/containerd/v2/cmd/containerd/server/config"
+	"github.com/sirupsen/logrus"
 
 	// Blank import registers all containerd plugins (services, snapshotters,
 	// runtimes, etc.) with the global registry. Without this, ctdserver.New()
@@ -153,6 +154,15 @@ func (s *Server) start() error {
 	cfg.GRPC.Address = socket
 	cfg.TTRPC.Address = socket + ".ttrpc"
 
+	// On Windows, fix containerd's logrus output for PowerShell.
+	// logrus defaults to \n line endings which cause stair-step output
+	// in PowerShell terminals that expect \r\n.
+	if goruntime.GOOS == "windows" {
+		logrus.SetFormatter(&crlfFormatter{parent: &logrus.TextFormatter{
+			FullTimestamp: true,
+		}})
+	}
+
 	// Create the in-process containerd server
 	srv, err := ctdserver.New(ctx, cfg)
 	if err != nil {
@@ -241,6 +251,25 @@ func (s *Server) start() error {
 	srv.Stop()
 	cancel()
 	return fmt.Errorf("timed out connecting to containerd at %s: %w", socket, err)
+}
+
+// crlfFormatter wraps a logrus formatter to use \r\n line endings on Windows.
+// PowerShell needs \r to reset the cursor to column 0; without it, each log
+// line starts one column further right (stair-step effect).
+type crlfFormatter struct {
+	parent logrus.Formatter
+}
+
+func (f *crlfFormatter) Format(entry *logrus.Entry) ([]byte, error) {
+	b, err := f.parent.Format(entry)
+	if err != nil {
+		return b, err
+	}
+	// Replace trailing \n with \r\n
+	if len(b) > 0 && b[len(b)-1] == '\n' {
+		b = append(b[:len(b)-1], '\r', '\n')
+	}
+	return b, nil
 }
 
 // ExecCtr runs the ctr CLI against ephemerd's containerd instance.
