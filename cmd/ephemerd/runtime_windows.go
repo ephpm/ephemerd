@@ -12,11 +12,11 @@ import (
 
 // startContainerRuntime starts containerd in-process for Windows jobs.
 // If Linux VM is enabled in config, boots a WSL2 Linux VM in the background
-// so Windows jobs can start immediately while the Linux VM is provisioning.
+// running the full ephemerd stack (scheduler + runner + CNI) so it can
+// independently handle Linux-labeled GitHub jobs.
 //
-// Returns the native containerd client. The Linux VM client becomes available
-// asynchronously once the WSL distro is ready.
-func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool, _ uint32, configFile string) (*client.Client, func(), error) {
+// Returns the native containerd client for Windows jobs.
+func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool, _ uint32, configFile string, privateKeyPath string) (*client.Client, func(), error) {
 	// Start native containerd for Windows container jobs
 	ctrd, err := containerd.New(containerd.Config{
 		DataDir: dataDir,
@@ -42,9 +42,10 @@ func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool
 		log.Info("starting Linux VM in background (WSL)")
 
 		lvm, err := vm.StartLinuxVM(vm.LinuxVMConfig{
-			DataDir:    dataDir,
-			ConfigFile: configFile,
-			Log:        log,
+			DataDir:        dataDir,
+			ConfigFile:     configFile,
+			PrivateKeyPath: privateKeyPath,
+			Log:            log,
 		})
 		if err != nil {
 			log.Warn("Linux VM not started — Linux jobs will not be available on this host", "error", err)
@@ -52,8 +53,7 @@ func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool
 		}
 
 		linuxVM = lvm
-		linuxVMClient = lvm.Client()
-		log.Info("Linux VM ready — this host can run both Windows and Linux jobs")
+		log.Info("Linux VM ready — WSL ephemerd handles Linux jobs independently")
 	}()
 
 	cleanup = func() {
@@ -67,8 +67,3 @@ func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool
 
 	return ctrd.Client(), cleanup, nil
 }
-
-// linuxVMClient holds the containerd client for the WSL2 Linux VM.
-// Used by the scheduler to route Linux-labeled jobs to the VM's containerd.
-// This is a temporary solution — should be properly wired through the runtime.
-var linuxVMClient *client.Client

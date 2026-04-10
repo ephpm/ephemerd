@@ -12,8 +12,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/defaults"
@@ -227,19 +229,58 @@ func (l *wslLinuxVM) installEphemerd() error {
 		return fmt.Errorf("chmod: %w", err)
 	}
 
+	// Ensure /var/lib/ephemerd exists for config and PEM
+	if err := wslExec("-d", distroName, "--", "mkdir", "-p", "/var/lib/ephemerd"); err != nil {
+		return fmt.Errorf("creating config dir: %w", err)
+	}
+
+	// Copy the GitHub App PEM file into the distro
+	if l.cfg.PrivateKeyPath != "" {
+		pemData, err := os.ReadFile(l.cfg.PrivateKeyPath)
+		if err != nil {
+			return fmt.Errorf("reading PEM file: %w", err)
+		}
+		pemDst := fmt.Sprintf(`\\wsl$\%s\var\lib\ephemerd\app.pem`, distroName)
+		if err := os.WriteFile(pemDst, pemData, 0o600); err != nil {
+			return fmt.Errorf("writing PEM to WSL: %w", err)
+		}
+		l.cfg.Log.Info("copied GitHub App PEM into WSL")
+	}
+
 	// Copy host config file into the distro so the inner ephemerd has GitHub/runner config
 	if l.cfg.ConfigFile != "" {
 		configData, err := os.ReadFile(l.cfg.ConfigFile)
 		if err != nil {
 			return fmt.Errorf("reading config file: %w", err)
 		}
-		if err := wslExec("-d", distroName, "--", "mkdir", "-p", "/var/lib/ephemerd"); err != nil {
-			return fmt.Errorf("creating config dir: %w", err)
+
+		// Rewrite the PEM path to the Linux-side location
+		if l.cfg.PrivateKeyPath != "" {
+			re := regexp.MustCompile(`(?m)^(\s*private_key_path\s*=\s*).*$`)
+			configData = re.ReplaceAll(configData, []byte(`${1}"/var/lib/ephemerd/app.pem"`))
 		}
+
 		configDst := fmt.Sprintf(`\\wsl$\%s\var\lib\ephemerd\config.toml`, distroName)
 		if err := os.WriteFile(configDst, configData, 0o644); err != nil {
 			return fmt.Errorf("writing config to WSL: %w", err)
 		}
+	}
+
+	// Install gcompat (glibc compat for containerd-shim-runc-v2) and iptables (for CNI/firewall).
+	// Done last because WSL networking may not be ready immediately after import.
+	// Retry with a timeout to handle transient DNS failures.
+	l.cfg.Log.Info("installing dependencies in WSL distro (gcompat, iptables)")
+	const apkTimeout = 2 * time.Minute
+	for attempt := range 3 {
+		if err := wslExecTimeout(apkTimeout, "-d", distroName, "--", "apk", "add", "--no-cache", "gcompat", "iptables"); err != nil {
+			l.cfg.Log.Warn("apk install attempt failed", "attempt", attempt+1, "error", err)
+			if attempt < 2 {
+				time.Sleep(3 * time.Second)
+				continue
+			}
+			return fmt.Errorf("installing dependencies: %w", err)
+		}
+		break
 	}
 
 	return nil
@@ -256,7 +297,6 @@ func (l *wslLinuxVM) launch() error {
 		"/opt/ephemerd/ephemerd", "serve",
 		"--data-dir", "/var/lib/ephemerd",
 		"--containerd-tcp-port", fmt.Sprintf("%d", l.cfg.ContainerdPort),
-		"--containerd-only",
 	)
 
 	// Pipe stdout/stderr to our logger
@@ -392,7 +432,7 @@ func wslOutput(args ...string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(decodeWSLOutput(out)), nil
 }
 
 func wslOutputTimeout(timeout time.Duration, args ...string) (string, error) {
@@ -406,7 +446,37 @@ func wslOutputTimeout(timeout time.Duration, args ...string) (string, error) {
 		}
 		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(decodeWSLOutput(out)), nil
+}
+
+// decodeWSLOutput converts WSL's UTF-16LE output (from wsl --list) to UTF-8.
+// If the output doesn't look like UTF-16LE, it's returned as-is.
+func decodeWSLOutput(b []byte) string {
+	// UTF-16LE BOM is FF FE; even without BOM, wsl --list outputs UTF-16LE
+	// which shows up as alternating bytes with nulls.
+	if len(b) >= 2 && b[0] == 0xFF && b[1] == 0xFE {
+		b = b[2:] // strip BOM
+	}
+	// Must be even length for UTF-16
+	if len(b)%2 != 0 {
+		return string(b)
+	}
+	// Quick check: if no null bytes, it's probably already UTF-8
+	hasNull := false
+	for i := 1; i < len(b); i += 2 {
+		if b[i] == 0 {
+			hasNull = true
+			break
+		}
+	}
+	if !hasNull {
+		return string(b)
+	}
+	u16 := make([]uint16, len(b)/2)
+	for i := range u16 {
+		u16[i] = uint16(b[2*i]) | uint16(b[2*i+1])<<8
+	}
+	return string(utf16.Decode(u16))
 }
 
 // killWSLService force-kills wslservice.exe to unstick a hung WSL.

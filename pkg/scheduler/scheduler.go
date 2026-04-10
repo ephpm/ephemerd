@@ -207,9 +207,32 @@ func (s *Scheduler) poll(ctx context.Context, events chan<- github.JobEvent) {
 	}
 }
 
+// canHandleJob returns false if the job's labels include an OS that doesn't
+// match the current platform. This prevents both the Windows and WSL schedulers
+// from trying to handle the same job — each only picks up jobs for its own OS.
+func (s *Scheduler) canHandleJob(jobLabels []string) bool {
+	for _, label := range jobLabels {
+		switch strings.ToLower(label) {
+		case "linux":
+			return goruntime.GOOS == "linux"
+		case "windows":
+			return goruntime.GOOS == "windows"
+		case "macos", "macosx":
+			return goruntime.GOOS == "darwin"
+		}
+	}
+	return true // no OS label → accept
+}
+
 func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	jobID := event.Job.GetID()
 	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo)
+
+	// Skip jobs whose OS labels don't match this platform
+	if labels := event.Job.Labels; len(labels) > 0 && !s.canHandleJob(labels) {
+		log.Debug("skipping job, OS labels don't match this platform", "labels", labels)
+		return
+	}
 
 	// Dedup: skip if we've already seen this job recently
 	s.mu.Lock()

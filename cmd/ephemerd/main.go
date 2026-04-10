@@ -114,7 +114,7 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	// Start container runtime.
 	// On Linux/Windows: embedded containerd runs in-process.
 	// On macOS: boot a Linux VM via Virtualization.framework, containerd runs inside it.
-	ctrdClient, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, configFile)
+	ctrdClient, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, configFile, cfg.GitHub.PrivateKeyPath)
 	if err != nil {
 		return fmt.Errorf("starting container runtime: %w", err)
 	}

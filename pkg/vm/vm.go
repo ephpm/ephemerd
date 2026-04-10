@@ -42,6 +42,10 @@ type LinuxVMConfig struct {
 	// ContainerdPort is the port containerd listens on inside the VM. Defaults to 10000.
 	ContainerdPort uint32
 
+	// PrivateKeyPath is the path to the GitHub App PEM file on the host.
+	// Copied into the VM so the inner ephemerd can authenticate independently.
+	PrivateKeyPath string
+
 	Log *slog.Logger
 }
 
