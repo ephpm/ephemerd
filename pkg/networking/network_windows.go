@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"github.com/Microsoft/hcsshim/hcn"
@@ -206,3 +207,5 @@ func (w *windowsNetworking) removeFirewallRules() {
 }
 
 func (w *windowsNetworking) cleanup() {}
+
+func cleanStaleBridge(_ *slog.Logger) {} // no-op on Windows (HCN, not CNI bridge)

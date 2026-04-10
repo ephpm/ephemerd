@@ -135,6 +135,12 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 			return fmt.Errorf("extracting CNI plugins: %w", err)
 		}
 
+		// Delete stale CNI bridge from a previous WSL boot. All WSL2 distros
+		// share one Linux kernel, so the bridge persists across distro instances.
+		// Without this, networking.New() picks a new random subnet that conflicts
+		// with the existing bridge's IP.
+		networking.CleanStaleBridge(log)
+
 		net, err := networking.New(networking.Config{
 			DataDir:   configDir,
 			Subnet:    cfg.Network.Subnet,

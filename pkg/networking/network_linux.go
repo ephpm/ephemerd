@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -112,6 +113,14 @@ func (l *linuxNetworking) cleanup() {
 	}
 
 	log.Info("networking cleaned up")
+}
+
+func cleanStaleBridge(log *slog.Logger) {
+	if err := exec.Command("ip", "link", "del", defaultBridgeName).Run(); err != nil {
+		log.Debug("no stale bridge to clean", "bridge", defaultBridgeName)
+	} else {
+		log.Info("deleted stale bridge", "bridge", defaultBridgeName)
+	}
 }
 
 func (l *linuxNetworking) writeConfig(path string) error {

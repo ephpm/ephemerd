@@ -4,6 +4,7 @@ package networking
 
 import (
 	"context"
+	"log/slog"
 )
 
 // darwinNetworking is a passthrough on macOS.
@@ -48,3 +49,5 @@ func (d *darwinNetworking) installFirewallRules() error {
 
 func (d *darwinNetworking) removeFirewallRules() {}
 func (d *darwinNetworking) cleanup()             {}
+
+func cleanStaleBridge(_ *slog.Logger) {} // no-op on macOS
