@@ -26,10 +26,6 @@ type LinuxVMConfig struct {
 	// DataDir is the ephemerd data directory. VM assets live under <DataDir>/vm/linux/.
 	DataDir string
 
-	// ConfigFile is the path to the host's config TOML file.
-	// Copied into the VM so the inner ephemerd has the same GitHub/runner config.
-	ConfigFile string
-
 	// CPUs is the number of virtual CPUs. Defaults to 2.
 	CPUs uint
 
@@ -41,10 +37,6 @@ type LinuxVMConfig struct {
 
 	// ContainerdPort is the port containerd listens on inside the VM. Defaults to 10000.
 	ContainerdPort uint32
-
-	// PrivateKeyPath is the path to the GitHub App PEM file on the host.
-	// Copied into the VM so the inner ephemerd can authenticate independently.
-	PrivateKeyPath string
 
 	Log *slog.Logger
 }
@@ -70,6 +62,10 @@ func (c *LinuxVMConfig) SetDefaults() {
 type LinuxVM interface {
 	// Client returns a containerd client connected to containerd inside the VM.
 	Client() *client.Client
+
+	// DispatchAddr returns the address of the dispatch gRPC server running
+	// inside the VM (e.g. "localhost:10001"). Empty if dispatch is unavailable.
+	DispatchAddr() string
 
 	// Stop gracefully shuts down the VM.
 	Stop()

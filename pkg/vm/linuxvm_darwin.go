@@ -52,6 +52,10 @@ func (l *darwinLinuxVM) Client() *client.Client {
 	return l.client
 }
 
+func (l *darwinLinuxVM) DispatchAddr() string {
+	return "" // macOS Linux VMs don't use the dispatch architecture
+}
+
 func (l *darwinLinuxVM) Stop() {
 	l.cfg.Log.Info("stopping Linux VM")
 

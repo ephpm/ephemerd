@@ -23,8 +23,9 @@ import (
 type Config struct {
 	Runtime         *runtime.Runtime
 	GitHub          *github.Client
-	Artifacts       *artifacts.Extractor // OCI image layer extractor for macOS VM jobs (nil if not available)
-	DataDir         string               // ephemerd data directory (used for artifact extraction paths)
+	Artifacts       *artifacts.Extractor  // OCI image layer extractor for macOS VM jobs (nil if not available)
+	LinuxDispatcher *DispatchClient       // if non-nil, Linux jobs are dispatched to this WSL worker via gRPC
+	DataDir         string                // ephemerd data directory (used for artifact extraction paths)
 	MaxConcurrent   int
 	Labels          []string
 	PollInterval    time.Duration // if >0, use polling mode (default)
@@ -59,6 +60,7 @@ type runningJob struct {
 	runnerID     int64
 	cancel       context.CancelFunc
 	artifactsDir string // non-empty if OCI artifacts were extracted for this job
+	dispatched   string // non-empty if dispatched to WSL worker (stores container name)
 	startedAt    time.Time
 }
 
@@ -207,14 +209,14 @@ func (s *Scheduler) poll(ctx context.Context, events chan<- github.JobEvent) {
 	}
 }
 
-// canHandleJob returns false if the job's labels include an OS that doesn't
-// match the current platform. This prevents both the Windows and WSL schedulers
-// from trying to handle the same job — each only picks up jobs for its own OS.
+// canHandleJob returns false if the job's labels include an OS that this
+// scheduler cannot handle. On Windows with a LinuxDispatcher, Linux jobs
+// are accepted and routed to the WSL worker via gRPC.
 func (s *Scheduler) canHandleJob(jobLabels []string) bool {
 	for _, label := range jobLabels {
 		switch strings.ToLower(label) {
 		case "linux":
-			return goruntime.GOOS == "linux"
+			return goruntime.GOOS == "linux" || s.cfg.LinuxDispatcher != nil
 		case "windows":
 			return goruntime.GOOS == "windows"
 		case "macos", "macosx":
@@ -222,6 +224,16 @@ func (s *Scheduler) canHandleJob(jobLabels []string) bool {
 		}
 	}
 	return true // no OS label → accept
+}
+
+// isLinuxJob returns true if the job's labels include "linux".
+func isLinuxJob(labels []string) bool {
+	for _, label := range labels {
+		if strings.ToLower(label) == "linux" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
@@ -254,6 +266,127 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 		return
 	}
 	s.mu.Unlock()
+
+	// Dispatch Linux jobs to the WSL worker if available
+	if s.cfg.LinuxDispatcher != nil && isLinuxJob(event.Job.Labels) {
+		s.handleLinuxJob(ctx, event)
+		return
+	}
+
+	s.handleLocalJob(ctx, event)
+}
+
+// handleLinuxJob dispatches a Linux job to the WSL worker via gRPC.
+// The Windows host registers the JIT runner (with Linux labels) and sends
+// Create/Wait/Destroy RPCs to the dispatch server running inside WSL.
+func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
+	jobID := event.Job.GetID()
+	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo, "dispatch", "linux")
+
+	unsee := func() {
+		s.mu.Lock()
+		delete(s.seen, jobID)
+		s.mu.Unlock()
+	}
+
+	// Acquire concurrency slot
+	select {
+	case s.sem <- struct{}{}:
+	case <-ctx.Done():
+		unsee()
+		return
+	}
+
+	log.Info("provisioning Linux runner via WSL dispatch")
+
+	image := s.cfg.GitHub.FetchJobImage(ctx, event.Repo, event.Job.GetRunID(), jobID)
+	if image != "" {
+		log.Info("using job-specified image", "image", image)
+	}
+
+	labels := buildLabelsForOS("linux", s.cfg.Labels)
+
+	const maxNameRetries = 3
+	name, jitConfig, err := s.registerRunner(ctx, event.Repo, labels, log, maxNameRetries)
+	if err != nil {
+		log.Error("failed to register JIT runner", "error", err)
+		unsee()
+		time.Sleep(5 * time.Second)
+		<-s.sem
+		return
+	}
+
+	encodedConfig := jitConfig.GetEncodedJITConfig()
+	runnerID := jitConfig.GetRunner().GetID()
+
+	var jobCtx context.Context
+	var cancel context.CancelFunc
+	if s.cfg.JobTimeout > 0 {
+		jobCtx, cancel = context.WithTimeout(ctx, s.cfg.JobTimeout)
+	} else {
+		jobCtx, cancel = context.WithCancel(ctx)
+	}
+
+	if err := s.cfg.LinuxDispatcher.Create(jobCtx, name, image, encodedConfig); err != nil {
+		log.Error("dispatch create failed", "error", err)
+		if rmErr := s.cfg.GitHub.RemoveRunner(ctx, event.Repo, runnerID); rmErr != nil {
+			log.Warn("failed to remove ghost runner", "runner_id", runnerID, "error", rmErr)
+		}
+		unsee()
+		cancel()
+		<-s.sem
+		return
+	}
+
+	// Track the dispatched job (env is nil — lifecycle managed by WSL worker)
+	s.mu.Lock()
+	s.running[jobID] = &runningJob{
+		repo:      event.Repo,
+		image:     image,
+		runnerID:  runnerID,
+		cancel:    cancel,
+		dispatched: name,
+		startedAt: time.Now(),
+	}
+	s.mu.Unlock()
+
+	log.Info("Linux runner dispatched to WSL", "name", name)
+
+	// Wait for the job to finish in the background
+	go func() {
+		defer func() { <-s.sem }()
+
+		exitCode, err := s.cfg.LinuxDispatcher.Wait(jobCtx, name)
+		if err != nil {
+			if jobCtx.Err() != nil {
+				log.Warn("dispatched runner killed (timeout or shutdown)", "error", err)
+			} else {
+				log.Error("dispatched runner wait failed", "error", err)
+			}
+		} else if exitCode != 0 {
+			log.Warn("dispatched runner exited with failure", "exit_code", exitCode)
+		} else {
+			log.Info("dispatched runner exited", "exit_code", exitCode)
+		}
+
+		// Always clean up
+		s.mu.Lock()
+		_, exists := s.running[jobID]
+		if exists {
+			delete(s.running, jobID)
+		}
+		s.mu.Unlock()
+
+		if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), name); err != nil {
+			log.Warn("dispatch destroy failed", "error", err)
+		}
+	}()
+}
+
+// handleLocalJob provisions a runner using the local containerd Runtime.
+func (s *Scheduler) handleLocalJob(ctx context.Context, event github.JobEvent) {
+	jobID := event.Job.GetID()
+	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo)
 
 	// On provisioning failure, remove from seen so the next poll retries
 	unsee := func() {
@@ -413,7 +546,13 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event github.JobEvent) 
 	)
 
 	job.cancel()
-	_ = s.cfg.Runtime.Destroy(context.Background(), job.env)
+	if job.dispatched != "" && s.cfg.LinuxDispatcher != nil {
+		if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), job.dispatched); err != nil {
+			log.Warn("failed to destroy dispatched runner", "error", err)
+		}
+	} else if job.env != nil {
+		_ = s.cfg.Runtime.Destroy(context.Background(), job.env)
+	}
 	if job.artifactsDir != "" {
 		artifacts.Cleanup(job.artifactsDir, s.cfg.Log)
 	}
@@ -472,7 +611,13 @@ func (s *Scheduler) destroyAll() {
 	for id, job := range jobs {
 		s.cfg.Log.Info("destroying runner on shutdown", "job_id", id)
 		job.cancel()
-		_ = s.cfg.Runtime.Destroy(context.Background(), job.env)
+		if job.dispatched != "" && s.cfg.LinuxDispatcher != nil {
+			if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), job.dispatched); err != nil {
+				s.cfg.Log.Warn("failed to destroy dispatched runner", "job_id", id, "error", err)
+			}
+		} else if job.env != nil {
+			_ = s.cfg.Runtime.Destroy(context.Background(), job.env)
+		}
 		if job.artifactsDir != "" {
 			artifacts.Cleanup(job.artifactsDir, s.cfg.Log)
 		}
@@ -517,17 +662,21 @@ func (s *Scheduler) cleanSeen() {
 }
 
 func (s *Scheduler) buildLabels() []string {
+	return buildLabelsForOS(goruntime.GOOS, s.cfg.Labels)
+}
+
+// buildLabelsForOS builds runner labels for a given target OS.
+// Used by the dispatcher to register Linux runners from the Windows host.
+func buildLabelsForOS(targetOS string, extraLabels []string) []string {
 	labels := []string{"self-hosted"}
 
-	// Add OS label
-	switch goruntime.GOOS {
+	switch targetOS {
 	case "windows":
 		labels = append(labels, "windows")
 	default:
 		labels = append(labels, "linux")
 	}
 
-	// Add arch label
 	switch goruntime.GOARCH {
 	case "arm64":
 		labels = append(labels, "arm64")
@@ -535,7 +684,7 @@ func (s *Scheduler) buildLabels() []string {
 		labels = append(labels, "x64")
 	}
 
-	labels = append(labels, s.cfg.Labels...)
+	labels = append(labels, extraLabels...)
 
 	return labels
 }

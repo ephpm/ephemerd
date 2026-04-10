@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -25,16 +24,16 @@ import (
 
 const wslCmdTimeout = 30 * time.Second
 
-const distroName = "ephemerd-linux"
-
 // wslLinuxVM runs ephemerd inside a WSL2 distro for Linux container jobs.
 type wslLinuxVM struct {
-	cfg        LinuxVMConfig
-	installDir string
-	client     *client.Client
-	cmd        *exec.Cmd
-	cancel     context.CancelFunc
-	done       chan struct{}
+	cfg          LinuxVMConfig
+	distroName   string // unique per-instance, e.g. "ephemerd-linux-a1b2c3d4"
+	installDir   string
+	client       *client.Client
+	dispatchAddr string // address of the dispatch gRPC server (e.g. "localhost:10001")
+	cmd          *exec.Cmd
+	cancel       context.CancelFunc
+	done         chan struct{}
 }
 
 // StartLinuxVM creates a WSL2 distro from an embedded Alpine rootfs,
@@ -45,6 +44,7 @@ func StartLinuxVM(cfg LinuxVMConfig) (LinuxVM, error) {
 
 	l := &wslLinuxVM{
 		cfg:        cfg,
+		distroName: generateDistroName("ephemerd-linux"),
 		installDir: filepath.Join(cfg.DataDir, "vm", "linux", "distro"),
 		done:       make(chan struct{}),
 	}
@@ -82,6 +82,10 @@ func (l *wslLinuxVM) Client() *client.Client {
 	return l.client
 }
 
+func (l *wslLinuxVM) DispatchAddr() string {
+	return l.dispatchAddr
+}
+
 func (l *wslLinuxVM) Stop() {
 	l.cfg.Log.Info("stopping Linux VM (WSL)")
 
@@ -107,10 +111,10 @@ func (l *wslLinuxVM) Stop() {
 // destroy terminates and unregisters the WSL distro.
 // Uses timeouts to avoid hanging if WSL service is stuck.
 func (l *wslLinuxVM) destroy() {
-	if err := wslExecTimeout(wslCmdTimeout, "--terminate", distroName); err != nil {
+	if err := wslExecTimeout(wslCmdTimeout, "--terminate", l.distroName); err != nil {
 		l.cfg.Log.Warn("wsl --terminate failed or timed out", "error", err)
 	}
-	if err := wslExecTimeout(wslCmdTimeout, "--unregister", distroName); err != nil {
+	if err := wslExecTimeout(wslCmdTimeout, "--unregister", l.distroName); err != nil {
 		l.cfg.Log.Warn("wsl --unregister failed or timed out", "error", err)
 	}
 }
@@ -131,14 +135,14 @@ func (l *wslLinuxVM) cleanupStaleDistro() {
 		}
 	}
 	for _, line := range strings.Split(out, "\n") {
-		if strings.TrimSpace(line) == distroName {
-			l.cfg.Log.Info("cleaning up stale WSL distro", "name", distroName)
-			if err := wslExecTimeout(wslCmdTimeout, "--terminate", distroName); err != nil {
+		name := strings.TrimSpace(line)
+		if strings.HasPrefix(name, "ephemerd-linux-") {
+			l.cfg.Log.Info("cleaning up stale WSL distro", "name", name)
+			if err := wslExecTimeout(wslCmdTimeout, "--terminate", name); err != nil {
 				l.cfg.Log.Warn("wsl --terminate timed out, killing wslservice", "error", err)
 				killWSLService(l.cfg.Log)
 			}
-			_ = wslExecTimeout(wslCmdTimeout, "--unregister", distroName)
-			return
+			_ = wslExecTimeout(wslCmdTimeout, "--unregister", name)
 		}
 	}
 }
@@ -150,8 +154,8 @@ func (l *wslLinuxVM) extractAssets() error {
 		return fmt.Errorf("creating vm directory: %w", err)
 	}
 
-	// Extract Alpine rootfs
-	rootfsName, err := findEmbedded("alpine-minirootfs-")
+	// Extract rootfs (pre-built with gcompat + iptables)
+	rootfsName, err := findEmbedded("ephemerd-rootfs-")
 	if err != nil {
 		return fmt.Errorf("finding rootfs: %w", err)
 	}
@@ -193,110 +197,64 @@ func findEmbedded(prefix string) (string, error) {
 
 // importDistro creates the WSL distro from the Alpine rootfs.
 func (l *wslLinuxVM) importDistro() error {
-	l.cfg.Log.Info("importing WSL distro", "name", distroName)
+	l.cfg.Log.Info("importing WSL distro", "name", l.distroName)
 
 	rootfsPath := filepath.Join(l.cfg.DataDir, "vm", "linux", "rootfs.tar.gz")
+
+	// Remove stale install directory (e.g. leftover ext4.vhdx from a previous distro).
+	// WSL --import fails with ERROR_FILE_EXISTS if the directory already contains data.
+	if err := os.RemoveAll(l.installDir); err != nil {
+		l.cfg.Log.Warn("failed to remove stale install dir", "path", l.installDir, "error", err)
+	}
 	if err := os.MkdirAll(l.installDir, 0o755); err != nil {
 		return fmt.Errorf("creating distro directory: %w", err)
 	}
 
-	return wslExec("--import", distroName, l.installDir, rootfsPath)
+	return wslExec("--import", l.distroName, l.installDir, rootfsPath)
 }
 
-// installEphemerd copies the Linux binary into the WSL distro via UNC path.
+// installEphemerd prepares the WSL distro for running ephemerd.
+// The binary itself is run directly from /mnt/c/ (the Windows filesystem)
+// to avoid the slow UNC copy over 9P. Only the data dir needs to be
+// created inside the distro; dependencies (gcompat, iptables) are
+// pre-installed in the rootfs at build time.
 func (l *wslLinuxVM) installEphemerd() error {
-	l.cfg.Log.Info("installing ephemerd in WSL distro")
+	l.cfg.Log.Info("preparing WSL distro for ephemerd")
 
-	// Create target directory inside the distro
-	if err := wslExec("-d", distroName, "--", "mkdir", "-p", "/opt/ephemerd"); err != nil {
-		return fmt.Errorf("creating /opt/ephemerd: %w", err)
-	}
-
-	// Copy binary via UNC path
-	src := filepath.Join(l.cfg.DataDir, "vm", "linux", "ephemerd-linux")
-	dst := fmt.Sprintf(`\\wsl$\%s\opt\ephemerd\ephemerd`, distroName)
-
-	srcData, err := os.ReadFile(src)
-	if err != nil {
-		return fmt.Errorf("reading ephemerd-linux: %w", err)
-	}
-	if err := os.WriteFile(dst, srcData, 0o755); err != nil {
-		return fmt.Errorf("writing to WSL UNC path: %w", err)
-	}
-
-	// Ensure executable
-	if err := wslExec("-d", distroName, "--", "chmod", "+x", "/opt/ephemerd/ephemerd"); err != nil {
-		return fmt.Errorf("chmod: %w", err)
-	}
-
-	// Ensure /var/lib/ephemerd exists for config and PEM
-	if err := wslExec("-d", distroName, "--", "mkdir", "-p", "/var/lib/ephemerd"); err != nil {
-		return fmt.Errorf("creating config dir: %w", err)
-	}
-
-	// Copy the GitHub App PEM file into the distro
-	if l.cfg.PrivateKeyPath != "" {
-		pemData, err := os.ReadFile(l.cfg.PrivateKeyPath)
-		if err != nil {
-			return fmt.Errorf("reading PEM file: %w", err)
-		}
-		pemDst := fmt.Sprintf(`\\wsl$\%s\var\lib\ephemerd\app.pem`, distroName)
-		if err := os.WriteFile(pemDst, pemData, 0o600); err != nil {
-			return fmt.Errorf("writing PEM to WSL: %w", err)
-		}
-		l.cfg.Log.Info("copied GitHub App PEM into WSL")
-	}
-
-	// Copy host config file into the distro so the inner ephemerd has GitHub/runner config
-	if l.cfg.ConfigFile != "" {
-		configData, err := os.ReadFile(l.cfg.ConfigFile)
-		if err != nil {
-			return fmt.Errorf("reading config file: %w", err)
-		}
-
-		// Rewrite the PEM path to the Linux-side location
-		if l.cfg.PrivateKeyPath != "" {
-			re := regexp.MustCompile(`(?m)^(\s*private_key_path\s*=\s*).*$`)
-			configData = re.ReplaceAll(configData, []byte(`${1}"/var/lib/ephemerd/app.pem"`))
-		}
-
-		configDst := fmt.Sprintf(`\\wsl$\%s\var\lib\ephemerd\config.toml`, distroName)
-		if err := os.WriteFile(configDst, configData, 0o644); err != nil {
-			return fmt.Errorf("writing config to WSL: %w", err)
-		}
-	}
-
-	// Install gcompat (glibc compat for containerd-shim-runc-v2) and iptables (for CNI/firewall).
-	// Done last because WSL networking may not be ready immediately after import.
-	// Retry with a timeout to handle transient DNS failures.
-	l.cfg.Log.Info("installing dependencies in WSL distro (gcompat, iptables)")
-	const apkTimeout = 2 * time.Minute
-	for attempt := range 3 {
-		if err := wslExecTimeout(apkTimeout, "-d", distroName, "--", "apk", "add", "--no-cache", "gcompat", "iptables"); err != nil {
-			l.cfg.Log.Warn("apk install attempt failed", "attempt", attempt+1, "error", err)
-			if attempt < 2 {
-				time.Sleep(3 * time.Second)
-				continue
-			}
-			return fmt.Errorf("installing dependencies: %w", err)
-		}
-		break
+	// Ensure /var/lib/ephemerd exists for containerd state
+	if err := wslExec("-d", l.distroName, "--", "mkdir", "-p", "/var/lib/ephemerd"); err != nil {
+		return fmt.Errorf("creating data dir: %w", err)
 	}
 
 	return nil
 }
 
+// wslBinaryPath returns the /mnt/ path to the extracted Linux binary,
+// accessible from inside WSL without copying it into the distro.
+// e.g. C:\ProgramData\ephemerd\vm\linux\ephemerd-linux → /mnt/c/ProgramData/ephemerd/vm/linux/ephemerd-linux
+func (l *wslLinuxVM) wslBinaryPath() string {
+	winPath := filepath.Join(l.cfg.DataDir, "vm", "linux", "ephemerd-linux")
+	// Convert C:\foo\bar → /mnt/c/foo/bar
+	drive := strings.ToLower(string(winPath[0]))
+	rest := filepath.ToSlash(winPath[2:]) // skip "C:"
+	return "/mnt/" + drive + rest
+}
+
 // launch starts ephemerd inside the WSL distro.
+// The binary runs directly from /mnt/c/ (the Windows filesystem) — no copy needed.
+// It loads into memory on exec and runs at native speed from there.
 func (l *wslLinuxVM) launch() error {
-	l.cfg.Log.Info("launching ephemerd in WSL", "port", l.cfg.ContainerdPort)
+	binPath := l.wslBinaryPath()
+	l.cfg.Log.Info("launching ephemerd in WSL", "binary", binPath, "port", l.cfg.ContainerdPort)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	l.cancel = cancel
 
-	l.cmd = exec.CommandContext(ctx, "wsl", "-d", distroName, "--",
-		"/opt/ephemerd/ephemerd", "serve",
+	l.cmd = exec.CommandContext(ctx, "wsl", "-d", l.distroName, "--",
+		binPath, "serve",
 		"--data-dir", "/var/lib/ephemerd",
 		"--containerd-tcp-port", fmt.Sprintf("%d", l.cfg.ContainerdPort),
+		"--containerd-only",
 	)
 
 	// Pipe stdout/stderr to our logger
@@ -344,7 +302,8 @@ func (l *wslLinuxVM) launch() error {
 	return nil
 }
 
-// waitForContainerd polls the TCP port until containerd responds.
+// waitForContainerd polls the TCP port until containerd responds,
+// then waits for the dispatch gRPC server on the next port.
 func (l *wslLinuxVM) waitForContainerd() error {
 	addr := fmt.Sprintf("localhost:%d", l.cfg.ContainerdPort)
 	l.cfg.Log.Info("waiting for containerd in WSL", "address", addr)
@@ -395,13 +354,43 @@ func (l *wslLinuxVM) waitForContainerd() error {
 		cancel()
 		if err == nil {
 			l.cfg.Log.Info("containerd ready in WSL", "address", addr)
-			return nil
+			break
 		}
 		lastErr = err
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	return fmt.Errorf("timed out waiting for containerd at %s: %w", addr, lastErr)
+	if l.client == nil {
+		return fmt.Errorf("timed out waiting for containerd at %s: %w", addr, lastErr)
+	}
+
+	// Wait for the dispatch gRPC server on containerdPort + 1
+	dispatchAddr := fmt.Sprintf("localhost:%d", l.cfg.ContainerdPort+1)
+	l.cfg.Log.Info("waiting for dispatch server in WSL", "address", dispatchAddr)
+
+	for i := range 30 {
+		select {
+		case <-l.done:
+			return fmt.Errorf("WSL ephemerd exited before dispatch server was ready")
+		default:
+		}
+
+		conn, err := net.DialTimeout("tcp", dispatchAddr, 2*time.Second)
+		if err != nil {
+			if i%10 == 0 && i > 0 {
+				l.cfg.Log.Debug("still waiting for dispatch server in WSL", "attempt", i)
+			}
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		conn.Close()
+
+		l.dispatchAddr = dispatchAddr
+		l.cfg.Log.Info("dispatch server ready in WSL", "address", dispatchAddr)
+		return nil
+	}
+
+	return fmt.Errorf("timed out waiting for dispatch server at %s", dispatchAddr)
 }
 
 func wslExec(args ...string) error {

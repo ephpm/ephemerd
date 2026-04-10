@@ -114,7 +114,7 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	// Start container runtime.
 	// On Linux/Windows: embedded containerd runs in-process.
 	// On macOS: boot a Linux VM via Virtualization.framework, containerd runs inside it.
-	ctrdClient, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, configFile, cfg.GitHub.PrivateKeyPath)
+	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort)
 	if err != nil {
 		return fmt.Errorf("starting container runtime: %w", err)
 	}
@@ -122,10 +122,54 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 
 	log.Info("container runtime ready")
 
-	// In containerd-only mode, just keep containerd running until shutdown.
-	// Used by the WSL Linux VM — the Windows host handles scheduling.
+	// In containerd-only mode, run containerd + dispatch worker (no scheduler).
+	// Used by the WSL Linux VM — the Windows host dispatches jobs via gRPC.
 	if containerdOnly {
-		log.Info("containerd-only mode, waiting for shutdown signal")
+		rm := runner.New(configDir, log)
+		if err := rm.Extract(); err != nil {
+			return fmt.Errorf("extracting runner: %w", err)
+		}
+
+		cm := cni.New(configDir, log)
+		if err := cm.Extract(); err != nil {
+			return fmt.Errorf("extracting CNI plugins: %w", err)
+		}
+
+		net, err := networking.New(networking.Config{
+			DataDir:   configDir,
+			Subnet:    cfg.Network.Subnet,
+			MTU:       cfg.Network.MTU,
+			CNIBinDir: cm.Dir(),
+			Log:       log,
+		})
+		if err != nil {
+			return fmt.Errorf("initializing networking: %w", err)
+		}
+		if err := net.InstallFirewallRules(); err != nil {
+			log.Warn("failed to install firewall rules", "error", err)
+		}
+		defer net.Cleanup()
+
+		rt, err := runtime.New(runtime.Config{
+			Client:      ctrdClient,
+			RunnerDir:   rm.Dir(),
+			RunnerMount: rm.ContainerDir(),
+			LogDir:      joinPath(configDir, "logs"),
+			Network:     net,
+			Log:         log,
+		})
+		if err != nil {
+			return fmt.Errorf("creating runtime: %w", err)
+		}
+		if err := rt.CleanOrphans(ctx); err != nil {
+			log.Warn("failed to clean orphan containers", "error", err)
+		}
+
+		dispatchPort := int(containerdTCPPort) + 1
+		dispatchCleanup := scheduler.StartDispatchServer(dispatchPort, rt, log)
+		defer dispatchCleanup()
+
+		log.Info("worker mode ready", "containerd_port", containerdTCPPort, "dispatch_port", dispatchPort)
 		<-ctx.Done()
 		return nil
 	}
@@ -209,11 +253,20 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	// into the shared data directory (available inside macOS VMs via virtio-fs).
 	artifactExtractor := artifacts.NewExtractor(ctrdClient, log)
 
+	// Wait for Linux dispatch client if WSL VM is booting in the background.
+	// All setup above (runner, CNI, networking, GitHub) runs in parallel with
+	// the WSL boot, so this typically doesn't add much delay.
+	linuxDispatcher := waitDispatch()
+	if linuxDispatcher != nil {
+		log.Info("Linux job dispatch enabled via WSL")
+	}
+
 	// Start scheduler (ties GitHub jobs to container lifecycle)
 	sched := scheduler.New(scheduler.Config{
 		Runtime:         rt,
 		GitHub:          gh,
 		Artifacts:       artifactExtractor,
+		LinuxDispatcher: linuxDispatcher,
 		DataDir:         configDir,
 		MaxConcurrent:   cfg.Runner.MaxConcurrent,
 		Labels:          cfg.Runner.ExtraLabels,
