@@ -150,7 +150,7 @@ func Rootfs() error {
 		oldFiles, _ := filepath.Glob(filepath.Join(vmEmbedDir, pattern))
 		for _, f := range oldFiles {
 			fmt.Printf("  Removing old rootfs: %s\n", f)
-			os.Remove(f)
+			_ = os.Remove(f)
 		}
 	}
 
@@ -183,7 +183,7 @@ func Rootfs() error {
 	}
 	defer func() {
 		if err != nil {
-			os.Remove(dest)
+			_ = os.Remove(dest)
 		}
 	}()
 
@@ -203,14 +203,14 @@ func Rootfs() error {
 			break
 		}
 		if terr != nil {
-			baseGz.Close()
+			_ = baseGz.Close()
 			_ = tw.Close()
 			_ = gw.Close()
 			_ = f.Close()
 			return fmt.Errorf("reading base rootfs tar: %w", terr)
 		}
 		if terr = tw.WriteHeader(hdr); terr != nil {
-			baseGz.Close()
+			_ = baseGz.Close()
 			_ = tw.Close()
 			_ = gw.Close()
 			_ = f.Close()
@@ -218,7 +218,7 @@ func Rootfs() error {
 		}
 		if hdr.Size > 0 {
 			if _, terr = io.Copy(tw, baseTr); terr != nil {
-				baseGz.Close()
+				_ = baseGz.Close()
 				_ = tw.Close()
 				_ = gw.Close()
 				_ = f.Close()
@@ -226,7 +226,7 @@ func Rootfs() error {
 			}
 		}
 	}
-	baseGz.Close()
+	_ = baseGz.Close()
 
 	// Append files from each APK package
 	for i, data := range pkgData {
@@ -265,7 +265,7 @@ func appendAPKFiles(tw *tar.Writer, apkData []byte) error {
 	if err != nil {
 		return fmt.Errorf("reading apk gzip: %w", err)
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }()
 	gz.Multistream(false)
 
 	for {

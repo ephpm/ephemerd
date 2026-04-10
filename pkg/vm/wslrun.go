@@ -13,8 +13,8 @@ import (
 // Each concurrent "ephemerd run" gets its own distro with a unique name.
 type RunDistro struct {
 	Name    string
-	dataDir string
-	log     *slog.Logger
+	dataDir string //nolint:unused // used on Windows
+	log     *slog.Logger //nolint:unused // used on Windows
 }
 
 // RunDistroConfig configures the creation of a new RunDistro.
