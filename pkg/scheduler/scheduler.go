@@ -16,6 +16,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/github"
 	"github.com/ephpm/ephemerd/pkg/names"
 	"github.com/ephpm/ephemerd/pkg/runtime"
+	"github.com/ephpm/ephemerd/pkg/tunnel"
 	gh "github.com/google/go-github/v72/github"
 )
 
@@ -29,10 +30,11 @@ type Config struct {
 	MaxConcurrent   int
 	Labels          []string
 	PollInterval    time.Duration // if >0, use polling mode (default)
-	WebhookPort     int           // webhook mode: listen port
-	WebhookSecret   string        // webhook mode: signature secret
-	TLSCert         string        // webhook mode: TLS certificate
-	TLSKey          string        // webhook mode: TLS private key
+	WebhookPort     int           // listen port for health/webhook server
+	WebhookSecret   string        // webhook signature secret
+	TLSCert         string        // TLS certificate path
+	TLSKey          string        // TLS private key path
+	Tunnel          tunnel.Provider // if non-nil, creates a public tunnel for webhooks
 	JobTimeout      time.Duration
 	ShutdownTimeout time.Duration
 	Log             *slog.Logger
@@ -120,23 +122,46 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		Handler: mux,
 	}
 
-	go func() {
-		if useTLS {
+	// Start HTTP server: via tunnel, TLS, or plain HTTP
+	if s.cfg.Tunnel != nil && useWebhook {
+		ln, err := s.cfg.Tunnel.Listen(ctx)
+		if err != nil {
+			return fmt.Errorf("starting webhook tunnel: %w", err)
+		}
+		webhookURL := s.cfg.Tunnel.PublicURL() + "/webhook"
+		s.cfg.Log.Info("webhook tunnel ready", "url", webhookURL)
+
+		// Register webhooks with GitHub automatically
+		hooks, err := s.cfg.GitHub.RegisterWebhooks(ctx, webhookURL, s.cfg.WebhookSecret)
+		if err != nil {
+			return fmt.Errorf("registering webhooks: %w", err)
+		}
+		defer s.cfg.GitHub.DeregisterWebhooks(context.Background(), hooks)
+
+		go func() {
+			if err := server.Serve(ln); err != http.ErrServerClosed {
+				s.cfg.Log.Error("webhook server error", "error", err)
+			}
+		}()
+	} else if useTLS {
+		go func() {
 			s.cfg.Log.Info("webhook server listening (TLS)", "port", s.cfg.WebhookPort)
 			if err := server.ListenAndServeTLS(s.cfg.TLSCert, s.cfg.TLSKey); err != http.ErrServerClosed {
 				s.cfg.Log.Error("webhook server error", "error", err)
 			}
-		} else {
+		}()
+	} else {
+		go func() {
 			if useWebhook {
-				s.cfg.Log.Info("webhook server listening (HTTP, use TLS termination proxy for production)", "port", s.cfg.WebhookPort)
+				s.cfg.Log.Info("webhook server listening (HTTP)", "port", s.cfg.WebhookPort)
 			} else {
 				s.cfg.Log.Info("health server listening", "port", s.cfg.WebhookPort)
 			}
 			if err := server.ListenAndServe(); err != http.ErrServerClosed {
 				s.cfg.Log.Error("server error", "error", err)
 			}
-		}
-	}()
+		}()
+	}
 	defer func() { _ = server.Shutdown(context.Background()) }()
 
 	if !useWebhook {

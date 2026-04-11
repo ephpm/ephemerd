@@ -1,0 +1,6 @@
+# Copy to terraform.tfvars and fill in your values.
+
+linode_token    = "your-linode-api-token"
+tunnel_domain   = "tunnels.example.com"
+region          = "us-mia"
+authorized_keys = ["ssh-ed25519 AAAA... you@host"]

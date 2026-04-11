@@ -11,11 +11,23 @@ import (
 
 type Config struct {
 	GitHub     GitHubConfig     `toml:"github"`
+	Webhook    WebhookConfig    `toml:"webhook"`
 	Containerd ContainerdConfig `toml:"containerd"`
 	Network    NetworkConfig    `toml:"network"`
 	VM         VMConfig         `toml:"vm"`
 	Runner     RunnerConfig     `toml:"runner"`
 	Log        LogConfig        `toml:"log"`
+}
+
+// WebhookConfig configures webhook delivery and tunnel providers.
+type WebhookConfig struct {
+	Secret        string `toml:"secret"`          // webhook signature secret
+	Port          int    `toml:"port"`            // listen port (default 8080)
+	TLSCert       string `toml:"tls_cert"`        // TLS certificate path
+	TLSKey        string `toml:"tls_key"`         // TLS private key path
+	Tunnel        string `toml:"tunnel"`          // tunnel provider: "ngrok", "localtunnel", or "" (none)
+	TunnelURL     string `toml:"tunnel_url"`      // localtunnel: self-hosted server URL
+	NgrokAuthtoken string `toml:"ngrok_authtoken"` // ngrok auth token (or use NGROK_AUTHTOKEN env)
 }
 
 // NetworkConfig configures container networking.
@@ -53,21 +65,17 @@ type MacOSVMToml struct {
 
 type GitHubConfig struct {
 	// Authentication: either a PAT or GitHub App
-	Token            string `toml:"token"`
-	AppID            int64  `toml:"app_id"`
-	InstallationID   int64  `toml:"installation_id"`
-	PrivateKeyPath   string `toml:"private_key_path"`
+	Token          string `toml:"token"`
+	AppID          int64  `toml:"app_id"`
+	InstallationID int64  `toml:"installation_id"`
+	PrivateKeyPath string `toml:"private_key_path"`
 
 	// Which org/user and repos to register runners for
 	Owner string   `toml:"owner"`
 	Repos []string `toml:"repos"`
 
-	// Job discovery: polling (default) or webhook
-	PollInterval  string `toml:"poll_interval"`  // polling interval (default "10s", set to "0" to disable)
-	WebhookPort   int    `toml:"webhook_port"`
-	WebhookSecret string `toml:"webhook_secret"`
-	TLSCert       string `toml:"tls_cert"` // path to TLS certificate, enables webhook mode
-	TLSKey        string `toml:"tls_key"`  // path to TLS private key
+	// Job discovery: polling interval (default "10s")
+	PollInterval string `toml:"poll_interval"`
 }
 
 type RunnerConfig struct {
@@ -120,8 +128,8 @@ func Load(path string) (*Config, error) {
 			JobTimeout:      "2h",
 			ShutdownTimeout: "5m",
 		},
-		GitHub: GitHubConfig{
-			WebhookPort: 8080,
+		Webhook: WebhookConfig{
+			Port: 8080,
 		},
 		Log: LogConfig{
 			Level:  "info",
