@@ -36,9 +36,9 @@ const (
 func All() {
 	switch runtime.GOOS {
 	case "windows":
-		mg.Deps(Runner, CNI, Shim)
+		mg.Deps(Runner, Cni, Shim)
 	default:
-		mg.Deps(Runner, CNI, Shim)
+		mg.Deps(Runner, Cni, Shim)
 	}
 }
 
@@ -55,24 +55,24 @@ func Runner() error {
 	return downloadFile(url, dest)
 }
 
-// RunnerLinux always downloads the Linux x64 runner (for embedding in Windows builds).
-func RunnerLinux() error {
+// Runnerlinux always downloads the Linux x64 runner (for embedding in Windows builds).
+func Runnerlinux() error {
 	filename := fmt.Sprintf("actions-runner-linux-x64-%s.tar.gz", RunnerVersion)
 	dest := filepath.Join(runnerEmbedDir, filename)
 	url := fmt.Sprintf("https://github.com/actions/runner/releases/download/v%s/%s", RunnerVersion, filename)
 	return downloadFile(url, dest)
 }
 
-// RunnerWindows always downloads the Windows x64 runner.
-func RunnerWindows() error {
+// Runnerwindows always downloads the Windows x64 runner.
+func Runnerwindows() error {
 	filename := fmt.Sprintf("actions-runner-win-x64-%s.zip", RunnerVersion)
 	dest := filepath.Join(runnerEmbedDir, filename)
 	url := fmt.Sprintf("https://github.com/actions/runner/releases/download/v%s/%s", RunnerVersion, filename)
 	return downloadFile(url, dest)
 }
 
-// CNI downloads the CNI plugins tarball (Linux only, no-op on other OS).
-func CNI() error {
+// Cni downloads the CNI plugins tarball (Linux only, no-op on other OS).
+func Cni() error {
 	if runtime.GOOS != "linux" {
 		fmt.Println("Skipping CNI download (not on Linux)")
 		return nil
@@ -84,8 +84,8 @@ func CNI() error {
 	return downloadFile(url, dest)
 }
 
-// CNILinux always downloads the Linux amd64 CNI plugins (for cross-compile embed).
-func CNILinux() error {
+// Cnilinux always downloads the Linux amd64 CNI plugins (for cross-compile embed).
+func Cnilinux() error {
 	filename := fmt.Sprintf("cni-plugins-linux-amd64-v%s.tgz", CNIVersion)
 	dest := filepath.Join(cniEmbedDir, filename)
 	url := fmt.Sprintf("https://github.com/containernetworking/plugins/releases/download/v%s/%s", CNIVersion, filename)
@@ -104,8 +104,8 @@ func Shim() error {
 	return downloadRunc()
 }
 
-// ShimLinux always downloads the Linux amd64 shim + runc (for cross-compile embed).
-func ShimLinux() error {
+// Shimlinux always downloads the Linux amd64 shim + runc (for cross-compile embed).
+func Shimlinux() error {
 	if err := downloadShimForArch("amd64"); err != nil {
 		return err
 	}
@@ -258,8 +258,8 @@ func Rootfs() error {
 	return nil
 }
 
-// GolangCILint downloads golangci-lint to ./bin/.
-func GolangCILint() error {
+// Golangcilint downloads golangci-lint to ./bin/.
+func Golangcilint() error {
 	goos := runtime.GOOS
 	goarch := runtime.GOARCH
 

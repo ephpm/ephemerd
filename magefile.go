@@ -28,7 +28,7 @@ func Test() error {
 
 // Lint runs golangci-lint (downloads linter and embedded deps first if needed).
 func Lint() error {
-	mg.Deps(download.GolangCILint, download.All)
+	mg.Deps(download.Golangcilint, download.All)
 	lint := filepath.Join("bin", "golangci-lint")
 	if runtime.GOOS == "windows" {
 		lint += ".exe"
@@ -37,12 +37,12 @@ func Lint() error {
 }
 
 // E2E runs unprivileged e2e tests (tunnel webhook round-trip). Requires GITHUB_TOKEN.
-func E2E() error {
+func E2e() error {
 	return sh.RunV("go", "test", "-tags", "e2e", "-v", "-timeout", "2m", "./test/e2e/...")
 }
 
 // E2EAll runs all e2e tests including privileged ones (requires root + containerd).
-func E2EAll() error {
+func E2eall() error {
 	mg.Deps(download.All)
 	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "5m", "./test/e2e/...")
 }
