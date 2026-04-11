@@ -102,8 +102,8 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
 
-	// Determine job discovery mode: webhook if secret is set, polling otherwise
-	useWebhook := s.cfg.WebhookSecret != ""
+	// Determine job discovery mode: webhook if tunnel or secret is set, polling otherwise
+	useWebhook := s.cfg.Tunnel != nil || s.cfg.WebhookSecret != ""
 	useTLS := s.cfg.TLSCert != "" && s.cfg.TLSKey != ""
 
 	if useWebhook {

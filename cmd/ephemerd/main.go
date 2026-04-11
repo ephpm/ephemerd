@@ -268,15 +268,17 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		log.Info("Linux job dispatch enabled via WSL")
 	}
 
-	// Set up webhook tunnel if configured
+	// Set up webhook tunnel (default: localtunnel, set tunnel = "none" for polling)
 	var tunnelProvider tunnel.Provider
-	if cfg.Webhook.Tunnel != "" {
+	if cfg.Webhook.Tunnel != "none" {
 		var err error
 		tunnelProvider, err = tunnel.New(cfg.Webhook.Tunnel, cfg.Webhook.NgrokAuthtoken, cfg.Webhook.TunnelURL)
 		if err != nil {
 			return fmt.Errorf("creating tunnel provider: %w", err)
 		}
 		log.Info("webhook tunnel configured", "provider", cfg.Webhook.Tunnel)
+	} else {
+		log.Info("polling mode enabled (tunnel disabled)")
 	}
 
 	// Start scheduler (ties GitHub jobs to container lifecycle)

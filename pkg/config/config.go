@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -20,13 +22,15 @@ type Config struct {
 }
 
 // WebhookConfig configures webhook delivery and tunnel providers.
+// By default, ephemerd uses localtunnel for instant webhook delivery.
+// Set tunnel = "none" to fall back to polling.
 type WebhookConfig struct {
-	Secret        string `toml:"secret"`          // webhook signature secret
-	Port          int    `toml:"port"`            // listen port (default 8080)
-	TLSCert       string `toml:"tls_cert"`        // TLS certificate path
-	TLSKey        string `toml:"tls_key"`         // TLS private key path
-	Tunnel        string `toml:"tunnel"`          // tunnel provider: "ngrok", "localtunnel", or "" (none)
-	TunnelURL     string `toml:"tunnel_url"`      // localtunnel: self-hosted server URL
+	Secret         string `toml:"secret"`          // webhook HMAC secret (auto-generated if empty)
+	Port           int    `toml:"port"`            // listen port for health endpoint (default 8080)
+	TLSCert        string `toml:"tls_cert"`        // TLS certificate path (direct TLS, no tunnel)
+	TLSKey         string `toml:"tls_key"`         // TLS private key path
+	Tunnel         string `toml:"tunnel"`          // "localtunnel" (default), "ngrok", or "none" (polling)
+	TunnelURL      string `toml:"tunnel_url"`      // localtunnel: self-hosted server URL
 	NgrokAuthtoken string `toml:"ngrok_authtoken"` // ngrok auth token (or use NGROK_AUTHTOKEN env)
 }
 
@@ -129,7 +133,8 @@ func Load(path string) (*Config, error) {
 			ShutdownTimeout: "5m",
 		},
 		Webhook: WebhookConfig{
-			Port: 8080,
+			Port:   8080,
+			Tunnel: "localtunnel",
 		},
 		Log: LogConfig{
 			Level:  "info",
@@ -178,6 +183,16 @@ func (c *Config) validate() error {
 		return fmt.Errorf("github.owner is required")
 	}
 	// repos is optional — if empty, ephemerd registers org-level runners
+
+	// Generate a random webhook secret if not explicitly set and tunnel is active
+	if c.Webhook.Secret == "" && c.Webhook.Tunnel != "none" {
+		b := make([]byte, 32)
+		if _, err := rand.Read(b); err != nil {
+			return fmt.Errorf("generating webhook secret: %w", err)
+		}
+		c.Webhook.Secret = hex.EncodeToString(b)
+	}
+
 	return nil
 }
 
