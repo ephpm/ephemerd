@@ -26,6 +26,25 @@ jobs:
       - name: CI (download, lint, test, build)
         run: mage ci
 
+  e2e-tunnel:
+    name: Tunnel E2E
+    needs: ci
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install mage
+        run: go install github.com/magefile/mage@latest
+
+      - name: Tunnel webhook round-trip
+        env:
+          GITHUB_TOKEN: ${{ secrets.WEBHOOK_TEST_TOKEN }}
+        run: mage e2e
+
   # build-matrix:
   #   name: Build
   #   runs-on: [self-hosted, linux, x64]

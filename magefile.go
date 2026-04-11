@@ -36,6 +36,17 @@ func Lint() error {
 	return sh.RunV(lint, "run", "./...")
 }
 
+// E2E runs unprivileged e2e tests (tunnel webhook round-trip). Requires GITHUB_TOKEN.
+func E2E() error {
+	return sh.RunV("go", "test", "-tags", "e2e", "-v", "-timeout", "2m", "./test/e2e/...")
+}
+
+// E2EAll runs all e2e tests including privileged ones (requires root + containerd).
+func E2EAll() error {
+	mg.Deps(download.All)
+	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "5m", "./test/e2e/...")
+}
+
 // CI runs download, lint, test, and build.
 func CI() {
 	mg.SerialDeps(Lint, Test, build.Build)

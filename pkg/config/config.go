@@ -159,8 +159,12 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) validate() error {
+	// Fall back to GITHUB_TOKEN env var if no token is configured
+	if c.GitHub.Token == "" {
+		c.GitHub.Token = os.Getenv("GITHUB_TOKEN")
+	}
 	if c.GitHub.Token == "" && c.GitHub.AppID == 0 {
-		return fmt.Errorf("github.token or github.app_id is required")
+		return fmt.Errorf("github.token or github.app_id is required (or set GITHUB_TOKEN env var)")
 	}
 	if c.GitHub.AppID != 0 {
 		if c.GitHub.InstallationID == 0 {

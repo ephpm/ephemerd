@@ -70,6 +70,16 @@ func (c *Client) DeregisterWebhooks(ctx context.Context, hooks []ManagedWebhook)
 	}
 }
 
+// PingWebhook triggers a ping event for a managed webhook.
+func (c *Client) PingWebhook(ctx context.Context, m ManagedWebhook) error {
+	if m.Repo == "" {
+		_, err := c.client.Organizations.PingHook(ctx, c.cfg.Owner, m.HookID)
+		return err
+	}
+	_, err := c.client.Repositories.PingHook(ctx, c.cfg.Owner, m.Repo, m.HookID)
+	return err
+}
+
 func (c *Client) deleteWebhook(ctx context.Context, m ManagedWebhook) error {
 	if m.Repo == "" {
 		_, err := c.client.Organizations.DeleteHook(ctx, c.cfg.Owner, m.HookID)
