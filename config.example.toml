@@ -15,18 +15,26 @@ owner = "your-org"
 # If omitted, registers org-level runners available to all repos in the org.
 # repos = ["repo1", "repo2"]
 
-# Job discovery: polling (default) or webhook
-# Polling checks the GitHub API every interval — no inbound ports or certs needed.
-# Set webhook_secret to enable webhook mode instead (instant delivery, no API polling).
-poll_interval = "10s"
+[webhook]
+# By default, ephemerd uses localtunnel to receive webhooks instantly.
+# The webhook secret is auto-generated each run. No config needed.
 
-# Webhook mode (optional): set webhook_secret to enable.
-# Works behind a TLS termination proxy like ngrok (plain HTTP).
-# Set tls_cert + tls_key for direct TLS without a proxy.
-# webhook_port = 8080
-# webhook_secret = "your_webhook_secret"
+# To use ngrok instead (more reliable, requires free account):
+# tunnel = "ngrok"
+# ngrok_authtoken = "your_ngrok_token"   # or set NGROK_AUTHTOKEN env var
+
+# To use a self-hosted localtunnel server:
+# tunnel_url = "http://tunnels.example.com"
+
+# To disable tunnels and fall back to polling (checks GitHub API every 10s):
+# tunnel = "none"
+
+# To use direct TLS instead of a tunnel (VPS with a public IP):
+# tunnel = "none"
 # tls_cert = "/etc/ephemerd/tls.crt"
 # tls_key = "/etc/ephemerd/tls.key"
+# secret = "your_webhook_secret"   # must be stable when not using a tunnel
+# port = 8080
 
 [network]
 # Container subnet. Ephemerd auto-picks a free subnet if this conflicts with

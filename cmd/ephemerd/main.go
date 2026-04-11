@@ -17,6 +17,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/runner"
 	"github.com/ephpm/ephemerd/pkg/runtime"
 	"github.com/ephpm/ephemerd/pkg/scheduler"
+	"github.com/ephpm/ephemerd/pkg/tunnel"
 	"github.com/urfave/cli/v3"
 )
 
@@ -267,6 +268,19 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		log.Info("Linux job dispatch enabled via WSL")
 	}
 
+	// Set up webhook tunnel (default: localtunnel, set tunnel = "none" for polling)
+	var tunnelProvider tunnel.Provider
+	if cfg.Webhook.Tunnel != "none" {
+		var err error
+		tunnelProvider, err = tunnel.New(cfg.Webhook.Tunnel, cfg.Webhook.NgrokAuthtoken, cfg.Webhook.TunnelURL)
+		if err != nil {
+			return fmt.Errorf("creating tunnel provider: %w", err)
+		}
+		log.Info("webhook tunnel configured", "provider", cfg.Webhook.Tunnel)
+	} else {
+		log.Info("polling mode enabled (tunnel disabled)")
+	}
+
 	// Start scheduler (ties GitHub jobs to container lifecycle)
 	sched := scheduler.New(scheduler.Config{
 		Runtime:         rt,
@@ -277,10 +291,11 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		MaxConcurrent:   cfg.Runner.MaxConcurrent,
 		Labels:          cfg.Runner.ExtraLabels,
 		PollInterval:    cfg.GitHub.ParsedPollInterval(),
-		WebhookPort:     cfg.GitHub.WebhookPort,
-		WebhookSecret:   cfg.GitHub.WebhookSecret,
-		TLSCert:         cfg.GitHub.TLSCert,
-		TLSKey:          cfg.GitHub.TLSKey,
+		WebhookPort:     cfg.Webhook.Port,
+		WebhookSecret:   cfg.Webhook.Secret,
+		TLSCert:         cfg.Webhook.TLSCert,
+		TLSKey:          cfg.Webhook.TLSKey,
+		Tunnel:          tunnelProvider,
 		JobTimeout:      cfg.Runner.ParsedJobTimeout(),
 		ShutdownTimeout: cfg.Runner.ParsedShutdownTimeout(),
 		Log:             log,

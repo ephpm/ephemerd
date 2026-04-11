@@ -356,11 +356,13 @@ func configCheckCmd() *cli.Command {
 			fmt.Printf("  Poll interval:   %s\n", cfg.GitHub.PollInterval)
 			fmt.Printf("  Log level:       %s\n", cfg.Log.Level)
 
-			if cfg.GitHub.TLSCert != "" {
-				fmt.Printf("  Mode:            webhook (TLS)\n")
-				fmt.Printf("  Webhook port:    %d\n", cfg.GitHub.WebhookPort)
-			} else {
+			if cfg.Webhook.Tunnel == "none" {
 				fmt.Printf("  Mode:            polling\n")
+			} else if cfg.Webhook.TLSCert != "" {
+				fmt.Printf("  Mode:            webhook (TLS)\n")
+				fmt.Printf("  Webhook port:    %d\n", cfg.Webhook.Port)
+			} else {
+				fmt.Printf("  Mode:            webhook (tunnel: %s)\n", cfg.Webhook.Tunnel)
 			}
 
 			if cfg.GitHub.Token != "" {

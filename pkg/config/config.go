@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -11,11 +13,25 @@ import (
 
 type Config struct {
 	GitHub     GitHubConfig     `toml:"github"`
+	Webhook    WebhookConfig    `toml:"webhook"`
 	Containerd ContainerdConfig `toml:"containerd"`
 	Network    NetworkConfig    `toml:"network"`
 	VM         VMConfig         `toml:"vm"`
 	Runner     RunnerConfig     `toml:"runner"`
 	Log        LogConfig        `toml:"log"`
+}
+
+// WebhookConfig configures webhook delivery and tunnel providers.
+// By default, ephemerd uses localtunnel for instant webhook delivery.
+// Set tunnel = "none" to fall back to polling.
+type WebhookConfig struct {
+	Secret         string `toml:"secret"`          // webhook HMAC secret (auto-generated if empty)
+	Port           int    `toml:"port"`            // listen port for health endpoint (default 8080)
+	TLSCert        string `toml:"tls_cert"`        // TLS certificate path (direct TLS, no tunnel)
+	TLSKey         string `toml:"tls_key"`         // TLS private key path
+	Tunnel         string `toml:"tunnel"`          // "localtunnel" (default), "ngrok", or "none" (polling)
+	TunnelURL      string `toml:"tunnel_url"`      // localtunnel: self-hosted server URL
+	NgrokAuthtoken string `toml:"ngrok_authtoken"` // ngrok auth token (or use NGROK_AUTHTOKEN env)
 }
 
 // NetworkConfig configures container networking.
@@ -53,21 +69,17 @@ type MacOSVMToml struct {
 
 type GitHubConfig struct {
 	// Authentication: either a PAT or GitHub App
-	Token            string `toml:"token"`
-	AppID            int64  `toml:"app_id"`
-	InstallationID   int64  `toml:"installation_id"`
-	PrivateKeyPath   string `toml:"private_key_path"`
+	Token          string `toml:"token"`
+	AppID          int64  `toml:"app_id"`
+	InstallationID int64  `toml:"installation_id"`
+	PrivateKeyPath string `toml:"private_key_path"`
 
 	// Which org/user and repos to register runners for
 	Owner string   `toml:"owner"`
 	Repos []string `toml:"repos"`
 
-	// Job discovery: polling (default) or webhook
-	PollInterval  string `toml:"poll_interval"`  // polling interval (default "10s", set to "0" to disable)
-	WebhookPort   int    `toml:"webhook_port"`
-	WebhookSecret string `toml:"webhook_secret"`
-	TLSCert       string `toml:"tls_cert"` // path to TLS certificate, enables webhook mode
-	TLSKey        string `toml:"tls_key"`  // path to TLS private key
+	// Job discovery: polling interval (default "10s")
+	PollInterval string `toml:"poll_interval"`
 }
 
 type RunnerConfig struct {
@@ -120,8 +132,9 @@ func Load(path string) (*Config, error) {
 			JobTimeout:      "2h",
 			ShutdownTimeout: "5m",
 		},
-		GitHub: GitHubConfig{
-			WebhookPort: 8080,
+		Webhook: WebhookConfig{
+			Port:   8080,
+			Tunnel: "localtunnel",
 		},
 		Log: LogConfig{
 			Level:  "info",
@@ -151,8 +164,12 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) validate() error {
+	// Fall back to GITHUB_TOKEN env var if no token is configured
+	if c.GitHub.Token == "" {
+		c.GitHub.Token = os.Getenv("GITHUB_TOKEN")
+	}
 	if c.GitHub.Token == "" && c.GitHub.AppID == 0 {
-		return fmt.Errorf("github.token or github.app_id is required")
+		return fmt.Errorf("github.token or github.app_id is required (or set GITHUB_TOKEN env var)")
 	}
 	if c.GitHub.AppID != 0 {
 		if c.GitHub.InstallationID == 0 {
@@ -166,6 +183,16 @@ func (c *Config) validate() error {
 		return fmt.Errorf("github.owner is required")
 	}
 	// repos is optional — if empty, ephemerd registers org-level runners
+
+	// Generate a random webhook secret if not explicitly set and tunnel is active
+	if c.Webhook.Secret == "" && c.Webhook.Tunnel != "none" {
+		b := make([]byte, 32)
+		if _, err := rand.Read(b); err != nil {
+			return fmt.Errorf("generating webhook secret: %w", err)
+		}
+		c.Webhook.Secret = hex.EncodeToString(b)
+	}
+
 	return nil
 }
 
