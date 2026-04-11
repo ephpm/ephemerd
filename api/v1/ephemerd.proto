@@ -58,3 +58,25 @@ message GetJobLogsRequest {
 message LogChunk {
   bytes data = 1;
 }
+
+// Dispatch is a lightweight job dispatch service used by the WSL containerd-only
+// worker. The Windows host scheduler sends Linux jobs here via gRPC; the worker
+// creates containers using its local (Linux) Runtime.
+service Dispatch {
+  rpc CreateJob(CreateJobRequest) returns (CreateJobResponse);
+  rpc WaitJob(WaitJobRequest) returns (WaitJobResponse);
+  rpc DestroyJob(DestroyJobRequest) returns (DestroyJobResponse);
+}
+
+message CreateJobRequest {
+  string id = 1;
+  string image = 2;
+  string jit_config = 3;
+}
+message CreateJobResponse {}
+
+message WaitJobRequest { string id = 1; }
+message WaitJobResponse { uint32 exit_code = 1; }
+
+message DestroyJobRequest { string id = 1; }
+message DestroyJobResponse {}

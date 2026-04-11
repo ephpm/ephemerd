@@ -122,6 +122,10 @@ func (c *controlServer) GetJobLogs(req *apiv1.GetJobLogsRequest, stream grpc.Ser
 		c.sched.mu.Unlock()
 		return status.Errorf(codes.NotFound, "job %d not found", req.Id)
 	}
+	if rj.env == nil {
+		c.sched.mu.Unlock()
+		return status.Errorf(codes.Unimplemented, "logs not available for dispatched jobs")
+	}
 	name := rj.env.ID
 	c.sched.mu.Unlock()
 
@@ -154,15 +158,20 @@ func (c *controlServer) GetJobLogs(req *apiv1.GetJobLogsRequest, stream grpc.Ser
 }
 
 func (c *controlServer) toProto(jobID int64, rj *runningJob) *apiv1.Job {
-	return &apiv1.Job{
+	job := &apiv1.Job{
 		Id:        jobID,
-		Name:      rj.env.ID,
 		Repo:      rj.repo,
 		Image:     rj.image,
 		RunnerId:  rj.runnerID,
 		Status:    "running",
-		Pid:       rj.env.Task.Pid(),
 		StartedAt: rj.startedAt.Format(time.RFC3339),
 		Uptime:    time.Since(rj.startedAt).Truncate(time.Second).String(),
 	}
+	if rj.dispatched != "" {
+		job.Name = rj.dispatched
+	} else if rj.env != nil {
+		job.Name = rj.env.ID
+		job.Pid = rj.env.Task.Pid()
+	}
+	return job
 }

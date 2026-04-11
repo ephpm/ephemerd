@@ -51,6 +51,7 @@ func main() {
 	}
 
 	if err := app.Run(context.Background(), os.Args); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -65,14 +66,22 @@ func serveCmd() *cli.Command {
 				Aliases: []string{"c"},
 				Usage:   "path to config file (default: <data-dir>/config.toml)",
 			},
+			&cli.UintFlag{
+				Name:  "containerd-tcp-port",
+				Usage: "also expose containerd on a TCP port (used by WSL host integration)",
+			},
+			&cli.BoolFlag{
+				Name:  "containerd-only",
+				Usage: "only run containerd (no scheduler, GitHub polling, or runner extraction)",
+			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			return serve(ctx, cmd.String("config"))
+			return serve(ctx, cmd.String("config"), uint32(cmd.Uint("containerd-tcp-port")), cmd.Bool("containerd-only"))
 		},
 	}
 }
 
-func serve(ctx context.Context, configFile string) error {
+func serve(ctx context.Context, configFile string, containerdTCPPort uint32, containerdOnly bool) error {
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -89,6 +98,11 @@ func serve(ctx context.Context, configFile string) error {
 	log := cfg.Logger()
 	log.Info("starting ephemerd", "version", version, "data_dir", configDir)
 
+	// Ensure data directory exists
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		return fmt.Errorf("creating data directory %s: %w", configDir, err)
+	}
+
 	// Write PID file for drain command
 	pidFile := joinPath(configDir, "ephemerd.pid")
 	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
@@ -100,13 +114,71 @@ func serve(ctx context.Context, configFile string) error {
 	// Start container runtime.
 	// On Linux/Windows: embedded containerd runs in-process.
 	// On macOS: boot a Linux VM via Virtualization.framework, containerd runs inside it.
-	ctrdClient, cleanup, err := startContainerRuntime(configDir, log)
+	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort)
 	if err != nil {
 		return fmt.Errorf("starting container runtime: %w", err)
 	}
 	defer cleanup()
 
 	log.Info("container runtime ready")
+
+	// In containerd-only mode, run containerd + dispatch worker (no scheduler).
+	// Used by the WSL Linux VM — the Windows host dispatches jobs via gRPC.
+	if containerdOnly {
+		rm := runner.New(configDir, log)
+		if err := rm.Extract(); err != nil {
+			return fmt.Errorf("extracting runner: %w", err)
+		}
+
+		cm := cni.New(configDir, log)
+		if err := cm.Extract(); err != nil {
+			return fmt.Errorf("extracting CNI plugins: %w", err)
+		}
+
+		// Delete stale CNI bridge from a previous WSL boot. All WSL2 distros
+		// share one Linux kernel, so the bridge persists across distro instances.
+		// Without this, networking.New() picks a new random subnet that conflicts
+		// with the existing bridge's IP.
+		networking.CleanStaleBridge(log)
+
+		net, err := networking.New(networking.Config{
+			DataDir:   configDir,
+			Subnet:    cfg.Network.Subnet,
+			MTU:       cfg.Network.MTU,
+			CNIBinDir: cm.Dir(),
+			Log:       log,
+		})
+		if err != nil {
+			return fmt.Errorf("initializing networking: %w", err)
+		}
+		if err := net.InstallFirewallRules(); err != nil {
+			log.Warn("failed to install firewall rules", "error", err)
+		}
+		defer net.Cleanup()
+
+		rt, err := runtime.New(runtime.Config{
+			Client:      ctrdClient,
+			RunnerDir:   rm.Dir(),
+			RunnerMount: rm.ContainerDir(),
+			LogDir:      joinPath(configDir, "logs"),
+			Network:     net,
+			Log:         log,
+		})
+		if err != nil {
+			return fmt.Errorf("creating runtime: %w", err)
+		}
+		if err := rt.CleanOrphans(ctx); err != nil {
+			log.Warn("failed to clean orphan containers", "error", err)
+		}
+
+		dispatchPort := int(containerdTCPPort) + 1
+		dispatchCleanup := scheduler.StartDispatchServer(dispatchPort, rt, log)
+		defer dispatchCleanup()
+
+		log.Info("worker mode ready", "containerd_port", containerdTCPPort, "dispatch_port", dispatchPort)
+		<-ctx.Done()
+		return nil
+	}
 
 	// Extract embedded GitHub Actions runner
 	rm := runner.New(configDir, log)
@@ -140,12 +212,13 @@ func serve(ctx context.Context, configFile string) error {
 
 	// Create runtime (container lifecycle manager)
 	rt, err := runtime.New(runtime.Config{
-		Client:      ctrdClient,
-		RunnerDir:   rm.Dir(),
-		RunnerMount: rm.ContainerDir(),
-		LogDir:      joinPath(configDir, "logs"),
-		Network:     net,
-		Log:         log,
+		Client:       ctrdClient,
+		RunnerDir:    rm.Dir(),
+		RunnerMount:  rm.ContainerDir(),
+		DefaultImage: cfg.Runner.DefaultImage,
+		LogDir:       joinPath(configDir, "logs"),
+		Network:      net,
+		Log:          log,
 	})
 	if err != nil {
 		return fmt.Errorf("creating runtime: %w", err)
@@ -157,12 +230,26 @@ func serve(ctx context.Context, configFile string) error {
 	}
 
 	// Create GitHub client
-	gh, err := github.New(github.Config{
+	ghCfg := github.Config{
 		Token: cfg.GitHub.Token,
 		Owner: cfg.GitHub.Owner,
 		Repos: cfg.GitHub.Repos,
 		Log:   log,
-	})
+	}
+	if cfg.GitHub.AppID != 0 {
+		appAuth, err := github.NewAppAuth(
+			cfg.GitHub.AppID,
+			cfg.GitHub.InstallationID,
+			cfg.GitHub.PrivateKeyPath,
+			log,
+		)
+		if err != nil {
+			return fmt.Errorf("initializing github app auth: %w", err)
+		}
+		defer appAuth.Stop()
+		ghCfg.AppAuth = appAuth
+	}
+	gh, err := github.New(ghCfg)
 	if err != nil {
 		return fmt.Errorf("creating github client: %w", err)
 	}
@@ -172,11 +259,20 @@ func serve(ctx context.Context, configFile string) error {
 	// into the shared data directory (available inside macOS VMs via virtio-fs).
 	artifactExtractor := artifacts.NewExtractor(ctrdClient, log)
 
+	// Wait for Linux dispatch client if WSL VM is booting in the background.
+	// All setup above (runner, CNI, networking, GitHub) runs in parallel with
+	// the WSL boot, so this typically doesn't add much delay.
+	linuxDispatcher := waitDispatch()
+	if linuxDispatcher != nil {
+		log.Info("Linux job dispatch enabled via WSL")
+	}
+
 	// Start scheduler (ties GitHub jobs to container lifecycle)
 	sched := scheduler.New(scheduler.Config{
 		Runtime:         rt,
 		GitHub:          gh,
 		Artifacts:       artifactExtractor,
+		LinuxDispatcher: linuxDispatcher,
 		DataDir:         configDir,
 		MaxConcurrent:   cfg.Runner.MaxConcurrent,
 		Labels:          cfg.Runner.ExtraLabels,

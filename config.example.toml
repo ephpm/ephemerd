@@ -1,6 +1,12 @@
 [github]
-# Authentication: personal access token with repo + admin:org scope
-token = "ghp_your_token_here"
+# Authentication: personal access token OR GitHub App credentials.
+# Use one approach — if app_id is set, it takes priority over token.
+# token = "ghp_your_token_here"
+
+# GitHub App authentication (recommended):
+# app_id = 123456
+# installation_id = 789012
+# private_key_path = "/path/to/app.pem"
 
 # Organization or user that owns the repos
 owner = "your-org"
@@ -36,6 +42,12 @@ poll_interval = "10s"
 # Max concurrent jobs
 max_concurrent = 4
 
+# Default container image for jobs that don't set EPHEMERD_IMAGE.
+# Leave blank to auto-detect:
+#   Linux  → ghcr.io/actions/actions-runner:latest
+#   Windows → mcr.microsoft.com/windows/servercore:ltsc20XX (matched to host OS)
+# default_image = ""
+
 # Extra labels applied to all runners (in addition to self-hosted, os, arch)
 extra_labels = []
 
@@ -44,6 +56,14 @@ job_timeout = "2h"
 
 # Time to wait for running jobs during graceful shutdown
 shutdown_timeout = "5m"
+
+[vm.linux]
+# Enable a Linux VM for running Linux jobs on Windows/macOS hosts.
+# On Windows: creates a WSL2 distro with an embedded ephemerd binary.
+# The distro is destroyed on shutdown. Requires WSL2 to be installed.
+# enabled = false
+# cpus = 2
+# memory_mb = 2048
 
 [log]
 # Log level: debug, info, warn, error

@@ -14,6 +14,7 @@ import (
 	"github.com/containerd/containerd/v2/client"
 	ctdserver "github.com/containerd/containerd/v2/cmd/containerd/server"
 	srvconfig "github.com/containerd/containerd/v2/cmd/containerd/server/config"
+	"github.com/sirupsen/logrus"
 
 	// Blank import registers all containerd plugins (services, snapshotters,
 	// runtimes, etc.) with the global registry. Without this, ctdserver.New()
@@ -24,6 +25,7 @@ import (
 // Config for the embedded containerd instance.
 type Config struct {
 	DataDir string
+	TCPPort uint32 // optional: also listen on TCP for remote access (e.g. from WSL host)
 	Log     *slog.Logger
 }
 
@@ -47,20 +49,20 @@ func New(cfg Config) (*Server, error) {
 		done: make(chan struct{}),
 	}
 
-	// Extract shim and runc binaries next to the ephemerd binary.
-	// Also add that directory to PATH so the shim can find runc.
-	shimCleanup, err := extractShims()
+	// Extract shim and runc binaries into the data directory.
+	// Add that directory to PATH so containerd and the shim can find runc.
+	shimDir, shimCleanup, err := extractShims(cfg.DataDir)
 	if err != nil {
 		return nil, fmt.Errorf("extracting shim binaries: %w", err)
 	}
 	s.shimCleanup = shimCleanup
 
-	self, err := os.Executable()
-	if err == nil {
-		shimDir := filepath.Dir(self)
-		if err := os.Setenv("PATH", shimDir+":"+os.Getenv("PATH")); err != nil {
-			return nil, fmt.Errorf("setting PATH: %w", err)
-		}
+	pathSep := ":"
+	if goruntime.GOOS == "windows" {
+		pathSep = ";"
+	}
+	if err := os.Setenv("PATH", shimDir+pathSep+os.Getenv("PATH")); err != nil {
+		return nil, fmt.Errorf("setting PATH: %w", err)
 	}
 
 	if err := s.setup(); err != nil {
@@ -152,6 +154,15 @@ func (s *Server) start() error {
 	cfg.GRPC.Address = socket
 	cfg.TTRPC.Address = socket + ".ttrpc"
 
+	// On Windows, fix containerd's logrus output for PowerShell.
+	// logrus defaults to \n line endings which cause stair-step output
+	// in PowerShell terminals that expect \r\n.
+	if goruntime.GOOS == "windows" {
+		logrus.SetFormatter(&crlfFormatter{parent: &logrus.TextFormatter{
+			FullTimestamp: true,
+		}})
+	}
+
 	// Create the in-process containerd server
 	srv, err := ctdserver.New(ctx, cfg)
 	if err != nil {
@@ -161,7 +172,7 @@ func (s *Server) start() error {
 	s.srv = srv
 
 	// Create gRPC listener and serve in background
-	l, err := net.Listen("unix", socket)
+	l, err := listen(socket)
 	if err != nil {
 		srv.Stop()
 		cancel()
@@ -184,7 +195,7 @@ func (s *Server) start() error {
 	if goruntime.GOOS != "windows" {
 		_ = os.Remove(ttrpcSocket)
 	}
-	tl, err := net.Listen("unix", ttrpcSocket)
+	tl, err := listen(ttrpcSocket)
 	if err != nil {
 		s.cfg.Log.Warn("failed to start tTRPC listener, some features may not work", "error", err)
 	} else {
@@ -197,6 +208,26 @@ func (s *Server) start() error {
 				}
 			}
 		}()
+	}
+
+	// Optionally listen on TCP for remote containerd access (e.g. Windows host → WSL)
+	if s.cfg.TCPPort > 0 {
+		tcpAddr := fmt.Sprintf("0.0.0.0:%d", s.cfg.TCPPort)
+		tcpL, err := net.Listen("tcp", tcpAddr)
+		if err != nil {
+			s.cfg.Log.Error("failed to start TCP listener for containerd", "addr", tcpAddr, "error", err)
+		} else {
+			go func() {
+				if err := srv.ServeGRPC(tcpL); err != nil {
+					select {
+					case <-ctx.Done():
+					default:
+						s.cfg.Log.Error("containerd TCP gRPC server error", "error", err)
+					}
+				}
+			}()
+			s.cfg.Log.Info("containerd TCP listener started", "addr", tcpAddr)
+		}
 	}
 
 	s.cfg.Log.Info("containerd server started in-process", "socket", socket)
@@ -220,6 +251,25 @@ func (s *Server) start() error {
 	srv.Stop()
 	cancel()
 	return fmt.Errorf("timed out connecting to containerd at %s: %w", socket, err)
+}
+
+// crlfFormatter wraps a logrus formatter to use \r\n line endings on Windows.
+// PowerShell needs \r to reset the cursor to column 0; without it, each log
+// line starts one column further right (stair-step effect).
+type crlfFormatter struct {
+	parent logrus.Formatter
+}
+
+func (f *crlfFormatter) Format(entry *logrus.Entry) ([]byte, error) {
+	b, err := f.parent.Format(entry)
+	if err != nil {
+		return b, err
+	}
+	// Replace trailing \n with \r\n
+	if len(b) > 0 && b[len(b)-1] == '\n' {
+		b = append(b[:len(b)-1], '\r', '\n')
+	}
+	return b, nil
 }
 
 // ExecCtr runs the ctr CLI against ephemerd's containerd instance.

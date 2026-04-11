@@ -6,8 +6,11 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"syscall"
 
+	"github.com/ephpm/ephemerd/pkg/vm"
 	"github.com/ephpm/ephemerd/pkg/workflow"
 	"github.com/urfave/cli/v3"
 )
@@ -93,6 +96,40 @@ func runWorkflow(ctx context.Context, workflowPath string, jobFilter string) err
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
+
+	// Detect target platform and delegate Linux jobs to WSL on Windows
+	platform := workflow.DetectPlatform(job.RunsOn)
+
+	if platform == workflow.PlatformLinux && runtime.GOOS == "windows" {
+		fmt.Printf("==> Job: %s (linux on windows — delegating to WSL)\n", jobName)
+
+		distro, err := vm.NewRunDistro(ctx, vm.RunDistroConfig{
+			DataDir: configDir,
+			Log:     log,
+		})
+		if err != nil {
+			return fmt.Errorf("setting up WSL run distro: %w", err)
+		}
+		defer distro.Destroy()
+
+		absWorkflow, err := filepath.Abs(workflowPath)
+		if err != nil {
+			return fmt.Errorf("resolving workflow path: %w", err)
+		}
+
+		exitCode, err := distro.Run(ctx, vm.RunInWSLConfig{
+			WorkflowPath: absWorkflow,
+			JobFilter:    jobFilter,
+			RepoDir:      repoDir,
+		})
+		if err != nil {
+			return err
+		}
+		if exitCode != 0 {
+			return fmt.Errorf("WSL ephemerd exited with code %d", exitCode)
+		}
+		return nil
+	}
 
 	runner := &workflow.Runner{
 		DataDir: configDir,

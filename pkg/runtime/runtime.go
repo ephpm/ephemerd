@@ -22,8 +22,8 @@ import (
 )
 
 const (
-	namespace    = "ephemerd"
-	defaultImage = "ghcr.io/actions/actions-runner:latest"
+	namespace         = "ephemerd"
+	defaultImageLinux = "ghcr.io/actions/actions-runner:latest"
 )
 
 // Config for the container runtime.
@@ -31,6 +31,7 @@ type Config struct {
 	Client       *client.Client
 	RunnerDir    string // host path to extracted runner binary
 	RunnerMount  string // container path to mount runner at
+	DefaultImage string // override default container image (auto-detected if empty)
 	LogDir       string // directory for per-job container logs
 	Network      *networking.Manager
 	Log          *slog.Logger
@@ -170,12 +171,17 @@ func (r *Runtime) PullImage(ctx context.Context, ref string) error {
 func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig string) (*RunnerEnv, error) {
 	ctx = namespaces.WithNamespace(ctx, namespace)
 
-	// Use the official GitHub Actions runner image when no custom image is specified.
-	// The official image has the runner binary pre-installed at /home/runner/.
-	// Custom images get our embedded runner binary mounted in.
+	// Use a default image when no custom image is specified.
+	// If runner.default_image is set in config, use that.
+	// Otherwise: Linux uses the official GHA runner image,
+	// Windows auto-selects a Server Core image matching the host OS build.
 	customImage := image != ""
 	if !customImage {
-		image = defaultImage
+		if r.cfg.DefaultImage != "" {
+			image = r.cfg.DefaultImage
+		} else {
+			image = defaultImage()
+		}
 	}
 
 	r.cfg.Log.Info("creating runner environment", "id", id, "image", image, "custom", customImage)
@@ -214,15 +220,24 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		// NoNewPrivileges=true which blocks privilege escalation, but
 		// jobs need sudo for apt-get install and similar operations.
 		oci.WithNewPrivileges,
-		oci.WithProcessArgs(entrypoint, "--jitconfig", jitConfig),
+	}
+	if goruntime.GOOS == "windows" {
+		// Wrap entrypoint in cmd.exe redirect so we can capture runner output
+		// to a file readable from the host (the runner dir is mounted in).
+		cmdLine := fmt.Sprintf(`%s --jitconfig %s > C:\actions-runner\runner.log 2>&1`, entrypoint, jitConfig)
+		opts = append(opts, oci.WithProcessArgs("cmd.exe", "/c", cmdLine))
+	} else {
+		opts = append(opts, oci.WithProcessArgs(entrypoint, "--jitconfig", jitConfig))
 	}
 
-	// Only mount our embedded runner for custom images — the official image
-	// already has the runner binary built in.
+	// Mount the embedded runner binary into the container.
+	// On Linux with the official GHA image, the runner is pre-installed so no mount needed.
+	// On Windows, always mount because there's no Windows GHA runner image.
+	needsRunnerMount := (customImage || goruntime.GOOS == "windows") && r.cfg.RunnerDir != "" && r.cfg.RunnerMount != ""
 	var jobRunnerDir string
-	if customImage && r.cfg.RunnerDir != "" && r.cfg.RunnerMount != "" {
+	if needsRunnerMount {
 		jobRunnerDir = filepath.Join(filepath.Dir(r.cfg.RunnerDir), "job-"+id)
-		if err := copyDirHardlink(r.cfg.RunnerDir, jobRunnerDir); err != nil {
+		if err := copyDirForJob(r.cfg.RunnerDir, jobRunnerDir); err != nil {
 			return nil, fmt.Errorf("copying runner dir for %s: %w", id, err)
 		}
 		opts = append(opts, withRunnerMount(jobRunnerDir, r.cfg.RunnerMount))
@@ -238,10 +253,29 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		opts = append(opts, withHyperVIsolation())
 	}
 
+	// On Windows, create HCN endpoint + namespace before the container so
+	// we can add them to the OCI spec. Hyper-V isolated containers require
+	// a pre-created network namespace with the endpoint attached.
+	var windowsEndpointID, windowsNetNS string
+	if goruntime.GOOS == "windows" && r.cfg.Network != nil {
+		result, err := r.cfg.Network.Setup(ctx, id, "")
+		if err != nil {
+			r.cfg.Log.Warn("failed to setup Windows network endpoint", "id", id, "error", err)
+		} else if result != nil {
+			windowsEndpointID = result.EndpointID
+			windowsNetNS = result.NetNS
+			opts = append(opts, withWindowsNetwork(windowsNetNS, windowsEndpointID))
+		}
+	}
+
 	snapshotName := id + "-snapshot"
 
 	// Clean up stale snapshot from a previous failed attempt
-	snapshotter := r.client.SnapshotService("overlayfs")
+	snapshotterName := "overlayfs"
+	if goruntime.GOOS == "windows" {
+		snapshotterName = "windows"
+	}
+	snapshotter := r.client.SnapshotService(snapshotterName)
 	if snapshotter != nil {
 		if _, err := snapshotter.Stat(ctx, snapshotName); err == nil {
 			r.cfg.Log.Info("removing stale snapshot before create", "name", snapshotName)
@@ -257,6 +291,12 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		client.WithNewSpec(opts...),
 	)
 	if err != nil {
+		// Clean up HCN endpoint + namespace on Windows
+		if windowsEndpointID != "" && r.cfg.Network != nil {
+			if tearErr := r.cfg.Network.Teardown(ctx, id, windowsNetNS); tearErr != nil {
+				r.cfg.Log.Debug("endpoint cleanup after failed container create", "error", tearErr)
+			}
+		}
 		// Clean up snapshot if container creation partially succeeded
 		if snapshotter != nil {
 			if rmErr := snapshotter.Remove(ctx, snapshotName); rmErr != nil {
@@ -266,9 +306,14 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		return nil, fmt.Errorf("creating container %s: %w", id, err)
 	}
 
-	// Create and start the task with per-job log capture
+	// Create and start the task with per-job log capture.
+	// On Windows, cio.LogFile uses file:// URIs which runhcs rejects
+	// (it only accepts binary:// scheme), and cio.WithStdio fails with
+	// Access Denied on named pipes. Use NullIO on Windows for now.
 	var creator cio.Creator
-	if r.cfg.LogDir != "" {
+	if goruntime.GOOS == "windows" {
+		creator = cio.NullIO
+	} else if r.cfg.LogDir != "" {
 		if err := os.MkdirAll(r.cfg.LogDir, 0o755); err != nil {
 			return nil, fmt.Errorf("creating log dir: %w", err)
 		}
@@ -280,6 +325,12 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 	}
 	task, err := container.NewTask(ctx, creator)
 	if err != nil {
+		// Clean up HCN endpoint + namespace on Windows
+		if windowsEndpointID != "" && r.cfg.Network != nil {
+			if tearErr := r.cfg.Network.Teardown(ctx, id, windowsNetNS); tearErr != nil {
+				r.cfg.Log.Debug("endpoint cleanup after failed task create", "error", tearErr)
+			}
+		}
 		if delErr := container.Delete(ctx, client.WithSnapshotCleanup); delErr != nil {
 			r.cfg.Log.Debug("container cleanup after failed task create", "error", delErr)
 		}
@@ -303,8 +354,12 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 	}
 
 	if err := task.Start(ctx); err != nil {
-		if r.cfg.Network != nil && netns != "" {
-			if tearErr := r.cfg.Network.Teardown(ctx, id, netns); tearErr != nil {
+		teardownNetNS := netns
+		if windowsNetNS != "" {
+			teardownNetNS = windowsNetNS
+		}
+		if r.cfg.Network != nil && (netns != "" || windowsEndpointID != "") {
+			if tearErr := r.cfg.Network.Teardown(ctx, id, teardownNetNS); tearErr != nil {
 				r.cfg.Log.Debug("network teardown after failed start", "error", tearErr)
 			}
 		}
@@ -319,9 +374,15 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 
 	r.cfg.Log.Info("runner environment started", "id", id)
 
+	// On Windows, use the HCN namespace ID for teardown
+	envNetns := netns
+	if windowsNetNS != "" {
+		envNetns = windowsNetNS
+	}
+
 	return &RunnerEnv{
 		ID:        id,
-		Netns:     netns,
+		Netns:     envNetns,
 		RunnerDir: jobRunnerDir,
 		Container: container,
 		Task:      task,
@@ -351,10 +412,12 @@ func (r *Runtime) Destroy(ctx context.Context, env *RunnerEnv) error {
 		r.cfg.Log.Warn("failed to delete task", "id", env.ID, "error", err)
 	}
 
-	// Teardown CNI networking
-	if r.cfg.Network != nil && env.Netns != "" {
-		if err := r.cfg.Network.Teardown(ctx, env.ID, env.Netns); err != nil {
-			r.cfg.Log.Warn("failed to teardown network", "id", env.ID, "error", err)
+	// Teardown networking (CNI on Linux, HCN endpoint on Windows)
+	if r.cfg.Network != nil {
+		if env.Netns != "" || goruntime.GOOS == "windows" {
+			if err := r.cfg.Network.Teardown(ctx, env.ID, env.Netns); err != nil {
+				r.cfg.Log.Warn("failed to teardown network", "id", env.ID, "error", err)
+			}
 		}
 	}
 
@@ -488,21 +551,34 @@ func withRunnerMount(hostDir, containerDir string) oci.SpecOpts {
 		if s.Mounts == nil {
 			s.Mounts = []ocispec.Mount{}
 		}
-		s.Mounts = append(s.Mounts, ocispec.Mount{
-			Destination: containerDir,
-			Type:        "bind",
-			Source:      hostDir,
-			Options:     []string{"rbind", "rw"},
-		})
+		if goruntime.GOOS == "windows" {
+			// Windows containers use mapped directories, not Linux bind mounts
+			s.Mounts = append(s.Mounts, ocispec.Mount{
+				Destination: containerDir,
+				Source:      hostDir,
+				Options:     []string{"rw"},
+			})
+		} else {
+			s.Mounts = append(s.Mounts, ocispec.Mount{
+				Destination: containerDir,
+				Type:        "bind",
+				Source:      hostDir,
+				Options:     []string{"rbind", "rw"},
+			})
+		}
 		return nil
 	}
 }
 
-// copyDirHardlink creates a copy of src at dst using hardlinks (cp -al).
-// This is instant and uses no extra disk space until files are modified.
-func copyDirHardlink(src, dst string) error {
+// copyDirForJob creates a writable copy of src at dst for a single job.
+// On Linux, uses hardlinks (cp -al) for instant, space-efficient copies.
+// On Windows, uses xcopy.
+func copyDirForJob(src, dst string) error {
 	if err := os.RemoveAll(dst); err != nil {
 		return err
+	}
+	if goruntime.GOOS == "windows" {
+		return exec.Command("xcopy", src, dst, "/E", "/I", "/Q", "/Y").Run()
 	}
 	return exec.Command("cp", "-al", src, dst).Run()
 }
@@ -514,6 +590,23 @@ func withHyperVIsolation() oci.SpecOpts {
 			s.Windows = &ocispec.Windows{}
 		}
 		s.Windows.HyperV = &ocispec.WindowsHyperV{}
+		return nil
+	}
+}
+
+// withWindowsNetwork configures networking for a Windows container.
+// Sets the NetworkNamespace (required for Hyper-V isolated containers)
+// and the EndpointList for runhcs to attach the network.
+func withWindowsNetwork(namespaceID, endpointID string) oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
+		if s.Windows == nil {
+			s.Windows = &ocispec.Windows{}
+		}
+		if s.Windows.Network == nil {
+			s.Windows.Network = &ocispec.WindowsNetwork{}
+		}
+		s.Windows.Network.NetworkNamespace = namespaceID
+		s.Windows.Network.EndpointList = append(s.Windows.Network.EndpointList, endpointID)
 		return nil
 	}
 }

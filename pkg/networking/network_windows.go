@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"github.com/Microsoft/hcsshim/hcn"
@@ -98,21 +99,30 @@ func (w *windowsNetworking) setup(ctx context.Context, id string, netns string) 
 		return nil, fmt.Errorf("creating HCN endpoint for %s: %w", id, err)
 	}
 
-	// Attach endpoint to the container's namespace
-	if netns != "" {
-		if err := created.NamespaceAttach(netns); err != nil {
-			created.Delete()
-			return nil, fmt.Errorf("attaching endpoint to namespace for %s: %w", id, err)
-		}
-	}
-
 	// Apply ACL policies to block private network access
 	if err := w.applyACLPolicies(created); err != nil {
 		w.cfg.Log.Warn("failed to apply ACL policies", "id", id, "error", err)
 	}
 
-	w.cfg.Log.Debug("HCN endpoint attached", "id", id, "endpoint", created.Id)
-	return &SetupResult{NetNS: netns}, nil
+	// Create an HCN network namespace and attach the endpoint.
+	// Hyper-V isolated containers (runhcs) require a pre-existing namespace
+	// with the endpoint attached; just putting the endpoint in EndpointList
+	// is not sufficient.
+	ns := &hcn.HostComputeNamespace{}
+	ns, err = ns.Create()
+	if err != nil {
+		created.Delete()
+		return nil, fmt.Errorf("creating HCN namespace for %s: %w", id, err)
+	}
+
+	if err := hcn.AddNamespaceEndpoint(ns.Id, created.Id); err != nil {
+		ns.Delete()
+		created.Delete()
+		return nil, fmt.Errorf("attaching endpoint to namespace for %s: %w", id, err)
+	}
+
+	w.cfg.Log.Debug("HCN endpoint created", "id", id, "endpoint", created.Id, "namespace", ns.Id)
+	return &SetupResult{NetNS: ns.Id, EndpointID: created.Id}, nil
 }
 
 func (w *windowsNetworking) teardown(ctx context.Context, id string, netns string) error {
@@ -126,7 +136,11 @@ func (w *windowsNetworking) teardown(ctx context.Context, id string, netns strin
 	}
 
 	if netns != "" {
+		// Detach endpoint from namespace, then delete the namespace
 		endpoint.NamespaceDetach(netns)
+		if ns, nsErr := hcn.GetNamespaceByID(netns); nsErr == nil {
+			ns.Delete()
+		}
 	}
 
 	if err := endpoint.Delete(); err != nil {
@@ -193,3 +207,5 @@ func (w *windowsNetworking) removeFirewallRules() {
 }
 
 func (w *windowsNetworking) cleanup() {}
+
+func cleanStaleBridge(_ *slog.Logger) {} // no-op on Windows (HCN, not CNI bridge)

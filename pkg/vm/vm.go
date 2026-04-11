@@ -4,7 +4,7 @@
 //
 //  1. Linux VM (long-running): On Windows and macOS hosts, a lightweight Linux VM
 //     runs containerd for Linux jobs. Same OCI images as native Linux.
-//     - Windows: Hyper-V Linux VM
+//     - Windows: WSL2 distro with embedded ephemerd binary (Hyper-V fallback for Server)
 //     - macOS: Virtualization.framework Linux VM
 //
 //  2. macOS VM (per-job): On macOS hosts, ephemeral macOS VMs run macOS-native
@@ -62,6 +62,10 @@ func (c *LinuxVMConfig) SetDefaults() {
 type LinuxVM interface {
 	// Client returns a containerd client connected to containerd inside the VM.
 	Client() *client.Client
+
+	// DispatchAddr returns the address of the dispatch gRPC server running
+	// inside the VM (e.g. "localhost:10001"). Empty if dispatch is unavailable.
+	DispatchAddr() string
 
 	// Stop gracefully shuts down the VM.
 	Stop()

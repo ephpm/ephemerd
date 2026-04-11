@@ -92,6 +92,9 @@ type Manager struct {
 type SetupResult struct {
 	// NetNS is the network namespace identifier (Linux: path, Windows: namespace ID).
 	NetNS string
+	// EndpointID is the HCN endpoint ID (Windows only). Used to attach
+	// the network to the container via the OCI spec.
+	EndpointID string
 }
 
 // platformNetworking is implemented per-OS.
@@ -137,4 +140,11 @@ func (m *Manager) InstallFirewallRules() error {
 func (m *Manager) Cleanup() {
 	m.platform.removeFirewallRules()
 	m.platform.cleanup()
+}
+
+// CleanStaleBridge deletes the ephemerd0 bridge if it exists. Used on startup
+// in the WSL containerd-only worker to remove bridges left over from a previous
+// boot (all WSL2 distros share one kernel so bridges persist across instances).
+func CleanStaleBridge(log *slog.Logger) {
+	cleanStaleBridge(log)
 }

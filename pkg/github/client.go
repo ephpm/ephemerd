@@ -21,12 +21,16 @@ type Config struct {
 	Owner string
 	Repos []string
 	Log   *slog.Logger
+
+	// App auth (used instead of Token when set)
+	AppAuth *AppAuth
 }
 
 // Client handles GitHub API interactions and webhook events.
 type Client struct {
 	cfg    Config
 	client *gh.Client
+	app    *AppAuth // nil when using PAT
 }
 
 // JobEvent is emitted when a workflow_job webhook fires.
@@ -37,13 +41,35 @@ type JobEvent struct {
 }
 
 // New creates a GitHub client.
+// Uses AppAuth for dynamic token refresh when configured, otherwise a static PAT.
 func New(cfg Config) (*Client, error) {
-	c := gh.NewClient(nil).WithAuthToken(cfg.Token)
+	var c *gh.Client
+	if cfg.AppAuth != nil {
+		// Use a custom transport that injects the latest token on each request.
+		httpClient := &http.Client{
+			Transport: &appAuthTransport{app: cfg.AppAuth},
+		}
+		c = gh.NewClient(httpClient)
+	} else {
+		c = gh.NewClient(nil).WithAuthToken(cfg.Token)
+	}
 
 	return &Client{
 		cfg:    cfg,
 		client: c,
+		app:    cfg.AppAuth,
 	}, nil
+}
+
+// appAuthTransport injects the current App installation token into each request.
+type appAuthTransport struct {
+	app *AppAuth
+}
+
+func (t *appAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	req.Header.Set("Authorization", "token "+t.app.Token())
+	return http.DefaultTransport.RoundTrip(req)
 }
 
 // IsOrgLevel returns true when no repos are configured, meaning ephemerd
