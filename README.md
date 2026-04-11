@@ -31,35 +31,40 @@ graph LR
 
 ### Windows
 
-Windows jobs run in Hyper-V isolated containers (each gets its own kernel). Linux jobs run inside a Hyper-V Linux VM with containerd inside it — same OCI images as native Linux.
+Windows jobs run in Hyper-V isolated containers (each gets its own kernel). Linux jobs are dispatched to a WSL2 distro via gRPC — ephemerd embeds an Alpine rootfs and a cross-compiled Linux binary, imports a WSL distro on startup, and runs containerd inside it. The Windows host runs a single scheduler that routes jobs by OS label.
+
+The WSL binary runs from `/mnt/c/` (the Windows filesystem mounted inside WSL) to avoid the slow 9P copy into the Linux filesystem. GitHub credentials stay on the Windows host — WSL only receives container lifecycle commands via gRPC dispatch.
 
 ```mermaid
 graph TB
-    GH[GitHub] -->|webhook / poll| E[ephemerd]
+    GH[GitHub] -->|webhook| E[ephemerd.exe]
 
     subgraph "Windows Host"
         E -->|Windows job| CTD[containerd native]
         CTD -->|Hyper-V container| WR[Windows Runner]
 
-        E -->|Linux job| VM[Hyper-V Linux VM]
-        VM -->|containerd in VM| LR[Linux Runner]
+        E -->|Linux job via gRPC| WSL[WSL2 distro — Alpine]
+        WSL -->|containerd in WSL| LC[OCI Container]
+        LC --> LR[Linux Runner]
     end
 ```
 
 ### macOS
 
-A long-running lightweight Linux VM hosts containerd for Linux jobs — same OCI images, same Dockerfiles. macOS-native jobs (Xcode, Swift) get their own ephemeral macOS VM cloned from a base image via APFS copy-on-write (instant, no data copied until writes occur).
+A long-running lightweight Linux VM (via Apple's Virtualization.framework) hosts containerd for Linux jobs — same OCI images, same Dockerfiles. macOS-native jobs (Xcode, Swift) get their own ephemeral macOS VM cloned from a base image via APFS copy-on-write (instant, no data copied until writes occur).
+
+The Linux VM uses virtio-fs to share files between the host and VM. OCI artifact layers are extracted on the host and mounted into the VM, so macOS jobs can access pre-built artifacts without downloading them during the job.
 
 ```mermaid
 graph TB
-    GH[GitHub] -->|webhook / poll| E[ephemerd]
+    GH[GitHub] -->|webhook| E[ephemerd]
 
     subgraph "macOS Host (Apple Silicon)"
         E -->|Linux job| LVM[Linux VM — Virtualization.framework]
         LVM -->|containerd in VM| LC[OCI Container]
         LC --> LR[Linux ARM64 Runner]
 
-        E -->|macOS job| MVM[macOS VM — clone-on-write]
+        E -->|macOS job| MVM[macOS VM — APFS clone-on-write]
         MVM --> MR[macOS Runner + Xcode]
     end
 ```
@@ -175,22 +180,19 @@ make build
 mkdir -p /var/lib/ephemerd
 cat > /var/lib/ephemerd/config.toml << 'EOF'
 [github]
-token = "ghp_your_token_here"
 owner = "your-org"
 # repos = ["repo1", "repo2"]  # optional — omit for org-level runners
-
-[runner]
-max_concurrent = 4
 EOF
 ```
 
 ### 3. Run
 
 ```bash
-sudo ephemerd serve
+export GITHUB_TOKEN="ghp_your_token_here"
+sudo -E ephemerd serve
 ```
 
-ephemerd starts containerd, begins polling GitHub for queued jobs, and provisions a container for each one.
+ephemerd starts containerd, opens a localtunnel, registers webhooks on GitHub, and provisions a container for each job — instantly.
 
 ### 4. Target it from your workflow
 
@@ -246,19 +248,18 @@ If `EPHEMERD_IMAGE` is not set, the base macOS VM boots as-is — all the tools 
 
 ```toml
 [github]
-token = "ghp_..."                     # PAT with repo + admin:org scope
+# Authentication: PAT or GITHUB_TOKEN env var
+# token = "ghp_..."                  # or set GITHUB_TOKEN env var
 owner = "your-org"                    # org or user
 # repos = ["repo1", "repo2"]         # optional — omit for org-level runners
-poll_interval = "10s"                 # how often to check for jobs (default)
 
-# Optional: webhook mode (instant, requires TLS)
-# webhook_port = 8080
-# webhook_secret = "your_secret"
-# tls_cert = "/etc/ephemerd/tls.crt"
-# tls_key = "/etc/ephemerd/tls.key"
+[webhook]
+# Default: localtunnel webhook delivery (instant, zero config)
+# tunnel = "ngrok"                   # use ngrok instead (requires auth token)
+# ngrok_authtoken = "..."            # or set NGROK_AUTHTOKEN env var
+# tunnel = "none"                    # disable tunnel, fall back to polling
 
 [runner]
-# Image is set per-job via EPHEMERD_IMAGE env var in workflow YAML
 max_concurrent = 4                    # parallel jobs
 extra_labels = []                     # additional runner labels
 job_timeout = "2h"                    # kill jobs after this
@@ -285,9 +286,66 @@ format = "text"                       # text or json
 
 ## Job Discovery
 
-**Polling (default):** ephemerd checks the GitHub API every 10 seconds for queued jobs. No inbound ports, no TLS certificates, works behind NAT. Ideal for homelab.
+### Webhook via Tunnel (default)
 
-**Webhook:** Add `tls_cert` and `tls_key` to enable a TLS webhook server. Configure a GitHub webhook pointing to `https://your-host:8080/webhook` with the `workflow_job` event. Instant job delivery, no polling delay.
+ephemerd creates a [localtunnel](https://github.com/localtunnel/localtunnel) to receive webhooks instantly — no public IP, no port forwarding, no configuration. On startup it generates a random HMAC secret, registers a `workflow_job` webhook on GitHub pointing at the tunnel URL, and starts receiving events. On shutdown, the webhook is automatically removed.
+
+```mermaid
+sequenceDiagram
+    participant E as ephemerd
+    participant LT as localtunnel.me
+    participant GH as GitHub
+
+    E->>LT: Connect tunnel
+    LT-->>E: Public URL (e.g. abc123.loca.lt)
+    E->>GH: POST /repos/.../hooks (register webhook)
+    GH-->>E: Hook created
+
+    Note over GH: Workflow job queued
+    GH->>LT: POST /webhook (workflow_job event)
+    LT->>E: Forward request
+    E->>E: Verify HMAC, create container, run job
+
+    Note over E: SIGTERM
+    E->>GH: DELETE /repos/.../hooks (deregister)
+    E->>LT: Close tunnel
+```
+
+Zero config needed — just set `GITHUB_TOKEN` and run `ephemerd serve`.
+
+To use [ngrok](https://ngrok.com) instead (more reliable, requires free account):
+
+```toml
+[webhook]
+tunnel = "ngrok"
+ngrok_authtoken = "your-token"
+```
+
+### Polling (opt-in)
+
+For environments where outbound tunnel connections aren't possible, disable the tunnel to fall back to polling. ephemerd checks the GitHub API every 10 seconds for queued jobs.
+
+```toml
+[webhook]
+tunnel = "none"
+```
+
+```mermaid
+sequenceDiagram
+    participant E as ephemerd
+    participant GH as GitHub
+
+    loop Every 10 seconds
+        E->>GH: GET /repos/.../actions/runs?status=queued
+        GH-->>E: Queued jobs (if any)
+    end
+
+    Note over GH: Workflow job queued
+    E->>GH: Poll finds queued job
+    E->>E: Create container, run job
+```
+
+No inbound ports, no TLS certificates, works behind NAT. Adds up to 10 seconds of latency before jobs start.
 
 ## Security
 
