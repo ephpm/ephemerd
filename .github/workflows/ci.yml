@@ -37,13 +37,10 @@ jobs:
       - name: Go vet
         run: go vet ./...
 
-      - name: Install golangci-lint
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-
       - name: Lint
-        run: golangci-lint run ./...
+        run: |
+          go install github.com/magefile/mage@latest
+          mage lint
 
       - name: Test
         run: go test -count=1 ./...

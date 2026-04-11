@@ -2,6 +2,7 @@ package download
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"compress/gzip"
@@ -17,16 +18,18 @@ import (
 )
 
 const (
-	RunnerVersion     = "2.333.1"
-	CNIVersion        = "1.6.2"
-	ContainerdVersion = "2.2.2"
-	RuncVersion       = "1.3.4"
-	AlpineVersion     = "3.21.3"
+	RunnerVersion        = "2.333.1"
+	CNIVersion           = "1.6.2"
+	ContainerdVersion    = "2.2.2"
+	RuncVersion          = "1.3.4"
+	AlpineVersion        = "3.21.3"
+	GolangCILintVersion  = "2.11.4"
 
 	runnerEmbedDir = "pkg/runner/embed"
 	cniEmbedDir    = "pkg/cni/embed"
 	shimEmbedDir   = "pkg/containerd/embed"
 	vmEmbedDir     = "pkg/vm/embed"
+	toolBinDir     = "bin"
 )
 
 // All downloads all assets appropriate for the current OS.
@@ -253,6 +256,108 @@ func Rootfs() error {
 
 	fmt.Printf("  Created %s\n", dest)
 	return nil
+}
+
+// GolangCILint downloads golangci-lint to ./bin/.
+func GolangCILint() error {
+	goos := runtime.GOOS
+	goarch := runtime.GOARCH
+
+	ext := "tar.gz"
+	if goos == "windows" {
+		ext = "zip"
+	}
+
+	filename := fmt.Sprintf("golangci-lint-%s-%s-%s.%s", GolangCILintVersion, goos, goarch, ext)
+	dest := filepath.Join(toolBinDir, "golangci-lint")
+	if goos == "windows" {
+		dest += ".exe"
+	}
+
+	if fileExists(dest) {
+		fmt.Printf("  %s already exists, skipping\n", dest)
+		return nil
+	}
+
+	if err := os.MkdirAll(toolBinDir, 0o755); err != nil {
+		return err
+	}
+
+	url := fmt.Sprintf("https://github.com/golangci/golangci-lint/releases/download/v%s/%s", GolangCILintVersion, filename)
+	fmt.Printf("  Downloading golangci-lint %s...\n", GolangCILintVersion)
+
+	data, err := httpGetBytes(url)
+	if err != nil {
+		return fmt.Errorf("downloading golangci-lint: %w", err)
+	}
+
+	binName := "golangci-lint"
+	if goos == "windows" {
+		binName = "golangci-lint.exe"
+	}
+	prefix := fmt.Sprintf("golangci-lint-%s-%s-%s/", GolangCILintVersion, goos, goarch)
+
+	if ext == "tar.gz" {
+		gr, gerr := gzip.NewReader(bytes.NewReader(data))
+		if gerr != nil {
+			return fmt.Errorf("gzip golangci-lint: %w", gerr)
+		}
+		defer func() { _ = gr.Close() }()
+
+		tr := tar.NewReader(gr)
+		for {
+			hdr, terr := tr.Next()
+			if terr == io.EOF {
+				return fmt.Errorf("golangci-lint binary not found in tarball")
+			}
+			if terr != nil {
+				return fmt.Errorf("tar golangci-lint: %w", terr)
+			}
+			if hdr.Name == prefix+binName {
+				f, ferr := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+				if ferr != nil {
+					return ferr
+				}
+				if _, ferr = io.Copy(f, tr); ferr != nil {
+					_ = f.Close()
+					return ferr
+				}
+				return f.Close()
+			}
+		}
+	}
+
+	// zip extraction for Windows
+	return extractZipBinary(data, prefix+binName, dest)
+}
+
+// extractZipBinary extracts a single file from a zip archive in memory.
+func extractZipBinary(zipData []byte, entryName, dest string) error {
+	r := bytes.NewReader(zipData)
+	zr, err := zip.NewReader(r, int64(len(zipData)))
+	if err != nil {
+		return fmt.Errorf("opening zip: %w", err)
+	}
+	for _, f := range zr.File {
+		if f.Name != entryName {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return fmt.Errorf("opening zip entry: %w", err)
+		}
+		defer func() { _ = rc.Close() }()
+		out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(out, rc); err != nil {
+			_ = out.Close()
+			return err
+		}
+		return out.Close()
+	}
+	return fmt.Errorf("golangci-lint binary not found in zip")
 }
 
 // appendAPKFiles extracts data files from an APK package and appends them

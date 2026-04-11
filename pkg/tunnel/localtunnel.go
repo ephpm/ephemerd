@@ -36,7 +36,7 @@ func (lt *LocalTunnel) Listen(ctx context.Context) (net.Listener, error) {
 	// Close listener when context is cancelled
 	go func() {
 		<-ctx.Done()
-		ln.Close()
+		_ = ln.Close()
 	}()
 
 	return ln, nil

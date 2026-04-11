@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/magefile/mage/mg"
 	"github.com/magefile/mage/sh"
@@ -13,7 +14,7 @@ import (
 	// mage:import build
 	build "github.com/ephpm/ephemerd/mage/build"
 	// mage:import download
-	_ "github.com/ephpm/ephemerd/mage/download"
+	download "github.com/ephpm/ephemerd/mage/download"
 )
 
 // Default target when running mage with no args.
@@ -24,9 +25,14 @@ func Test() error {
 	return sh.RunV("go", "test", "./...")
 }
 
-// Lint runs golangci-lint.
+// Lint runs golangci-lint (downloads it to ./bin if needed).
 func Lint() error {
-	return sh.RunV("golangci-lint", "run", "./...")
+	mg.Deps(download.GolangCILint)
+	lint := filepath.Join("bin", "golangci-lint")
+	if runtime.GOOS == "windows" {
+		lint += ".exe"
+	}
+	return sh.RunV(lint, "run", "./...")
 }
 
 // CI runs lint and tests.

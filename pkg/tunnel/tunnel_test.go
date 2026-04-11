@@ -1,7 +1,6 @@
 package tunnel
 
 import (
-	"os"
 	"testing"
 )
 
@@ -49,13 +48,7 @@ func TestNew(t *testing.T) {
 	}
 
 	// Ensure NGROK_AUTHTOKEN doesn't interfere with tests
-	orig := os.Getenv("NGROK_AUTHTOKEN")
-	os.Unsetenv("NGROK_AUTHTOKEN")
-	defer func() {
-		if orig != "" {
-			os.Setenv("NGROK_AUTHTOKEN", orig)
-		}
-	}()
+	t.Setenv("NGROK_AUTHTOKEN", "")
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -78,16 +71,7 @@ func TestNew(t *testing.T) {
 }
 
 func TestNgrokAuthTokenFromEnv(t *testing.T) {
-	orig := os.Getenv("NGROK_AUTHTOKEN")
-	defer func() {
-		if orig != "" {
-			os.Setenv("NGROK_AUTHTOKEN", orig)
-		} else {
-			os.Unsetenv("NGROK_AUTHTOKEN")
-		}
-	}()
-
-	os.Setenv("NGROK_AUTHTOKEN", "env-token")
+	t.Setenv("NGROK_AUTHTOKEN", "env-token")
 
 	n, err := NewNgrok("")
 	if err != nil {
@@ -99,16 +83,7 @@ func TestNgrokAuthTokenFromEnv(t *testing.T) {
 }
 
 func TestNgrokExplicitTokenOverridesEnv(t *testing.T) {
-	orig := os.Getenv("NGROK_AUTHTOKEN")
-	defer func() {
-		if orig != "" {
-			os.Setenv("NGROK_AUTHTOKEN", orig)
-		} else {
-			os.Unsetenv("NGROK_AUTHTOKEN")
-		}
-	}()
-
-	os.Setenv("NGROK_AUTHTOKEN", "env-token")
+	t.Setenv("NGROK_AUTHTOKEN", "env-token")
 
 	n, err := NewNgrok("explicit-token")
 	if err != nil {
@@ -120,13 +95,7 @@ func TestNgrokExplicitTokenOverridesEnv(t *testing.T) {
 }
 
 func TestNgrokNoTokenErrors(t *testing.T) {
-	orig := os.Getenv("NGROK_AUTHTOKEN")
-	os.Unsetenv("NGROK_AUTHTOKEN")
-	defer func() {
-		if orig != "" {
-			os.Setenv("NGROK_AUTHTOKEN", orig)
-		}
-	}()
+	t.Setenv("NGROK_AUTHTOKEN", "")
 
 	_, err := NewNgrok("")
 	if err == nil {
