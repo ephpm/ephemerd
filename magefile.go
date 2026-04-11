@@ -20,14 +20,15 @@ import (
 // Default target when running mage with no args.
 var Default = build.Build
 
-// Test runs all Go tests.
+// Test runs all Go tests (downloads embedded deps first if needed).
 func Test() error {
-	return sh.RunV("go", "test", "./...")
+	mg.Deps(download.All)
+	return sh.RunV("go", "test", "-count=1", "./...")
 }
 
-// Lint runs golangci-lint (downloads it to ./bin if needed).
+// Lint runs golangci-lint (downloads linter and embedded deps first if needed).
 func Lint() error {
-	mg.Deps(download.GolangCILint)
+	mg.Deps(download.GolangCILint, download.All)
 	lint := filepath.Join("bin", "golangci-lint")
 	if runtime.GOOS == "windows" {
 		lint += ".exe"
@@ -35,9 +36,9 @@ func Lint() error {
 	return sh.RunV(lint, "run", "./...")
 }
 
-// CI runs lint and tests.
+// CI runs download, lint, test, and build.
 func CI() {
-	mg.SerialDeps(Lint, Test)
+	mg.SerialDeps(Lint, Test, build.Build)
 }
 
 // Generate runs protobuf code generation.
