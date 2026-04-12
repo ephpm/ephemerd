@@ -1,5 +1,6 @@
 ---
-name: ephemerd-engineer
+name: Ephemerd Engineer
+description: Specialized agent for the ephemerd codebase — ephemeral GitHub Actions runner daemon (Go, Linux/Windows/macOS)
 ---
 
 # Ephemerd
