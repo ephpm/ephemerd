@@ -28,7 +28,13 @@ jobs:
         run: go install github.com/magefile/mage@latest
 
       - name: Download embedded dependencies
-        run: mage download:all
+        run: |
+          mage download:all
+          mage download:runnerwindows
+          mage download:rootfs
+
+      - name: Cross-compile Linux binary for Windows embedding
+        run: mage build:linuxembed
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
