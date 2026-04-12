@@ -27,19 +27,36 @@ func (lt *LocalTunnel) Listen(ctx context.Context) (net.Listener, error) {
 		opts.BaseURL = lt.baseURL
 	}
 
-	ln, err := localtunnel.Listen(opts)
-	if err != nil {
-		return nil, fmt.Errorf("localtunnel listen: %w", err)
+	// localtunnel.Listen does not accept a context and can hang indefinitely
+	// (e.g. waiting for TCP connections from an unreliable free server).
+	// Run it in a goroutine and race against the context.
+	type result struct {
+		ln  *localtunnel.Listener
+		err error
 	}
-	lt.url = ln.URL()
-
-	// Close listener when context is cancelled
+	ch := make(chan result, 1)
 	go func() {
-		<-ctx.Done()
-		_ = ln.Close()
+		ln, err := localtunnel.Listen(opts)
+		ch <- result{ln, err}
 	}()
 
-	return ln, nil
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-ch:
+		if r.err != nil {
+			return nil, fmt.Errorf("localtunnel listen: %w", r.err)
+		}
+		lt.url = r.ln.URL()
+
+		// Close listener when context is cancelled
+		go func() {
+			<-ctx.Done()
+			_ = r.ln.Close()
+		}()
+
+		return r.ln, nil
+	}
 }
 
 func (lt *LocalTunnel) PublicURL() string {

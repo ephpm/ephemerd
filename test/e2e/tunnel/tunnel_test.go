@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -188,17 +189,48 @@ func verifyWebhookSignature(body []byte, signature string, secret string) bool {
 	return hmac.Equal([]byte(signature[7:]), []byte(expected))
 }
 
+// listenWithRetry attempts to establish a localtunnel connection with retries.
+// The free loca.lt server is unreliable and Listen can hang indefinitely,
+// so each attempt gets a short timeout and we retry until the deadline.
+func listenWithRetry(t *testing.T, deadline time.Duration) (net.Listener, *tunnel.LocalTunnel) {
+	t.Helper()
+	start := time.Now()
+	for attempt := 1; time.Since(start) < deadline; attempt++ {
+		lt := tunnel.NewLocalTunnel("")
+
+		type result struct {
+			ln  net.Listener
+			err error
+		}
+		ch := make(chan result, 1)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		go func() {
+			ln, err := lt.Listen(ctx)
+			ch <- result{ln, err}
+		}()
+
+		select {
+		case r := <-ch:
+			cancel()
+			if r.err != nil {
+				t.Logf("attempt %d: listen failed: %v", attempt, r.err)
+				continue
+			}
+			t.Logf("attempt %d: tunnel ready: %s", attempt, lt.PublicURL())
+			return r.ln, lt
+		case <-ctx.Done():
+			cancel()
+			t.Logf("attempt %d: timed out after 10s, retrying...", attempt)
+		}
+	}
+	t.Fatalf("failed to establish tunnel after %s", deadline)
+	return nil, nil
+}
+
 // TestLocaltunnelHTTP verifies the tunnel works for basic HTTP without GitHub.
 // This is a fast sanity check that doesn't need a GitHub token.
 func TestLocaltunnelHTTP(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	lt := tunnel.NewLocalTunnel("")
-	ln, err := lt.Listen(ctx)
-	if err != nil {
-		t.Fatalf("localtunnel listen: %v", err)
-	}
+	ln, lt := listenWithRetry(t, 90*time.Second)
 	defer func() { _ = ln.Close() }()
 
 	publicURL := lt.PublicURL()
