@@ -40,6 +40,34 @@ func All() {
 	default:
 		mg.Deps(Runner, Cni, Shim)
 	}
+	// Ensure placeholder files exist for go:embed directives that reference
+	// cross-compiled assets (e.g. ephemerd-linux on Windows). Without these,
+	// go test/vet/lint fail even though the real files are only needed at runtime.
+	_ = EnsurePlaceholders()
+}
+
+// EnsurePlaceholders creates empty placeholder files for any go:embed targets
+// that don't exist. This allows go test, go vet, and linting to succeed on
+// platforms where cross-compiled assets aren't available (e.g. ephemerd-linux
+// on Windows without a full two-stage build).
+func EnsurePlaceholders() error {
+	placeholders := []string{
+		filepath.Join(vmEmbedDir, "ephemerd-linux"),
+	}
+	for _, p := range placeholders {
+		if fileExists(p) {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			return fmt.Errorf("creating directory for placeholder %s: %w", p, err)
+		}
+		f, err := os.Create(p)
+		if err != nil {
+			return fmt.Errorf("creating placeholder %s: %w", p, err)
+		}
+		_ = f.Close()
+	}
+	return nil
 }
 
 // Runner downloads the GitHub Actions runner archive for the current platform.
