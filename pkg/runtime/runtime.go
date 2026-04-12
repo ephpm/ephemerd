@@ -26,6 +26,22 @@ const (
 	defaultImageLinux = "ghcr.io/actions/actions-runner:latest"
 )
 
+// containerCapabilities is the minimum set of Linux capabilities for CI jobs.
+// Covers apt-get install, sudo, adduser, and service management.
+// Docker-in-Docker is not supported — use Kaniko or Buildah for image builds.
+var containerCapabilities = []string{
+	"CAP_CHOWN",            // dpkg chown on installed files
+	"CAP_DAC_OVERRIDE",     // write to dirs owned by other users
+	"CAP_FOWNER",           // chmod/utimes on files not owned by process
+	"CAP_FSETID",           // preserve SUID/SGID bits (sudo, passwd)
+	"CAP_KILL",             // signal processes (postinst service restarts)
+	"CAP_SETGID",           // adduser/addgroup in maintainer scripts
+	"CAP_SETUID",           // setuid in maintainer scripts
+	"CAP_MKNOD",            // create device nodes (some packages)
+	"CAP_SYS_CHROOT",       // chroot in maintainer scripts
+	"CAP_NET_BIND_SERVICE", // bind to ports < 1024
+}
+
 // Config for the container runtime.
 type Config struct {
 	Client       *client.Client
@@ -220,7 +236,12 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		// NoNewPrivileges=true which blocks privilege escalation, but
 		// jobs need sudo for apt-get install and similar operations.
 		oci.WithNewPrivileges,
+		// Restrict capabilities to the minimum needed for CI jobs.
+		// This covers apt-get install, adduser, sudo, and service management.
+		// Docker-in-Docker is not supported (no CAP_SYS_ADMIN/CAP_NET_ADMIN).
+		oci.WithCapabilities(containerCapabilities),
 	}
+	opts = append(opts, seccompOpts()...)
 	if goruntime.GOOS == "windows" {
 		// Wrap entrypoint in cmd.exe redirect so we can capture runner output
 		// to a file readable from the host (the runner dir is mounted in).

@@ -405,6 +405,8 @@ The same image runs on every host — Linux directly, Windows via Hyper-V Linux 
 
 **macOS builds require macOS** — the darwin binary uses Virtualization.framework (CGO + Apple SDK). Cross-compilation from Linux isn't possible. Build on a Mac or use GitHub's macOS hosted runners for the darwin release.
 
+**No Docker-in-Docker** — containers run with a restricted capability set (no `CAP_SYS_ADMIN` or `CAP_NET_ADMIN`), so `docker build` and `docker compose` won't work inside jobs. For building container images in CI, use [Kaniko](https://github.com/GoogleContainerTools/kaniko) or [Buildah](https://github.com/containers/buildah) which run in userspace without a daemon.
+
 **ARM64 Windows** — ephemerd supports it at the infrastructure level, but PHP and most build toolchains don't ship ARM64 Windows binaries yet.
 
 ## Architecture

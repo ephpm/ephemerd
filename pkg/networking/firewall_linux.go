@@ -60,10 +60,11 @@ func (l *linuxNetworking) installFirewallRules() error {
 		return fmt.Errorf("adding container-to-container rule: %w", err)
 	}
 
-	// 3. Allow DNS to any destination
+	// 3. Allow DNS only to the bridge gateway (prevents DNS tunneling to private networks)
+	gateway := deriveGateway(l.cfg.subnet())
 	for _, proto := range []string{"udp", "tcp"} {
-		l.cfg.Log.Info("adding firewall rule", "rule", "allow DNS "+proto)
-		if err := iptables("-A", chainName, "-p", proto, "--dport", "53", "-j", "ACCEPT"); err != nil {
+		l.cfg.Log.Info("adding firewall rule", "rule", "allow DNS "+proto+" to gateway")
+		if err := iptables("-A", chainName, "-p", proto, "-d", gateway, "--dport", "53", "-j", "ACCEPT"); err != nil {
 			return fmt.Errorf("adding DNS rule (%s): %w", proto, err)
 		}
 	}
