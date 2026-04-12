@@ -22,14 +22,14 @@ type Config struct {
 }
 
 // WebhookConfig configures webhook delivery and tunnel providers.
-// By default, ephemerd uses localtunnel for instant webhook delivery.
-// Set tunnel = "none" to fall back to polling.
+// By default, ephemerd uses polling (tunnel = "none").
+// Set tunnel = "localtunnel" or "ngrok" for instant webhook delivery.
 type WebhookConfig struct {
 	Secret         string `toml:"secret"`          // webhook HMAC secret (auto-generated if empty)
 	Port           int    `toml:"port"`            // listen port for health endpoint (default 8080)
 	TLSCert        string `toml:"tls_cert"`        // TLS certificate path (direct TLS, no tunnel)
 	TLSKey         string `toml:"tls_key"`         // TLS private key path
-	Tunnel         string `toml:"tunnel"`          // "localtunnel" (default), "ngrok", or "none" (polling)
+	Tunnel         string `toml:"tunnel"`          // "none" (default, polling), "localtunnel", or "ngrok"
 	TunnelURL      string `toml:"tunnel_url"`      // localtunnel: self-hosted server URL
 	NgrokAuthtoken string `toml:"ngrok_authtoken"` // ngrok auth token (or use NGROK_AUTHTOKEN env)
 }
@@ -134,7 +134,7 @@ func Load(path string) (*Config, error) {
 		},
 		Webhook: WebhookConfig{
 			Port:   8080,
-			Tunnel: "localtunnel",
+			Tunnel: "none",
 		},
 		Log: LogConfig{
 			Level:  "info",

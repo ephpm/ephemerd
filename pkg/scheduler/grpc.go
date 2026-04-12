@@ -39,6 +39,10 @@ func (s *Scheduler) startControlServer() (func(), error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", socketPath, err)
 	}
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		_ = lis.Close()
+		return nil, fmt.Errorf("chmod %s: %w", socketPath, err)
+	}
 
 	srv := grpc.NewServer()
 	apiv1.RegisterControlServer(srv, &controlServer{

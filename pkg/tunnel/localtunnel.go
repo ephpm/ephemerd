@@ -3,9 +3,18 @@ package tunnel
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
+	"time"
 
-	localtunnel "github.com/localtunnel/go-localtunnel"
+	"github.com/ephpm/ephemerd/pkg/localtunnel"
+)
+
+const (
+	// attemptTimeout is how long each tunnel connection attempt gets.
+	attemptTimeout = 10 * time.Second
+	// listenTimeout is the total time to keep retrying before giving up.
+	listenTimeout = 2 * time.Minute
 )
 
 // LocalTunnel implements Provider using localtunnel.
@@ -21,25 +30,43 @@ func NewLocalTunnel(baseURL string) *LocalTunnel {
 	return &LocalTunnel{baseURL: baseURL}
 }
 
+// Listen establishes a tunnel, retrying on failure. Each attempt gets a 10s
+// timeout. Retries continue for up to 2 minutes or until ctx is cancelled.
+// This is blocking — if localtunnel is configured, ephemerd cannot receive
+// webhooks without a tunnel.
 func (lt *LocalTunnel) Listen(ctx context.Context) (net.Listener, error) {
 	opts := localtunnel.Options{}
 	if lt.baseURL != "" {
 		opts.BaseURL = lt.baseURL
 	}
 
-	ln, err := localtunnel.Listen(opts)
-	if err != nil {
-		return nil, fmt.Errorf("localtunnel listen: %w", err)
+	deadline := time.After(listenTimeout)
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
+		ln, err := localtunnel.Listen(attemptCtx, opts)
+		cancel()
+
+		if err == nil {
+			lt.url = ln.URL()
+			if attempt > 1 {
+				slog.Info("localtunnel connected after retries", "attempt", attempt, "url", lt.url)
+			}
+			return ln, nil
+		}
+
+		lastErr = err
+		slog.Warn("localtunnel attempt failed, retrying", "attempt", attempt, "error", err)
+
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("localtunnel listen cancelled: %w", ctx.Err())
+		case <-deadline:
+			return nil, fmt.Errorf("localtunnel listen failed after %s (%d attempts): %w", listenTimeout, attempt, lastErr)
+		case <-time.After(time.Second):
+			// brief pause before retry
+		}
 	}
-	lt.url = ln.URL()
-
-	// Close listener when context is cancelled
-	go func() {
-		<-ctx.Done()
-		_ = ln.Close()
-	}()
-
-	return ln, nil
 }
 
 func (lt *LocalTunnel) PublicURL() string {

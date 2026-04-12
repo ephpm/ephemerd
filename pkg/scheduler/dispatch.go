@@ -90,7 +90,7 @@ func (s *dispatchServer) DestroyJob(ctx context.Context, req *apiv1.DestroyJobRe
 // StartDispatchServer starts the dispatch gRPC server on the given TCP port.
 // Returns a cleanup function that gracefully stops the server.
 func StartDispatchServer(port int, rt *runtime.Runtime, log *slog.Logger) func() {
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	lis, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		log.Error("dispatch: failed to listen", "port", port, "error", err)
 		return func() {}

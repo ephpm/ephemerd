@@ -212,7 +212,7 @@ func (s *Server) start() error {
 
 	// Optionally listen on TCP for remote containerd access (e.g. Windows host → WSL)
 	if s.cfg.TCPPort > 0 {
-		tcpAddr := fmt.Sprintf("0.0.0.0:%d", s.cfg.TCPPort)
+		tcpAddr := fmt.Sprintf("127.0.0.1:%d", s.cfg.TCPPort)
 		tcpL, err := net.Listen("tcp", tcpAddr)
 		if err != nil {
 			s.cfg.Log.Error("failed to start TCP listener for containerd", "addr", tcpAddr, "error", err)

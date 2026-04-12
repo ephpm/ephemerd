@@ -37,8 +37,8 @@ owner = "testorg"
 	if cfg.Webhook.Port != 8080 {
 		t.Errorf("Webhook.Port = %d, want 8080", cfg.Webhook.Port)
 	}
-	if cfg.Webhook.Tunnel != "localtunnel" {
-		t.Errorf("Webhook.Tunnel = %q, want %q", cfg.Webhook.Tunnel, "localtunnel")
+	if cfg.Webhook.Tunnel != "none" {
+		t.Errorf("Webhook.Tunnel = %q, want %q", cfg.Webhook.Tunnel, "none")
 	}
 	if cfg.Log.Level != "info" {
 		t.Errorf("Log.Level = %q, want %q", cfg.Log.Level, "info")
