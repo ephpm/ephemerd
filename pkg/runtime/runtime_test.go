@@ -1,6 +1,8 @@
 package runtime
 
 import (
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -129,5 +131,43 @@ func TestDefaultImageLinuxConstant(t *testing.T) {
 	}
 	if !strings.Contains(defaultImageLinux, "actions-runner") {
 		t.Errorf("defaultImageLinux = %q, expected to contain 'actions-runner'", defaultImageLinux)
+	}
+}
+
+// --- seccompOpts tests ---
+
+func TestSeccompOpts(t *testing.T) {
+	opts := seccompOpts()
+	switch runtime.GOOS {
+	case "linux":
+		if len(opts) == 0 {
+			t.Error("seccompOpts() on Linux should return profile options")
+		}
+	default:
+		if opts != nil {
+			t.Errorf("seccompOpts() on %s should return nil, got %v", runtime.GOOS, opts)
+		}
+	}
+}
+
+// --- copyDirForJob tests ---
+
+func TestCopyDirForJob(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "file.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := filepath.Join(t.TempDir(), "copy")
+	if err := copyDirForJob(src, dst); err != nil {
+		t.Fatalf("copyDirForJob error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dst, "file.txt"))
+	if err != nil {
+		t.Fatalf("reading copied file: %v", err)
+	}
+	if string(data) != "hello" {
+		t.Errorf("copied file = %q, want %q", string(data), "hello")
 	}
 }

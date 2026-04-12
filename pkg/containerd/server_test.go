@@ -95,3 +95,52 @@ func TestConfig_ZeroValue(t *testing.T) {
 		t.Errorf("zero TCPPort = %d", cfg.TCPPort)
 	}
 }
+
+// --- crlfFormatter with fields ---
+
+func TestCRLFFormatter_WithFields(t *testing.T) {
+	f := &crlfFormatter{parent: &logrus.TextFormatter{
+		DisableTimestamp: true,
+		DisableColors:    true,
+	}}
+
+	entry := logrus.WithFields(logrus.Fields{
+		"component": "containerd",
+		"port":      10000,
+	})
+	entry.Message = "server started"
+
+	b, err := f.Format(entry)
+	if err != nil {
+		t.Fatalf("Format() error: %v", err)
+	}
+
+	s := string(b)
+	if !strings.HasSuffix(s, "\r\n") {
+		t.Errorf("expected \\r\\n ending with fields")
+	}
+	if !strings.Contains(s, "server started") {
+		t.Errorf("message not in output: %q", s)
+	}
+}
+
+// --- SocketPath consistency ---
+
+func TestSocketPath_DifferentDataDirs(t *testing.T) {
+	p1 := SocketPath("/data1")
+	p2 := SocketPath("/data2")
+	if p1 == p2 && runtime.GOOS != "windows" {
+		t.Error("different data dirs should produce different socket paths on non-Windows")
+	}
+}
+
+func TestSocketPath_WindowsAlwaysSamePipe(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-only")
+	}
+	p1 := SocketPath(`C:\data1`)
+	p2 := SocketPath(`C:\data2`)
+	if p1 != p2 {
+		t.Errorf("Windows named pipe should be constant, got %q vs %q", p1, p2)
+	}
+}
