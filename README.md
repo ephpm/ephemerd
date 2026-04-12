@@ -286,49 +286,9 @@ format = "text"                       # text or json
 
 ## Job Discovery
 
-### Webhook via Tunnel (default)
+### Polling (default)
 
-ephemerd creates a [localtunnel](https://github.com/localtunnel/localtunnel) to receive webhooks instantly — no public IP, no port forwarding, no configuration. On startup it generates a random HMAC secret, registers a `workflow_job` webhook on GitHub pointing at the tunnel URL, and starts receiving events. On shutdown, the webhook is automatically removed.
-
-```mermaid
-sequenceDiagram
-    participant E as ephemerd
-    participant LT as localtunnel.me
-    participant GH as GitHub
-
-    E->>LT: Connect tunnel
-    LT-->>E: Public URL (e.g. abc123.loca.lt)
-    E->>GH: POST /repos/.../hooks (register webhook)
-    GH-->>E: Hook created
-
-    Note over GH: Workflow job queued
-    GH->>LT: POST /webhook (workflow_job event)
-    LT->>E: Forward request
-    E->>E: Verify HMAC, create container, run job
-
-    Note over E: SIGTERM
-    E->>GH: DELETE /repos/.../hooks (deregister)
-    E->>LT: Close tunnel
-```
-
-Zero config needed — just set `GITHUB_TOKEN` and run `ephemerd serve`.
-
-To use [ngrok](https://ngrok.com) instead (more reliable, requires free account):
-
-```toml
-[webhook]
-tunnel = "ngrok"
-ngrok_authtoken = "your-token"
-```
-
-### Polling (opt-in)
-
-For environments where outbound tunnel connections aren't possible, disable the tunnel to fall back to polling. ephemerd checks the GitHub API every 10 seconds for queued jobs.
-
-```toml
-[webhook]
-tunnel = "none"
-```
+By default, ephemerd polls the GitHub API for queued jobs. No inbound ports, no tunnels, no TLS certificates — works behind NAT, on laptops, anywhere.
 
 ```mermaid
 sequenceDiagram
@@ -345,7 +305,77 @@ sequenceDiagram
     E->>E: Create container, run job
 ```
 
-No inbound ports, no TLS certificates, works behind NAT. Adds up to 10 seconds of latency before jobs start.
+Jobs start within 10 seconds of being queued. Tune the interval in the config:
+
+```toml
+[github]
+poll_interval = "5s"   # faster polling, uses more API quota
+```
+
+#### Rate limits and GitHub App authentication
+
+A personal access token (PAT) gets 5,000 API requests per hour. At the default 10s poll interval, ephemerd uses ~360 requests/hour per repo — fine for a few repos, but it adds up.
+
+For higher limits, use a [GitHub App](https://docs.github.com/en/apps/creating-github-apps/about-creating-github-apps/about-creating-github-apps) instead of a PAT. GitHub Apps get 15,000 requests per hour per installation and don't count against your personal quota.
+
+1. [Create a GitHub App](https://github.com/settings/apps/new) with these permissions:
+   - **Repository permissions**: Actions (read), Administration (read/write)
+   - **Organization permissions**: Self-hosted runners (read/write)
+   - **Subscribe to events**: Workflow job
+2. Generate a private key and download the `.pem` file
+3. Install the app on your org or repos
+4. Configure ephemerd:
+
+```toml
+[github]
+app_id = 123456
+installation_id = 789012
+private_key_path = "/path/to/app.pem"
+owner = "your-org"
+```
+
+ephemerd automatically refreshes the installation token before it expires.
+
+### Webhook via Tunnel (opt-in)
+
+For instant job delivery with zero latency, ephemerd can create a tunnel and register webhooks automatically. On startup it generates a random HMAC secret, registers a `workflow_job` webhook on GitHub, and starts receiving events. On shutdown, the webhook is removed.
+
+```mermaid
+sequenceDiagram
+    participant E as ephemerd
+    participant T as Tunnel Server
+    participant GH as GitHub
+
+    E->>T: Connect tunnel
+    T-->>E: Public URL
+    E->>GH: POST /repos/.../hooks (register webhook)
+    GH-->>E: Hook created
+
+    Note over GH: Workflow job queued
+    GH->>T: POST /webhook (workflow_job event)
+    T->>E: Forward request
+    E->>E: Verify HMAC, create container, run job
+
+    Note over E: SIGTERM
+    E->>GH: DELETE /repos/.../hooks (deregister)
+    E->>T: Close tunnel
+```
+
+We recommend a self-hosted localtunnel server ($5/month Linode Nanode — see [examples/localtunnel](examples/localtunnel)) over the free public server, which is unreliable.
+
+```toml
+[webhook]
+tunnel = "localtunnel"
+tunnel_url = "http://tunnels.example.com"
+```
+
+Or use [ngrok](https://ngrok.com) (requires free account):
+
+```toml
+[webhook]
+tunnel = "ngrok"
+ngrok_authtoken = "your-token"
+```
 
 ## Security
 
