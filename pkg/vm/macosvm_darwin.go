@@ -229,11 +229,14 @@ func (m *darwinMacOSVM) RunnerAddress() string {
 	return ip
 }
 
-// WaitForRunner polls until the GitHub Actions runner inside the VM is
-// reachable. The runner listens on a well-known port after reading the
-// JIT config from the virtio-fs share. Returns the VM's IP address.
+// WaitForRunner polls until the GitHub Actions runner inside the VM signals
+// readiness by writing a .ready file to the virtio-fs shared directory.
+// Falls back to IP discovery + SSH check if the guest doesn't write the file.
+// Returns the VM's IP address.
 func (m *darwinMacOSVM) WaitForRunner(ctx context.Context) (string, error) {
 	m.cfg.Log.Info("waiting for macOS VM runner to become reachable", "id", m.id)
+
+	readyPath := filepath.Join(m.jobDir, ".ready")
 
 	for i := range 120 { // up to ~2 minutes
 		select {
@@ -244,6 +247,26 @@ func (m *darwinMacOSVM) WaitForRunner(ctx context.Context) (string, error) {
 		case <-time.After(1 * time.Second):
 		}
 
+		// Primary check: guest writes .ready file to the shared directory
+		// after the runner starts. This works regardless of SSH being enabled.
+		if _, err := os.Stat(readyPath); err == nil {
+			m.cfg.Log.Info("macOS VM runner signaled ready via .ready file", "id", m.id)
+			ip, err := m.discoverIP()
+			if err != nil {
+				m.cfg.Log.Warn("runner ready but IP not yet discoverable, continuing to poll", "id", m.id, "error", err)
+				continue
+			}
+			m.cfg.Log.Info("macOS VM runner reachable", "id", m.id, "ip", ip)
+			return ip, nil
+		}
+
+		// Ping the NAT subnet to populate ARP entries. Vz NAT uses
+		// 192.168.64.0/24 by default. Without this, the ARP table may
+		// not have the VM's entry until the guest sends outbound traffic.
+		if i%5 == 0 {
+			m.probeSubnet()
+		}
+
 		ip, err := m.discoverIP()
 		if err != nil {
 			if i%15 == 0 && i > 0 {
@@ -252,7 +275,8 @@ func (m *darwinMacOSVM) WaitForRunner(ctx context.Context) (string, error) {
 			continue
 		}
 
-		// Check if SSH is reachable (port 22) as a proxy for the VM being booted
+		// Fallback: check if SSH is reachable as a proxy for the VM being booted.
+		// This covers base images that don't write .ready but have SSH enabled.
 		conn, err := net.DialTimeout("tcp", ip+":22", 2*time.Second)
 		if err != nil {
 			if i%15 == 0 && i > 0 {
@@ -262,11 +286,28 @@ func (m *darwinMacOSVM) WaitForRunner(ctx context.Context) (string, error) {
 		}
 		conn.Close()
 
-		m.cfg.Log.Info("macOS VM runner reachable", "id", m.id, "ip", ip)
+		m.cfg.Log.Info("macOS VM runner reachable (SSH fallback)", "id", m.id, "ip", ip)
 		return ip, nil
 	}
 
 	return "", fmt.Errorf("timed out waiting for macOS VM runner (id=%s)", m.id)
+}
+
+// probeSubnet sends ICMP pings across the Vz NAT subnet to populate
+// the host's ARP table. Without this, a quiet VM won't appear in ARP
+// until it sends outbound traffic on its own.
+func (m *darwinMacOSVM) probeSubnet() {
+	// Vz NAT typically uses 192.168.64.0/24. Ping a small range around
+	// the common DHCP allocation window (.2 through .10).
+	for i := 2; i <= 10; i++ {
+		ip := fmt.Sprintf("192.168.64.%d", i)
+		// Non-blocking ping: just send and move on. We only care about
+		// triggering ARP, not about the reply.
+		go func(addr string) {
+			cmd := exec.Command("ping", "-c", "1", "-W", "100", addr)
+			cmd.Run() // ignore errors — host may not respond
+		}(ip)
+	}
 }
 
 // discoverIP finds the VM's IP by looking up its MAC address in the ARP table.
@@ -282,11 +323,18 @@ func (m *darwinMacOSVM) discoverIP() (string, error) {
 		return "", fmt.Errorf("running arp: %w", err)
 	}
 
-	targetMAC := strings.ToLower(m.macAddr)
+	targetMAC := normalizeMAC(m.macAddr)
 	scanner := bufio.NewScanner(strings.NewReader(string(out)))
 	for scanner.Scan() {
-		line := strings.ToLower(scanner.Text())
-		if !strings.Contains(line, targetMAC) {
+		line := scanner.Text()
+		// Extract MAC from ARP line and normalize both for comparison.
+		// macOS arp may omit leading zeros (e.g., "a:b:c:d:e:f" vs "0a:0b:0c:0d:0e:0f").
+		fields := strings.Fields(line)
+		if len(fields) < 4 || fields[1] == "(incomplete)" {
+			continue
+		}
+		arpMAC := normalizeMAC(fields[3])
+		if arpMAC != targetMAC {
 			continue
 		}
 		// Extract IP from between parentheses
@@ -299,6 +347,7 @@ func (m *darwinMacOSVM) discoverIP() (string, error) {
 
 	return "", fmt.Errorf("MAC %s not found in ARP table", m.macAddr)
 }
+
 
 func (m *darwinMacOSVM) Wait(ctx context.Context) (int, error) {
 	select {
