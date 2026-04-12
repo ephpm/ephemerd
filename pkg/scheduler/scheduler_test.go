@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"testing"
 	"time"
 
@@ -71,7 +72,42 @@ func TestNew_ZeroWebhookPort(t *testing.T) {
 	}
 }
 
+// --- isMacOSJob tests ---
+
+func TestIsMacOSJob(t *testing.T) {
+	tests := []struct {
+		labels []string
+		want   bool
+	}{
+		{[]string{"self-hosted", "macos", "arm64"}, true},
+		{[]string{"self-hosted", "macosx"}, true},
+		{[]string{"macos-14"}, true},
+		{[]string{"macos-latest"}, true},
+		{[]string{"self-hosted", "MACOS", "ARM64"}, true},
+		{[]string{"self-hosted", "linux", "x64"}, false},
+		{[]string{"ubuntu-latest"}, false},
+		{[]string{"windows-latest"}, false},
+		{[]string{"self-hosted"}, false},
+		{nil, false},
+		{[]string{}, false},
+	}
+
+	for _, tt := range tests {
+		got := isMacOSJob(tt.labels)
+		if got != tt.want {
+			t.Errorf("isMacOSJob(%v) = %v, want %v", tt.labels, got, tt.want)
+		}
+	}
+}
+
 // --- buildLabelsForOS tests ---
+
+func expectedArchLabel() string {
+	if runtime.GOARCH == "arm64" {
+		return "arm64"
+	}
+	return "x64"
+}
 
 func TestBuildLabelsForOS(t *testing.T) {
 	tests := []struct {
@@ -83,7 +119,7 @@ func TestBuildLabelsForOS(t *testing.T) {
 	}{
 		{"linux", "linux", nil, "self-hosted", "linux"},
 		{"windows", "windows", nil, "self-hosted", "windows"},
-		{"darwin defaults to linux", "darwin", nil, "self-hosted", "linux"},
+		{"darwin", "darwin", nil, "self-hosted", "macos"},
 		{"with extra labels", "linux", []string{"gpu", "fast"}, "self-hosted", "linux"},
 	}
 
@@ -99,17 +135,32 @@ func TestBuildLabelsForOS(t *testing.T) {
 			if labels[1] != tt.wantOS {
 				t.Errorf("labels[1] = %q, want %q", labels[1], tt.wantOS)
 			}
-			// Third label should be an arch (x64 or arm64)
 			if labels[2] != "x64" && labels[2] != "arm64" {
 				t.Errorf("labels[2] = %q, want x64 or arm64", labels[2])
 			}
-			// Extra labels should be appended
 			for i, extra := range tt.extra {
 				if labels[3+i] != extra {
 					t.Errorf("labels[%d] = %q, want %q", 3+i, labels[3+i], extra)
 				}
 			}
 		})
+	}
+}
+
+func TestBuildLabelsForOS_Darwin(t *testing.T) {
+	labels := buildLabelsForOS("darwin", []string{"gpu"})
+
+	if labels[0] != "self-hosted" {
+		t.Errorf("labels[0] = %q, want self-hosted", labels[0])
+	}
+	if labels[1] != "macos" {
+		t.Errorf("labels[1] = %q, want macos", labels[1])
+	}
+	if labels[2] != expectedArchLabel() {
+		t.Errorf("labels[2] = %q, want %q", labels[2], expectedArchLabel())
+	}
+	if labels[3] != "gpu" {
+		t.Errorf("labels[3] = %q, want gpu", labels[3])
 	}
 }
 
@@ -164,7 +215,6 @@ func TestCanHandleJob(t *testing.T) {
 	}{
 		{"no OS label accepts", []string{"self-hosted", "x64"}, false, true},
 		{"empty labels accepts", nil, false, true},
-		// Platform-specific tests depend on GOOS, so test the dispatch path
 		{"linux with dispatcher", []string{"self-hosted", "linux"}, true, true},
 	}
 
@@ -172,7 +222,7 @@ func TestCanHandleJob(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := New(Config{Log: testLogger()})
 			if tt.dispatcher {
-				s.cfg.LinuxDispatcher = &DispatchClient{} // non-nil signals dispatcher available
+				s.cfg.LinuxDispatcher = &DispatchClient{}
 			}
 			if got := s.canHandleJob(tt.labels); got != tt.want {
 				t.Errorf("canHandleJob(%v) = %v, want %v", tt.labels, got, tt.want)
@@ -184,19 +234,14 @@ func TestCanHandleJob(t *testing.T) {
 func TestCanHandleJob_PlatformSpecific(t *testing.T) {
 	s := New(Config{Log: testLogger()})
 
-	// "windows" label: should only succeed on Windows
 	winResult := s.canHandleJob([]string{"self-hosted", "windows"})
-	// "macos"/"macosx" label: should only succeed on darwin
 	macResult := s.canHandleJob([]string{"self-hosted", "macos"})
 	macxResult := s.canHandleJob([]string{"self-hosted", "macosx"})
 
-	// We can't assert the exact value since it depends on GOOS,
-	// but we can verify macos and macosx behave the same
 	if macResult != macxResult {
 		t.Errorf("macos (%v) and macosx (%v) should produce the same result", macResult, macxResult)
 	}
 
-	// On any single platform, at most one of these should be true
 	trueCount := 0
 	if winResult {
 		trueCount++
@@ -264,7 +309,6 @@ func TestIsConflict_NoConflict(t *testing.T) {
 func TestCleanSeen_RemovesExpired(t *testing.T) {
 	s := New(Config{Log: testLogger()})
 
-	// Add entries: one fresh, one expired
 	s.seen[1] = time.Now()
 	s.seen[2] = time.Now().Add(-seenTTL - time.Minute)
 	s.seen[3] = time.Now().Add(-seenTTL - time.Hour)
@@ -284,7 +328,7 @@ func TestCleanSeen_RemovesExpired(t *testing.T) {
 
 func TestCleanSeen_EmptyMap(t *testing.T) {
 	s := New(Config{Log: testLogger()})
-	s.cleanSeen() // should not panic
+	s.cleanSeen()
 	if len(s.seen) != 0 {
 		t.Errorf("seen map should be empty, got %d entries", len(s.seen))
 	}
@@ -401,13 +445,10 @@ func TestHandleHealthz_Draining(t *testing.T) {
 
 func TestSocketPath(t *testing.T) {
 	path := SocketPath("/var/lib/ephemerd")
-	// Should end with the socket filename
 	if path == "" {
 		t.Fatal("SocketPath returned empty string")
 	}
-	// Should contain the data dir
 	if path != "/var/lib/ephemerd/ephemerd.sock" {
-		// On Windows the separator is different
 		t.Logf("SocketPath = %q (OS-specific separator)", path)
 	}
 }

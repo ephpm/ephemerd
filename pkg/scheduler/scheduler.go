@@ -17,6 +17,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/names"
 	"github.com/ephpm/ephemerd/pkg/runtime"
 	"github.com/ephpm/ephemerd/pkg/tunnel"
+	"github.com/ephpm/ephemerd/pkg/vm"
 	gh "github.com/google/go-github/v72/github"
 )
 
@@ -26,6 +27,7 @@ type Config struct {
 	GitHub          *github.Client
 	Artifacts       *artifacts.Extractor  // OCI image layer extractor for macOS VM jobs (nil if not available)
 	LinuxDispatcher *DispatchClient       // if non-nil, Linux jobs are dispatched to this WSL worker via gRPC
+	MacOSVMConfig   *vm.MacOSVMConfig     // if non-nil, macOS-native jobs are enabled (darwin only)
 	DataDir         string                // ephemerd data directory (used for artifact extraction paths)
 	MaxConcurrent   int
 	Labels          []string
@@ -61,8 +63,9 @@ type runningJob struct {
 	image        string
 	runnerID     int64
 	cancel       context.CancelFunc
-	artifactsDir string // non-empty if OCI artifacts were extracted for this job
-	dispatched   string // non-empty if dispatched to WSL worker (stores container name)
+	artifactsDir string    // non-empty if OCI artifacts were extracted for this job
+	dispatched   string    // non-empty if dispatched to WSL worker (stores container name)
+	macosVM      vm.MacOSVM // non-nil if running as a macOS VM job
 	startedAt    time.Time
 }
 
@@ -261,6 +264,20 @@ func isLinuxJob(labels []string) bool {
 	return false
 }
 
+// isMacOSJob returns true if the job's labels include a macOS identifier.
+func isMacOSJob(labels []string) bool {
+	for _, label := range labels {
+		switch strings.ToLower(label) {
+		case "macos", "macosx":
+			return true
+		}
+		if strings.HasPrefix(strings.ToLower(label), "macos-") {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	jobID := event.Job.GetID()
 	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo)
@@ -295,6 +312,12 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	// Dispatch Linux jobs to the WSL worker if available
 	if s.cfg.LinuxDispatcher != nil && isLinuxJob(event.Job.Labels) {
 		s.handleLinuxJob(ctx, event)
+		return
+	}
+
+	// Route macOS-native jobs to per-job macOS VMs
+	if s.cfg.MacOSVMConfig != nil && isMacOSJob(event.Job.Labels) {
+		s.handleMacOSJob(ctx, event)
 		return
 	}
 
@@ -404,6 +427,179 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
 
 		if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), name); err != nil {
 			log.Warn("dispatch destroy failed", "error", err)
+		}
+	}()
+}
+
+// handleMacOSJob provisions a per-job macOS VM via Virtualization.framework.
+// The base image must have the GitHub Actions runner pre-installed. The JIT
+// config is passed via a virtio-fs shared directory.
+func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
+	jobID := event.Job.GetID()
+	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo, "platform", "macos")
+
+	unsee := func() {
+		s.mu.Lock()
+		delete(s.seen, jobID)
+		s.mu.Unlock()
+	}
+
+	// Acquire concurrency slot
+	select {
+	case s.sem <- struct{}{}:
+	case <-ctx.Done():
+		unsee()
+		return
+	}
+
+	log.Info("provisioning macOS VM runner for job")
+
+	// Extract OCI artifacts if an image is specified
+	image := s.cfg.GitHub.FetchJobImage(ctx, event.Repo, event.Job.GetRunID(), jobID)
+	var artifactsDir string
+	if image != "" && s.cfg.Artifacts != nil {
+		artifactsDir = artifacts.ArtifactsDir(s.cfg.DataDir, fmt.Sprintf("%d", jobID))
+		log.Info("extracting OCI artifacts for macOS VM job", "image", image, "dest", artifactsDir)
+		if err := s.cfg.Artifacts.Extract(ctx, image, artifactsDir); err != nil {
+			log.Error("failed to extract OCI artifacts", "image", image, "error", err)
+			artifacts.Cleanup(artifactsDir, s.cfg.Log)
+			artifactsDir = ""
+		}
+	}
+
+	// Register runner with macOS labels
+	labels := buildLabelsForOS("darwin", s.cfg.Labels)
+	const maxNameRetries = 3
+	name, jitConfig, err := s.registerRunner(ctx, event.Repo, labels, log, maxNameRetries)
+	if err != nil {
+		log.Error("failed to register JIT runner", "error", err)
+		if artifactsDir != "" {
+			artifacts.Cleanup(artifactsDir, s.cfg.Log)
+		}
+		unsee()
+		time.Sleep(5 * time.Second)
+		<-s.sem
+		return
+	}
+
+	encodedConfig := jitConfig.GetEncodedJITConfig()
+	runnerID := jitConfig.GetRunner().GetID()
+
+	// Create the macOS VM
+	macVM, err := vm.NewMacOSVM(*s.cfg.MacOSVMConfig, fmt.Sprintf("%d", jobID))
+	if err != nil {
+		log.Error("failed to create macOS VM", "error", err)
+		if rmErr := s.cfg.GitHub.RemoveRunner(ctx, event.Repo, runnerID); rmErr != nil {
+			log.Warn("failed to remove ghost runner", "runner_id", runnerID, "error", rmErr)
+		}
+		if artifactsDir != "" {
+			artifacts.Cleanup(artifactsDir, s.cfg.Log)
+		}
+		unsee()
+		<-s.sem
+		return
+	}
+
+	// Write JIT config to the shared directory before booting
+	if err := macVM.WriteJITConfig(encodedConfig); err != nil {
+		log.Error("failed to write JIT config", "error", err)
+		macVM.Stop()
+		if rmErr := s.cfg.GitHub.RemoveRunner(ctx, event.Repo, runnerID); rmErr != nil {
+			log.Warn("failed to remove ghost runner", "runner_id", runnerID, "error", rmErr)
+		}
+		if artifactsDir != "" {
+			artifacts.Cleanup(artifactsDir, s.cfg.Log)
+		}
+		unsee()
+		<-s.sem
+		return
+	}
+
+	var jobCtx context.Context
+	var cancel context.CancelFunc
+	if s.cfg.JobTimeout > 0 {
+		jobCtx, cancel = context.WithTimeout(ctx, s.cfg.JobTimeout)
+	} else {
+		jobCtx, cancel = context.WithCancel(ctx)
+	}
+
+	// Boot the VM
+	if err := macVM.Start(jobCtx); err != nil {
+		log.Error("failed to start macOS VM", "error", err)
+		macVM.Stop()
+		if rmErr := s.cfg.GitHub.RemoveRunner(ctx, event.Repo, runnerID); rmErr != nil {
+			log.Warn("failed to remove ghost runner", "runner_id", runnerID, "error", rmErr)
+		}
+		if artifactsDir != "" {
+			artifacts.Cleanup(artifactsDir, s.cfg.Log)
+		}
+		unsee()
+		cancel()
+		<-s.sem
+		return
+	}
+
+	// Wait for the runner inside the VM to become reachable
+	ip, err := macVM.WaitForRunner(jobCtx)
+	if err != nil {
+		log.Error("macOS VM runner not reachable", "error", err)
+		macVM.Stop()
+		if rmErr := s.cfg.GitHub.RemoveRunner(ctx, event.Repo, runnerID); rmErr != nil {
+			log.Warn("failed to remove ghost runner", "runner_id", runnerID, "error", rmErr)
+		}
+		if artifactsDir != "" {
+			artifacts.Cleanup(artifactsDir, s.cfg.Log)
+		}
+		unsee()
+		cancel()
+		<-s.sem
+		return
+	}
+
+	// Track the running job
+	s.mu.Lock()
+	s.running[jobID] = &runningJob{
+		repo:         event.Repo,
+		image:        image,
+		runnerID:     runnerID,
+		cancel:       cancel,
+		artifactsDir: artifactsDir,
+		macosVM:      macVM,
+		startedAt:    time.Now(),
+	}
+	s.mu.Unlock()
+
+	log.Info("macOS VM runner ready", "name", name, "ip", ip)
+
+	// Wait for the job to finish in the background
+	go func() {
+		defer func() { <-s.sem }()
+
+		exitCode, err := macVM.Wait(jobCtx)
+		if err != nil {
+			if jobCtx.Err() != nil {
+				log.Warn("macOS VM killed (timeout or shutdown)", "error", err)
+			} else {
+				log.Error("macOS VM crashed", "error", err)
+			}
+		} else if exitCode != 0 {
+			log.Warn("macOS VM exited with failure", "exit_code", exitCode)
+		} else {
+			log.Info("macOS VM exited", "exit_code", exitCode)
+		}
+
+		// Clean up
+		s.mu.Lock()
+		rj, exists := s.running[jobID]
+		if exists {
+			delete(s.running, jobID)
+			s.mu.Unlock()
+			rj.macosVM.Stop()
+			if rj.artifactsDir != "" {
+				artifacts.Cleanup(rj.artifactsDir, s.cfg.Log)
+			}
+		} else {
+			s.mu.Unlock()
 		}
 	}()
 }
@@ -571,7 +767,9 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event github.JobEvent) 
 	)
 
 	job.cancel()
-	if job.dispatched != "" && s.cfg.LinuxDispatcher != nil {
+	if job.macosVM != nil {
+		job.macosVM.Stop()
+	} else if job.dispatched != "" && s.cfg.LinuxDispatcher != nil {
 		if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), job.dispatched); err != nil {
 			log.Warn("failed to destroy dispatched runner", "error", err)
 		}
@@ -636,7 +834,9 @@ func (s *Scheduler) destroyAll() {
 	for id, job := range jobs {
 		s.cfg.Log.Info("destroying runner on shutdown", "job_id", id)
 		job.cancel()
-		if job.dispatched != "" && s.cfg.LinuxDispatcher != nil {
+		if job.macosVM != nil {
+			job.macosVM.Stop()
+		} else if job.dispatched != "" && s.cfg.LinuxDispatcher != nil {
 			if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), job.dispatched); err != nil {
 				s.cfg.Log.Warn("failed to destroy dispatched runner", "job_id", id, "error", err)
 			}
@@ -698,6 +898,8 @@ func buildLabelsForOS(targetOS string, extraLabels []string) []string {
 	switch targetOS {
 	case "windows":
 		labels = append(labels, "windows")
+	case "darwin":
+		labels = append(labels, "macos")
 	default:
 		labels = append(labels, "linux")
 	}

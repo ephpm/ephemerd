@@ -147,4 +147,67 @@ jobs:
 			}
 		}
 	}
+
+	// On macOS, verify macOS jobs are recognized for VM routing
+	if runtime.GOOS == "darwin" {
+		for jobName, plat := range expected {
+			if plat == workflow.PlatformMacOS {
+				t.Logf("job %q (macos) would be routed to a macOS VM on this darwin host", jobName)
+			}
+		}
+	}
+}
+
+// TestE2E_RunRouting_MacOSLabels verifies that various macOS label formats
+// are correctly detected as macOS jobs.
+func TestE2E_RunRouting_MacOSLabels(t *testing.T) {
+	dir := t.TempDir()
+	wfPath := filepath.Join(dir, "macos-labels.yml")
+	if err := os.WriteFile(wfPath, []byte(`
+name: macOS Labels CI
+on: push
+jobs:
+  macos-bare:
+    runs-on: macos-14
+    steps:
+      - run: sw_vers
+  macos-latest:
+    runs-on: macos-latest
+    steps:
+      - run: sw_vers
+  macos-self-hosted:
+    runs-on: [self-hosted, macos, arm64]
+    steps:
+      - run: sw_vers
+  macosx-label:
+    runs-on: [self-hosted, macosx]
+    steps:
+      - run: sw_vers
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	wf, err := workflow.Parse(wfPath)
+	if err != nil {
+		t.Fatalf("parsing workflow: %v", err)
+	}
+
+	expected := map[string]workflow.TargetPlatform{
+		"macos-bare":        workflow.PlatformMacOS,
+		"macos-latest":      workflow.PlatformMacOS,
+		"macos-self-hosted": workflow.PlatformMacOS,
+		"macosx-label":      workflow.PlatformMacOS,
+	}
+
+	for jobName, wantPlatform := range expected {
+		job, ok := wf.Jobs[jobName]
+		if !ok {
+			t.Errorf("job %q not found in workflow", jobName)
+			continue
+		}
+		got := workflow.DetectPlatform(job.RunsOn)
+		if got != wantPlatform {
+			t.Errorf("job %q: DetectPlatform = %v, want %v", jobName, got, wantPlatform)
+		}
+	}
 }
