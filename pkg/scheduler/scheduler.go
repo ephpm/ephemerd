@@ -15,6 +15,7 @@ import (
 
 	"github.com/ephpm/ephemerd/pkg/artifacts"
 	"github.com/ephpm/ephemerd/pkg/github"
+	"github.com/ephpm/ephemerd/pkg/metrics"
 	"github.com/ephpm/ephemerd/pkg/names"
 	"github.com/ephpm/ephemerd/pkg/runtime"
 	"github.com/ephpm/ephemerd/pkg/tunnel"
@@ -122,6 +123,23 @@ func New(cfg Config) *Scheduler {
 // webhooks (when TLS certs are configured), and manages runner lifecycle.
 func (s *Scheduler) Run(ctx context.Context) error {
 	events := make(chan github.JobEvent, 32)
+
+	// Set static metrics
+	metrics.ConcurrentCapacity.Set(float64(s.cfg.MaxConcurrent))
+
+	// Update uptime periodically
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				metrics.UptimeSeconds.Set(time.Since(s.startTime).Seconds())
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	// Clean old job logs on startup, then periodically every hour
 	logDir := filepath.Join(s.cfg.DataDir, "logs")
@@ -240,6 +258,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		case event := <-events:
 			switch event.Action {
 			case "queued":
+				metrics.JobsQueuedTotal.Inc()
 				go s.handleQueued(ctx, event)
 			case "completed":
 				go s.handleCompleted(ctx, event)
@@ -267,6 +286,8 @@ func (s *Scheduler) pollLoop(ctx context.Context, interval time.Duration, events
 }
 
 func (s *Scheduler) poll(ctx context.Context, events chan<- github.JobEvent) {
+	metrics.GitHubPollTotal.Inc()
+
 	jobs, err := s.cfg.GitHub.PollJobs(ctx)
 	if err != nil {
 		s.cfg.Log.Warn("poll failed", "error", err)
@@ -443,6 +464,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
 		startedAt: time.Now(),
 	}
 	s.mu.Unlock()
+	metrics.JobsActive.Inc()
 
 	log.Info("Linux runner dispatched to WSL", "name", name)
 
@@ -614,6 +636,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 		startedAt:    time.Now(),
 	}
 	s.mu.Unlock()
+	metrics.JobsActive.Inc()
 
 	log.Info("macOS VM runner ready", "name", name, "ip", ip)
 
@@ -753,6 +776,7 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event github.JobEvent) {
 		startedAt:    time.Now(),
 	}
 	s.mu.Unlock()
+	metrics.JobsActive.Inc()
 
 	log.Info("runner environment ready", "name", name)
 
@@ -808,9 +832,15 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event github.JobEvent) 
 		return
 	}
 
+	conclusion := event.Job.GetConclusion()
 	log.Info("job completed, destroying runner environment",
-		"conclusion", event.Job.GetConclusion(),
+		"conclusion", conclusion,
 	)
+
+	// Record metrics
+	metrics.JobsActive.Dec()
+	metrics.JobsTotal.WithLabelValues(event.Repo, conclusion).Inc()
+	metrics.JobDuration.WithLabelValues(event.Repo).Observe(time.Since(job.startedAt).Seconds())
 
 	resetBackoff(event.Repo)
 	job.cancel()
@@ -835,6 +865,7 @@ func (s *Scheduler) drain() {
 	s.draining = true
 	count := len(s.running)
 	s.mu.Unlock()
+	metrics.Draining.Set(1)
 
 	if count == 0 {
 		return

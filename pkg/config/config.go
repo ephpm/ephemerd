@@ -18,7 +18,18 @@ type Config struct {
 	Network    NetworkConfig    `toml:"network"`
 	VM         VMConfig         `toml:"vm"`
 	Runner     RunnerConfig     `toml:"runner"`
+	Metrics    MetricsConfig    `toml:"metrics"`
 	Log        LogConfig        `toml:"log"`
+}
+
+// MetricsConfig configures the Prometheus metrics endpoint.
+// Disabled by default. Set enabled = true to expose /metrics.
+type MetricsConfig struct {
+	Enabled bool   `toml:"enabled"`  // enable /metrics endpoint (default false)
+	Port    int    `toml:"port"`     // listen port (default 9090)
+	Path    string `toml:"path"`     // metrics path (default "/metrics")
+	TLSCert string `toml:"tls_cert"` // TLS certificate path (optional)
+	TLSKey  string `toml:"tls_key"`  // TLS private key path (optional)
 }
 
 // WebhookConfig configures webhook delivery and tunnel providers.
@@ -135,6 +146,10 @@ func Load(path string) (*Config, error) {
 		Webhook: WebhookConfig{
 			Port:   8080,
 			Tunnel: "none",
+		},
+		Metrics: MetricsConfig{
+			Port: 9090,
+			Path: "/metrics",
 		},
 		Log: LogConfig{
 			Level:  "info",

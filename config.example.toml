@@ -71,6 +71,16 @@ shutdown_timeout = "5m"
 # cpus = 2
 # memory_mb = 2048
 
+[metrics]
+# Enable Prometheus metrics endpoint. Disabled by default.
+# enabled = true
+# port = 9090
+# path = "/metrics"
+
+# Optional TLS for the metrics endpoint
+# tls_cert = "/etc/ephemerd/metrics.crt"
+# tls_key = "/etc/ephemerd/metrics.key"
+
 [log]
 # Log level: debug, info, warn, error
 level = "info"
