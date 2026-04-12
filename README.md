@@ -380,6 +380,29 @@ tunnel = "ngrok"
 ngrok_authtoken = "your-token"
 ```
 
+### Webhook via Direct TLS (VPS / public IP)
+
+If your machine has a public IP and a TLS certificate (from Let's Encrypt, etc.), ephemerd can receive webhooks directly — no tunnel needed. You manage the webhook registration in GitHub yourself.
+
+```toml
+[webhook]
+tunnel = "none"
+tls_cert = "/etc/ephemerd/tls.crt"
+tls_key = "/etc/ephemerd/tls.key"
+secret = "your-webhook-secret"
+port = 8080
+```
+
+Then add a webhook in your GitHub repo or org settings:
+
+1. Go to **Settings → Webhooks → Add webhook**
+2. **Payload URL**: `https://your-host:8080/webhook`
+3. **Content type**: `application/json`
+4. **Secret**: same value as `secret` in your config
+5. **Events**: select "Workflow jobs"
+
+ephemerd verifies the HMAC-SHA256 signature on every delivery.
+
 ## Security
 
 Every job runs in full isolation:

@@ -138,8 +138,29 @@ func (r *RunnerConfig) ParsedShutdownTimeout() time.Duration {
 }
 
 type LogConfig struct {
-	Level  string `toml:"level"`
-	Format string `toml:"format"` // "text" or "json"
+	Level        string `toml:"level"`
+	Format       string `toml:"format"`        // "text" or "json"
+	LogRetention string `toml:"log_retention"` // max age for job log files (e.g. "7d", "24h"); default "7d"
+}
+
+// LogRetentionDuration returns the parsed log retention duration.
+// Supports Go duration strings (e.g. "168h") and a "d" suffix for days (e.g. "7d").
+// Returns 7 days if the value is empty or invalid.
+func (lc LogConfig) LogRetentionDuration() time.Duration {
+	s := lc.LogRetention
+	if s == "" {
+		return 7 * 24 * time.Hour
+	}
+	// Support "Nd" shorthand for days.
+	if len(s) > 1 && s[len(s)-1] == 'd' {
+		if d, err := time.ParseDuration(s[:len(s)-1] + "h"); err == nil {
+			return d * 24
+		}
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		return d
+	}
+	return 7 * 24 * time.Hour
 }
 
 func Load(path string) (*Config, error) {

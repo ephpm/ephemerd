@@ -87,3 +87,7 @@ level = "info"
 
 # Log format: text or json
 format = "text"
+
+# How long to keep job log files before automatic cleanup.
+# Supports Go durations (e.g. "168h") and a "d" shorthand (e.g. "7d").
+# log_retention = "7d"

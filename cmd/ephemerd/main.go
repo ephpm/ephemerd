@@ -328,6 +328,7 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		Tunnel:          tunnelProvider,
 		JobTimeout:      cfg.Runner.ParsedJobTimeout(),
 		ShutdownTimeout: cfg.Runner.ParsedShutdownTimeout(),
+		LogRetention:    cfg.Log.LogRetentionDuration(),
 		Log:             log,
 	})
 
