@@ -4,6 +4,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -126,7 +127,8 @@ func (d *RunDistro) Run(ctx context.Context, cfg RunInWSLConfig) (int, error) {
 	cmd.Stdin = os.Stdin
 
 	if err := cmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
 			return exitErr.ExitCode(), nil
 		}
 		return 1, fmt.Errorf("running ephemerd in WSL: %w", err)

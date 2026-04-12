@@ -1,0 +1,34 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - errorlint
+    - bodyclose
+    - nilerr
+
+  disable:
+    - depguard
+    - wrapcheck
+    - exhaustruct
+
+  exclusions:
+    rules:
+      - path: "localtunnel"
+        linters:
+          - errorlint
+          - bodyclose
+      - path: "api/v1"
+        linters:
+          - errorlint
+      - path: "mage/"
+        linters:
+          - errorlint
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
