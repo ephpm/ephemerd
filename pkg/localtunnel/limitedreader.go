@@ -3,7 +3,6 @@ package localtunnel
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 )
 
 // A simple limitedReader similar to io.LimitReader that also let's us know
@@ -38,11 +37,11 @@ func readAtmost(r io.ReadCloser, maxSize int64) ([]byte, error) {
 		return nil, nil
 	}
 	// Close the reader no matter what happens
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	// If r.maxSize is zero or less read the entire body regardless of length
 	if maxSize <= 0 {
-		return ioutil.ReadAll(r)
+		return io.ReadAll(r)
 	}
 
 	// Read at-most maxSize from body and check that we read it all
@@ -50,7 +49,7 @@ func readAtmost(r io.ReadCloser, maxSize int64) ([]byte, error) {
 		reader:   r,
 		maxBytes: maxSize,
 	}
-	body, err := ioutil.ReadAll(&reader)
+	body, err := io.ReadAll(&reader)
 	if err != nil {
 		return nil, err
 	}

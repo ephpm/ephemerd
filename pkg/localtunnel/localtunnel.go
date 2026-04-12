@@ -53,17 +53,17 @@ func (lt *LocalTunnel) listen() {
 func (lt *LocalTunnel) forward(remoteConn net.Conn) {
 	localConn, err := net.Dial("tcp", lt.localAddr)
 	if err != nil {
-		remoteConn.Close()
+		_ = remoteConn.Close()
 		return
 	}
 
 	go func() {
-		io.Copy(remoteConn, localConn)
-		remoteConn.Close()
+		_, _ = io.Copy(remoteConn, localConn)
+		_ = remoteConn.Close()
 	}()
 	go func() {
-		io.Copy(localConn, remoteConn)
-		localConn.Close()
+		_, _ = io.Copy(localConn, remoteConn)
+		_ = localConn.Close()
 	}()
 }
 

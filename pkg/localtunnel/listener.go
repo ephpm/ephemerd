@@ -156,7 +156,7 @@ func (l *Listener) handle(c net.Conn) error {
 		case <-doneReading:
 			return
 		case <-l.context.Done():
-			c.Close()
+			_ = c.Close()
 		}
 	}()
 
@@ -168,7 +168,7 @@ func (l *Listener) handle(c net.Conn) error {
 	if err != nil {
 		// Ignore if it took more than 30s
 		if start.Before(time.Now().Add(-30 * time.Second)) {
-			c.Close()
+			_ = c.Close()
 			return nil
 		}
 		return err
@@ -185,7 +185,7 @@ func (l *Listener) handle(c net.Conn) error {
 	}
 
 	// Always close the remote connection
-	c.Close()
+	_ = c.Close()
 	return nil
 }
 
