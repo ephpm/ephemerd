@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	goruntime "runtime"
 	"strings"
 	"sync"
@@ -57,6 +58,34 @@ type Scheduler struct {
 
 const seenTTL = 10 * time.Minute
 
+// failureBackoff tracks per-repo failure counts to compute exponential backoff.
+// Resets to zero on the next successful job for that repo.
+var (
+	failureCounts   = map[string]int{}
+	failureCountsMu sync.Mutex
+)
+
+// backoffDuration returns an exponential backoff duration based on consecutive
+// failure count: 2s, 4s, 8s, 16s, 32s, capped at 60s.
+func backoffDuration(repo string) time.Duration {
+	failureCountsMu.Lock()
+	failureCounts[repo]++
+	n := failureCounts[repo]
+	failureCountsMu.Unlock()
+
+	d := time.Duration(1<<min(n, 6)) * time.Second // 2, 4, 8, 16, 32, 64
+	if d > 60*time.Second {
+		d = 60 * time.Second
+	}
+	return d
+}
+
+func resetBackoff(repo string) {
+	failureCountsMu.Lock()
+	delete(failureCounts, repo)
+	failureCountsMu.Unlock()
+}
+
 type runningJob struct {
 	env          *runtime.RunnerEnv
 	repo         string
@@ -93,6 +122,23 @@ func New(cfg Config) *Scheduler {
 // webhooks (when TLS certs are configured), and manages runner lifecycle.
 func (s *Scheduler) Run(ctx context.Context) error {
 	events := make(chan github.JobEvent, 32)
+
+	// Clean old job logs on startup, then periodically every hour
+	logDir := filepath.Join(s.cfg.DataDir, "logs")
+	const logMaxAge = 7 * 24 * time.Hour // keep logs for 7 days
+	runtime.CleanOldLogs(logDir, logMaxAge, s.cfg.Log)
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				runtime.CleanOldLogs(logDir, logMaxAge, s.cfg.Log)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	// Start gRPC control server on unix socket
 	grpcCleanup, err := s.startControlServer()
@@ -359,7 +405,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
 	if err != nil {
 		log.Error("failed to register JIT runner", "error", err)
 		unsee()
-		time.Sleep(5 * time.Second)
+		time.Sleep(backoffDuration(event.Repo))
 		<-s.sem
 		return
 	}
@@ -477,7 +523,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
 		unsee()
-		time.Sleep(5 * time.Second)
+		time.Sleep(backoffDuration(event.Repo))
 		<-s.sem
 		return
 	}
@@ -766,6 +812,7 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event github.JobEvent) 
 		"conclusion", event.Job.GetConclusion(),
 	)
 
+	resetBackoff(event.Repo)
 	job.cancel()
 	if job.macosVM != nil {
 		job.macosVM.Stop()
@@ -872,7 +919,9 @@ func (s *Scheduler) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(status)
+	if err := json.NewEncoder(w).Encode(status); err != nil {
+		s.cfg.Log.Error("failed to encode healthz response", "error", err)
+	}
 }
 
 

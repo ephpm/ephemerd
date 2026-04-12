@@ -33,12 +33,12 @@ type RunInWSLConfig struct {
 // generateDistroName returns a unique WSL distro name with the given prefix
 // and an 8-character hex suffix from crypto/rand.
 // Example: "ephemerd-run-a1b2c3d4"
-func generateDistroName(prefix string) string {
+func generateDistroName(prefix string) (string, error) {
 	var b [4]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+		return "", fmt.Errorf("crypto/rand failed: %w", err)
 	}
-	return prefix + "-" + hex.EncodeToString(b[:])
+	return prefix + "-" + hex.EncodeToString(b[:]), nil
 }
 
 // WindowsPathToWSL converts a Windows absolute path to a WSL /mnt/ path.

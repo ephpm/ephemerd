@@ -159,7 +159,10 @@ func (a *AppAuth) signJWT() (string, error) {
 
 func (a *AppAuth) exchangeToken(jwt string) (string, time.Time, error) {
 	url := fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", a.installationID)
-	req, _ := http.NewRequest("POST", url, nil)
+	req, err := http.NewRequest("POST", url, nil)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("creating token exchange request: %w", err)
+	}
 	req.Header.Set("Authorization", "Bearer "+jwt)
 	req.Header.Set("Accept", "application/vnd.github+json")
 
@@ -169,7 +172,10 @@ func (a *AppAuth) exchangeToken(jwt string) (string, time.Time, error) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("reading token response body: %w", err)
+	}
 	if resp.StatusCode != 201 {
 		return "", time.Time{}, fmt.Errorf("GitHub API %d: %s", resp.StatusCode, body)
 	}
@@ -182,12 +188,20 @@ func (a *AppAuth) exchangeToken(jwt string) (string, time.Time, error) {
 		return "", time.Time{}, fmt.Errorf("parsing token response: %w", err)
 	}
 
-	expires, _ := time.Parse(time.RFC3339, result.ExpiresAt)
+	expires, err := time.Parse(time.RFC3339, result.ExpiresAt)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("parsing token expiry %q: %w", result.ExpiresAt, err)
+	}
 	return result.Token, expires, nil
 }
 
 func mustJSON(v any) []byte {
-	b, _ := json.Marshal(v)
+	b, err := json.Marshal(v)
+	if err != nil {
+		// This only marshals simple maps with string/int values — if it fails,
+		// the JWT will be malformed and the API call will fail with a clear error.
+		return []byte("{}")
+	}
 	return b
 }
 

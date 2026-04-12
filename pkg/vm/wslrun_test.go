@@ -77,8 +77,10 @@ func TestWindowsPathToWSL(t *testing.T) {
 
 func TestGenerateDistroName(t *testing.T) {
 	t.Run("format", func(t *testing.T) {
-		name := generateDistroName("ephemerd-run")
-		// Should match: ephemerd-run-<8 hex chars>
+		name, err := generateDistroName("ephemerd-run")
+		if err != nil {
+			t.Fatalf("generateDistroName failed: %v", err)
+		}
 		re := regexp.MustCompile(`^ephemerd-run-[0-9a-f]{8}$`)
 		if !re.MatchString(name) {
 			t.Errorf("generateDistroName(\"ephemerd-run\") = %q, does not match expected pattern", name)
@@ -86,7 +88,10 @@ func TestGenerateDistroName(t *testing.T) {
 	})
 
 	t.Run("serve prefix", func(t *testing.T) {
-		name := generateDistroName("ephemerd-linux")
+		name, err := generateDistroName("ephemerd-linux")
+		if err != nil {
+			t.Fatalf("generateDistroName failed: %v", err)
+		}
 		re := regexp.MustCompile(`^ephemerd-linux-[0-9a-f]{8}$`)
 		if !re.MatchString(name) {
 			t.Errorf("generateDistroName(\"ephemerd-linux\") = %q, does not match expected pattern", name)
@@ -96,7 +101,10 @@ func TestGenerateDistroName(t *testing.T) {
 	t.Run("uniqueness", func(t *testing.T) {
 		seen := make(map[string]bool)
 		for range 100 {
-			name := generateDistroName("ephemerd-run")
+			name, err := generateDistroName("ephemerd-run")
+			if err != nil {
+				t.Fatalf("generateDistroName failed: %v", err)
+			}
 			if seen[name] {
 				t.Fatalf("duplicate name generated: %s", name)
 			}
@@ -118,7 +126,11 @@ func TestGenerateDistroName(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				for range namesPerGoroutine {
-					name := generateDistroName("ephemerd-run")
+					name, err := generateDistroName("ephemerd-run")
+					if err != nil {
+						t.Errorf("generateDistroName failed: %v", err)
+						return
+					}
 					mu.Lock()
 					if seen[name] {
 						duplicates = append(duplicates, name)

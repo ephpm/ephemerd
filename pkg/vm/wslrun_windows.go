@@ -14,8 +14,13 @@ import (
 // NewRunDistro creates a fresh WSL distro with a unique name for a single
 // "ephemerd run" invocation. Call Destroy() when done.
 func NewRunDistro(ctx context.Context, cfg RunDistroConfig) (*RunDistro, error) {
+	name, err := generateDistroName("ephemerd-run")
+	if err != nil {
+		return nil, fmt.Errorf("generating distro name: %w", err)
+	}
+
 	d := &RunDistro{
-		Name:    generateDistroName("ephemerd-run"),
+		Name:    name,
 		dataDir: cfg.DataDir,
 		log:     cfg.Log,
 	}
