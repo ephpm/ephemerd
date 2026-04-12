@@ -255,12 +255,16 @@ func (l *wslLinuxVM) launch() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	l.cancel = cancel
 
-	l.cmd = exec.CommandContext(ctx, "wsl", "-d", l.distroName, "--",
+	args := []string{"-d", l.distroName, "--",
 		binPath, "serve",
 		"--data-dir", "/var/lib/ephemerd",
 		"--containerd-tcp-port", fmt.Sprintf("%d", l.cfg.ContainerdPort),
 		"--containerd-only",
-	)
+	}
+	if l.cfg.DindEnabled {
+		args = append(args, "--dind")
+	}
+	l.cmd = exec.CommandContext(ctx, "wsl", args...)
 
 	// Pipe stdout/stderr to our logger
 	stdout, err := l.cmd.StdoutPipe()
@@ -373,7 +377,10 @@ func (l *wslLinuxVM) waitForContainerd() error {
 	dispatchAddr := fmt.Sprintf("localhost:%d", l.cfg.ContainerdPort+1)
 	l.cfg.Log.Info("waiting for dispatch server in WSL", "address", dispatchAddr)
 
-	for i := range 30 {
+	// The dispatch server starts after containerd + runner extraction + CNI +
+	// networking are all ready inside WSL. On first run the runner extraction
+	// can take 30-60s, so allow up to 90s total.
+	for i := range 90 {
 		select {
 		case <-l.done:
 			return fmt.Errorf("WSL ephemerd exited before dispatch server was ready")

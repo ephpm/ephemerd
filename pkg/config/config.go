@@ -17,6 +17,7 @@ type Config struct {
 	Containerd ContainerdConfig `toml:"containerd"`
 	Network    NetworkConfig    `toml:"network"`
 	VM         VMConfig         `toml:"vm"`
+	Dind       DindConfig       `toml:"dind"`
 	Runner     RunnerConfig     `toml:"runner"`
 	Metrics    MetricsConfig    `toml:"metrics"`
 	Log        LogConfig        `toml:"log"`
@@ -53,6 +54,11 @@ type NetworkConfig struct {
 
 type ContainerdConfig struct {
 	// Reserved for future containerd-specific settings (e.g. snapshotter overrides)
+}
+
+// DindConfig configures the fake Docker daemon mounted into job containers.
+type DindConfig struct {
+	Enabled bool `toml:"enabled"` // mount /var/run/docker.sock with a fake Docker API
 }
 
 // VMConfig configures virtual machines for cross-OS job execution.

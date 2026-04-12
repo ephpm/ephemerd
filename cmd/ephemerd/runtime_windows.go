@@ -18,7 +18,7 @@ import (
 // Returns the native containerd client for Windows jobs and a function that
 // blocks until the Linux dispatch client is ready (nil if Linux VM is disabled
 // or failed to start).
-func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool, _ uint32) (*client.Client, func() *scheduler.DispatchClient, func(), error) {
+func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool, _ uint32, dindEnabled bool) (*client.Client, func() *scheduler.DispatchClient, func(), error) {
 	// Start native containerd for Windows container jobs
 	ctrd, err := containerd.New(containerd.Config{
 		DataDir: dataDir,
@@ -45,8 +45,9 @@ func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool
 		log.Info("starting Linux VM in background (WSL)")
 
 		lvm, err := vm.StartLinuxVM(vm.LinuxVMConfig{
-			DataDir: dataDir,
-			Log:     log,
+			DataDir:     dataDir,
+			DindEnabled: dindEnabled,
+			Log:         log,
 		})
 		if err != nil {
 			log.Warn("Linux VM not started — Linux jobs will not be available on this host", "error", err)
