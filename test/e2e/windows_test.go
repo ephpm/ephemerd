@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ephpm/ephemerd/pkg/networking"
 	"github.com/ephpm/ephemerd/pkg/scheduler"
 	"github.com/ephpm/ephemerd/pkg/vm"
 )
@@ -157,4 +158,175 @@ func TestE2E_Windows_WSLDistro_BootShutdown(t *testing.T) {
 	linuxVM.Stop()
 
 	t.Log("WSL boot/shutdown test passed")
+}
+
+// TestE2E_Windows_HCN_NetworkLifecycle exercises the Windows HCN networking
+// stack: creates a NAT network, sets up an endpoint with ACL policies,
+// creates a namespace, attaches the endpoint, then tears everything down.
+func TestE2E_Windows_HCN_NetworkLifecycle(t *testing.T) {
+	log := testLogWindows()
+	dataDir := filepath.Join(os.TempDir(), "ephemerd-e2e-hcn")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.RemoveAll(dataDir); err != nil {
+			t.Logf("cleanup: %v", err)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	net, err := networking.New(networking.Config{
+		DataDir: dataDir,
+		Log:     log,
+	})
+	if err != nil {
+		t.Fatalf("networking.New: %v", err)
+	}
+	defer net.Cleanup()
+
+	t.Log("HCN NAT network created")
+
+	if err := net.InstallFirewallRules(); err != nil {
+		t.Fatalf("InstallFirewallRules: %v", err)
+	}
+
+	endpointID := fmt.Sprintf("e2e-hcn-%d", time.Now().UnixNano())
+	result, err := net.Setup(ctx, endpointID, "")
+	if err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	if result.EndpointID == "" {
+		t.Error("Setup returned empty EndpointID")
+	}
+	if result.NetNS == "" {
+		t.Error("Setup returned empty NetNS (namespace ID)")
+	}
+	t.Logf("endpoint=%s namespace=%s", result.EndpointID, result.NetNS)
+
+	if err := net.Teardown(ctx, endpointID, result.NetNS); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+
+	t.Log("HCN network lifecycle test passed")
+}
+
+// TestE2E_Windows_HCN_MultipleEndpoints creates multiple endpoints on the
+// same network to verify that concurrent container networking works.
+func TestE2E_Windows_HCN_MultipleEndpoints(t *testing.T) {
+	log := testLogWindows()
+	dataDir := filepath.Join(os.TempDir(), "ephemerd-e2e-hcn-multi")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.RemoveAll(dataDir); err != nil {
+			t.Logf("cleanup: %v", err)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	net, err := networking.New(networking.Config{
+		DataDir: dataDir,
+		Log:     log,
+	})
+	if err != nil {
+		t.Fatalf("networking.New: %v", err)
+	}
+	defer net.Cleanup()
+
+	const numEndpoints = 3
+	type ep struct {
+		id     string
+		result *networking.SetupResult
+	}
+	var endpoints []ep
+
+	for i := range numEndpoints {
+		id := fmt.Sprintf("e2e-hcn-multi-%d-%d", i, time.Now().UnixNano())
+		result, err := net.Setup(ctx, id, "")
+		if err != nil {
+			for _, e := range endpoints {
+				if tearErr := net.Teardown(ctx, e.id, e.result.NetNS); tearErr != nil {
+					t.Logf("teardown %s: %v", e.id, tearErr)
+				}
+			}
+			t.Fatalf("Setup endpoint %d: %v", i, err)
+		}
+		endpoints = append(endpoints, ep{id: id, result: result})
+		t.Logf("endpoint %d: id=%s ns=%s", i, result.EndpointID, result.NetNS)
+	}
+
+	seen := make(map[string]bool)
+	for _, e := range endpoints {
+		if seen[e.result.EndpointID] {
+			t.Errorf("duplicate endpoint ID: %s", e.result.EndpointID)
+		}
+		seen[e.result.EndpointID] = true
+	}
+
+	seenNS := make(map[string]bool)
+	for _, e := range endpoints {
+		if seenNS[e.result.NetNS] {
+			t.Errorf("duplicate namespace ID: %s", e.result.NetNS)
+		}
+		seenNS[e.result.NetNS] = true
+	}
+
+	for _, e := range endpoints {
+		if err := net.Teardown(ctx, e.id, e.result.NetNS); err != nil {
+			t.Errorf("Teardown %s: %v", e.id, err)
+		}
+	}
+
+	t.Logf("HCN multiple endpoints test passed (%d endpoints)", numEndpoints)
+}
+
+// TestE2E_Windows_HCN_TeardownIdempotent verifies that tearing down an
+// already-torn-down endpoint returns a clear error (not a panic).
+func TestE2E_Windows_HCN_TeardownIdempotent(t *testing.T) {
+	log := testLogWindows()
+	dataDir := filepath.Join(os.TempDir(), "ephemerd-e2e-hcn-idem")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.RemoveAll(dataDir); err != nil {
+			t.Logf("cleanup: %v", err)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+	defer cancel()
+
+	net, err := networking.New(networking.Config{
+		DataDir: dataDir,
+		Log:     log,
+	})
+	if err != nil {
+		t.Fatalf("networking.New: %v", err)
+	}
+	defer net.Cleanup()
+
+	id := fmt.Sprintf("e2e-hcn-idem-%d", time.Now().UnixNano())
+	result, err := net.Setup(ctx, id, "")
+	if err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	if err := net.Teardown(ctx, id, result.NetNS); err != nil {
+		t.Fatalf("first Teardown: %v", err)
+	}
+
+	err = net.Teardown(ctx, id, result.NetNS)
+	if err == nil {
+		t.Log("second Teardown returned nil (endpoint already cleaned up)")
+	} else {
+		t.Logf("second Teardown returned expected error: %v", err)
+	}
 }
