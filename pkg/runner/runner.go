@@ -251,7 +251,7 @@ func extractTarGz(r io.Reader, dest string) error {
 			}
 			if _, copyErr := io.Copy(f, tr); copyErr != nil {
 				if err := f.Close(); err != nil {
-					return fmt.Errorf("closing file %s after write error: %w (write: %v)", target, err, copyErr)
+					return fmt.Errorf("closing file %s after write error: %w (write: %w)", target, err, copyErr)
 				}
 				return fmt.Errorf("writing file %s: %w", target, copyErr)
 			}
