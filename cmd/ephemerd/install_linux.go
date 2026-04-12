@@ -9,7 +9,7 @@ import (
 )
 
 func installService(binPath, dataDir string) error {
-	if _, err := os.Stat("/etc/systemd/system"); err != nil {
+	if !hasSystemd() {
 		fmt.Println("  systemd not found, skipping service installation")
 		return nil
 	}
@@ -53,6 +53,11 @@ WantedBy=multi-user.target
 	}
 
 	return nil
+}
+
+func hasSystemd() bool {
+	_, err := os.Stat("/etc/systemd/system")
+	return err == nil
 }
 
 func printNextSteps(dataDir string) {
