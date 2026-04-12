@@ -17,6 +17,7 @@ package vm
 import (
 	"context"
 	"log/slog"
+	"strings"
 
 	"github.com/containerd/containerd/v2/client"
 )
@@ -109,8 +110,9 @@ type MacOSVM interface {
 	// Start boots the VM from a clone-on-write copy of the base image.
 	Start(ctx context.Context) error
 
-	// WaitForRunner blocks until the GitHub runner inside the VM is reachable
-	// (SSH on port 22). Returns the VM's discovered IP address.
+	// WaitForRunner blocks until the GitHub runner inside the VM is reachable.
+	// Checks for a .ready sentinel file on the virtio-fs share first, then
+	// falls back to SSH port 22. Returns the VM's discovered IP address.
 	WaitForRunner(ctx context.Context) (string, error)
 
 	// RunnerAddress returns the VM's discovered IP address, or empty if not yet known.
@@ -121,4 +123,21 @@ type MacOSVM interface {
 
 	// Stop forcefully stops the VM and deletes the clone.
 	Stop()
+}
+
+// normalizeMAC converts a MAC address to a canonical lowercase form with
+// zero-padded octets (e.g., "a:b:c:d:e:f" → "0a:0b:0c:0d:0e:0f").
+// macOS arp output may omit leading zeros while Vz reports them — this
+// ensures reliable comparison regardless of format.
+func normalizeMAC(mac string) string {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(mac)), ":")
+	if len(parts) != 6 {
+		return strings.ToLower(mac)
+	}
+	for i, p := range parts {
+		if len(p) == 1 {
+			parts[i] = "0" + p
+		}
+	}
+	return strings.Join(parts, ":")
 }

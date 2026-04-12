@@ -98,6 +98,40 @@ func TestNewMacOSVM_StubOnNonDarwin(t *testing.T) {
 	}
 }
 
+// --- normalizeMAC ---
+
+func TestNormalizeMAC(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		// Already canonical
+		{"0a:0b:0c:0d:0e:0f", "0a:0b:0c:0d:0e:0f"},
+		// Missing leading zeros (macOS arp output format)
+		{"a:b:c:d:e:f", "0a:0b:0c:0d:0e:0f"},
+		// Mixed
+		{"aa:b:cc:0d:e:ff", "aa:0b:cc:0d:0e:ff"},
+		// Uppercase
+		{"AA:BB:CC:DD:EE:FF", "aa:bb:cc:dd:ee:ff"},
+		// Mixed case with missing zeros
+		{"A:B:C:D:E:F", "0a:0b:0c:0d:0e:0f"},
+		// Whitespace
+		{"  aa:bb:cc:dd:ee:ff  ", "aa:bb:cc:dd:ee:ff"},
+		// Non-MAC input (passthrough)
+		{"not-a-mac", "not-a-mac"},
+		{"", ""},
+		// Wrong number of octets
+		{"aa:bb:cc", "aa:bb:cc"},
+	}
+
+	for _, tt := range tests {
+		got := normalizeMAC(tt.input)
+		if got != tt.want {
+			t.Errorf("normalizeMAC(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
 func TestStartLinuxVM_ErrorsOnLinux(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("stub test only applies on Linux")
