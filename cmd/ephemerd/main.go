@@ -13,6 +13,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/config"
 	"github.com/ephpm/ephemerd/pkg/containerd"
 	"github.com/ephpm/ephemerd/pkg/github"
+	"github.com/ephpm/ephemerd/pkg/metrics"
 	"github.com/ephpm/ephemerd/pkg/networking"
 	"github.com/ephpm/ephemerd/pkg/runner"
 	"github.com/ephpm/ephemerd/pkg/runtime"
@@ -316,6 +317,18 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		ShutdownTimeout: cfg.Runner.ParsedShutdownTimeout(),
 		Log:             log,
 	})
+
+	// Start metrics server if enabled
+	if cfg.Metrics.Enabled {
+		metricsCleanup := metrics.Serve(ctx, metrics.ServerConfig{
+			Port:    cfg.Metrics.Port,
+			Path:    cfg.Metrics.Path,
+			TLSCert: cfg.Metrics.TLSCert,
+			TLSKey:  cfg.Metrics.TLSKey,
+			Log:     log,
+		})
+		defer metricsCleanup()
+	}
 
 	log.Info("ephemerd ready", "repos", cfg.GitHub.Repos, "max_concurrent", cfg.Runner.MaxConcurrent)
 
