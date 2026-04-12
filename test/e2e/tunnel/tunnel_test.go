@@ -269,7 +269,10 @@ func TestLocaltunnelHTTP(t *testing.T) {
 			time.Sleep(2 * time.Second)
 			continue
 		}
-		body, _ = io.ReadAll(resp.Body)
+		body, err = io.ReadAll(resp.Body)
+		if err != nil {
+			t.Logf("attempt %d: error reading body: %v", attempt, err)
+		}
 		if err := resp.Body.Close(); err != nil {
 			t.Logf("error closing response body: %v", err)
 		}
