@@ -171,31 +171,42 @@ A single machine can serve multiple job types:
 
 ### 1. Install
 
-Download the binary for your platform from [Releases](https://github.com/ephpm/ephemerd/releases), or build from source:
-
 ```bash
-mage build
+curl -fsSL https://raw.githubusercontent.com/ephpm/ephemerd/main/install.sh | sudo bash
 ```
+
+This downloads the latest binary, creates a default config at `/var/lib/ephemerd/config.toml`, and installs a systemd service (Linux) or launchd plist (macOS).
+
+Or download manually from [Releases](https://github.com/ephpm/ephemerd/releases), or build from source with `mage build`.
 
 ### 2. Configure
 
 ```bash
-mkdir -p /var/lib/ephemerd
-cat > /var/lib/ephemerd/config.toml << 'EOF'
-[github]
-owner = "your-org"
-# repos = ["repo1", "repo2"]  # optional — omit for org-level runners
-EOF
+sudo vim /var/lib/ephemerd/config.toml   # set github.owner
+sudo vim /etc/default/ephemerd           # set GITHUB_TOKEN
 ```
 
-### 3. Run
+### 3. Start
+
+```bash
+sudo systemctl start ephemerd
+sudo systemctl enable ephemerd   # start on boot
+```
+
+Or run manually:
 
 ```bash
 export GITHUB_TOKEN="ghp_your_token_here"
 sudo -E ephemerd serve
 ```
 
-ephemerd starts containerd, opens a localtunnel, registers webhooks on GitHub, and provisions a container for each job — instantly.
+### Uninstall
+
+```bash
+sudo ephemerd uninstall
+```
+
+This stops the service, removes the binary, service files, and data directory. Use `--keep-data` to preserve your config and logs.
 
 ### 4. Target it from your workflow
 
@@ -398,6 +409,8 @@ ephemerd status         Show running jobs, health, uptime
 ephemerd drain          Stop accepting new jobs, wait for running jobs
 ephemerd images         List cached container images
 ephemerd config         Validate configuration
+ephemerd doctor         Check system readiness and clean up stale state
+ephemerd uninstall      Remove binary, service, and data
 ephemerd ctrctl         Debug the embedded containerd (passthrough to ctr)
 ```
 
