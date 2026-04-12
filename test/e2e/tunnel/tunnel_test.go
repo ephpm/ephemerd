@@ -125,18 +125,23 @@ func TestLocaltunnelWebhook(t *testing.T) {
 		gh.DeregisterWebhooks(context.Background(), hooks)
 	}()
 
-	// 4. Ping the webhook via GitHub API — this triggers a "ping" event
-	for _, hook := range hooks {
-		t.Logf("pinging webhook %d", hook.HookID)
-		if err := gh.PingWebhook(ctx, hook); err != nil {
-			t.Fatalf("pinging webhook: %v", err)
+	// 4. Ping the webhook via GitHub API — retry since the free tunnel may drop connections
+	pingHooks := func() {
+		for _, hook := range hooks {
+			t.Logf("pinging webhook %d", hook.HookID)
+			if err := gh.PingWebhook(ctx, hook); err != nil {
+				t.Logf("ping failed (will retry): %v", err)
+			}
 		}
 	}
+	pingHooks()
 
-	// 5. Wait for the ping to arrive
-	deadline := time.After(30 * time.Second)
+	// 5. Wait for the ping to arrive, re-pinging periodically
+	deadline := time.After(60 * time.Second)
 	ticker := time.NewTicker(500 * time.Millisecond)
+	reping := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
+	defer reping.Stop()
 
 	for {
 		select {
@@ -145,6 +150,9 @@ func TestLocaltunnelWebhook(t *testing.T) {
 			count := len(received)
 			mu.Unlock()
 			t.Fatalf("timed out waiting for webhook ping (received %d events)", count)
+		case <-reping.C:
+			t.Log("re-pinging webhook...")
+			pingHooks()
 		case <-ticker.C:
 			mu.Lock()
 			count := len(received)
@@ -251,19 +259,31 @@ func TestLocaltunnelHTTP(t *testing.T) {
 	}()
 	defer func() { _ = server.Shutdown(context.Background()) }()
 
-	// Hit the public URL
+	// Hit the public URL — retry on transient errors (502, 503, connection resets)
 	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(publicURL + "/healthz")
-	if err != nil {
-		t.Fatalf("GET %s/healthz: %v", publicURL, err)
+	var body []byte
+	for attempt := 1; attempt <= 10; attempt++ {
+		resp, err := client.Get(publicURL + "/healthz")
+		if err != nil {
+			t.Logf("attempt %d: GET error: %v", attempt, err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		body, _ = io.ReadAll(resp.Body)
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("error closing response body: %v", err)
+		}
+		if resp.StatusCode == http.StatusOK {
+			t.Logf("attempt %d: success", attempt)
+			break
+		}
+		t.Logf("attempt %d: status %d, retrying...", attempt, resp.StatusCode)
+		body = nil
+		time.Sleep(2 * time.Second)
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET /healthz: status %d", resp.StatusCode)
+	if body == nil {
+		t.Fatal("failed to get successful response after 10 attempts")
 	}
-
-	body, _ := io.ReadAll(resp.Body)
 	t.Logf("response: %s", string(body))
 
 	var result struct {
