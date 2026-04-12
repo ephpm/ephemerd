@@ -221,6 +221,8 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		RunnerMount:  rm.ContainerDir(),
 		DefaultImage: cfg.Runner.DefaultImage,
 		LogDir:       joinPath(configDir, "logs"),
+		DataDir:      configDir,
+		DindEnabled:  cfg.Dind.Enabled,
 		Network:      net,
 		Log:          log,
 	})

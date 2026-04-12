@@ -17,6 +17,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/ephpm/ephemerd/pkg/dind"
 	"github.com/ephpm/ephemerd/pkg/networking"
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -49,6 +50,8 @@ type Config struct {
 	RunnerMount  string // container path to mount runner at
 	DefaultImage string // override default container image (auto-detected if empty)
 	LogDir       string // directory for per-job container logs
+	DataDir      string // ephemerd data directory (used for dind socket paths)
+	DindEnabled  bool   // mount a fake Docker socket into each container
 	Network      *networking.Manager
 	Log          *slog.Logger
 }
@@ -65,6 +68,7 @@ type RunnerEnv struct {
 	ID        string
 	Netns     string // network namespace path (Linux only)
 	RunnerDir string // per-job runner copy, cleaned up on destroy
+	Dind      *dind.Server // per-job fake Docker daemon (nil if disabled)
 	Container client.Container
 	Task      client.Task
 }
@@ -269,6 +273,25 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		opts = append(opts, withDNSMount(filepath.Dir(r.cfg.LogDir), id))
 	}
 
+	// Start per-job fake Docker daemon and mount socket into container
+	var dindServer *dind.Server
+	if r.cfg.DindEnabled && goruntime.GOOS != "windows" {
+		var err error
+		dindServer, err = dind.New(dind.Config{
+			JobID:   id,
+			DataDir: r.cfg.DataDir,
+			Client:  r.client,
+			Log:     r.cfg.Log,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("creating dind server for %s: %w", id, err)
+		}
+		if err := dindServer.Start(); err != nil {
+			return nil, fmt.Errorf("starting dind server for %s: %w", id, err)
+		}
+		opts = append(opts, withDockerSocket(dindServer.SocketPath()))
+	}
+
 	// Add Hyper-V isolation on Windows
 	if goruntime.GOOS == "windows" {
 		opts = append(opts, withHyperVIsolation())
@@ -306,12 +329,20 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		}
 	}
 
+	// stopDind is a cleanup helper — safe to call if dindServer is nil.
+	stopDind := func() {
+		if dindServer != nil {
+			dindServer.Stop()
+		}
+	}
+
 	container, err := r.client.NewContainer(ctx, id,
 		client.WithImage(img),
 		client.WithNewSnapshot(snapshotName, img),
 		client.WithNewSpec(opts...),
 	)
 	if err != nil {
+		stopDind()
 		// Clean up HCN endpoint + namespace on Windows
 		if windowsEndpointID != "" && r.cfg.Network != nil {
 			if tearErr := r.cfg.Network.Teardown(ctx, id, windowsNetNS); tearErr != nil {
@@ -346,6 +377,7 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 	}
 	task, err := container.NewTask(ctx, creator)
 	if err != nil {
+		stopDind()
 		// Clean up HCN endpoint + namespace on Windows
 		if windowsEndpointID != "" && r.cfg.Network != nil {
 			if tearErr := r.cfg.Network.Teardown(ctx, id, windowsNetNS); tearErr != nil {
@@ -364,6 +396,7 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		pid := task.Pid()
 		netns = fmt.Sprintf("/proc/%d/ns/net", pid)
 		if _, err := r.cfg.Network.Setup(ctx, id, netns); err != nil {
+			stopDind()
 			if _, delErr := task.Delete(ctx, client.WithProcessKill); delErr != nil {
 				r.cfg.Log.Debug("task cleanup after failed network setup", "error", delErr)
 			}
@@ -375,6 +408,7 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 	}
 
 	if err := task.Start(ctx); err != nil {
+		stopDind()
 		teardownNetNS := netns
 		if windowsNetNS != "" {
 			teardownNetNS = windowsNetNS
@@ -405,6 +439,7 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		ID:        id,
 		Netns:     envNetns,
 		RunnerDir: jobRunnerDir,
+		Dind:      dindServer,
 		Container: container,
 		Task:      task,
 	}, nil
@@ -440,6 +475,11 @@ func (r *Runtime) Destroy(ctx context.Context, env *RunnerEnv) error {
 				r.cfg.Log.Warn("failed to teardown network", "id", env.ID, "error", err)
 			}
 		}
+	}
+
+	// Stop fake Docker daemon
+	if env.Dind != nil {
+		env.Dind.Stop()
 	}
 
 	// Delete container and snapshot
@@ -562,6 +602,22 @@ func isRoutableDNS(ip string) bool {
 		return false
 	}
 	return true
+}
+
+// withDockerSocket bind-mounts the fake Docker daemon socket into the container.
+func withDockerSocket(hostSocketPath string) oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
+		if s.Mounts == nil {
+			s.Mounts = []ocispec.Mount{}
+		}
+		s.Mounts = append(s.Mounts, ocispec.Mount{
+			Destination: "/var/run/docker.sock",
+			Type:        "bind",
+			Source:      hostSocketPath,
+			Options:     []string{"rbind", "rw"},
+		})
+		return nil
+	}
 }
 
 // withRunnerMount bind-mounts a per-job copy of the runner directory into the container.
