@@ -78,14 +78,18 @@ func serveCmd() *cli.Command {
 				Name:  "containerd-only",
 				Usage: "only run containerd (no scheduler, GitHub polling, or runner extraction)",
 			},
+			&cli.BoolFlag{
+				Name:  "dind",
+				Usage: "mount a fake Docker socket into each container (passed to WSL worker)",
+			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			return serve(ctx, cmd.String("config"), uint32(cmd.Uint("containerd-tcp-port")), cmd.Bool("containerd-only"))
+			return serve(ctx, cmd.String("config"), uint32(cmd.Uint("containerd-tcp-port")), cmd.Bool("containerd-only"), cmd.Bool("dind"))
 		},
 	}
 }
 
-func serve(ctx context.Context, configFile string, containerdTCPPort uint32, containerdOnly bool) error {
+func serve(ctx context.Context, configFile string, containerdTCPPort uint32, containerdOnly bool, dindFlag bool) error {
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -97,6 +101,11 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	cfg, err := config.Load(configFile)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
+	}
+
+	// CLI --dind flag overrides config file
+	if dindFlag {
+		cfg.Dind.Enabled = true
 	}
 
 	log := cfg.Logger()
@@ -118,7 +127,7 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	// Start container runtime.
 	// On Linux/Windows: embedded containerd runs in-process.
 	// On macOS: boot a Linux VM via Virtualization.framework, containerd runs inside it.
-	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort)
+	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, cfg.Dind.Enabled)
 	if err != nil {
 		return fmt.Errorf("starting container runtime: %w", err)
 	}
@@ -165,6 +174,8 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 			RunnerDir:   rm.Dir(),
 			RunnerMount: rm.ContainerDir(),
 			LogDir:      joinPath(configDir, "logs"),
+			DataDir:     configDir,
+			DindEnabled: cfg.Dind.Enabled,
 			Network:     net,
 			Log:         log,
 		})

@@ -5,10 +5,10 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -94,6 +94,9 @@ format = "text"
 	t.Log("waiting for ephemerd + WSL to initialize...")
 	time.Sleep(60 * time.Second)
 
+	// Record time before triggering so we can find the right run
+	triggerTime := time.Now()
+
 	// Trigger the dind-test workflow via gh CLI
 	t.Log("triggering dind-test workflow via gh CLI...")
 	ghRun := exec.CommandContext(ctx, "gh", "workflow", "run", "dind-test.yml",
@@ -105,10 +108,10 @@ format = "text"
 		t.Fatalf("triggering workflow: %v\n%s", err, string(out))
 	}
 
-	// Wait a moment for GitHub to create the run
-	time.Sleep(5 * time.Second)
+	// Wait for GitHub to create the run
+	time.Sleep(10 * time.Second)
 
-	// Poll for workflow completion
+	// Poll for workflow completion — only consider runs created after triggerTime
 	t.Log("polling for workflow run completion...")
 	deadline := time.After(6 * time.Minute)
 	ticker := time.NewTicker(15 * time.Second)
@@ -119,7 +122,7 @@ format = "text"
 		case <-deadline:
 			t.Fatal("timed out waiting for dind-test workflow to complete")
 		case <-ticker.C:
-			status, conclusion := getLatestRunStatus(t, ctx, token)
+			status, conclusion := getRunStatusAfter(t, ctx, token, triggerTime)
 			t.Logf("workflow status: %s, conclusion: %s", status, conclusion)
 			if status == "completed" {
 				if conclusion != "success" {
@@ -132,15 +135,15 @@ format = "text"
 	}
 }
 
-// getLatestRunStatus returns the status and conclusion of the most recent
-// dind-test.yml workflow run.
-func getLatestRunStatus(t *testing.T, ctx context.Context, token string) (status, conclusion string) {
+// getRunStatusAfter returns the status and conclusion of the most recent
+// dind-test.yml workflow run created after the given time.
+func getRunStatusAfter(t *testing.T, ctx context.Context, token string, after time.Time) (status, conclusion string) {
 	t.Helper()
 	cmd := exec.CommandContext(ctx, "gh", "run", "list",
 		"--repo", "ephpm/ephemerd",
 		"--workflow", "dind-test.yml",
-		"--limit", "1",
-		"--json", "status,conclusion",
+		"--limit", "5",
+		"--json", "status,conclusion,createdAt",
 	)
 	cmd.Env = append(os.Environ(), "GH_TOKEN="+token)
 	var out bytes.Buffer
@@ -151,24 +154,29 @@ func getLatestRunStatus(t *testing.T, ctx context.Context, token string) (status
 		return "unknown", ""
 	}
 
-	// Parse minimal JSON: [{"status":"completed","conclusion":"success"}]
-	s := strings.TrimSpace(out.String())
-	// Quick-and-dirty parse
-	if strings.Contains(s, `"completed"`) {
-		status = "completed"
-	} else if strings.Contains(s, `"in_progress"`) {
-		status = "in_progress"
-	} else if strings.Contains(s, `"queued"`) {
-		status = "queued"
-	} else {
-		status = "unknown"
+	// Parse JSON array to find a run created after our trigger time
+	type runEntry struct {
+		Status     string `json:"status"`
+		Conclusion string `json:"conclusion"`
+		CreatedAt  string `json:"createdAt"`
 	}
-	if strings.Contains(s, `"success"`) {
-		conclusion = "success"
-	} else if strings.Contains(s, `"failure"`) {
-		conclusion = "failure"
+	var runs []runEntry
+	if err := json.Unmarshal(out.Bytes(), &runs); err != nil {
+		t.Logf("parsing gh output: %v", err)
+		return "unknown", ""
 	}
-	return
+
+	for _, r := range runs {
+		created, err := time.Parse(time.RFC3339, r.CreatedAt)
+		if err != nil {
+			continue
+		}
+		if created.After(after) {
+			return r.Status, r.Conclusion
+		}
+	}
+
+	return "pending", "" // run not yet visible
 }
 
 // findEphemerdBinary locates the compiled ephemerd binary.

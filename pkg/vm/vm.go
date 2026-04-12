@@ -39,6 +39,10 @@ type LinuxVMConfig struct {
 	// ContainerdPort is the port containerd listens on inside the VM. Defaults to 10000.
 	ContainerdPort uint32
 
+	// DindEnabled passes --dind to the VM's ephemerd serve, mounting a fake
+	// Docker socket into each container.
+	DindEnabled bool
+
 	Log *slog.Logger
 }
 
