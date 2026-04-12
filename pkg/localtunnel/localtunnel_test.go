@@ -1,8 +1,11 @@
 package localtunnel
 
 import (
+	"context"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -357,3 +360,45 @@ func (m *mockConn) SetWriteDeadline(_ time.Time) error  { return nil }
 type testLogger struct{}
 
 func (testLogger) Println(...interface{}) {}
+
+// --- Listen with mock server ---
+
+// --- Listen error paths (these return before proxy setup, so they don't hang) ---
+
+func TestListen_ServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := Listen(ctx, Options{
+		BaseURL: srv.URL,
+		Log:     &testLogger{},
+	})
+	if err == nil {
+		t.Fatal("expected error for 500 response")
+	}
+}
+
+func TestListen_InvalidJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := w.Write([]byte("not json")); err != nil {
+			t.Logf("writing response: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := Listen(ctx, Options{
+		BaseURL: srv.URL,
+		Log:     &testLogger{},
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid JSON response")
+	}
+}

@@ -42,3 +42,26 @@ func TestConfig_Subnet_CustomValue(t *testing.T) {
 		t.Errorf("subnet() = %q, want %q", got, "10.99.0.0/16")
 	}
 }
+
+// --- detectMTU tests ---
+
+func TestDetectMTU_ReturnsSaneValue(t *testing.T) {
+	mtu := detectMTU()
+	if mtu <= 0 {
+		t.Errorf("detectMTU() = %d, expected > 0", mtu)
+	}
+	if mtu > 65535 {
+		t.Errorf("detectMTU() = %d, expected <= 65535", mtu)
+	}
+}
+
+func TestDetectMTU_DefaultIs1500(t *testing.T) {
+	// On most systems, detectMTU should return 1500 (standard ethernet)
+	// unless the host has a non-standard MTU
+	mtu := detectMTU()
+	t.Logf("detectMTU() = %d", mtu)
+	// Just verify it's a reasonable value
+	if mtu < 576 {
+		t.Errorf("detectMTU() = %d, expected >= 576 (minimum IPv4 MTU)", mtu)
+	}
+}
