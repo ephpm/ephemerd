@@ -11,6 +11,7 @@ ephemerd is a single binary with several subcommands.
 | [jobs](jobs.md) | List and manage running jobs |
 | [config](config.md) | Validate the configuration file |
 | [doctor](doctor.md) | Check system readiness and clean up stale state |
+| [install](install.md) | Install binary and register as a system service |
 | [uninstall](uninstall.md) | Remove ephemerd from the system |
 
 ## Global flags

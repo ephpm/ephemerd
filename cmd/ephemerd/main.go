@@ -51,6 +51,7 @@ func main() {
 			configCheckCmd(),
 			ctrctlCmd(),
 			doctorCmd(),
+			installCmd(),
 			uninstallCmd(),
 		},
 	}

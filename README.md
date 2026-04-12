@@ -171,13 +171,15 @@ A single machine can serve multiple job types:
 
 ### 1. Install
 
+Download the latest binary from [Releases](https://github.com/ephpm/ephemerd/releases), then:
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ephpm/ephemerd/main/install.sh | sudo bash
+sudo ./ephemerd install
 ```
 
-This downloads the latest binary, creates a default config at `/var/lib/ephemerd/config.toml`, and installs a systemd service (Linux) or launchd plist (macOS).
+This copies the binary to `/usr/local/bin/`, creates a default config at `/var/lib/ephemerd/config.toml`, and installs a systemd service (Linux), launchd plist (macOS), or Windows service.
 
-Or download manually from [Releases](https://github.com/ephpm/ephemerd/releases), or build from source with `mage build`.
+Or build from source with `mage build`.
 
 ### 2. Configure
 
@@ -410,6 +412,7 @@ ephemerd drain          Stop accepting new jobs, wait for running jobs
 ephemerd images         List cached container images
 ephemerd config         Validate configuration
 ephemerd doctor         Check system readiness and clean up stale state
+ephemerd install        Install binary and register as a system service
 ephemerd uninstall      Remove binary, service, and data
 ephemerd ctrctl         Debug the embedded containerd (passthrough to ctr)
 ```
