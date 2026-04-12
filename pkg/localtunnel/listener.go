@@ -156,7 +156,9 @@ func (l *Listener) handle(c net.Conn) error {
 		case <-doneReading:
 			return
 		case <-l.context.Done():
-			_ = c.Close()
+			if err := c.Close(); err != nil {
+				l.log.Println("error closing connection on context cancel:", err)
+			}
 		}
 	}()
 
@@ -168,7 +170,9 @@ func (l *Listener) handle(c net.Conn) error {
 	if err != nil {
 		// Ignore if it took more than 30s
 		if start.Before(time.Now().Add(-30 * time.Second)) {
-			_ = c.Close()
+			if cerr := c.Close(); cerr != nil {
+				l.log.Println("error closing stale connection:", cerr)
+			}
 			return nil
 		}
 		return err
@@ -185,7 +189,9 @@ func (l *Listener) handle(c net.Conn) error {
 	}
 
 	// Always close the remote connection
-	_ = c.Close()
+	if err := c.Close(); err != nil {
+		l.log.Println("error closing remote connection:", err)
+	}
 	return nil
 }
 
@@ -214,7 +220,9 @@ func (l *Listener) abort(err error) {
 		l.cancel()
 		go func() {
 			for c := range l.incoming {
-				c.Close()
+				if err := c.Close(); err != nil {
+					l.log.Println("error closing incoming connection:", err)
+				}
 			}
 		}()
 		l.done.Wait()

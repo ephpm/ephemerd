@@ -51,19 +51,31 @@ func (lt *LocalTunnel) listen() {
 }
 
 func (lt *LocalTunnel) forward(remoteConn net.Conn) {
+	log := lt.listener.log
+
 	localConn, err := net.Dial("tcp", lt.localAddr)
 	if err != nil {
-		_ = remoteConn.Close()
+		if cerr := remoteConn.Close(); cerr != nil {
+			log.Println("error closing remote conn after dial failure:", cerr)
+		}
 		return
 	}
 
 	go func() {
-		_, _ = io.Copy(remoteConn, localConn)
-		_ = remoteConn.Close()
+		if _, err := io.Copy(remoteConn, localConn); err != nil {
+			log.Println("error copying to remote:", err)
+		}
+		if err := remoteConn.Close(); err != nil {
+			log.Println("error closing remote conn:", err)
+		}
 	}()
 	go func() {
-		_, _ = io.Copy(localConn, remoteConn)
-		_ = localConn.Close()
+		if _, err := io.Copy(localConn, remoteConn); err != nil {
+			log.Println("error copying to local:", err)
+		}
+		if err := localConn.Close(); err != nil {
+			log.Println("error closing local conn:", err)
+		}
 	}()
 }
 
