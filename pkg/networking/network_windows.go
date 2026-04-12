@@ -111,13 +111,13 @@ func (w *windowsNetworking) setup(ctx context.Context, id string, netns string) 
 	ns := &hcn.HostComputeNamespace{}
 	ns, err = ns.Create()
 	if err != nil {
-		created.Delete()
+		_ = created.Delete()
 		return nil, fmt.Errorf("creating HCN namespace for %s: %w", id, err)
 	}
 
 	if err := hcn.AddNamespaceEndpoint(ns.Id, created.Id); err != nil {
-		ns.Delete()
-		created.Delete()
+		_ = ns.Delete()
+		_ = created.Delete()
 		return nil, fmt.Errorf("attaching endpoint to namespace for %s: %w", id, err)
 	}
 
@@ -137,9 +137,9 @@ func (w *windowsNetworking) teardown(ctx context.Context, id string, netns strin
 
 	if netns != "" {
 		// Detach endpoint from namespace, then delete the namespace
-		endpoint.NamespaceDetach(netns)
+		_ = endpoint.NamespaceDetach(netns)
 		if ns, nsErr := hcn.GetNamespaceByID(netns); nsErr == nil {
-			ns.Delete()
+			_ = ns.Delete()
 		}
 	}
 
