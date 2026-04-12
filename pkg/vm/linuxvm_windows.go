@@ -42,9 +42,14 @@ type wslLinuxVM struct {
 func StartLinuxVM(cfg LinuxVMConfig) (LinuxVM, error) {
 	cfg.SetDefaults()
 
+	distroName, err := generateDistroName("ephemerd-linux")
+	if err != nil {
+		return nil, fmt.Errorf("generating distro name: %w", err)
+	}
+
 	l := &wslLinuxVM{
 		cfg:        cfg,
-		distroName: generateDistroName("ephemerd-linux"),
+		distroName: distroName,
 		installDir: filepath.Join(cfg.DataDir, "vm", "linux", "distro"),
 		done:       make(chan struct{}),
 	}
