@@ -1,7 +1,7 @@
 package localtunnel
 
 // DefaultBaseURL is the default value for the Options.BaseURL
-var DefaultBaseURL = "https://localtunnel.me"
+var DefaultBaseURL = "https://loca.lt"
 
 // DefaultMaxConnections is the default value for Options.MaxConnections
 var DefaultMaxConnections = 10
