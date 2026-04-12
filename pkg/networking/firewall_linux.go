@@ -19,7 +19,7 @@ var deniedRanges = []string{
 func iptables(args ...string) error {
 	out, err := exec.Command("iptables", args...).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%s: %s", err, out)
+		return fmt.Errorf("iptables: %w: %s", err, out)
 	}
 	return nil
 }
