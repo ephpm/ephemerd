@@ -18,6 +18,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/runtime"
 	"github.com/ephpm/ephemerd/pkg/scheduler"
 	"github.com/ephpm/ephemerd/pkg/tunnel"
+	"github.com/ephpm/ephemerd/pkg/vm"
 	"github.com/urfave/cli/v3"
 )
 
@@ -260,6 +261,19 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	// into the shared data directory (available inside macOS VMs via virtio-fs).
 	artifactExtractor := artifacts.NewExtractor(ctrdClient, log)
 
+	// Configure macOS VM support if enabled
+	var macOSVMConfig *vm.MacOSVMConfig
+	if cfg.VM.MacOS.Enabled {
+		macOSVMConfig = &vm.MacOSVMConfig{
+			DataDir:   configDir,
+			BaseImage: cfg.VM.MacOS.BaseImage,
+			CPUs:      cfg.VM.MacOS.CPUs,
+			MemoryMB:  cfg.VM.MacOS.MemoryMB,
+			Log:       log,
+		}
+		log.Info("macOS VM support enabled", "base_image", cfg.VM.MacOS.BaseImage)
+	}
+
 	// Wait for Linux dispatch client if WSL VM is booting in the background.
 	// All setup above (runner, CNI, networking, GitHub) runs in parallel with
 	// the WSL boot, so this typically doesn't add much delay.
@@ -287,6 +301,7 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		GitHub:          gh,
 		Artifacts:       artifactExtractor,
 		LinuxDispatcher: linuxDispatcher,
+		MacOSVMConfig:   macOSVMConfig,
 		DataDir:         configDir,
 		MaxConcurrent:   cfg.Runner.MaxConcurrent,
 		Labels:          cfg.Runner.ExtraLabels,

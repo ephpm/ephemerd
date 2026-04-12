@@ -102,11 +102,18 @@ func (c *MacOSVMConfig) SetDefaults() {
 // MacOSVM is an ephemeral macOS VM for a single job.
 // Only available on macOS hosts via Virtualization.framework.
 type MacOSVM interface {
+	// WriteJITConfig writes the encoded JIT runner config to the job's shared
+	// directory so the guest can pick it up on boot via virtio-fs.
+	WriteJITConfig(encodedJIT string) error
+
 	// Start boots the VM from a clone-on-write copy of the base image.
 	Start(ctx context.Context) error
 
-	// RunnerAddress returns the address to connect to the GitHub runner inside the VM.
-	// Typically ssh://... or a vsock address for injecting the JIT config.
+	// WaitForRunner blocks until the GitHub runner inside the VM is reachable
+	// (SSH on port 22). Returns the VM's discovered IP address.
+	WaitForRunner(ctx context.Context) (string, error)
+
+	// RunnerAddress returns the VM's discovered IP address, or empty if not yet known.
 	RunnerAddress() string
 
 	// Wait blocks until the VM exits. Returns the exit code.
