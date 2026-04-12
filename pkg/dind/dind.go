@@ -64,8 +64,10 @@ func New(cfg Config) (*Server, error) {
 	// Use a short socket name — Unix sockets have a 108-byte path limit.
 	sockPath := filepath.Join(dockerDir, "d.sock")
 
-	// Remove stale socket from a previous crash
-	os.Remove(sockPath)
+	// Remove stale socket from a previous crash (best-effort, may not exist)
+	if err := os.Remove(sockPath); err != nil && !os.IsNotExist(err) {
+		cfg.Log.Debug("removing stale socket", "path", sockPath, "error", err)
+	}
 
 	return &Server{
 		jobID:    cfg.JobID,
@@ -110,10 +112,14 @@ func (s *Server) Stop() {
 	s.log.Info("stopping fake docker daemon")
 
 	if s.server != nil {
-		s.server.Shutdown(context.Background())
+		if err := s.server.Shutdown(context.Background()); err != nil {
+			s.log.Debug("shutting down fake docker server", "error", err)
+		}
 	}
 	if s.listener != nil {
-		s.listener.Close()
+		if err := s.listener.Close(); err != nil {
+			s.log.Debug("closing listener", "error", err)
+		}
 	}
 
 	// Clean up the socket and job docker directory
@@ -171,7 +177,9 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("API-Version", "1.45")
 	w.Header().Set("Docker-Experimental", "false")
 	w.Header().Set("Content-Type", "text/plain")
-	w.Write([]byte("OK"))
+	if _, err := w.Write([]byte("OK")); err != nil {
+		s.log.Debug("writing ping response", "error", err)
+	}
 }
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
@@ -268,9 +276,19 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 
 	writeProgress := func(status string) {
 		msg := map[string]string{"status": status}
-		data, _ := json.Marshal(msg)
-		w.Write(data)
-		w.Write([]byte("\n"))
+		data, err := json.Marshal(msg)
+		if err != nil {
+			s.log.Debug("marshaling progress", "error", err)
+			return
+		}
+		if _, err := w.Write(data); err != nil {
+			s.log.Debug("writing progress data", "error", err)
+			return
+		}
+		if _, err := w.Write([]byte("\n")); err != nil {
+			s.log.Debug("writing progress newline", "error", err)
+			return
+		}
 		if flusher != nil {
 			flusher.Flush()
 		}
@@ -317,5 +335,9 @@ func (s *Server) handleNotImplemented(w http.ResponseWriter, r *http.Request) {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		// Can't write an error response since we already wrote the status code.
+		// Log it for debugging — this typically means the client disconnected.
+		slog.Debug("writing JSON response", "error", err)
+	}
 }

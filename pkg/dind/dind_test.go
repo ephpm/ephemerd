@@ -52,7 +52,11 @@ func TestPing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /_ping: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
@@ -76,7 +80,11 @@ func TestVersion(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GET %s: %v", path, err)
 		}
-		defer resp.Body.Close()
+		defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("%s: status = %d, want 200", path, resp.StatusCode)
@@ -103,7 +111,11 @@ func TestInfo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /info: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
@@ -126,7 +138,11 @@ func TestImageListEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /images/json: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
@@ -149,7 +165,11 @@ func TestNotImplemented(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /containers/json: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusNotImplemented {
 		t.Errorf("status = %d, want 501", resp.StatusCode)
@@ -198,7 +218,11 @@ func TestImagePullNoClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST /images/create: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", resp.StatusCode)
@@ -213,7 +237,11 @@ func TestImagePullMissingFromImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST /images/create: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", resp.StatusCode)
