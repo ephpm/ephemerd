@@ -368,6 +368,36 @@ func TestLogger_Formats(t *testing.T) {
 	}
 }
 
+// --- LogRetentionDuration tests ---
+
+func TestLogRetentionDuration_Default(t *testing.T) {
+	lc := LogConfig{}
+	if d := lc.LogRetentionDuration(); d != 7*24*time.Hour {
+		t.Errorf("empty LogRetention = %v, want 168h", d)
+	}
+}
+
+func TestLogRetentionDuration_Days(t *testing.T) {
+	lc := LogConfig{LogRetention: "14d"}
+	if d := lc.LogRetentionDuration(); d != 14*24*time.Hour {
+		t.Errorf("LogRetention = %v, want 336h", d)
+	}
+}
+
+func TestLogRetentionDuration_Hours(t *testing.T) {
+	lc := LogConfig{LogRetention: "48h"}
+	if d := lc.LogRetentionDuration(); d != 48*time.Hour {
+		t.Errorf("LogRetention = %v, want 48h", d)
+	}
+}
+
+func TestLogRetentionDuration_Invalid(t *testing.T) {
+	lc := LogConfig{LogRetention: "garbage"}
+	if d := lc.LogRetentionDuration(); d != 7*24*time.Hour {
+		t.Errorf("invalid LogRetention = %v, want 168h fallback", d)
+	}
+}
+
 // --- VM config TOML parsing ---
 
 func TestLoad_VMConfig(t *testing.T) {

@@ -41,6 +41,7 @@ type Config struct {
 	Tunnel          tunnel.Provider // if non-nil, creates a public tunnel for webhooks
 	JobTimeout      time.Duration
 	ShutdownTimeout time.Duration
+	LogRetention    time.Duration // max age for job log files (default 7d)
 	Log             *slog.Logger
 }
 
@@ -141,9 +142,13 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		}
 	}()
 
-	// Clean old job logs on startup, then periodically every hour
+	// Clean old job logs on startup, then periodically every hour.
+	// Retention period is configurable via [log] log_retention (default 7d).
 	logDir := filepath.Join(s.cfg.DataDir, "logs")
-	const logMaxAge = 7 * 24 * time.Hour // keep logs for 7 days
+	logMaxAge := s.cfg.LogRetention
+	if logMaxAge <= 0 {
+		logMaxAge = 7 * 24 * time.Hour
+	}
 	runtime.CleanOldLogs(logDir, logMaxAge, s.cfg.Log)
 	go func() {
 		ticker := time.NewTicker(1 * time.Hour)
