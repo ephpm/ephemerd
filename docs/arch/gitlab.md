@@ -1,5 +1,7 @@
 # Multi-Platform CI: JobProvider Interface for GitLab (and Beyond)
 
+> **Status: Design document only.** No code exists for GitLab integration yet. This describes the planned architecture for when we add support.
+
 ## Context
 
 ephemerd currently only supports GitHub Actions. The scheduler, poller, webhook handler, and runner lifecycle are all hardwired to GitHub types and APIs. Adding GitLab CI support (or Gitea/Forgejo) requires decoupling the scheduler from GitHub.

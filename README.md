@@ -441,7 +441,7 @@ The same image runs on every host — Linux directly, Windows via Hyper-V Linux 
 
 ## Architecture
 
-See [docs/architecture.md](docs/architecture.md) for the full design document covering isolation backends, embedded containerd, VM lifecycle, and the GitHub integration model.
+See [docs/arch/overview.md](docs/arch/overview.md) for the full design document covering isolation backends, embedded containerd, VM lifecycle, and the GitHub integration model.
 
 ## License
 
