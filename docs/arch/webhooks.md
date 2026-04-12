@@ -94,7 +94,7 @@ func (n *NgrokTunnel) PublicURL() string {
 
 ### localtunnel
 
-**Import:** `github.com/localtunnel/go-localtunnel`
+**Import:** `github.com/ephpm/ephemerd/pkg/localtunnel` (vendored from `github.com/localtunnel/go-localtunnel` with context support added)
 
 **Auth:** none. Fully free, no account needed.
 
