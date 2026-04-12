@@ -49,6 +49,9 @@ poll_interval = "5s"
 [dind]
 enabled = true
 
+[vm.linux]
+enabled = true
+
 [runner]
 max_concurrent = 2
 job_timeout = "10m"
@@ -86,9 +89,10 @@ format = "text"
 		}
 	}()
 
-	// Wait for ephemerd to be ready
-	t.Log("waiting for ephemerd to initialize...")
-	time.Sleep(15 * time.Second)
+	// Wait for ephemerd + WSL Linux VM + containerd + dispatch server to be ready.
+	// The WSL boot takes ~20-30s on first run.
+	t.Log("waiting for ephemerd + WSL to initialize...")
+	time.Sleep(60 * time.Second)
 
 	// Trigger the dind-test workflow via gh CLI
 	t.Log("triggering dind-test workflow via gh CLI...")
