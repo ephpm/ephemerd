@@ -171,7 +171,7 @@ A single machine can serve multiple job types:
 Download the binary for your platform from [Releases](https://github.com/ephpm/ephemerd/releases), or build from source:
 
 ```bash
-make build
+mage build
 ```
 
 ### 2. Configure

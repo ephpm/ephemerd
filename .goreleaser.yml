@@ -2,9 +2,7 @@ version: 2
 
 before:
   hooks:
-    - cmd: bash -c 'RUNNER_VERSION={{.Env.RUNNER_VERSION}} GOOS={{.Os}} GOARCH={{.Arch}} make download-runner'
-      env:
-        - RUNNER_VERSION={{ if index .Env "RUNNER_VERSION" }}{{ .Env.RUNNER_VERSION }}{{ else }}2.333.1{{ end }}
+    - cmd: mage download:all
 
 builds:
   - id: ephemerd
@@ -15,7 +13,7 @@ builds:
     ldflags:
       - -s -w
       - -X main.version={{.Version}}
-      - -X github.com/ephpm/ephemerd/pkg/runner.Version={{ if index .Env "RUNNER_VERSION" }}{{ .Env.RUNNER_VERSION }}{{ else }}2.333.1{{ end }}
+      - -X github.com/ephpm/ephemerd/pkg/runner.Version=2.333.1
     goos:
       - linux
       - windows
