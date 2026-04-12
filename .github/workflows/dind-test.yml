@@ -1,0 +1,44 @@
+name: dind-test
+on:
+  workflow_dispatch:
+
+jobs:
+  docker-ping:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Check docker socket exists
+        run: test -S /var/run/docker.sock && echo "docker.sock exists"
+
+      - name: Docker version
+        run: |
+          curl -s --unix-socket /var/run/docker.sock http://docker/version
+          echo ""
+
+      - name: Docker ping
+        run: |
+          RESULT=$(curl -s --unix-socket /var/run/docker.sock http://docker/_ping)
+          echo "ping result: $RESULT"
+          [ "$RESULT" = "OK" ]
+
+      - name: Docker info
+        run: |
+          curl -s --unix-socket /var/run/docker.sock http://docker/info | grep -q ephemerd-dind
+
+  docker-cli:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Install Docker CLI
+        run: |
+          apk add --no-cache docker-cli || apt-get update && apt-get install -y docker.io || true
+
+      - name: Docker version via CLI
+        run: docker version
+
+      - name: Docker info via CLI
+        run: docker info
+
+      - name: Docker pull alpine
+        run: docker pull alpine:latest
+
+      - name: Docker images shows alpine
+        run: docker images | grep alpine
