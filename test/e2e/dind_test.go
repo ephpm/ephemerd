@@ -1,293 +1,203 @@
-//go:build e2e && privileged
+//go:build e2e
 
 package e2e
 
 import (
+	"bytes"
 	"context"
-	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/containerd/containerd/v2/client"
-	"github.com/containerd/containerd/v2/core/containers"
-	"github.com/containerd/containerd/v2/pkg/cio"
-	"github.com/containerd/containerd/v2/pkg/namespaces"
-	"github.com/containerd/containerd/v2/pkg/oci"
-	"github.com/ephpm/ephemerd/pkg/dind"
-	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-// TestE2E_Dind_PingVersion verifies the fake Docker daemon is reachable
-// from inside a container via /var/run/docker.sock.
-func TestE2E_Dind_PingVersion(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping e2e test in short mode")
+// TestE2E_Dind_WorkflowRun starts ephemerd with dind.enabled, triggers a
+// workflow that runs docker commands inside the job, and verifies success.
+//
+// Requires:
+//   - GITHUB_TOKEN with repo + admin:org scope
+//   - gh CLI installed
+//   - ephemerd binary built (run 'mage build' first)
+//   - .github/workflows/dind-test.yml exists in the repo
+//
+// Run with:
+//
+//	go test -tags e2e -run TestE2E_Dind_WorkflowRun -v -timeout 10m ./test/e2e/
+func TestE2E_Dind_WorkflowRun(t *testing.T) {
+	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		t.Skip("GITHUB_TOKEN not set")
+	}
+	if _, err := exec.LookPath("gh"); err != nil {
+		t.Skip("gh CLI not found")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ephemerdBin := findEphemerdBinary(t)
+	t.Logf("using ephemerd binary: %s", ephemerdBin)
+
+	dataDir := t.TempDir()
+
+	// Write config with dind enabled
+	configPath := filepath.Join(dataDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(`[github]
+owner = "ephpm"
+repos = ["ephemerd"]
+poll_interval = "5s"
+
+[dind]
+enabled = true
+
+[runner]
+max_concurrent = 2
+job_timeout = "10m"
+
+[webhook]
+tunnel = "none"
+
+[log]
+level = "debug"
+format = "text"
+`), 0o644); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 
-	ctrdClient := sharedCtrd.Client()
-	nsCtx := namespaces.WithNamespace(ctx, e2eNamespace)
-
-	// Start fake Docker daemon
-	dindSrv, err := dind.New(dind.Config{
-		JobID:   "e2e-dind-ping",
-		DataDir: sharedDataDir,
-		Client:  ctrdClient,
-		Log:     sharedLog,
-	})
-	if err != nil {
-		t.Fatalf("creating dind server: %v", err)
-	}
-	if err := dindSrv.Start(); err != nil {
-		t.Fatalf("starting dind server: %v", err)
-	}
-	defer dindSrv.Stop()
-
-	// Pull an image with curl/wget available for testing
-	testImage := "docker.io/library/alpine:latest"
-	if _, err := ctrdClient.GetImage(nsCtx, testImage); err != nil {
-		if _, err := ctrdClient.Pull(nsCtx, testImage, client.WithPullUnpack); err != nil {
-			t.Fatalf("pulling image: %v", err)
-		}
-	}
-	img, err := ctrdClient.GetImage(nsCtx, testImage)
-	if err != nil {
-		t.Fatalf("getting image: %v", err)
-	}
-
-	containerID := fmt.Sprintf("e2e-dind-ping-%d", time.Now().UnixNano())
-
-	specOpts := []oci.SpecOpts{
-		oci.WithImageConfig(img),
-		oci.WithProcessArgs("sleep", "86400"),
-		oci.WithNewPrivileges,
-		withDockerSocketMount(dindSrv.SocketPath()),
-	}
-
-	container, err := ctrdClient.NewContainer(nsCtx, containerID,
-		client.WithImage(img),
-		client.WithNewSnapshot(containerID+"-snapshot", img),
-		client.WithNewSpec(specOpts...),
+	// Start ephemerd as a subprocess
+	cmd := exec.CommandContext(ctx, ephemerdBin, "serve",
+		"--config", configPath,
+		"--data-dir", dataDir,
 	)
-	if err != nil {
-		t.Fatalf("creating container: %v", err)
-	}
-	defer func() { _ = container.Delete(nsCtx, client.WithSnapshotCleanup) }()
+	cmd.Env = append(os.Environ(), "GITHUB_TOKEN="+token)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
 
-	task, err := container.NewTask(nsCtx, cio.NullIO)
-	if err != nil {
-		t.Fatalf("creating task: %v", err)
+	t.Log("starting ephemerd serve...")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting ephemerd: %v", err)
 	}
 	defer func() {
-		if status, serr := task.Status(nsCtx); serr == nil && status.Status == client.Running {
-			_ = task.Kill(nsCtx, 9)
-			exitCh, werr := task.Wait(nsCtx)
-			if werr == nil {
-				<-exitCh
-			}
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
 		}
-		_, _ = task.Delete(nsCtx, client.WithProcessKill)
 	}()
 
-	if err := task.Start(nsCtx); err != nil {
-		t.Fatalf("starting task: %v", err)
-	}
+	// Wait for ephemerd to be ready
+	t.Log("waiting for ephemerd to initialize...")
+	time.Sleep(15 * time.Second)
 
-	// Install curl inside the container and test the Docker socket
-	steps := []struct {
-		name string
-		cmd  string
-	}{
-		{"Install curl", "apk add --no-cache curl"},
-		{"Ping docker socket", `curl -s --unix-socket /var/run/docker.sock http://docker/_ping`},
-		{"Check version", `curl -s --unix-socket /var/run/docker.sock http://docker/version | grep -q ephemerd`},
-		{"Check info", `curl -s --unix-socket /var/run/docker.sock http://docker/info | grep -q ephemerd-dind`},
-		{"List images (empty)", `curl -s --unix-socket /var/run/docker.sock http://docker/images/json | grep -q '\[\]'`},
-		{"Versioned endpoint", `curl -s --unix-socket /var/run/docker.sock http://docker/v1.45/version | grep -q ephemerd`},
-	}
-
-	for i, step := range steps {
-		t.Logf("--- Step: %s", step.name)
-		exitCode := execInContainer(t, nsCtx, task, containerID, i, step.cmd)
-		if exitCode != 0 {
-			t.Fatalf("step %q failed with exit code %d", step.name, exitCode)
-		}
-		t.Logf("    passed")
-	}
-
-	t.Log("==> Docker socket ping/version test passed")
-}
-
-// TestE2E_Dind_DockerCLI verifies that the actual Docker CLI works against
-// the fake daemon — docker info, docker pull, docker images.
-func TestE2E_Dind_DockerCLI(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping e2e test in short mode")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	ctrdClient := sharedCtrd.Client()
-	nsCtx := namespaces.WithNamespace(ctx, e2eNamespace)
-
-	// Start fake Docker daemon
-	dindSrv, err := dind.New(dind.Config{
-		JobID:   "e2e-dind-cli",
-		DataDir: sharedDataDir,
-		Client:  ctrdClient,
-		Log:     sharedLog,
-	})
-	if err != nil {
-		t.Fatalf("creating dind server: %v", err)
-	}
-	if err := dindSrv.Start(); err != nil {
-		t.Fatalf("starting dind server: %v", err)
-	}
-	defer dindSrv.Stop()
-
-	// Use an image that has Docker CLI pre-installed
-	dockerImage := "docker.io/library/docker:cli"
-	if _, err := ctrdClient.GetImage(nsCtx, dockerImage); err != nil {
-		t.Log("pulling docker:cli image...")
-		if _, err := ctrdClient.Pull(nsCtx, dockerImage, client.WithPullUnpack); err != nil {
-			t.Fatalf("pulling docker:cli: %v", err)
-		}
-	}
-	img, err := ctrdClient.GetImage(nsCtx, dockerImage)
-	if err != nil {
-		t.Fatalf("getting image: %v", err)
-	}
-
-	containerID := fmt.Sprintf("e2e-dind-cli-%d", time.Now().UnixNano())
-	netDataDir := filepath.Join(sharedDataDir, "net-dind-cli")
-	os.MkdirAll(netDataDir, 0o755)
-
-	specOpts := []oci.SpecOpts{
-		oci.WithImageConfig(img),
-		oci.WithProcessArgs("sleep", "86400"),
-		oci.WithNewPrivileges,
-		withDockerSocketMount(dindSrv.SocketPath()),
-		withDNSMount(netDataDir, containerID),
-	}
-
-	container, err := ctrdClient.NewContainer(nsCtx, containerID,
-		client.WithImage(img),
-		client.WithNewSnapshot(containerID+"-snapshot", img),
-		client.WithNewSpec(specOpts...),
+	// Trigger the dind-test workflow via gh CLI
+	t.Log("triggering dind-test workflow via gh CLI...")
+	ghRun := exec.CommandContext(ctx, "gh", "workflow", "run", "dind-test.yml",
+		"--repo", "ephpm/ephemerd",
+		"--ref", "main",
 	)
-	if err != nil {
-		t.Fatalf("creating container: %v", err)
+	ghRun.Env = append(os.Environ(), "GH_TOKEN="+token)
+	if out, err := ghRun.CombinedOutput(); err != nil {
+		t.Fatalf("triggering workflow: %v\n%s", err, string(out))
 	}
-	defer func() { _ = container.Delete(nsCtx, client.WithSnapshotCleanup) }()
 
-	task, err := container.NewTask(nsCtx, cio.NullIO)
-	if err != nil {
-		t.Fatalf("creating task: %v", err)
-	}
-	defer func() {
-		if status, serr := task.Status(nsCtx); serr == nil && status.Status == client.Running {
-			_ = task.Kill(nsCtx, 9)
-			exitCh, werr := task.Wait(nsCtx)
-			if werr == nil {
-				<-exitCh
+	// Wait a moment for GitHub to create the run
+	time.Sleep(5 * time.Second)
+
+	// Poll for workflow completion
+	t.Log("polling for workflow run completion...")
+	deadline := time.After(6 * time.Minute)
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for dind-test workflow to complete")
+		case <-ticker.C:
+			status, conclusion := getLatestRunStatus(t, ctx, token)
+			t.Logf("workflow status: %s, conclusion: %s", status, conclusion)
+			if status == "completed" {
+				if conclusion != "success" {
+					t.Fatalf("dind-test workflow failed: %s", conclusion)
+				}
+				t.Log("==> dind-test workflow passed!")
+				return
 			}
 		}
-		_, _ = task.Delete(nsCtx, client.WithProcessKill)
-	}()
-
-	if err := task.Start(nsCtx); err != nil {
-		t.Fatalf("starting task: %v", err)
 	}
-
-	steps := []struct {
-		name string
-		cmd  string
-	}{
-		{"docker version", "docker version"},
-		{"docker info", "docker info"},
-		{"docker images (empty)", "docker images"},
-		{"docker pull alpine", "docker pull alpine:latest"},
-		{"docker images (has alpine)", "docker images | grep alpine"},
-	}
-
-	for i, step := range steps {
-		t.Logf("--- Step: %s", step.name)
-		exitCode := execInContainer(t, nsCtx, task, containerID, i, step.cmd)
-		if exitCode != 0 {
-			t.Fatalf("step %q failed with exit code %d", step.name, exitCode)
-		}
-		t.Logf("    passed")
-	}
-
-	t.Log("==> Docker CLI test passed")
 }
 
-// execInContainer runs a command inside a running task and returns the exit code.
-func execInContainer(t *testing.T, ctx context.Context, task client.Task, containerID string, stepIdx int, cmd string) uint32 {
+// getLatestRunStatus returns the status and conclusion of the most recent
+// dind-test.yml workflow run.
+func getLatestRunStatus(t *testing.T, ctx context.Context, token string) (status, conclusion string) {
 	t.Helper()
-
-	execID := fmt.Sprintf("step-%d-%d", stepIdx, time.Now().UnixNano())
-	pspec := &ocispec.Process{
-		Args: []string{"/bin/sh", "-e", "-c", cmd},
-		Cwd:  "/",
-		User: ocispec.User{UID: 0, GID: 0},
+	cmd := exec.CommandContext(ctx, "gh", "run", "list",
+		"--repo", "ephpm/ephemerd",
+		"--workflow", "dind-test.yml",
+		"--limit", "1",
+		"--json", "status,conclusion",
+	)
+	cmd.Env = append(os.Environ(), "GH_TOKEN="+token)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		t.Logf("gh run list: %v", err)
+		return "unknown", ""
 	}
 
-	process, err := task.Exec(ctx, execID, pspec, cio.NewCreator(cio.WithStdio))
-	if err != nil {
-		t.Fatalf("exec: %v", err)
+	// Parse minimal JSON: [{"status":"completed","conclusion":"success"}]
+	s := strings.TrimSpace(out.String())
+	// Quick-and-dirty parse
+	if strings.Contains(s, `"completed"`) {
+		status = "completed"
+	} else if strings.Contains(s, `"in_progress"`) {
+		status = "in_progress"
+	} else if strings.Contains(s, `"queued"`) {
+		status = "queued"
+	} else {
+		status = "unknown"
 	}
-
-	exitCh, err := process.Wait(ctx)
-	if err != nil {
-		process.Delete(ctx, client.WithProcessKill)
-		t.Fatalf("wait: %v", err)
+	if strings.Contains(s, `"success"`) {
+		conclusion = "success"
+	} else if strings.Contains(s, `"failure"`) {
+		conclusion = "failure"
 	}
-
-	if err := process.Start(ctx); err != nil {
-		process.Delete(ctx, client.WithProcessKill)
-		t.Fatalf("start: %v", err)
-	}
-
-	select {
-	case status := <-exitCh:
-		process.Delete(ctx)
-		return status.ExitCode()
-	case <-ctx.Done():
-		process.Delete(ctx, client.WithProcessKill)
-		t.Fatalf("timed out")
-		return 1
-	}
+	return
 }
 
-// withDockerSocketMount binds the fake Docker socket into the container.
-func withDockerSocketMount(hostSocketPath string) oci.SpecOpts {
-	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
-		if s.Mounts == nil {
-			s.Mounts = []ocispec.Mount{}
+// findEphemerdBinary locates the compiled ephemerd binary.
+func findEphemerdBinary(t *testing.T) string {
+	t.Helper()
+	repoRoot := findRepoRootFrom(t)
+	for _, name := range []string{"ephemerd.exe", "ephemerd"} {
+		p := filepath.Join(repoRoot, name)
+		if _, err := os.Stat(p); err == nil {
+			return p
 		}
-		s.Mounts = append(s.Mounts, ocispec.Mount{
-			Destination: "/var/run/docker.sock",
-			Type:        "bind",
-			Source:      hostSocketPath,
-			Options:     []string{"rbind", "rw"},
-		})
-		return nil
 	}
+	if p, err := exec.LookPath("ephemerd"); err == nil {
+		return p
+	}
+	t.Fatal("ephemerd binary not found — run 'mage build' first")
+	return ""
 }
 
-// isDockerInPath checks if the Docker CLI is available.
-func isDockerInPath() bool {
-	for _, dir := range strings.Split(os.Getenv("PATH"), ":") {
-		if _, err := os.Stat(filepath.Join(dir, "docker")); err == nil {
-			return true
-		}
+func findRepoRootFrom(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getting working directory: %v", err)
 	}
-	return false
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("could not find repository root (no go.mod found)")
+		}
+		dir = parent
+	}
 }
