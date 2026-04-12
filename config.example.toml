@@ -16,18 +16,16 @@ owner = "your-org"
 # repos = ["repo1", "repo2"]
 
 [webhook]
-# By default, ephemerd uses localtunnel to receive webhooks instantly.
-# The webhook secret is auto-generated each run. No config needed.
+# By default, ephemerd polls the GitHub API every 10s for new jobs.
+# No inbound ports or tunnels required.
 
-# To use ngrok instead (more reliable, requires free account):
+# To use localtunnel for instant webhook delivery:
+# tunnel = "localtunnel"
+# tunnel_url = "http://tunnels.example.com"   # self-hosted server (recommended)
+
+# To use ngrok instead (requires free account):
 # tunnel = "ngrok"
 # ngrok_authtoken = "your_ngrok_token"   # or set NGROK_AUTHTOKEN env var
-
-# To use a self-hosted localtunnel server:
-# tunnel_url = "http://tunnels.example.com"
-
-# To disable tunnels and fall back to polling (checks GitHub API every 10s):
-# tunnel = "none"
 
 # To use direct TLS instead of a tunnel (VPS with a public IP):
 # tunnel = "none"
