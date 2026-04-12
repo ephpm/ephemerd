@@ -21,12 +21,15 @@ ephemerd is a single binary that runs on Linux, Windows, and macOS. It embeds co
 Containers run directly on the host via the embedded containerd. No VM needed — fastest path.
 
 ```mermaid
-graph LR
+graph TB
     GH[GitHub] -->|webhook / poll| E[ephemerd]
-    E -->|create container| C[containerd]
-    C -->|OCI container| R[Runner + Job]
-    R -->|job complete| E
-    E -->|destroy container| C
+
+    subgraph "Linux Host"
+        E -->|create container| CTD[containerd — embedded]
+        CTD -->|OCI container| R[Runner + Job]
+        R -->|job complete| E
+        E -->|destroy container| CTD
+    end
 ```
 
 ### Windows
