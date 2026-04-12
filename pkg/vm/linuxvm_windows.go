@@ -326,7 +326,7 @@ func (l *wslLinuxVM) waitForContainerd() error {
 			time.Sleep(1 * time.Second)
 			continue
 		}
-		tcpConn.Close()
+		_ = tcpConn.Close()
 
 		// containerd's Windows dialer only supports named pipes, so we
 		// bypass it with a direct gRPC TCP connection.
@@ -383,7 +383,7 @@ func (l *wslLinuxVM) waitForContainerd() error {
 			time.Sleep(1 * time.Second)
 			continue
 		}
-		conn.Close()
+		_ = conn.Close()
 
 		l.dispatchAddr = dispatchAddr
 		l.cfg.Log.Info("dispatch server ready in WSL", "address", dispatchAddr)
@@ -413,15 +413,6 @@ func wslExecTimeout(timeout time.Duration, args ...string) error {
 		return err
 	}
 	return nil
-}
-
-func wslOutput(args ...string) (string, error) {
-	cmd := exec.Command("wsl", args...)
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(decodeWSLOutput(out)), nil
 }
 
 func wslOutputTimeout(timeout time.Duration, args ...string) (string, error) {
