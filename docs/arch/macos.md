@@ -137,7 +137,9 @@ APFS clone-on-write means the per-job copy is nearly instant and only allocates 
 
 ### Runner Integration
 
-The base image includes a pre-configured GitHub Actions runner. On boot, the runner starts automatically and picks up the JIT config injected by ephemerd. IP discovery for connecting to the runner uses mDNS/Bonjour (`.local` addresses).
+The base image includes a pre-configured GitHub Actions runner. The JIT config is passed via a virtio-fs shared directory (`.jit_config` file). On boot, the runner reads the config from the share and registers with GitHub.
+
+IP discovery uses ARP table lookup — ephemerd records the VM's MAC address at creation time, then probes the Vz NAT subnet and scans `arp -an` output to find the corresponding IP. MAC addresses are normalized (zero-padded) to handle format differences between Vz and macOS ARP output. The guest signals readiness by writing a `.ready` sentinel file to the shared directory; SSH port 22 is used as a fallback.
 
 ## Job Routing
 
