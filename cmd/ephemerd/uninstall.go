@@ -29,6 +29,12 @@ func uninstallCmd() *cli.Command {
 			fmt.Println("Uninstalling ephemerd...")
 			fmt.Println()
 
+			// Run doctor cleanup first to remove stale runtime state
+			// (containers, network bridges, WSL distros, etc.)
+			fmt.Println("Cleaning up runtime state...")
+			cleanupRuntime(dataDir)
+			fmt.Println()
+
 			// Stop and remove the service
 			switch runtime.GOOS {
 			case "linux":
@@ -87,6 +93,29 @@ func uninstallCmd() *cli.Command {
 			return nil
 		},
 	}
+}
+
+// cleanupRuntime runs the same cleanup as `ephemerd doctor --clean` to remove
+// stale containers, network bridges, WSL distros, CNI state, etc. before
+// removing the data directory.
+func cleanupRuntime(dataDir string) {
+	info := func(msg string) { fmt.Printf("  %s\n", msg) }
+	noop := func(string) {}
+
+	// Remove stale control socket
+	socketPath := filepath.Join(dataDir, "ephemerd.sock")
+	if err := os.Remove(socketPath); err == nil {
+		info("removed stale control socket")
+	}
+
+	// Remove stale PID file
+	pidFile := filepath.Join(dataDir, "ephemerd.pid")
+	if err := os.Remove(pidFile); err == nil {
+		info("removed stale PID file")
+	}
+
+	// Platform-specific cleanup (network bridges, WSL distros, VM clones, CNI state)
+	platformCleanup(dataDir, info, info, noop)
 }
 
 func uninstallSystemd() {
