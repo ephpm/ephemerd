@@ -1,11 +1,14 @@
 package config
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
+	goruntime "runtime"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -253,12 +256,28 @@ func (c *Config) Logger() *slog.Logger {
 
 	opts := &slog.HandlerOptions{Level: level}
 
+	// On Windows, slog's \n doesn't include \r, causing stair-step output
+	// in PowerShell/cmd.exe terminals. Wrap stderr to fix line endings.
+	var w io.Writer = os.Stderr
+	if goruntime.GOOS == "windows" {
+		w = &crlfWriter{w: os.Stderr}
+	}
+
 	var handler slog.Handler
 	if c.Log.Format == "json" {
-		handler = slog.NewJSONHandler(os.Stderr, opts)
+		handler = slog.NewJSONHandler(w, opts)
 	} else {
-		handler = slog.NewTextHandler(os.Stderr, opts)
+		handler = slog.NewTextHandler(w, opts)
 	}
 
 	return slog.New(handler)
+}
+
+// crlfWriter wraps a writer to replace bare \n with \r\n for Windows terminals.
+type crlfWriter struct{ w io.Writer }
+
+func (c *crlfWriter) Write(p []byte) (int, error) {
+	replaced := bytes.ReplaceAll(p, []byte("\n"), []byte("\r\n"))
+	_, err := c.w.Write(replaced)
+	return len(p), err
 }
