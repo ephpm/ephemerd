@@ -144,7 +144,13 @@ func (m *darwinMacOSVM) Start(ctx context.Context) error {
 		cancel()
 		return fmt.Errorf("creating network config: %w", err)
 	}
-	m.macAddr = netConfig.MACAddress().String()
+	macAddress, err := vz.NewRandomLocallyAdministeredMACAddress()
+	if err != nil {
+		cancel()
+		return fmt.Errorf("creating MAC address: %w", err)
+	}
+	netConfig.SetMACAddress(macAddress)
+	m.macAddr = macAddress.String()
 	vmConfig.SetNetworkDevicesVirtualMachineConfiguration([]*vz.VirtioNetworkDeviceConfiguration{netConfig})
 
 	// Disk: the cloned image
@@ -362,7 +368,7 @@ func (m *darwinMacOSVM) Stop() {
 	m.cfg.Log.Info("stopping macOS VM", "id", m.id)
 
 	if m.vm != nil {
-		if canStop, err := m.vm.CanRequestStop(); err == nil && canStop {
+		if m.vm.CanRequestStop() {
 			m.vm.RequestStop()
 		}
 
