@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	runtime_ "runtime"
 	"strconv"
 	"syscall"
 
@@ -78,6 +79,11 @@ func serveCmd() *cli.Command {
 				Name:  "containerd-tcp-port",
 				Usage: "also expose containerd on a TCP port (used by WSL host integration)",
 			},
+			&cli.StringFlag{
+				Name:  "containerd-tcp-addr",
+				Value: "127.0.0.1",
+				Usage: "bind address for the containerd TCP listener (use 0.0.0.0 when host lives outside the network namespace)",
+			},
 			&cli.BoolFlag{
 				Name:  "containerd-only",
 				Usage: "only run containerd (no scheduler, GitHub polling, or runner extraction)",
@@ -88,20 +94,24 @@ func serveCmd() *cli.Command {
 			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			return serve(ctx, cmd.String("config"), uint32(cmd.Uint("containerd-tcp-port")), cmd.Bool("containerd-only"), cmd.Bool("dind"))
+			return serve(ctx, cmd.String("config"), uint32(cmd.Uint("containerd-tcp-port")), cmd.String("containerd-tcp-addr"), cmd.Bool("containerd-only"), cmd.Bool("dind"))
 		},
 	}
 }
 
-func serve(ctx context.Context, configFile string, containerdTCPPort uint32, containerdOnly bool, dindFlag bool) error {
+func serve(ctx context.Context, configFile string, containerdTCPPort uint32, containerdTCPAddr string, containerdOnly bool, dindFlag bool) error {
 	// Check if another instance is already running.
 	if cc, err := dialControl(ctx); err == nil {
 		if resp, err := cc.Status(ctx, &apiv1.StatusRequest{}); err == nil {
-			_ = cc.Close()
+			if closeErr := cc.Close(); closeErr != nil {
+				return fmt.Errorf("closing control connection: %w", closeErr)
+			}
 			return fmt.Errorf("ephemerd is already running (status: %s, active jobs: %d, uptime: %s)",
 				resp.Status, resp.ActiveJobs, resp.Uptime)
 		}
-		_ = cc.Close()
+		if closeErr := cc.Close(); closeErr != nil {
+			return fmt.Errorf("closing control connection: %w", closeErr)
+		}
 	}
 
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
@@ -141,7 +151,7 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	// Start container runtime.
 	// On Linux/Windows: embedded containerd runs in-process.
 	// On macOS: boot a Linux VM via Virtualization.framework, containerd runs inside it.
-	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, cfg.Dind.Enabled)
+	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, containerdTCPAddr, cfg.Dind.Enabled)
 	if err != nil {
 		return fmt.Errorf("starting container runtime: %w", err)
 	}
@@ -240,16 +250,24 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	defer net.Cleanup()
 
 	// Create runtime (container lifecycle manager)
+	// On Darwin the Linux VM sees the host's DataDir at /mnt/ephemerd
+	// (virtio-fs share tag "ephemerd"). Bind-mount sources pointed at the
+	// DataDir need to be translated to that VM-side path.
+	containerDataDir := configDir
+	if runtime_.GOOS == "darwin" {
+		containerDataDir = "/mnt/ephemerd"
+	}
 	rt, err := runtime.New(runtime.Config{
-		Client:       ctrdClient,
-		RunnerDir:    rm.Dir(),
-		RunnerMount:  rm.ContainerDir(),
-		DefaultImage: cfg.Runner.DefaultImage,
-		LogDir:       joinPath(configDir, "logs"),
-		DataDir:      configDir,
-		DindEnabled:  cfg.Dind.Enabled,
-		Network:      net,
-		Log:          log,
+		Client:           ctrdClient,
+		RunnerDir:        rm.Dir(),
+		RunnerMount:      rm.ContainerDir(),
+		DefaultImage:     cfg.Runner.DefaultImage,
+		LogDir:           joinPath(configDir, "logs"),
+		DataDir:          configDir,
+		ContainerDataDir: containerDataDir,
+		DindEnabled:      cfg.Dind.Enabled,
+		Network:          net,
+		Log:              log,
 	})
 	if err != nil {
 		return fmt.Errorf("creating runtime: %w", err)
