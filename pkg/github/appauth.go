@@ -31,6 +31,10 @@ type AppAuth struct {
 	token   string
 	expires time.Time
 
+	// refreshMu serializes on-demand token refreshes so concurrent callers
+	// don't thunder into GitHub's token endpoint.
+	refreshMu sync.Mutex
+
 	done chan struct{}
 }
 
@@ -77,8 +81,38 @@ func NewAppAuth(appID, installationID int64, keyPath string, log *slog.Logger) (
 	return a, nil
 }
 
-// Token returns the current valid installation token.
+// Token returns the current valid installation token, refreshing it
+// synchronously if the cached token expires within 5 minutes. The background
+// refreshLoop is still the primary path; this is a safety net so a missed
+// background refresh doesn't cause repeated 401s for hours.
 func (a *AppAuth) Token() string {
+	a.mu.RLock()
+	tok := a.token
+	remaining := time.Until(a.expires)
+	a.mu.RUnlock()
+
+	if remaining > 5*time.Minute {
+		return tok
+	}
+	// Token is expired or expiring soon — refresh synchronously, serialized
+	// via refreshMu so concurrent Token() callers collapse into a single
+	// GitHub round-trip. Re-check expiry once we hold the lock in case
+	// another goroutine already refreshed.
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
+
+	a.mu.RLock()
+	remaining = time.Until(a.expires)
+	a.mu.RUnlock()
+	if remaining > 5*time.Minute {
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		return a.token
+	}
+
+	if err := a.refresh(); err != nil {
+		a.log.Warn("on-demand token refresh failed", "error", err)
+	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.token
