@@ -1,0 +1,63 @@
+name: Test arm64 runners (smoke)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/test-arm64-smoke.yml'
+
+jobs:
+  linux-arm64:
+    runs-on: [self-hosted, linux, arm64]
+    steps:
+      - name: System info
+        run: |
+          echo "=== Linux arm64 smoke test ==="
+          echo "Hostname: $(hostname)"
+          echo "User: $(whoami)"
+          uname -a
+          cat /etc/os-release 2>/dev/null | head -5
+          echo ""
+          echo "CPU:"
+          grep -E "model name|Processor|BogoMIPS" /proc/cpuinfo | head -3
+          echo ""
+          echo "Memory (MB):"
+          free -m 2>/dev/null | head -3 || cat /proc/meminfo | head -3
+
+      - name: Network
+        run: |
+          echo "=== Outbound internet ==="
+          curl -sI --max-time 10 https://github.com | head -3 || echo "no internet"
+          echo ""
+          echo "DNS:"
+          nslookup github.com 2>&1 | head -5 || host github.com 2>&1 | head -3
+
+      - uses: actions/checkout@v4
+
+      - name: Verify checkout
+        run: |
+          echo "=== Repo ==="
+          ls -la | head -20
+          echo ""
+          git log --oneline -3
+
+  macos-arm64:
+    runs-on: [self-hosted, macos, arm64]
+    steps:
+      - name: System info
+        run: |
+          echo "=== macOS arm64 smoke test ==="
+          sw_vers
+          uname -a
+          echo "User: $(whoami)"
+          echo ""
+          system_profiler SPHardwareDataType 2>/dev/null | head -15
+
+      - uses: actions/checkout@v4
+
+      - name: Verify checkout
+        run: |
+          echo "=== Repo ==="
+          ls -la | head -20
+          echo ""
+          git log --oneline -3
