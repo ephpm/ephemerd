@@ -5,12 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
-	"os/exec"
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
@@ -21,7 +18,6 @@ import (
 	"github.com/ephpm/ephemerd/pkg/github"
 	"github.com/ephpm/ephemerd/pkg/metrics"
 	"github.com/ephpm/ephemerd/pkg/names"
-	"github.com/ephpm/ephemerd/pkg/runner"
 	"github.com/ephpm/ephemerd/pkg/runtime"
 	"github.com/ephpm/ephemerd/pkg/tunnel"
 	"github.com/ephpm/ephemerd/pkg/vm"
@@ -325,7 +321,11 @@ func (s *Scheduler) canHandleJob(jobLabels []string) bool {
 		case "windows":
 			osOK = goruntime.GOOS == "windows"
 		case "macos", "macosx":
-			osOK = goruntime.GOOS == "darwin"
+			// macOS jobs need a per-job VM for isolation. Without
+			// MacOSVMConfig we refuse the job rather than fall back to
+			// running on the host — sharing the runner process tree with
+			// other jobs (and the daemon) is a non-starter for CI.
+			osOK = goruntime.GOOS == "darwin" && s.cfg.MacOSVMConfig != nil
 		}
 	}
 	if !osOK {
@@ -410,15 +410,9 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 		return
 	}
 
-	// Route macOS-native jobs to per-job macOS VMs
+	// Route macOS-native jobs to per-job macOS VMs.
 	if s.cfg.MacOSVMConfig != nil && isMacOSJob(event.Job.Labels) {
 		s.handleMacOSJob(ctx, event)
-		return
-	}
-
-	// On macOS without a VM base image, run macOS jobs natively on the host.
-	if goruntime.GOOS == "darwin" && isMacOSJob(event.Job.Labels) {
-		s.handleMacOSNative(ctx, event)
 		return
 	}
 
@@ -531,165 +525,6 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
 			log.Warn("dispatch destroy failed", "error", err)
 		}
 	}()
-}
-
-// handleMacOSNative runs a macOS job by spawning the GitHub Actions runner
-// natively on the host Mac. Used when no MacOSVMConfig is set — i.e. there's
-// no per-job VM base image, so jobs share the host but each gets an isolated
-// copy of the runner directory and a JIT registration.
-//
-// The runner self-deregisters once the JIT lease completes, so we only need
-// to call RemoveRunner if the process exits dirty.
-func (s *Scheduler) handleMacOSNative(ctx context.Context, event github.JobEvent) {
-	jobID := event.Job.GetID()
-	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo, "platform", "macos-native")
-
-	unsee := func() {
-		s.mu.Lock()
-		delete(s.seen, jobID)
-		s.mu.Unlock()
-	}
-
-	// Acquire concurrency slot
-	select {
-	case s.sem <- struct{}{}:
-	case <-ctx.Done():
-		unsee()
-		return
-	}
-
-	log.Info("provisioning macOS runner natively on host")
-
-	// Register a JIT runner with macOS labels so GitHub routes the job here.
-	labels := buildLabelsForOS("darwin", s.cfg.Labels)
-	const maxNameRetries = 3
-	name, jitConfig, err := s.registerRunner(ctx, event.Repo, labels, log, maxNameRetries)
-	if err != nil {
-		log.Error("failed to register JIT runner", "error", err)
-		unsee()
-		time.Sleep(backoffDuration(event.Repo))
-		<-s.sem
-		return
-	}
-
-	encodedConfig := jitConfig.GetEncodedJITConfig()
-	runnerID := jitConfig.GetRunner().GetID()
-
-	// Each job runs in its own copy of the runner directory so concurrent
-	// invocations don't trample over each other's _diag/work/_temp dirs.
-	srcRunnerDir := filepath.Join(s.cfg.DataDir, "runners", runnerVersion())
-	jobRunnerDir := filepath.Join(s.cfg.DataDir, "runners", "jobs", fmt.Sprintf("%d-%s", jobID, name))
-	if err := copyTree(srcRunnerDir, jobRunnerDir); err != nil {
-		log.Error("copying runner dir for native job", "error", err)
-		if rmErr := s.cfg.GitHub.RemoveRunner(ctx, event.Repo, runnerID); rmErr != nil {
-			log.Warn("failed to remove ghost runner", "runner_id", runnerID, "error", rmErr)
-		}
-		unsee()
-		<-s.sem
-		return
-	}
-
-	jobCtx, cancel := context.WithCancel(ctx)
-	if s.cfg.JobTimeout > 0 {
-		jobCtx, cancel = context.WithTimeout(ctx, s.cfg.JobTimeout)
-	}
-
-	// Track the running job so doctor/drain can see it.
-	s.mu.Lock()
-	s.running[jobID] = &runningJob{
-		repo:      event.Repo,
-		runnerID:  runnerID,
-		startedAt: time.Now(),
-		cancel:    cancel,
-	}
-	s.mu.Unlock()
-
-	go func() {
-		defer cancel()
-		defer func() {
-			_ = os.RemoveAll(jobRunnerDir)
-			s.mu.Lock()
-			delete(s.running, jobID)
-			s.mu.Unlock()
-			<-s.sem
-		}()
-
-		runScript := filepath.Join(jobRunnerDir, "run.sh")
-		cmd := exec.CommandContext(jobCtx, runScript, "--jitconfig", encodedConfig)
-		cmd.Dir = jobRunnerDir
-		// The GHA runner refuses to run as root unless this is set. ephemerd
-		// is a daemon (we own the box), so this is acceptable here.
-		cmd.Env = append(os.Environ(), "RUNNER_ALLOW_RUNASROOT=1")
-		// Capture stdout/stderr to a per-job log file for inspection.
-		logPath := filepath.Join(s.cfg.DataDir, "logs", name+".log")
-		_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
-		logFile, ferr := os.Create(logPath)
-		if ferr == nil {
-			cmd.Stdout = logFile
-			cmd.Stderr = logFile
-			defer logFile.Close()
-		}
-		log.Info("starting native macOS runner", "name", name, "log", logPath)
-
-		err := cmd.Run()
-		exitCode := 0
-		if err != nil {
-			if ee, ok := err.(*exec.ExitError); ok {
-				exitCode = ee.ExitCode()
-			} else {
-				exitCode = -1
-			}
-			log.Warn("native macOS runner exited with error", "name", name, "exit", exitCode, "error", err)
-			// Best-effort runner cleanup if it didn't self-deregister.
-			if rmErr := s.cfg.GitHub.RemoveRunner(context.Background(), event.Repo, runnerID); rmErr != nil {
-				log.Debug("remove ghost runner", "error", rmErr)
-			}
-		} else {
-			log.Info("native macOS runner exited", "name", name, "exit", exitCode)
-		}
-	}()
-}
-
-// runnerVersion returns the embedded runner version (set via ldflags at build).
-func runnerVersion() string { return runner.Version }
-
-// copyTree recursively copies srcDir to dstDir, preserving file modes.
-// Used to give each native macOS job its own runner directory.
-func copyTree(srcDir, dstDir string) error {
-	return filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(srcDir, path)
-		if err != nil {
-			return err
-		}
-		target := filepath.Join(dstDir, rel)
-		if info.IsDir() {
-			return os.MkdirAll(target, info.Mode())
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			link, err := os.Readlink(path)
-			if err != nil {
-				return err
-			}
-			return os.Symlink(link, target)
-		}
-		src, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer src.Close()
-		dst, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
-		if err != nil {
-			return err
-		}
-		defer dst.Close()
-		if _, err := io.Copy(dst, src); err != nil {
-			return err
-		}
-		return nil
-	})
 }
 
 // handleMacOSJob provisions a per-job macOS VM via Virtualization.framework.
