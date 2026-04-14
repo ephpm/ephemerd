@@ -36,6 +36,15 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	// When invoked as a subprocess by TestCrictl_*, re-enter as crictl
+	// against the socket passed via env. The child exits via crictl.Main()
+	// so m.Run() is never reached on this path.
+	if sock := os.Getenv(crictlSocketEnv); sock != "" {
+		args := strings.Split(os.Getenv(crictlArgsEnv), "\x00")
+		_ = ctdpkg.ExecCrictl(sock, args)
+		return
+	}
+
 	if os.Getuid() != 0 {
 		fmt.Println("SKIP: e2e tests require root")
 		os.Exit(0)

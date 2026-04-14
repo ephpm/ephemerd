@@ -50,6 +50,7 @@ func main() {
 			imagesCmd(),
 			configCheckCmd(),
 			ctrctlCmd(),
+			crictlCmd(),
 			doctorCmd(),
 			installCmd(),
 			uninstallCmd(),
@@ -362,6 +363,22 @@ func ctrctlCmd() *cli.Command {
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			socketPath := containerd.SocketPath(configDir)
 			return containerd.ExecCtr(socketPath, cmd.Args().Slice())
+		},
+	}
+}
+
+// crictlCmd exposes the upstream crictl CLI against ephemerd's embedded
+// containerd CRI socket. The crictl library is linked in-process; no external
+// binary is required. See docs/arch/crictl.md.
+func crictlCmd() *cli.Command {
+	return &cli.Command{
+		Name:            "crictl",
+		Usage:           "Access the embedded containerd CRI (in-process crictl)",
+		Description:     "Runs crictl commands against ephemerd's embedded containerd CRI endpoint.\nAll arguments after 'crictl' are passed directly to crictl (e.g. ps, images, info, exec).",
+		SkipFlagParsing: true,
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			socketPath := containerd.SocketPath(configDir)
+			return containerd.ExecCrictl(socketPath, cmd.Args().Slice())
 		},
 	}
 }
