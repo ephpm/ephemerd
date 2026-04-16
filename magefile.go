@@ -47,6 +47,13 @@ func E2eall() error {
 	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "5m", "./test/e2e/...")
 }
 
+// E2EForgejo runs the Forgejo provider e2e test.
+// Boots a Forgejo instance via docker-compose, runs a full workflow, and tears down.
+// Requires: docker with compose support.
+func E2eforgejo() error {
+	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "3m", "-run", "TestForgejo_E2E", "./test/e2e/forgejo/")
+}
+
 // CI runs download, lint, test, and build.
 func CI() {
 	mg.SerialDeps(Lint, Test, build.Build)

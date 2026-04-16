@@ -13,6 +13,8 @@ import (
 
 type Config struct {
 	GitHub     GitHubConfig     `toml:"github"`
+	Forgejo    ForgejoConfig    `toml:"forgejo"`
+	GitLab     GitLabConfig     `toml:"gitlab"`
 	Webhook    WebhookConfig    `toml:"webhook"`
 	Containerd ContainerdConfig `toml:"containerd"`
 	Network    NetworkConfig    `toml:"network"`
@@ -21,6 +23,20 @@ type Config struct {
 	Runner     RunnerConfig     `toml:"runner"`
 	Metrics    MetricsConfig    `toml:"metrics"`
 	Log        LogConfig        `toml:"log"`
+}
+
+// Provider returns the name of the configured forge provider.
+// Exactly one of [github], [forgejo], or [gitlab] should have credentials set.
+// Returns "github" by default for backward compatibility.
+func (c *Config) Provider() string {
+	switch {
+	case c.Forgejo.InstanceURL != "":
+		return "forgejo"
+	case c.GitLab.InstanceURL != "":
+		return "gitlab"
+	default:
+		return "github"
+	}
 }
 
 // MetricsConfig configures the Prometheus metrics endpoint.
@@ -97,6 +113,23 @@ type GitHubConfig struct {
 
 	// Job discovery: polling interval (default "10s")
 	PollInterval string `toml:"poll_interval"`
+}
+
+// ForgejoConfig configures the Forgejo Actions provider.
+// Set instance_url and token to enable Forgejo instead of GitHub.
+type ForgejoConfig struct {
+	InstanceURL string   `toml:"instance_url"`  // Forgejo instance URL (e.g., "https://codeberg.org")
+	Token       string   `toml:"token"`         // runner registration token from Forgejo admin
+	Owner       string   `toml:"owner"`         // org or user (empty = instance-level runner)
+	Repos       []string `toml:"repos"`         // limit to specific repos (empty = all)
+}
+
+// GitLabConfig configures the GitLab CI provider.
+// Set instance_url and token to enable GitLab instead of GitHub.
+type GitLabConfig struct {
+	InstanceURL string   `toml:"instance_url"` // GitLab instance URL (e.g., "https://gitlab.com")
+	Token       string   `toml:"token"`        // runner authentication token (glrt-xxx for GitLab 16+)
+	Tags        []string `toml:"tags"`         // runner tags for job matching
 }
 
 type RunnerConfig struct {
