@@ -312,29 +312,41 @@ func (s *Scheduler) poll(ctx context.Context, events chan<- github.JobEvent) {
 	}
 }
 
-// canHandleJob returns false if the job's labels include an OS that this
-// scheduler cannot handle. On Windows with a LinuxDispatcher, Linux jobs
-// are accepted and routed to the WSL worker via gRPC.
+// canHandleJob returns false if the job's labels include an OS or
+// architecture that this scheduler cannot handle.
 func (s *Scheduler) canHandleJob(jobLabels []string) bool {
+	osOK := true // assume OK until we see an OS label we can't handle
 	for _, label := range jobLabels {
 		switch strings.ToLower(label) {
 		case "linux":
-			// Linux jobs run:
-			//   - natively on Linux hosts
-			//   - via WSL dispatch on Windows (LinuxDispatcher set)
-			//   - inside the embedded Linux VM on macOS (containerd client
-			//     returned by runtime_darwin.go points into the VM)
-			return goruntime.GOOS == "linux" || goruntime.GOOS == "darwin" || s.cfg.LinuxDispatcher != nil
+			// Linux jobs run natively on Linux, via WSL dispatch on Windows,
+			// or inside the embedded Linux VM on macOS.
+			osOK = goruntime.GOOS == "linux" || goruntime.GOOS == "darwin" || s.cfg.LinuxDispatcher != nil
 		case "windows":
-			return goruntime.GOOS == "windows"
+			osOK = goruntime.GOOS == "windows"
 		case "macos", "macosx":
-			// On Darwin we always accept macOS jobs: route to the per-job
-			// macOS VM when a base image is configured, otherwise run the
-			// runner natively on the host.
-			return goruntime.GOOS == "darwin"
+			osOK = goruntime.GOOS == "darwin"
 		}
 	}
-	return true // no OS label → accept
+	if !osOK {
+		return false
+	}
+	// Arch check: if the job asks for an arch we can't satisfy, skip. We
+	// don't emulate (no qemu-user, no rosetta-in-container), so x64 jobs
+	// on an arm64 host and vice versa won't work.
+	for _, label := range jobLabels {
+		switch strings.ToLower(label) {
+		case "x64", "amd64":
+			if goruntime.GOARCH != "amd64" {
+				return false
+			}
+		case "arm64", "aarch64":
+			if goruntime.GOARCH != "arm64" {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // isLinuxJob returns true if the job's labels include "linux".
