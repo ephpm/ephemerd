@@ -759,8 +759,7 @@ memory_mb = 4096
 disk_size_gb = 100
 
 [vm.macos]
-enabled = true
-base_image = "/path/to/macos.img"
+disk_image = "/path/to/macos.img"
 cpus = 8
 memory_mb = 16384
 `), 0644); err != nil {
@@ -784,11 +783,8 @@ memory_mb = 16384
 	if cfg.VM.Linux.DiskSizeGB != 100 {
 		t.Errorf("VM.Linux.DiskSizeGB = %d, want 100", cfg.VM.Linux.DiskSizeGB)
 	}
-	if !cfg.VM.MacOS.Enabled {
-		t.Error("VM.MacOS.Enabled = false, want true")
-	}
-	if cfg.VM.MacOS.BaseImage != "/path/to/macos.img" {
-		t.Errorf("VM.MacOS.BaseImage = %q, want %q", cfg.VM.MacOS.BaseImage, "/path/to/macos.img")
+	if cfg.VM.MacOS.DiskImage != "/path/to/macos.img" {
+		t.Errorf("VM.MacOS.DiskImage = %q, want %q", cfg.VM.MacOS.DiskImage, "/path/to/macos.img")
 	}
 	if cfg.VM.MacOS.CPUs != 8 {
 		t.Errorf("VM.MacOS.CPUs = %d, want 8", cfg.VM.MacOS.CPUs)

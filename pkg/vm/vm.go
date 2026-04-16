@@ -81,9 +81,11 @@ type MacOSVMConfig struct {
 	// DataDir is the ephemerd data directory. VM assets live under <DataDir>/vm/macos/.
 	DataDir string
 
-	// BaseImage is the path to the provisioned macOS disk image.
-	// Created via 'ephemerd vm setup-macos' or manually.
-	BaseImage string
+	// DiskImage is the path to the installed macOS disk (produced from
+	// an Apple IPSW via EnsureMacOSBaseImage). Each job gets an APFS
+	// clone of this file. Not to be confused with the OCI base image
+	// that jobs overlay onto the VM at runtime.
+	DiskImage string
 
 	// CPUs per macOS VM. Defaults to 4.
 	CPUs uint

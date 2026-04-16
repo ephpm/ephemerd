@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -23,6 +24,7 @@ type darwinMacOSVM struct {
 	id        string
 	vm        *vz.VirtualMachine
 	clonePath string
+	auxPath   string // per-job copy of aux storage (Vz locks it exclusively)
 	jobDir    string // shared directory for JIT config exchange
 	macAddr   string // VM's MAC address for ARP-based IP discovery
 	cancel    context.CancelFunc
@@ -33,11 +35,11 @@ type darwinMacOSVM struct {
 func NewMacOSVM(cfg MacOSVMConfig, jobID string) (MacOSVM, error) {
 	cfg.SetDefaults()
 
-	if cfg.BaseImage == "" {
-		return nil, fmt.Errorf("vm.macos.base_image is required for macOS-native jobs")
+	if cfg.DiskImage == "" {
+		return nil, fmt.Errorf("MacOSVMConfig.DiskImage is required for macOS-native jobs")
 	}
-	if _, err := os.Stat(cfg.BaseImage); os.IsNotExist(err) {
-		return nil, fmt.Errorf("macOS base image not found: %s\n\nRun 'ephemerd vm setup-macos' to create one", cfg.BaseImage)
+	if _, err := os.Stat(cfg.DiskImage); os.IsNotExist(err) {
+		return nil, fmt.Errorf("macOS VM disk image not found: %s (expected EnsureMacOSBaseImage to have produced it)", cfg.DiskImage)
 	}
 
 	jobDir := filepath.Join(cfg.DataDir, "vm", "macos", "jobs", jobID)
@@ -72,14 +74,16 @@ func (m *darwinMacOSVM) Start(ctx context.Context) error {
 	}
 
 	m.clonePath = filepath.Join(cloneDir, m.id+".img")
+	m.auxPath = filepath.Join(cloneDir, m.id+".aux")
 
 	// Use APFS clone (cp -c) for instant copy-on-write
-	if err := exec.CommandContext(ctx, "cp", "-c", m.cfg.BaseImage, m.clonePath).Run(); err != nil {
-		// Fall back to regular copy if APFS clone isn't supported
-		m.cfg.Log.Warn("APFS clone failed, falling back to regular copy", "error", err)
-		if err := exec.CommandContext(ctx, "cp", m.cfg.BaseImage, m.clonePath).Run(); err != nil {
-			return fmt.Errorf("copying base image: %w", err)
-		}
+	if err := apfsCopy(ctx, m.cfg.DiskImage, m.clonePath, m.cfg.Log); err != nil {
+		return fmt.Errorf("copying VM disk image: %w", err)
+	}
+	// Aux storage is locked exclusively by Vz — each VM needs its own copy.
+	files := macOSVMFiles(m.cfg.DataDir)
+	if err := apfsCopy(ctx, files.AuxStorage, m.auxPath, m.cfg.Log); err != nil {
+		return fmt.Errorf("copying aux storage: %w", err)
 	}
 
 	// Ensure job shared directory exists for JIT config exchange
@@ -103,8 +107,34 @@ func (m *darwinMacOSVM) Start(ctx context.Context) error {
 		return fmt.Errorf("creating VM config: %w", err)
 	}
 
-	// macOS platform config (required for macOS guests on Apple Silicon)
-	platformConfig, err := vz.NewMacPlatformConfiguration()
+	// macOS platform config — hardware model from the install, per-job aux
+	// storage clone (Vz locks it exclusively), and a fresh machine identifier
+	// so concurrent VMs don't collide.
+	hwData, err := os.ReadFile(files.HardwareModel)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("reading hardware model: %w", err)
+	}
+	hw, err := vz.NewMacHardwareModelWithData(hwData)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("loading hardware model: %w", err)
+	}
+	mid, err := vz.NewMacMachineIdentifier()
+	if err != nil {
+		cancel()
+		return fmt.Errorf("creating machine identifier: %w", err)
+	}
+	aux, err := vz.NewMacAuxiliaryStorage(m.auxPath)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("loading auxiliary storage: %w", err)
+	}
+	platformConfig, err := vz.NewMacPlatformConfiguration(
+		vz.WithMacHardwareModel(hw),
+		vz.WithMacMachineIdentifier(mid),
+		vz.WithMacAuxiliaryStorage(aux),
+	)
 	if err != nil {
 		cancel()
 		return fmt.Errorf("creating platform config: %w", err)
@@ -384,10 +414,12 @@ func (m *darwinMacOSVM) Stop() {
 		m.cancel()
 	}
 
-	// Delete the clone
-	if m.clonePath != "" {
-		if err := os.Remove(m.clonePath); err != nil && !os.IsNotExist(err) {
-			m.cfg.Log.Warn("failed to remove VM clone", "path", m.clonePath, "error", err)
+	// Delete the clones
+	for _, path := range []string{m.clonePath, m.auxPath} {
+		if path != "" {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				m.cfg.Log.Warn("failed to remove VM clone", "path", path, "error", err)
+			}
 		}
 	}
 
@@ -399,4 +431,16 @@ func (m *darwinMacOSVM) Stop() {
 	}
 
 	m.cfg.Log.Info("macOS VM destroyed", "id", m.id)
+}
+
+// apfsCopy uses APFS clone-on-write (cp -c) for instant copies, falling
+// back to a regular copy on non-APFS volumes.
+func apfsCopy(ctx context.Context, src, dst string, log *slog.Logger) error {
+	if err := exec.CommandContext(ctx, "cp", "-c", src, dst).Run(); err != nil {
+		log.Warn("APFS clone failed, falling back to regular copy", "error", err)
+		if err := exec.CommandContext(ctx, "cp", src, dst).Run(); err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -102,10 +102,18 @@ type LinuxVMToml struct {
 	DiskSizeGB uint64 `toml:"disk_size_gb"` // sparse disk size in GB (default: 50)
 }
 
-// MacOSVMToml configures per-job macOS VMs on macOS hosts.
+// MacOSVMToml configures per-job macOS VMs. macOS jobs always run in a
+// per-job VM on darwin hosts — there's no other way on Apple Silicon —
+// so there's no enable/disable toggle. On non-darwin hosts this block
+// is ignored.
 type MacOSVMToml struct {
-	Enabled   bool   `toml:"enabled"`    // enable macOS-native jobs
-	BaseImage string `toml:"base_image"` // path to provisioned macOS disk image
+	// DiskImage is an optional path to a pre-installed macOS VM disk
+	// (produced by `ephemerd vm setup-macos` or an operator-supplied
+	// restore of an Apple IPSW). If empty, ephemerd downloads the latest
+	// Apple-signed IPSW on first boot and installs stock macOS into
+	// <data_dir>/vm/macos/base.img. Distinct from the OCI base image
+	// overlaid per job — that's fetched from the job's image label.
+	DiskImage string `toml:"disk_image"`
 	CPUs      uint   `toml:"cpus"`       // CPUs per VM (default: 4)
 	MemoryMB  uint64 `toml:"memory_mb"`  // memory per VM in MB (default: 8192)
 }

@@ -111,22 +111,52 @@ No disk image means no first-boot formatting step, no cleanup, and no leftover s
 
 ### How It Works
 
-macOS-native jobs (Xcode builds, Swift tests, etc.) run inside ephemeral macOS VMs. Each job gets a fresh VM cloned from a provisioned base image.
+macOS-native jobs (Xcode builds, Swift tests, etc.) run inside ephemeral macOS VMs. Each job gets a fresh VM APFS-cloned from a provisioned macOS **disk image**.
+
+Two images are involved in each job — don't confuse them:
+
+- **macOS VM disk image** (`<data_dir>/vm/macos/base.img`): a Vz-bootable stock macOS install, produced once from an Apple IPSW. This is what the VM boots from. Configured via `vm.macos.disk_image`.
+- **OCI base image** (per-job): release artifacts / toolchains (Xcode, Swift SDK, whatever the job needs) pulled from a container registry and overlaid onto the running VM via virtio-fs. Configured per job via the workflow's image label.
 
 ```
-Base image (provisioned once):
-  macOS installed via 'ephemerd vm setup-macos'
-  Xcode, CLI tools, GitHub runner pre-installed
-  Stored at vm.macos.base_image config path
+macOS VM disk image (provisioned once, automatically on first boot):
+  Apple IPSW downloaded → installed into <data_dir>/vm/macos/base.img
+  Stock macOS, no tooling or runner baked in
 
 Per-job:
-  APFS clone (cp -c) of base image → instant, near-zero I/O
+  APFS clone (cp -c) of base.img → instant, near-zero I/O
   Boot Vz VM from clone (MacOSBootLoader, Apple Silicon platform)
+  OCI artifacts bind-mounted through virtio-fs share
+  GHA runner started inside the guest
   Job runs natively inside macOS
   VM stops, clone deleted
 ```
 
-APFS clone-on-write means the per-job copy is nearly instant and only allocates disk space for writes. A 60 GB base image produces a clone in milliseconds.
+APFS clone-on-write means the per-job copy is nearly instant and only allocates disk space for writes. A 40 GB disk image produces a clone in milliseconds.
+
+### First-boot macOS install — plan for the delay
+
+The first time ephemerd starts on a Mac, it will **block for 30–60 minutes** while it downloads and installs macOS. This is a one-time, unattended operation that happens automatically — there's no opt-in flag because a Mac host running macOS jobs needs a macOS base image, full stop. The steps:
+
+1. Fetches the latest Apple-signed IPSW (~14 GB) into `<data_dir>/vm/macos/restore.ipsw`.
+2. Runs `VZMacOSInstaller` to install stock macOS into `<data_dir>/vm/macos/base.img` (~40 GB). This is the same flow the first-run-experience in Apple's own `Virtualization` sample uses — it writes iBoot, SEP firmware, the root volume, recovery, etc.
+3. Saves the matching hardware model / machine identifier / auxiliary storage next to the disk image.
+4. Deletes the IPSW once the install succeeds, reclaiming ~14 GB.
+
+Progress is logged every 30 seconds, so `tail -f /var/log/ephemerd.log` (or wherever you've teed stdout) shows download bytes and install percent. Typical lines:
+
+```
+msg="downloading macOS IPSW from Apple — this is ~14 GB" dest=/var/lib/ephemerd/vm/macos/restore.ipsw.part
+msg="IPSW download progress" percent=37.4 bytes=5432140800
+msg="IPSW download complete" path=/var/lib/ephemerd/vm/macos/restore.ipsw
+msg="starting macOS install — this may take 20–45 minutes"
+msg="macOS install progress" percent=42.1
+msg="macOS install complete" disk=/var/lib/ephemerd/vm/macos/base.img
+```
+
+**Ephemerd will not accept any macOS jobs during this window.** Linux jobs still work — Linux VM boot is independent. Subsequent daemon restarts skip this phase entirely because `base.img` already exists; if you ever want to redo the install, delete the `vm/macos/` directory.
+
+If you'd rather supply your own image (e.g. one with Xcode and build tooling baked in) set `vm.macos.base_image` to the path in `config.toml` and the auto-install is skipped.
 
 ### macOS VM Configuration
 

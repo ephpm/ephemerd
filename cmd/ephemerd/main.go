@@ -308,19 +308,6 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	// into the shared data directory (available inside macOS VMs via virtio-fs).
 	artifactExtractor := artifacts.NewExtractor(ctrdClient, log)
 
-	// Configure macOS VM support if enabled
-	var macOSVMConfig *vm.MacOSVMConfig
-	if cfg.VM.MacOS.Enabled {
-		macOSVMConfig = &vm.MacOSVMConfig{
-			DataDir:   configDir,
-			BaseImage: cfg.VM.MacOS.BaseImage,
-			CPUs:      cfg.VM.MacOS.CPUs,
-			MemoryMB:  cfg.VM.MacOS.MemoryMB,
-			Log:       log,
-		}
-		log.Info("macOS VM support enabled", "base_image", cfg.VM.MacOS.BaseImage)
-	}
-
 	// Wait for Linux dispatch client if WSL VM is booting in the background.
 	// All setup above (runner, CNI, networking, GitHub) runs in parallel with
 	// the WSL boot, so this typically doesn't add much delay.
@@ -348,7 +335,6 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		GitHub:          gh,
 		Artifacts:       artifactExtractor,
 		LinuxDispatcher: linuxDispatcher,
-		MacOSVMConfig:   macOSVMConfig,
 		DataDir:         configDir,
 		MaxConcurrent:   cfg.Runner.MaxConcurrent,
 		Labels:          cfg.Runner.ExtraLabels,
@@ -375,6 +361,29 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 			Log:     log,
 		})
 		defer metricsCleanup()
+	}
+
+	// Provision the macOS VM disk in the background so the scheduler can
+	// start accepting Linux jobs immediately. macOS jobs are rejected
+	// (MacOSVMConfig == nil) until the install finishes.
+	if runtime_.GOOS == "darwin" {
+		go func() {
+			files, err := vm.EnsureMacOSVMDisk(ctx, configDir, vm.MacOSInstallOptions{
+				CustomDiskImage: cfg.VM.MacOS.DiskImage,
+			}, log)
+			if err != nil {
+				log.Error("macOS VM disk provisioning failed — macOS jobs will be unavailable", "error", err)
+				return
+			}
+			sched.SetMacOSVMConfig(&vm.MacOSVMConfig{
+				DataDir:   configDir,
+				DiskImage: files.DiskImage,
+				CPUs:      cfg.VM.MacOS.CPUs,
+				MemoryMB:  cfg.VM.MacOS.MemoryMB,
+				Log:       log,
+			})
+			log.Info("macOS VM support ready", "disk_image", files.DiskImage)
+		}()
 	}
 
 	log.Info("ephemerd ready", "repos", cfg.GitHub.Repos, "max_concurrent", cfg.Runner.MaxConcurrent)

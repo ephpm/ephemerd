@@ -62,6 +62,16 @@ type Scheduler struct {
 
 const seenTTL = 10 * time.Minute
 
+// SetMacOSVMConfig enables macOS job support after startup. This is used when
+// the macOS disk image is being provisioned in the background — the scheduler
+// starts immediately for Linux jobs and picks up macOS jobs once the install
+// finishes.
+func (s *Scheduler) SetMacOSVMConfig(cfg *vm.MacOSVMConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cfg.MacOSVMConfig = cfg
+}
+
 // failureBackoff tracks per-repo failure counts to compute exponential backoff.
 // Resets to zero on the next successful job for that repo.
 var (
@@ -411,8 +421,20 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	}
 
 	// Route macOS-native jobs to per-job macOS VMs.
-	if s.cfg.MacOSVMConfig != nil && isMacOSJob(event.Job.Labels) {
-		s.handleMacOSJob(ctx, event)
+	if isMacOSJob(event.Job.Labels) {
+		s.mu.Lock()
+		macCfg := s.cfg.MacOSVMConfig
+		s.mu.Unlock()
+		if macCfg != nil {
+			s.handleMacOSJob(ctx, event)
+			return
+		}
+		// macOS VM disk is still being provisioned — remove from seen so
+		// the next poll retries this job once the install finishes.
+		s.mu.Lock()
+		delete(s.seen, jobID)
+		s.mu.Unlock()
+		log.Info("macOS VM disk not ready yet, deferring job")
 		return
 	}
 
