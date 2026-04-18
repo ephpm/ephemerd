@@ -333,6 +333,50 @@ func TestParsedShutdownTimeout_Invalid(t *testing.T) {
 	}
 }
 
+// --- ImageForRepo tests ---
+
+func TestImageForRepo_Override(t *testing.T) {
+	r := &RunnerConfig{
+		DefaultImage: "default:latest",
+		Images: map[string]string{
+			"ephemerd": "ephpm/ephemerd:runner-ci-linux",
+			"ephpm":    "ephpm/ephpm:ci-runner",
+		},
+	}
+	if img := r.ImageForRepo("ephemerd"); img != "ephpm/ephemerd:runner-ci-linux" {
+		t.Errorf("ImageForRepo(ephemerd) = %q, want ephpm/ephemerd:runner-ci-linux", img)
+	}
+	if img := r.ImageForRepo("ephpm"); img != "ephpm/ephpm:ci-runner" {
+		t.Errorf("ImageForRepo(ephpm) = %q, want ephpm/ephpm:ci-runner", img)
+	}
+}
+
+func TestImageForRepo_FallbackToDefault(t *testing.T) {
+	r := &RunnerConfig{
+		DefaultImage: "default:latest",
+		Images: map[string]string{
+			"ephemerd": "custom:latest",
+		},
+	}
+	if img := r.ImageForRepo("other-repo"); img != "default:latest" {
+		t.Errorf("ImageForRepo(other-repo) = %q, want default:latest", img)
+	}
+}
+
+func TestImageForRepo_NoImagesMap(t *testing.T) {
+	r := &RunnerConfig{DefaultImage: "default:latest"}
+	if img := r.ImageForRepo("anything"); img != "default:latest" {
+		t.Errorf("ImageForRepo(anything) = %q, want default:latest", img)
+	}
+}
+
+func TestImageForRepo_EmptyDefault(t *testing.T) {
+	r := &RunnerConfig{}
+	if img := r.ImageForRepo("anything"); img != "" {
+		t.Errorf("ImageForRepo(anything) = %q, want empty", img)
+	}
+}
+
 // --- Logger tests ---
 
 func TestLogger_Levels(t *testing.T) {

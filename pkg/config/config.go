@@ -165,11 +165,22 @@ type WoodpeckerConfig struct {
 }
 
 type RunnerConfig struct {
-	MaxConcurrent   int      `toml:"max_concurrent"`
-	ExtraLabels     []string `toml:"extra_labels"`
-	DefaultImage    string   `toml:"default_image"`
-	JobTimeout      string   `toml:"job_timeout"`
-	ShutdownTimeout string   `toml:"shutdown_timeout"`
+	MaxConcurrent   int               `toml:"max_concurrent"`
+	ExtraLabels     []string          `toml:"extra_labels"`
+	DefaultImage    string            `toml:"default_image"`
+	Images          map[string]string `toml:"images"`          // per-repo image overrides (repo name → image)
+	JobTimeout      string            `toml:"job_timeout"`
+	ShutdownTimeout string            `toml:"shutdown_timeout"`
+}
+
+// ImageForRepo returns the container image for a given repo.
+// Checks per-repo overrides first, then falls back to default_image.
+// Returns empty string if neither is set (caller should use provider default).
+func (r *RunnerConfig) ImageForRepo(repo string) string {
+	if img, ok := r.Images[repo]; ok {
+		return img
+	}
+	return r.DefaultImage
 }
 
 // ParsedPollInterval returns the poll interval as a time.Duration.
