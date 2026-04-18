@@ -1050,7 +1050,7 @@ func (s *Scheduler) serveTunnelWithReconnect(ctx context.Context, server *http.S
 
 	for {
 		err := server.Serve(ln)
-		if err == http.ErrServerClosed || ctx.Err() != nil {
+		if errors.Is(err, http.ErrServerClosed) || ctx.Err() != nil {
 			return
 		}
 		consecutiveFailures++
@@ -1098,7 +1098,7 @@ func (s *Scheduler) serveTunnelWithReconnect(ctx context.Context, server *http.S
 		newHooks, err := s.cfg.GitHub.RegisterWebhooks(ctx, webhookURL, s.cfg.WebhookSecret)
 		if err != nil {
 			s.cfg.Log.Error("failed to re-register webhooks after tunnel reconnect", "error", err)
-			newLn.Close()
+			_ = newLn.Close()
 			delay = min(delay*2, tunnelMaxReconnectDelay)
 			continue
 		}

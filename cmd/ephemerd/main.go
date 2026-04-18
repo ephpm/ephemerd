@@ -97,11 +97,11 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	// Check if another instance is already running.
 	if cc, err := dialControl(ctx); err == nil {
 		if resp, err := cc.Status(ctx, &apiv1.StatusRequest{}); err == nil {
-			cc.Close()
+			_ = cc.Close()
 			return fmt.Errorf("ephemerd is already running (status: %s, active jobs: %d, uptime: %s)",
 				resp.Status, resp.ActiveJobs, resp.Uptime)
 		}
-		cc.Close()
+		_ = cc.Close()
 	}
 
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
