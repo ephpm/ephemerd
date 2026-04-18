@@ -11,11 +11,11 @@ func TestLinuxVMConfig_SetDefaults(t *testing.T) {
 	cfg := LinuxVMConfig{}
 	cfg.SetDefaults()
 
-	if cfg.CPUs != 2 {
-		t.Errorf("CPUs = %d, want 2", cfg.CPUs)
+	if cfg.CPUs != 1 {
+		t.Errorf("CPUs = %d, want 1", cfg.CPUs)
 	}
-	if cfg.MemoryMB != 2048 {
-		t.Errorf("MemoryMB = %d, want 2048", cfg.MemoryMB)
+	if cfg.MemoryMB != 1024 {
+		t.Errorf("MemoryMB = %d, want 1024", cfg.MemoryMB)
 	}
 	if cfg.DiskSizeGB != 50 {
 		t.Errorf("DiskSizeGB = %d, want 50", cfg.DiskSizeGB)
@@ -55,8 +55,8 @@ func TestLinuxVMConfig_SetDefaults_PartialCustom(t *testing.T) {
 	if cfg.CPUs != 4 {
 		t.Errorf("CPUs = %d, want 4 (custom)", cfg.CPUs)
 	}
-	if cfg.MemoryMB != 2048 {
-		t.Errorf("MemoryMB = %d, want 2048 (default)", cfg.MemoryMB)
+	if cfg.MemoryMB != 1024 {
+		t.Errorf("MemoryMB = %d, want 1024 (default)", cfg.MemoryMB)
 	}
 }
 
@@ -66,11 +66,11 @@ func TestMacOSVMConfig_SetDefaults(t *testing.T) {
 	cfg := MacOSVMConfig{}
 	cfg.SetDefaults()
 
-	if cfg.CPUs != 4 {
-		t.Errorf("CPUs = %d, want 4", cfg.CPUs)
+	if cfg.CPUs != 2 {
+		t.Errorf("CPUs = %d, want 2", cfg.CPUs)
 	}
-	if cfg.MemoryMB != 8192 {
-		t.Errorf("MemoryMB = %d, want 8192", cfg.MemoryMB)
+	if cfg.MemoryMB != 2048 {
+		t.Errorf("MemoryMB = %d, want 2048", cfg.MemoryMB)
 	}
 }
 

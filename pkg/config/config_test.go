@@ -272,22 +272,22 @@ func TestValidate_PreservesExplicitSecret(t *testing.T) {
 
 func TestParsedPollInterval_Default(t *testing.T) {
 	g := &GitHubConfig{}
-	if d := g.ParsedPollInterval(); d != 10*time.Second {
-		t.Errorf("empty PollInterval = %v, want 10s", d)
+	if d := g.ParsedPollInterval(); d != 30*time.Second {
+		t.Errorf("empty PollInterval = %v, want 30s", d)
 	}
 }
 
 func TestParsedPollInterval_Valid(t *testing.T) {
-	g := &GitHubConfig{PollInterval: "30s"}
-	if d := g.ParsedPollInterval(); d != 30*time.Second {
-		t.Errorf("PollInterval = %v, want 30s", d)
+	g := &GitHubConfig{PollInterval: "15s"}
+	if d := g.ParsedPollInterval(); d != 15*time.Second {
+		t.Errorf("PollInterval = %v, want 15s", d)
 	}
 }
 
 func TestParsedPollInterval_Invalid(t *testing.T) {
 	g := &GitHubConfig{PollInterval: "notaduration"}
-	if d := g.ParsedPollInterval(); d != 10*time.Second {
-		t.Errorf("invalid PollInterval = %v, want 10s fallback", d)
+	if d := g.ParsedPollInterval(); d != 30*time.Second {
+		t.Errorf("invalid PollInterval = %v, want 30s fallback", d)
 	}
 }
 
