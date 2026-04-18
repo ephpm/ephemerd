@@ -30,17 +30,6 @@ jobs:
     name: Build (macOS arm64)
     runs-on: [self-hosted, macos, arm64]
     steps:
-      - name: Install Xcode CLI tools
-        run: |
-          if ! xcode-select -p &>/dev/null; then
-            # Headless install — create the trigger file and use softwareupdate
-            sudo touch /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
-            PROD=$(softwareupdate -l 2>/dev/null | grep -o '.*Command Line Tools.*' | head -1 | sed 's/^[* ]*//')
-            sudo softwareupdate -i "$PROD" --verbose 2>&1 | tail -5
-            sudo rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
-          fi
-          xcode-select -p
-
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5

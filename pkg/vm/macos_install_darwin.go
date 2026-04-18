@@ -27,7 +27,7 @@ import (
 )
 
 // MacOSVMDiskFiles are the on-disk artifacts needed to boot macOS VMs.
-// Pulled from a Tart OCI image (ghcr.io/cirruslabs/macos-*-vanilla).
+// Pulled from a Tart OCI image (ghcr.io/cirruslabs/macos-*-base).
 type MacOSVMDiskFiles struct {
 	DataDir       string // e.g. /var/lib/ephemerd/vm/macos
 	DiskImage     string // base.img — the bootable macOS VM disk
@@ -56,13 +56,13 @@ type MacOSInstallOptions struct {
 
 	// TartImage overrides the default Tart OCI image reference.
 	// Default is auto-detected from the host macOS version
-	// (e.g. ghcr.io/cirruslabs/macos-tahoe-vanilla:latest).
+	// (e.g. ghcr.io/cirruslabs/macos-tahoe-base:latest).
 	TartImage string
 }
 
 // EnsureMacOSVMDisk makes sure a bootable macOS disk image exists.
 // If a custom disk image is configured, uses that. Otherwise pulls a
-// pre-built Tart vanilla image from ghcr.io. Idempotent.
+// pre-built Tart base image from ghcr.io. Idempotent.
 func EnsureMacOSVMDisk(ctx context.Context, dataDir string, opts MacOSInstallOptions, log *slog.Logger) (*MacOSVMDiskFiles, error) {
 	files := macOSVMFiles(dataDir)
 	if opts.CustomDiskImage != "" {
@@ -116,7 +116,7 @@ func EnsureMacOSVMDisk(ctx context.Context, dataDir string, opts MacOSInstallOpt
 	return &files, nil
 }
 
-// defaultTartImage returns the Tart vanilla image reference matching
+// defaultTartImage returns the Tart base image reference matching
 // the host's macOS major version.
 func defaultTartImage() (string, error) {
 	out, err := exec.Command("sw_vers", "-productVersion").Output()
@@ -141,7 +141,7 @@ func defaultTartImage() (string, error) {
 		codename = "tahoe"
 	}
 
-	return fmt.Sprintf("ghcr.io/cirruslabs/macos-%s-vanilla:latest", codename), nil
+	return fmt.Sprintf("ghcr.io/cirruslabs/macos-%s-base:latest", codename), nil
 }
 
 // Tart OCI media types
@@ -174,7 +174,7 @@ type tartConfig struct {
 
 // pullTartImage pulls a Tart OCI image and extracts disk, NVRAM, and config.
 func pullTartImage(ctx context.Context, imageRef string, files *MacOSVMDiskFiles, log *slog.Logger) error {
-	// Parse image reference: ghcr.io/cirruslabs/macos-tahoe-vanilla:latest
+	// Parse image reference: ghcr.io/cirruslabs/macos-tahoe-base:latest
 	registry, repo, tag, err := parseImageRef(imageRef)
 	if err != nil {
 		return err
@@ -456,7 +456,7 @@ func appleDecompressLZ4Stream(r io.Reader, w io.Writer) (int64, error) {
 	}
 }
 
-// parseImageRef splits "ghcr.io/cirruslabs/macos-tahoe-vanilla:latest"
+// parseImageRef splits "ghcr.io/cirruslabs/macos-tahoe-base:latest"
 // into registry, repository, and tag.
 func parseImageRef(ref string) (registry, repo, tag string, err error) {
 	// Split tag
@@ -720,7 +720,7 @@ func fileExists(path string) bool {
 
 // Runner startup script — runs on every per-job VM boot via LaunchDaemon.
 // Mounts virtio-fs shares, installs ephemeral SSH key, starts GHA runner.
-// Tart vanilla images have user "admin" with password "admin" and sudo.
+// Tart base images have user "admin" with password "admin" and sudo.
 const macOSRunnerScript = `#!/bin/bash
 # No set -e — we want to log failures, not silently exit.
 exec &>/tmp/ephemerd-runner.log
