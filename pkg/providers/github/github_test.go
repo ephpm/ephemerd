@@ -109,7 +109,7 @@ func TestConvertEvent_NilJob(t *testing.T) {
 
 func TestStop_NilCancel(t *testing.T) {
 	p := New(nil, slog.Default())
-	if err := p.Stop(nil); err != nil {
+	if err := p.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop with nil cancel: %v", err)
 	}
 }

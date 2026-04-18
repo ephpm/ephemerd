@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -375,7 +376,7 @@ func TestLogger_DebugEnabled(t *testing.T) {
 
 	// Debug logger should log at debug level
 	handler := logger.Handler()
-	if !handler.Enabled(nil, -4) { // slog.LevelDebug == -4
+	if !handler.Enabled(context.TODO(), -4) { // slog.LevelDebug == -4
 		t.Error("debug logger should be enabled at debug level")
 	}
 }
@@ -385,10 +386,10 @@ func TestLogger_InfoDisablesDebug(t *testing.T) {
 	logger := cfg.Logger()
 
 	handler := logger.Handler()
-	if handler.Enabled(nil, -4) { // slog.LevelDebug
+	if handler.Enabled(context.TODO(), -4) { // slog.LevelDebug
 		t.Error("info logger should NOT be enabled at debug level")
 	}
-	if !handler.Enabled(nil, 0) { // slog.LevelInfo
+	if !handler.Enabled(context.TODO(), 0) { // slog.LevelInfo
 		t.Error("info logger should be enabled at info level")
 	}
 }
@@ -398,10 +399,10 @@ func TestLogger_WarnLevel(t *testing.T) {
 	logger := cfg.Logger()
 
 	handler := logger.Handler()
-	if handler.Enabled(nil, 0) { // slog.LevelInfo
+	if handler.Enabled(context.TODO(), 0) { // slog.LevelInfo
 		t.Error("warn logger should NOT be enabled at info level")
 	}
-	if !handler.Enabled(nil, 4) { // slog.LevelWarn
+	if !handler.Enabled(context.TODO(), 4) { // slog.LevelWarn
 		t.Error("warn logger should be enabled at warn level")
 	}
 }
@@ -411,10 +412,10 @@ func TestLogger_ErrorLevel(t *testing.T) {
 	logger := cfg.Logger()
 
 	handler := logger.Handler()
-	if handler.Enabled(nil, 4) { // slog.LevelWarn
+	if handler.Enabled(context.TODO(), 4) { // slog.LevelWarn
 		t.Error("error logger should NOT be enabled at warn level")
 	}
-	if !handler.Enabled(nil, 8) { // slog.LevelError
+	if !handler.Enabled(context.TODO(), 8) { // slog.LevelError
 		t.Error("error logger should be enabled at error level")
 	}
 }
@@ -424,10 +425,10 @@ func TestLogger_UnknownDefaultsToInfo(t *testing.T) {
 	logger := cfg.Logger()
 
 	handler := logger.Handler()
-	if handler.Enabled(nil, -4) { // slog.LevelDebug
+	if handler.Enabled(context.TODO(), -4) { // slog.LevelDebug
 		t.Error("unknown level should default to info, not enable debug")
 	}
-	if !handler.Enabled(nil, 0) { // slog.LevelInfo
+	if !handler.Enabled(context.TODO(), 0) { // slog.LevelInfo
 		t.Error("unknown level should default to info")
 	}
 }

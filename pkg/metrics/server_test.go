@@ -111,8 +111,9 @@ func TestServe_CleanupShutsDownServer(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Server should no longer accept connections
-	_, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", port))
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", port))
 	if err == nil {
+		_ = resp.Body.Close()
 		t.Error("expected connection error after cleanup, but request succeeded")
 	}
 }
