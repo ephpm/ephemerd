@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	runtime_ "runtime"
 	"strconv"
 	"syscall"
 
@@ -47,12 +48,17 @@ func main() {
 		Commands: []*cli.Command{
 			serveCmd(),
 			runCmd(),
+			startCmd(),
+			stopCmd(),
+			restartCmd(),
+			logsCmd(),
 			statusCmd(),
 			drainCmd(),
 			jobsCmd(),
 			imagesCmd(),
 			configCheckCmd(),
 			ctrctlCmd(),
+			crictlCmd(),
 			doctorCmd(),
 			installCmd(),
 			uninstallCmd(),
@@ -79,6 +85,11 @@ func serveCmd() *cli.Command {
 				Name:  "containerd-tcp-port",
 				Usage: "also expose containerd on a TCP port (used by WSL host integration)",
 			},
+			&cli.StringFlag{
+				Name:  "containerd-tcp-addr",
+				Value: "127.0.0.1",
+				Usage: "bind address for the containerd TCP listener (use 0.0.0.0 when host lives outside the network namespace)",
+			},
 			&cli.BoolFlag{
 				Name:  "containerd-only",
 				Usage: "only run containerd (no scheduler, GitHub polling, or runner extraction)",
@@ -89,20 +100,24 @@ func serveCmd() *cli.Command {
 			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			return serve(ctx, cmd.String("config"), uint32(cmd.Uint("containerd-tcp-port")), cmd.Bool("containerd-only"), cmd.Bool("dind"))
+			return serve(ctx, cmd.String("config"), uint32(cmd.Uint("containerd-tcp-port")), cmd.String("containerd-tcp-addr"), cmd.Bool("containerd-only"), cmd.Bool("dind"))
 		},
 	}
 }
 
-func serve(ctx context.Context, configFile string, containerdTCPPort uint32, containerdOnly bool, dindFlag bool) error {
+func serve(ctx context.Context, configFile string, containerdTCPPort uint32, containerdTCPAddr string, containerdOnly bool, dindFlag bool) error {
 	// Check if another instance is already running.
 	if cc, err := dialControl(ctx); err == nil {
 		if resp, err := cc.Status(ctx, &apiv1.StatusRequest{}); err == nil {
-			_ = cc.Close()
+			if closeErr := cc.Close(); closeErr != nil {
+				return fmt.Errorf("closing control connection: %w", closeErr)
+			}
 			return fmt.Errorf("ephemerd is already running (status: %s, active jobs: %d, uptime: %s)",
 				resp.Status, resp.ActiveJobs, resp.Uptime)
 		}
-		_ = cc.Close()
+		if closeErr := cc.Close(); closeErr != nil {
+			return fmt.Errorf("closing control connection: %w", closeErr)
+		}
 	}
 
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
@@ -142,7 +157,7 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	// Start container runtime.
 	// On Linux/Windows: embedded containerd runs in-process.
 	// On macOS: boot a Linux VM via Virtualization.framework, containerd runs inside it.
-	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, cfg.Dind.Enabled)
+	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, containerdTCPAddr, cfg.Dind.Enabled)
 	if err != nil {
 		return fmt.Errorf("starting container runtime: %w", err)
 	}
@@ -289,17 +304,25 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	}
 
 	// Create runtime (container lifecycle manager)
+	// On Darwin the Linux VM sees the host's DataDir at /mnt/ephemerd
+	// (virtio-fs share tag "ephemerd"). Bind-mount sources pointed at the
+	// DataDir need to be translated to that VM-side path.
+	containerDataDir := configDir
+	if runtime_.GOOS == "darwin" {
+		containerDataDir = "/mnt/ephemerd"
+	}
 	rt, err := runtime.New(runtime.Config{
-		Client:          ctrdClient,
-		RunnerDir:       rm.Dir(),
-		RunnerMount:     rm.ContainerDir(),
-		DefaultImage:    cfg.Runner.DefaultImage,
-		LogDir:          joinPath(configDir, "logs"),
-		DataDir:         configDir,
-		DindEnabled:     cfg.Dind.Enabled,
-		CacheProxyEnv:   cacheProxyEnvVars,
-		Network:         net,
-		Log:             log,
+		Client:           ctrdClient,
+		RunnerDir:        rm.Dir(),
+		RunnerMount:      rm.ContainerDir(),
+		DefaultImage:     cfg.Runner.DefaultImage,
+		LogDir:           joinPath(configDir, "logs"),
+		DataDir:          configDir,
+		ContainerDataDir: containerDataDir,
+		DindEnabled:      cfg.Dind.Enabled,
+		CacheProxyEnv:    cacheProxyEnvVars,
+		Network:          net,
+		Log:              log,
 	})
 	if err != nil {
 		return fmt.Errorf("creating runtime: %w", err)
@@ -340,19 +363,6 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	// into the shared data directory (available inside macOS VMs via virtio-fs).
 	artifactExtractor := artifacts.NewExtractor(ctrdClient, log)
 
-	// Configure macOS VM support if enabled
-	var macOSVMConfig *vm.MacOSVMConfig
-	if cfg.VM.MacOS.Enabled {
-		macOSVMConfig = &vm.MacOSVMConfig{
-			DataDir:   configDir,
-			BaseImage: cfg.VM.MacOS.BaseImage,
-			CPUs:      cfg.VM.MacOS.CPUs,
-			MemoryMB:  cfg.VM.MacOS.MemoryMB,
-			Log:       log,
-		}
-		log.Info("macOS VM support enabled", "base_image", cfg.VM.MacOS.BaseImage)
-	}
-
 	// Wait for Linux dispatch client if WSL VM is booting in the background.
 	// All setup above (runner, CNI, networking, GitHub) runs in parallel with
 	// the WSL boot, so this typically doesn't add much delay.
@@ -380,9 +390,9 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		GitHub:          gh,
 		Artifacts:       artifactExtractor,
 		LinuxDispatcher: linuxDispatcher,
-		MacOSVMConfig:   macOSVMConfig,
 		DataDir:         configDir,
 		MaxConcurrent:   cfg.Runner.MaxConcurrent,
+		MaxMacOSVMs:     cfg.VM.MacOS.MaxConcurrent,
 		Labels:          cfg.Runner.ExtraLabels,
 		PollInterval:    cfg.GitHub.ParsedPollInterval(),
 		WebhookPort:     cfg.Webhook.Port,
@@ -409,6 +419,37 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		defer metricsCleanup()
 	}
 
+	// Pull the macOS base image (Tart OCI) in the background so the
+	// scheduler can start accepting Linux jobs immediately.
+	// Skipped when cross_platform = false (e.g. Gitea/Forgejo).
+	if runtime_.GOOS == "darwin" && cfg.VM.CrossPlatformEnabled() {
+		sshSigner, sshPubKey, err := vm.GenerateEphemeralSSHKey()
+		if err != nil {
+			return fmt.Errorf("generating ephemeral SSH key: %w", err)
+		}
+		log.Info("generated ephemeral SSH key for macOS VM access (in-memory only, rotates on restart)")
+
+		go func() {
+			files, err := vm.EnsureMacOSVMDisk(ctx, configDir, vm.MacOSInstallOptions{
+				CustomDiskImage: cfg.VM.MacOS.DiskImage,
+			}, log)
+			if err != nil {
+				log.Error("macOS VM disk provisioning failed — macOS jobs will be unavailable", "error", err)
+				return
+			}
+			sched.SetMacOSVMConfig(&vm.MacOSVMConfig{
+				DataDir:   configDir,
+				DiskImage: files.DiskImage,
+				SSHSigner: sshSigner,
+				SSHPubKey: sshPubKey,
+				CPUs:      cfg.VM.MacOS.CPUs,
+				MemoryMB:  cfg.VM.MacOS.MemoryMB,
+				Log:       log,
+			})
+			log.Info("macOS VM support ready", "disk_image", files.DiskImage)
+		}()
+	}
+
 	log.Info("ephemerd ready", "repos", cfg.GitHub.Repos, "max_concurrent", cfg.Runner.MaxConcurrent)
 
 	return sched.Run(ctx)
@@ -425,6 +466,22 @@ func ctrctlCmd() *cli.Command {
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			socketPath := containerd.SocketPath(configDir)
 			return containerd.ExecCtr(socketPath, cmd.Args().Slice())
+		},
+	}
+}
+
+// crictlCmd exposes the upstream crictl CLI against ephemerd's embedded
+// containerd CRI socket. The crictl library is linked in-process; no external
+// binary is required. See docs/arch/crictl.md.
+func crictlCmd() *cli.Command {
+	return &cli.Command{
+		Name:            "crictl",
+		Usage:           "Access the embedded containerd CRI (in-process crictl)",
+		Description:     "Runs crictl commands against ephemerd's embedded containerd CRI endpoint.\nAll arguments after 'crictl' are passed directly to crictl (e.g. ps, images, info, exec).",
+		SkipFlagParsing: true,
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			socketPath := containerd.SocketPath(configDir)
+			return containerd.ExecCrictl(socketPath, cmd.Args().Slice())
 		},
 	}
 }

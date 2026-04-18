@@ -63,6 +63,120 @@ func Linuxembed() error {
 	)
 }
 
+// Macos performs the Darwin build with embedded Linux VM assets:
+// 1. Download aarch64 rootfs, kernel, and initrd
+// 2. Cross-compile static Linux binary (linux/arm64)
+// 3. Build macOS binary embedding all VM assets
+// 4. Ad-hoc codesign with the virtualization entitlement (Vz requires it)
+func Macos() error {
+	// The kernel/initrd/rootfs downloads are independent and safe to parallelize.
+	mg.Deps(download.Kernel, download.Initrd, download.Rootfs)
+
+	// Linuxembedarm64 temporarily stashes non-Linux runners from pkg/runner/embed
+	// while it builds. Runner (downloads osx-arm64) must run after this completes
+	// — running them in parallel would let the osx runner re-appear mid-stash and
+	// get embedded into ephemerd-linux.
+	mg.SerialDeps(Linuxembedarm64, download.Runner)
+
+	// Remove any x86_64 rootfs to avoid embed conflicts
+	matches, _ := filepath.Glob("pkg/vm/embed/ephemerd-rootfs-*-x86_64.tar.gz")
+	for _, m := range matches {
+		fmt.Printf("  Removing %s (not needed in macOS binary)\n", m)
+		_ = os.Remove(m)
+	}
+
+	output := "ephemerd"
+	if env := os.Getenv("OUTPUT"); env != "" {
+		output = env
+	}
+
+	// The Linux runner is already embedded inside ephemerd-linux (which is itself
+	// embedded in the darwin binary). Keeping it in pkg/runner/embed too would
+	// triple-embed it. Stash it for the duration of this build.
+	stash, err := stashNonMatchingRunners("actions-runner-osx-")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = restoreStashed(stash) }()
+
+	if err := sh.RunV("go", "build", "-ldflags", ldflags(), "-o", output, "./cmd/ephemerd/"); err != nil {
+		return err
+	}
+
+	// Codesign with virtualization entitlement — required by Virtualization.framework.
+	// Ad-hoc signing (-s -) is fine for local development; set CODESIGN_IDENTITY
+	// for a proper Developer ID signature.
+	identity := "-"
+	if env := os.Getenv("CODESIGN_IDENTITY"); env != "" {
+		identity = env
+	}
+	entitlements := filepath.Join("mage", "build", "ephemerd.entitlements")
+	fmt.Printf("  Codesigning %s with entitlements (%s)...\n", output, identity)
+	return sh.RunV("codesign", "--force", "--sign", identity,
+		"--entitlements", entitlements, output)
+}
+
+// Linuxembedarm64 cross-compiles a static Linux ephemerd binary for arm64 embedding.
+// Temporarily removes non-Linux runners from pkg/runner/embed/ so they don't get
+// embedded in the Linux binary (which only needs the Linux runner).
+func Linuxembedarm64() error {
+	mg.Deps(download.Runnerlinuxarm64, download.Cnilinuxarm64, download.Shimlinuxarm64)
+
+	if err := os.MkdirAll("pkg/vm/embed", 0o755); err != nil {
+		return err
+	}
+
+	// Move non-Linux runners out of the embed dir for the duration of this build
+	// so they don't get triple-embedded via `//go:embed all:embed` in pkg/runner/.
+	stash, err := stashNonMatchingRunners("actions-runner-linux-")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = restoreStashed(stash) }()
+
+	return sh.RunWith(
+		map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "arm64"},
+		"go", "build", "-ldflags", ldflags(), "-o", "pkg/vm/embed/ephemerd-linux", "./cmd/ephemerd/",
+	)
+}
+
+// stashNonMatchingRunners moves any runner tarball NOT starting with `keepPrefix`
+// OUT of the embed directory (to a sibling .stash dir) and returns (original,
+// stashed) path pairs for later restoration. Must move OUT of the embed dir —
+// `//go:embed all:embed` picks up any file in there regardless of extension.
+func stashNonMatchingRunners(keepPrefix string) ([][2]string, error) {
+	matches, _ := filepath.Glob("pkg/runner/embed/actions-runner-*")
+	stashDir := "pkg/runner/.embed-stash"
+	if err := os.MkdirAll(stashDir, 0o755); err != nil {
+		return nil, err
+	}
+	var stashed [][2]string
+	for _, m := range matches {
+		base := filepath.Base(m)
+		if strings.HasPrefix(base, keepPrefix) {
+			continue
+		}
+		stash := filepath.Join(stashDir, base)
+		if err := os.Rename(m, stash); err != nil {
+			for _, pair := range stashed {
+				_ = os.Rename(pair[1], pair[0])
+			}
+			return nil, fmt.Errorf("stashing %s: %w", m, err)
+		}
+		stashed = append(stashed, [2]string{m, stash})
+	}
+	return stashed, nil
+}
+
+func restoreStashed(stashed [][2]string) error {
+	for _, pair := range stashed {
+		if err := os.Rename(pair[1], pair[0]); err != nil {
+			return fmt.Errorf("restoring %s: %w", pair[0], err)
+		}
+	}
+	return nil
+}
+
 func ldflags() string {
 	version := gitVersion()
 	return fmt.Sprintf("-s -w -X main.version=%s -X github.com/ephpm/ephemerd/pkg/runner.Version=%s -X github.com/ephpm/ephemerd/pkg/cni.Version=%s",

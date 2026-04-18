@@ -113,6 +113,9 @@ func Clean() error {
 		"pkg/containerd/embed/runc",
 		"pkg/vm/embed/ephemerd-linux",
 		"pkg/vm/embed/alpine-minirootfs-*",
+		"pkg/vm/embed/ephemerd-rootfs-*",
+		"pkg/vm/embed/vmlinuz",
+		"pkg/vm/embed/initrd",
 	}
 	for _, p := range patterns {
 		matches, _ := filepath.Glob(p)

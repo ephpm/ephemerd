@@ -157,6 +157,7 @@ func jobsCmd() *cli.Command {
 		Commands: []*cli.Command{
 			jobKillCmd(),
 			jobLogsCmd(),
+			jobSSHCmd(),
 		},
 	}
 }

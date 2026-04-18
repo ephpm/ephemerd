@@ -89,8 +89,13 @@ func (s *dispatchServer) DestroyJob(ctx context.Context, req *apiv1.DestroyJobRe
 
 // StartDispatchServer starts the dispatch gRPC server on the given TCP port.
 // Returns a cleanup function that gracefully stops the server.
+//
+// Binds to 0.0.0.0 so the host (outside the VM) can reach it. WSL on Windows
+// shares localhost with the host, so this used to be 127.0.0.1, but the same
+// process is now invoked from inside an Apple Vz VM where the host lives on
+// the NAT side and needs the listener exposed on the VM's external interface.
 func StartDispatchServer(port int, rt *runtime.Runtime, log *slog.Logger) func() {
-	lis, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	lis, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
 	if err != nil {
 		log.Error("dispatch: failed to listen", "port", port, "error", err)
 		return func() {}

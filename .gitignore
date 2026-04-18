@@ -11,3 +11,9 @@ pkg/containerd/embed/containerd-shim-runc-v2
 pkg/containerd/embed/runc
 pkg/vm/embed/ephemerd-linux
 pkg/vm/embed/alpine-minirootfs-*
+pkg/vm/embed/ephemerd-rootfs-*
+pkg/vm/embed/vmlinuz
+pkg/vm/embed/initrd
+
+# JetBrains
+.idea/

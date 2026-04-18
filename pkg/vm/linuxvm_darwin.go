@@ -3,24 +3,53 @@
 package vm
 
 import (
+	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Code-Hex/vz/v3"
 	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/defaults"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
+
+func sha256Bytes(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
 
 // darwinLinuxVM runs a Linux VM on macOS using Virtualization.framework.
 type darwinLinuxVM struct {
-	cfg    LinuxVMConfig
-	vm     *vz.VirtualMachine
-	client *client.Client
-	cancel context.CancelFunc
-	done   chan struct{}
+	cfg          LinuxVMConfig
+	vm           *vz.VirtualMachine
+	client       *client.Client
+	cancel       context.CancelFunc
+	done         chan struct{}
+	macAddr      string // MAC assigned to the VM, used to look up its NAT IP via ARP
+	dispatchAddr string // <vm-ip>:<containerd_port+1> if the dispatch server is up
 }
 
 // StartLinuxVM boots a Linux VM on macOS and waits for containerd inside it.
@@ -53,7 +82,7 @@ func (l *darwinLinuxVM) Client() *client.Client {
 }
 
 func (l *darwinLinuxVM) DispatchAddr() string {
-	return "" // macOS Linux VMs don't use the dispatch architecture
+	return l.dispatchAddr
 }
 
 func (l *darwinLinuxVM) Stop() {
@@ -64,7 +93,7 @@ func (l *darwinLinuxVM) Stop() {
 	}
 
 	if l.vm != nil {
-		if canStop, err := l.vm.CanRequestStop(); err == nil && canStop {
+		if l.vm.CanRequestStop() {
 			if _, err := l.vm.RequestStop(); err != nil {
 				l.cfg.Log.Warn("graceful VM stop failed, forcing", "error", err)
 			}
@@ -109,9 +138,68 @@ func (l *darwinLinuxVM) ensureAssets() error {
 		return fmt.Errorf("creating vm directory: %w", err)
 	}
 
-	for _, path := range []string{l.kernelPath(), l.initrdPath()} {
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			return fmt.Errorf("required VM asset not found: %s\n\nRun 'ephemerd vm setup' to download the Linux kernel and initrd", path)
+	// Always sync embedded assets to disk if the embedded version differs.
+	// Using size as a cheap freshness check — if the embedded binary size
+	// doesn't match what's on disk, overwrite. This means `mage build:macos`
+	// followed by a daemon restart is sufficient to pick up new kernels,
+	// initrds, rootfs tarballs, or the linux binary — no manual deletion.
+	syncTargets := []struct {
+		src  string
+		dest string
+		mode os.FileMode
+	}{
+		{"embed/vmlinuz", l.kernelPath(), 0o644},
+		{"embed/initrd", l.initrdPath(), 0o644},
+		{"embed/ephemerd-linux", filepath.Join(dir, "ephemerd-linux"), 0o755},
+	}
+	for _, t := range syncTargets {
+		data, err := vmFS.ReadFile(t.src)
+		if err != nil {
+			return fmt.Errorf("reading embedded %s: %w", t.src, err)
+		}
+		if len(data) == 0 {
+			return fmt.Errorf("embedded %s is empty (placeholder only); rebuild with 'mage build:macos'", t.src)
+		}
+		// Compare SHA-256 instead of size — code edits to ephemerd-linux can
+		// produce a binary of identical length but different bytes, and we'd
+		// keep the stale on-disk copy.
+		if existingHash, err := fileSHA256(t.dest); err == nil {
+			if existingHash == sha256Bytes(data) {
+				continue
+			}
+		}
+		l.cfg.Log.Info("syncing embedded asset to disk", "src", t.src, "dest", t.dest, "size", len(data))
+		if err := os.WriteFile(t.dest, data, t.mode); err != nil {
+			return fmt.Errorf("writing %s: %w", t.dest, err)
+		}
+	}
+
+	// Sync rootfs tarball (the embedded name includes the Alpine version,
+	// so it's sufficient to replace any mismatching ones).
+	rootfsName, err := findEmbeddedDarwin("ephemerd-rootfs-")
+	if err != nil {
+		return fmt.Errorf("finding embedded rootfs: %w", err)
+	}
+	rootfsData, err := vmFS.ReadFile(rootfsName)
+	if err != nil {
+		return fmt.Errorf("reading embedded rootfs: %w", err)
+	}
+	if len(rootfsData) == 0 {
+		return fmt.Errorf("embedded rootfs is empty (placeholder only); rebuild with 'mage build:macos'")
+	}
+	rootfsDest := filepath.Join(dir, filepath.Base(rootfsName))
+	if st, err := os.Stat(rootfsDest); err != nil || st.Size() != int64(len(rootfsData)) {
+		// Remove any older/mismatched rootfs tarballs
+		if existing, _ := filepath.Glob(filepath.Join(dir, "ephemerd-rootfs-*.tar.gz")); len(existing) > 0 {
+			for _, p := range existing {
+				if p != rootfsDest {
+					_ = os.Remove(p)
+				}
+			}
+		}
+		l.cfg.Log.Info("syncing embedded rootfs to disk", "name", rootfsName)
+		if err := os.WriteFile(rootfsDest, rootfsData, 0o644); err != nil {
+			return fmt.Errorf("writing rootfs: %w", err)
 		}
 	}
 
@@ -132,6 +220,20 @@ func (l *darwinLinuxVM) ensureAssets() error {
 	return nil
 }
 
+// findEmbeddedDarwin finds a file in the embedded FS by prefix.
+func findEmbeddedDarwin(prefix string) (string, error) {
+	entries, err := vmFS.ReadDir("embed")
+	if err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), prefix) {
+			return "embed/" + e.Name(), nil
+		}
+	}
+	return "", fmt.Errorf("no embedded file with prefix %q found", prefix)
+}
+
 func (l *darwinLinuxVM) boot() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	l.cancel = cancel
@@ -140,7 +242,7 @@ func (l *darwinLinuxVM) boot() error {
 		l.kernelPath(),
 		vz.WithInitrd(l.initrdPath()),
 		vz.WithCommandLine(fmt.Sprintf(
-			"console=hvc0 root=/dev/vda rw ephemerd.containerd_port=%d ephemerd.share_tag=ephemerd quiet",
+			"console=hvc0 root=/dev/vda rw ephemerd.containerd_port=%d ephemerd.share_tag=ephemerd",
 			l.cfg.ContainerdPort,
 		)),
 	)
@@ -163,6 +265,26 @@ func (l *darwinLinuxVM) boot() error {
 	}
 	vmConfig.SetEntropyDevicesVirtualMachineConfiguration([]*vz.VirtioEntropyDeviceConfiguration{entropy})
 
+	// Serial console → <DataDir>/vm/linux/console.log. This is hvc0 inside the
+	// guest (kernel cmdline has console=hvc0). Captures initrd + kernel output
+	// for debugging. File is opened with append so each boot extends the log.
+	consolePath := filepath.Join(l.vmDir(), "console.log")
+	serialAttach, err := vz.NewFileSerialPortAttachment(consolePath, true)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("creating serial port attachment (%s): %w", consolePath, err)
+	}
+	// Vz creates the file 0600 root:wheel when ephemerd runs as root.
+	// Loosen so the owning user (and debug scripts) can tail it.
+	_ = os.Chmod(consolePath, 0o644)
+	serialConfig, err := vz.NewVirtioConsoleDeviceSerialPortConfiguration(serialAttach)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("creating serial console config: %w", err)
+	}
+	vmConfig.SetSerialPortsVirtualMachineConfiguration([]*vz.VirtioConsoleDeviceSerialPortConfiguration{serialConfig})
+	l.cfg.Log.Info("VM serial console", "log", consolePath)
+
 	// NAT networking
 	natAttachment, err := vz.NewNATNetworkDeviceAttachment()
 	if err != nil {
@@ -174,6 +296,16 @@ func (l *darwinLinuxVM) boot() error {
 		cancel()
 		return fmt.Errorf("creating network config: %w", err)
 	}
+	// Assign an explicit MAC so we can discover the VM's NAT IP in the host's
+	// ARP table. Without this the driver picks a random one we can't recover.
+	mac, err := vz.NewRandomLocallyAdministeredMACAddress()
+	if err != nil {
+		cancel()
+		return fmt.Errorf("generating MAC address: %w", err)
+	}
+	netConfig.SetMACAddress(mac)
+	l.macAddr = mac.String()
+	l.cfg.Log.Info("VM MAC address", "mac", l.macAddr)
 	vmConfig.SetNetworkDevicesVirtualMachineConfiguration([]*vz.VirtioNetworkDeviceConfiguration{netConfig})
 
 	// Disk
@@ -250,22 +382,76 @@ func (l *darwinLinuxVM) boot() error {
 }
 
 func (l *darwinLinuxVM) waitForContainerd() error {
-	addr := fmt.Sprintf("127.0.0.1:%d", l.cfg.ContainerdPort)
+	// Apple Vz exposes the VM over NAT (192.168.64.x/24 by default) — not via
+	// host-localhost port forwarding. We discover the VM's IP from the host
+	// ARP table using the MAC we assigned at boot, then connect to it.
+	l.cfg.Log.Info("waiting for VM to appear in ARP", "mac", l.macAddr)
+
+	var vmIP string
+	for i := range 60 {
+		// Prime ARP by pinging the NAT subnet (Vz uses 192.168.64.0/24).
+		if i%5 == 0 {
+			l.probeSubnet()
+		}
+		ip, err := l.discoverIP()
+		if err == nil {
+			vmIP = ip
+			l.cfg.Log.Info("VM discovered in ARP", "ip", vmIP, "mac", l.macAddr)
+			break
+		}
+		if i%10 == 0 && i > 0 {
+			l.cfg.Log.Debug("still looking for VM in ARP", "attempt", i, "error", err)
+		}
+		time.Sleep(1 * time.Second)
+	}
+	if vmIP == "" {
+		return fmt.Errorf("timed out finding VM in ARP (mac=%s)", l.macAddr)
+	}
+
+	addr := fmt.Sprintf("%s:%d", vmIP, l.cfg.ContainerdPort)
 	l.cfg.Log.Info("waiting for containerd in Linux VM", "address", addr)
 
-	for i := range 60 {
+	// Sanity check: can we even ping the VM? If not, the host has no route.
+	pingCmd := exec.Command("ping", "-c", "2", "-W", "1000", vmIP)
+	if out, err := pingCmd.CombinedOutput(); err != nil {
+		l.cfg.Log.Warn("ping to VM failed — host may have no route to NAT subnet",
+			"ip", vmIP, "error", err, "output", string(out))
+	} else {
+		l.cfg.Log.Info("ping to VM OK", "ip", vmIP)
+	}
+
+	var lastErr error
+	for i := range 120 {
 		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 		if err != nil {
-			if i%10 == 0 && i > 0 {
-				l.cfg.Log.Debug("still waiting for containerd in VM", "attempt", i)
+			lastErr = err
+			if i%15 == 0 && i > 0 {
+				l.cfg.Log.Debug("still waiting for containerd in VM", "attempt", i, "error", err)
 			}
 			time.Sleep(1 * time.Second)
 			continue
 		}
 		conn.Close()
 
-		l.client, err = client.New(addr)
+		// containerd's client.New(addr) tries to parse addr as a Unix socket
+		// path. For a TCP endpoint we need to hand it a pre-built gRPC conn
+		// (same workaround as the Windows/WSL path).
+		grpcConn, err := grpc.NewClient(addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithDefaultCallOptions(
+				grpc.MaxCallRecvMsgSize(defaults.DefaultMaxRecvMsgSize),
+				grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize),
+			),
+		)
 		if err != nil {
+			lastErr = err
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		l.client, err = client.NewWithConn(grpcConn)
+		if err != nil {
+			lastErr = err
+			_ = grpcConn.Close()
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
@@ -274,11 +460,78 @@ func (l *darwinLinuxVM) waitForContainerd() error {
 		_, err = l.client.Version(ctx)
 		cancel()
 		if err == nil {
-			l.cfg.Log.Info("containerd ready in Linux VM")
-			return nil
+			l.cfg.Log.Info("containerd ready in Linux VM", "address", addr)
+			break
 		}
+		lastErr = err
 		time.Sleep(500 * time.Millisecond)
 	}
+	if l.client == nil {
+		return fmt.Errorf("timed out waiting for containerd at %s: %w", addr, lastErr)
+	}
 
-	return fmt.Errorf("timed out waiting for containerd at %s", addr)
+	// Also wait for the dispatch gRPC server (containerd port + 1).
+	// The scheduler routes Linux jobs through this so containers get full
+	// CNI networking via ephemerd-linux instead of being created over the
+	// raw containerd API (which skips CRI's CNI invocation).
+	dispatchAddr := fmt.Sprintf("%s:%d", vmIP, l.cfg.ContainerdPort+1)
+	l.cfg.Log.Info("waiting for dispatch server in Linux VM", "address", dispatchAddr)
+	for i := range 90 {
+		conn, err := net.DialTimeout("tcp", dispatchAddr, 2*time.Second)
+		if err != nil {
+			if i%15 == 0 && i > 0 {
+				l.cfg.Log.Debug("still waiting for dispatch server", "attempt", i, "error", err)
+			}
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		_ = conn.Close()
+		l.dispatchAddr = dispatchAddr
+		l.cfg.Log.Info("dispatch server ready in Linux VM", "address", dispatchAddr)
+		return nil
+	}
+	return fmt.Errorf("timed out waiting for dispatch server at %s", dispatchAddr)
+}
+
+// probeSubnet pings the Vz NAT subnet to populate the host ARP table.
+// Without this, a VM that hasn't sent traffic to the host yet won't
+// appear in `arp -an` output. Vz reuses the bridge across reboots and
+// the DHCP lease cache can push newer VMs well past .10, so sweep wide.
+func (l *darwinLinuxVM) probeSubnet() {
+	for i := 2; i <= 64; i++ {
+		ip := fmt.Sprintf("192.168.64.%d", i)
+		go func(addr string) {
+			cmd := exec.Command("ping", "-c", "1", "-W", "100", addr)
+			_ = cmd.Run()
+		}(ip)
+	}
+}
+
+// discoverIP looks up l.macAddr in the host's ARP table and returns the IP.
+func (l *darwinLinuxVM) discoverIP() (string, error) {
+	if l.macAddr == "" {
+		return "", fmt.Errorf("no MAC address recorded for VM")
+	}
+	out, err := exec.Command("arp", "-an").Output()
+	if err != nil {
+		return "", fmt.Errorf("running arp: %w", err)
+	}
+	target := normalizeMAC(l.macAddr)
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		fields := strings.Fields(line)
+		if len(fields) < 4 || fields[1] == "(incomplete)" {
+			continue
+		}
+		if normalizeMAC(fields[3]) != target {
+			continue
+		}
+		start := strings.Index(line, "(")
+		end := strings.Index(line, ")")
+		if start >= 0 && end > start {
+			return line[start+1 : end], nil
+		}
+	}
+	return "", fmt.Errorf("MAC %s not in ARP table", l.macAddr)
 }

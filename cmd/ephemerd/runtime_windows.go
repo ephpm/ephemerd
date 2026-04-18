@@ -18,7 +18,7 @@ import (
 // Returns the native containerd client for Windows jobs and a function that
 // blocks until the Linux dispatch client is ready (nil if Linux VM is disabled
 // or failed to start).
-func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool, _ uint32, dindEnabled bool) (*client.Client, func() *scheduler.DispatchClient, func(), error) {
+func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool, _ uint32, _ string, dindEnabled bool) (*client.Client, func() *scheduler.DispatchClient, func(), error) {
 	// Start native containerd for Windows container jobs
 	ctrd, err := containerd.New(containerd.Config{
 		DataDir: dataDir,
