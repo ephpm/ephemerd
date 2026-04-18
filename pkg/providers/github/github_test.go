@@ -1,6 +1,7 @@
 package github
 
 import (
+	"context"
 	"log/slog"
 	"testing"
 
@@ -103,6 +104,24 @@ func TestConvertEvent_NilJob(t *testing.T) {
 	// when stored in Raw (any). This is expected Go behavior.
 	if ev.Raw.(*gh.WorkflowJob) != nil {
 		t.Error("Raw should hold a nil *WorkflowJob when Job is nil")
+	}
+}
+
+func TestStop_NilCancel(t *testing.T) {
+	p := New(nil, slog.Default())
+	if err := p.Stop(nil); err != nil {
+		t.Fatalf("Stop with nil cancel: %v", err)
+	}
+}
+
+func TestStop_WithCancel(t *testing.T) {
+	p := New(nil, slog.Default())
+	// Simulate Start having set a cancel func
+	_, cancel := context.WithCancel(context.Background())
+	p.cancel = cancel
+
+	if err := p.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop error: %v", err)
 	}
 }
 

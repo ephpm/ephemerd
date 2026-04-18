@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 // --- isRoutableDNS tests ---
@@ -147,6 +149,223 @@ func TestSeccompOpts(t *testing.T) {
 		if opts != nil {
 			t.Errorf("seccompOpts() on %s should return nil, got %v", runtime.GOOS, opts)
 		}
+	}
+}
+
+// --- withDockerSocket tests ---
+
+func TestWithDockerSocket(t *testing.T) {
+	s := &ocispec.Spec{}
+	opt := withDockerSocket("/tmp/docker.sock")
+	if err := opt(nil, nil, nil, s); err != nil {
+		t.Fatalf("withDockerSocket error: %v", err)
+	}
+
+	if len(s.Mounts) != 1 {
+		t.Fatalf("expected 1 mount, got %d", len(s.Mounts))
+	}
+	m := s.Mounts[0]
+	if m.Destination != "/var/run/docker.sock" {
+		t.Errorf("Destination = %q, want /var/run/docker.sock", m.Destination)
+	}
+	if m.Source != "/tmp/docker.sock" {
+		t.Errorf("Source = %q, want /tmp/docker.sock", m.Source)
+	}
+	if m.Type != "bind" {
+		t.Errorf("Type = %q, want bind", m.Type)
+	}
+	hasRW := false
+	for _, opt := range m.Options {
+		if opt == "rw" {
+			hasRW = true
+		}
+	}
+	if !hasRW {
+		t.Error("expected 'rw' in mount options")
+	}
+}
+
+func TestWithDockerSocket_NilMounts(t *testing.T) {
+	s := &ocispec.Spec{Mounts: nil}
+	opt := withDockerSocket("/sock")
+	if err := opt(nil, nil, nil, s); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Mounts) != 1 {
+		t.Errorf("expected 1 mount, got %d", len(s.Mounts))
+	}
+}
+
+// --- withRunnerMount tests ---
+
+func TestWithRunnerMount(t *testing.T) {
+	s := &ocispec.Spec{}
+	opt := withRunnerMount("/host/runner", "/actions-runner")
+	if err := opt(nil, nil, nil, s); err != nil {
+		t.Fatalf("withRunnerMount error: %v", err)
+	}
+
+	if len(s.Mounts) != 1 {
+		t.Fatalf("expected 1 mount, got %d", len(s.Mounts))
+	}
+	m := s.Mounts[0]
+	if m.Destination != "/actions-runner" {
+		t.Errorf("Destination = %q, want /actions-runner", m.Destination)
+	}
+	if m.Source != "/host/runner" {
+		t.Errorf("Source = %q, want /host/runner", m.Source)
+	}
+
+	if runtime.GOOS == "windows" {
+		// On Windows, type is empty (mapped directories)
+		hasRW := false
+		for _, opt := range m.Options {
+			if opt == "rw" {
+				hasRW = true
+			}
+		}
+		if !hasRW {
+			t.Error("expected 'rw' in mount options on Windows")
+		}
+	} else {
+		if m.Type != "bind" {
+			t.Errorf("Type = %q, want bind", m.Type)
+		}
+	}
+}
+
+// --- withHyperVIsolation tests ---
+
+func TestWithHyperVIsolation(t *testing.T) {
+	s := &ocispec.Spec{}
+	opt := withHyperVIsolation()
+	if err := opt(nil, nil, nil, s); err != nil {
+		t.Fatalf("withHyperVIsolation error: %v", err)
+	}
+
+	if s.Windows == nil {
+		t.Fatal("Windows section should be set")
+	}
+	if s.Windows.HyperV == nil {
+		t.Error("HyperV should be set")
+	}
+}
+
+func TestWithHyperVIsolation_ExistingWindows(t *testing.T) {
+	s := &ocispec.Spec{
+		Windows: &ocispec.Windows{},
+	}
+	opt := withHyperVIsolation()
+	if err := opt(nil, nil, nil, s); err != nil {
+		t.Fatal(err)
+	}
+	if s.Windows.HyperV == nil {
+		t.Error("HyperV should be set even with existing Windows section")
+	}
+}
+
+// --- withWindowsNetwork tests ---
+
+func TestWithWindowsNetwork(t *testing.T) {
+	s := &ocispec.Spec{}
+	opt := withWindowsNetwork("ns-123", "ep-456")
+	if err := opt(nil, nil, nil, s); err != nil {
+		t.Fatalf("withWindowsNetwork error: %v", err)
+	}
+
+	if s.Windows == nil {
+		t.Fatal("Windows section should be set")
+	}
+	if s.Windows.Network == nil {
+		t.Fatal("Network section should be set")
+	}
+	if s.Windows.Network.NetworkNamespace != "ns-123" {
+		t.Errorf("NetworkNamespace = %q, want ns-123", s.Windows.Network.NetworkNamespace)
+	}
+	if len(s.Windows.Network.EndpointList) != 1 || s.Windows.Network.EndpointList[0] != "ep-456" {
+		t.Errorf("EndpointList = %v, want [ep-456]", s.Windows.Network.EndpointList)
+	}
+}
+
+func TestWithWindowsNetwork_AppendsEndpoint(t *testing.T) {
+	s := &ocispec.Spec{
+		Windows: &ocispec.Windows{
+			Network: &ocispec.WindowsNetwork{
+				EndpointList: []string{"existing-ep"},
+			},
+		},
+	}
+	opt := withWindowsNetwork("ns-123", "ep-456")
+	if err := opt(nil, nil, nil, s); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Windows.Network.EndpointList) != 2 {
+		t.Fatalf("expected 2 endpoints, got %d", len(s.Windows.Network.EndpointList))
+	}
+	if s.Windows.Network.EndpointList[0] != "existing-ep" {
+		t.Errorf("first endpoint = %q, want existing-ep", s.Windows.Network.EndpointList[0])
+	}
+	if s.Windows.Network.EndpointList[1] != "ep-456" {
+		t.Errorf("second endpoint = %q, want ep-456", s.Windows.Network.EndpointList[1])
+	}
+}
+
+// --- withDNSMount tests ---
+
+func TestWithDNSMount(t *testing.T) {
+	hostDir := t.TempDir()
+	containerDir := hostDir // same on Linux/Windows
+
+	s := &ocispec.Spec{}
+	opt := withDNSMount(hostDir, containerDir, "test-job-1")
+	if err := opt(nil, nil, nil, s); err != nil {
+		t.Fatalf("withDNSMount error: %v", err)
+	}
+
+	// Should have created the resolv.conf file
+	confPath := filepath.Join(hostDir, "dns", "test-job-1.conf")
+	data, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatalf("resolv.conf not created: %v", err)
+	}
+	if len(data) == 0 {
+		t.Error("resolv.conf is empty")
+	}
+	if !strings.Contains(string(data), "nameserver") {
+		t.Errorf("resolv.conf should contain nameserver, got: %q", string(data))
+	}
+
+	// Should have added a mount
+	if len(s.Mounts) != 1 {
+		t.Fatalf("expected 1 mount, got %d", len(s.Mounts))
+	}
+	m := s.Mounts[0]
+	if m.Destination != "/etc/resolv.conf" {
+		t.Errorf("Destination = %q, want /etc/resolv.conf", m.Destination)
+	}
+	expectedSrc := filepath.Join(containerDir, "dns", "test-job-1.conf")
+	if m.Source != expectedSrc {
+		t.Errorf("Source = %q, want %q", m.Source, expectedSrc)
+	}
+}
+
+func TestWithDNSMount_DifferentContainerDir(t *testing.T) {
+	hostDir := t.TempDir()
+	containerDir := "/mnt/ephemerd" // virtio-fs path
+
+	s := &ocispec.Spec{}
+	opt := withDNSMount(hostDir, containerDir, "job-42")
+	if err := opt(nil, nil, nil, s); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(s.Mounts) != 1 {
+		t.Fatalf("expected 1 mount, got %d", len(s.Mounts))
+	}
+	// Source should use the container dir, not host dir
+	wantSrc := filepath.Join("/mnt/ephemerd", "dns", "job-42.conf")
+	if s.Mounts[0].Source != wantSrc {
+		t.Errorf("Source = %q, want %q", s.Mounts[0].Source, wantSrc)
 	}
 }
 

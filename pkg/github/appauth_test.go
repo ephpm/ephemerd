@@ -239,6 +239,88 @@ func TestMustJSON(t *testing.T) {
 	}
 }
 
+func TestAppAuth_Token_NearExpiry(t *testing.T) {
+	key, _ := generateTestKey(t)
+	a := &AppAuth{
+		appID: 1,
+		key:   key,
+		log:   discardLogger(),
+		done:  make(chan struct{}),
+	}
+
+	// Set a token that expires in 3 minutes (< 5min threshold)
+	a.mu.Lock()
+	a.token = "stale-token"
+	a.expires = time.Now().Add(3 * time.Minute)
+	a.mu.Unlock()
+
+	// Token() should attempt a refresh (which will fail against real API),
+	// but should still return the existing token rather than empty string
+	got := a.Token()
+	if got == "" {
+		t.Error("Token() should return existing token even if refresh fails")
+	}
+}
+
+func TestAppAuth_Token_WellWithinExpiry(t *testing.T) {
+	key, _ := generateTestKey(t)
+	a := &AppAuth{
+		appID: 1,
+		key:   key,
+		log:   discardLogger(),
+		done:  make(chan struct{}),
+	}
+
+	// Set a token that expires in 30 minutes (well within threshold)
+	a.mu.Lock()
+	a.token = "good-token"
+	a.expires = time.Now().Add(30 * time.Minute)
+	a.mu.Unlock()
+
+	got := a.Token()
+	if got != "good-token" {
+		t.Errorf("Token() = %q, want %q", got, "good-token")
+	}
+}
+
+// --- appAuthTransport ---
+
+func TestAppAuthTransport(t *testing.T) {
+	key, _ := generateTestKey(t)
+	a := &AppAuth{
+		appID: 1,
+		key:   key,
+		log:   discardLogger(),
+		done:  make(chan struct{}),
+	}
+	a.mu.Lock()
+	a.token = "transport-test-token"
+	a.expires = time.Now().Add(1 * time.Hour)
+	a.mu.Unlock()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if auth != "token transport-test-token" {
+			t.Errorf("Authorization = %q, want %q", auth, "token transport-test-token")
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	transport := &appAuthTransport{app: a}
+	client := &http.Client{Transport: transport}
+
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("GET error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
 // --- NewAppAuth with PEM file ---
 
 func TestNewAppAuth_InvalidPath(t *testing.T) {
