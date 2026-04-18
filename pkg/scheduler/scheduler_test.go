@@ -460,3 +460,81 @@ func TestSeenTTL(t *testing.T) {
 		t.Errorf("seenTTL = %v, want 10m", seenTTL)
 	}
 }
+
+// --- backoffDuration tests ---
+
+func TestBackoffDuration_ExponentialSequence(t *testing.T) {
+	repo := "test-backoff-sequence"
+	// Reset any prior state
+	resetBackoff(repo)
+
+	// Each call increments the failure count: 2^1, 2^2, 2^3, ...
+	expected := []time.Duration{
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		16 * time.Second,
+		32 * time.Second,
+		60 * time.Second, // capped at 60s
+		60 * time.Second, // stays capped
+	}
+
+	for i, want := range expected {
+		got := backoffDuration(repo)
+		if got != want {
+			t.Errorf("call %d: backoffDuration(%q) = %v, want %v", i+1, repo, got, want)
+		}
+	}
+
+	// Clean up
+	resetBackoff(repo)
+}
+
+func TestBackoffDuration_IndependentRepos(t *testing.T) {
+	resetBackoff("repo-a")
+	resetBackoff("repo-b")
+
+	// Advance repo-a 3 times
+	backoffDuration("repo-a")
+	backoffDuration("repo-a")
+	d3 := backoffDuration("repo-a") // 3rd call → 2^3 = 8s
+
+	// repo-b should start fresh
+	d1 := backoffDuration("repo-b") // 1st call → 2^1 = 2s
+
+	if d3 != 8*time.Second {
+		t.Errorf("repo-a call 3: got %v, want 8s", d3)
+	}
+	if d1 != 2*time.Second {
+		t.Errorf("repo-b call 1: got %v, want 2s", d1)
+	}
+
+	resetBackoff("repo-a")
+	resetBackoff("repo-b")
+}
+
+func TestResetBackoff(t *testing.T) {
+	repo := "test-reset"
+	resetBackoff(repo)
+
+	// Build up some backoff
+	backoffDuration(repo) // 2s
+	backoffDuration(repo) // 4s
+	backoffDuration(repo) // 8s
+
+	// Reset
+	resetBackoff(repo)
+
+	// Should restart from 2s
+	got := backoffDuration(repo)
+	if got != 2*time.Second {
+		t.Errorf("after reset: backoffDuration = %v, want 2s", got)
+	}
+
+	resetBackoff(repo)
+}
+
+func TestResetBackoff_NonexistentRepo(t *testing.T) {
+	// Should not panic
+	resetBackoff("never-seen-before")
+}

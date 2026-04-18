@@ -132,6 +132,55 @@ func TestNormalizeMAC(t *testing.T) {
 	}
 }
 
+// --- GenerateEphemeralSSHKey ---
+
+func TestGenerateEphemeralSSHKey_ReturnsValidKey(t *testing.T) {
+	priv, pubLine, err := GenerateEphemeralSSHKey()
+	if err != nil {
+		t.Fatalf("GenerateEphemeralSSHKey() error: %v", err)
+	}
+	if priv == nil {
+		t.Fatal("private key is nil")
+	}
+	if len(priv) != 64 { // ed25519 private key is 64 bytes
+		t.Errorf("private key length = %d, want 64", len(priv))
+	}
+	if pubLine == "" {
+		t.Fatal("public key line is empty")
+	}
+}
+
+func TestGenerateEphemeralSSHKey_PubKeyFormat(t *testing.T) {
+	_, pubLine, err := GenerateEphemeralSSHKey()
+	if err != nil {
+		t.Fatalf("GenerateEphemeralSSHKey() error: %v", err)
+	}
+	// Should start with ssh-ed25519 and end with "ephemerd\n"
+	if len(pubLine) < 20 {
+		t.Fatalf("public key line too short: %q", pubLine)
+	}
+	if pubLine[:len("ssh-ed25519 ")] != "ssh-ed25519 " {
+		t.Errorf("public key should start with 'ssh-ed25519 ', got %q", pubLine[:20])
+	}
+	if pubLine[len(pubLine)-9:] != "ephemerd\n" {
+		t.Errorf("public key should end with 'ephemerd\\n', got %q", pubLine[len(pubLine)-9:])
+	}
+}
+
+func TestGenerateEphemeralSSHKey_Uniqueness(t *testing.T) {
+	_, pub1, err := GenerateEphemeralSSHKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, pub2, err := GenerateEphemeralSSHKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pub1 == pub2 {
+		t.Error("two calls should produce different keys")
+	}
+}
+
 func TestStartLinuxVM_ErrorsOnLinux(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("stub test only applies on Linux")

@@ -247,3 +247,66 @@ func TestImagePullMissingFromImage(t *testing.T) {
 		t.Errorf("status = %d, want 400", resp.StatusCode)
 	}
 }
+
+// --- indexOf tests ---
+
+func TestIndexOf(t *testing.T) {
+	tests := []struct {
+		s    string
+		b    byte
+		want int
+	}{
+		{"hello", 'l', 2},
+		{"hello", 'o', 4},
+		{"hello", 'h', 0},
+		{"hello", 'z', -1},
+		{"", '/', -1},
+		{"/version", '/', 0},
+		{"1.45/version", '/', 4},
+	}
+
+	for _, tt := range tests {
+		got := indexOf(tt.s, tt.b)
+		if got != tt.want {
+			t.Errorf("indexOf(%q, %q) = %d, want %d", tt.s, tt.b, got, tt.want)
+		}
+	}
+}
+
+// --- route version prefix stripping tests ---
+
+func TestRouteVer(t *testing.T) {
+	s := newTestServer(t)
+	client := dialSocket(s.SocketPath())
+
+	// Versioned path should route to the same handler as unversioned
+	paths := []struct {
+		path       string
+		wantStatus int
+	}{
+		{"/_ping", http.StatusOK},
+		{"/v1.45/_ping", http.StatusOK},
+		{"/v1.24/_ping", http.StatusOK},
+		{"/version", http.StatusOK},
+		{"/v1.45/version", http.StatusOK},
+		{"/info", http.StatusOK},
+		{"/v1.45/info", http.StatusOK},
+		{"/images/json", http.StatusOK},
+		{"/v1.45/images/json", http.StatusOK},
+		{"/unknown/endpoint", http.StatusNotImplemented},
+		{"/v1.45/unknown/endpoint", http.StatusNotImplemented},
+	}
+
+	for _, tt := range paths {
+		resp, err := client.Get("http://docker" + tt.path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", tt.path, err)
+		}
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+		if resp.StatusCode != tt.wantStatus {
+			t.Errorf("GET %s: status = %d, want %d", tt.path, resp.StatusCode, tt.wantStatus)
+		}
+	}
+}

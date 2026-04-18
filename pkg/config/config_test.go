@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -734,6 +735,90 @@ agent_secret = "my-secret"
 	}
 	if cfg.Woodpecker.AgentSecret != "my-secret" {
 		t.Errorf("AgentSecret = %q, want %q", cfg.Woodpecker.AgentSecret, "my-secret")
+	}
+}
+
+// --- CrossPlatformEnabled tests ---
+
+func TestCrossPlatformEnabled_NilDefault(t *testing.T) {
+	v := &VMConfig{}
+	if !v.CrossPlatformEnabled() {
+		t.Error("CrossPlatformEnabled() should default to true when nil")
+	}
+}
+
+func TestCrossPlatformEnabled_ExplicitTrue(t *testing.T) {
+	b := true
+	v := &VMConfig{CrossPlatform: &b}
+	if !v.CrossPlatformEnabled() {
+		t.Error("CrossPlatformEnabled() should be true when set to true")
+	}
+}
+
+func TestCrossPlatformEnabled_ExplicitFalse(t *testing.T) {
+	b := false
+	v := &VMConfig{CrossPlatform: &b}
+	if v.CrossPlatformEnabled() {
+		t.Error("CrossPlatformEnabled() should be false when set to false")
+	}
+}
+
+// --- crlfWriter tests ---
+
+func TestCrlfWriter_ReplacesNewlines(t *testing.T) {
+	var buf bytes.Buffer
+	w := &crlfWriter{w: &buf}
+
+	_, err := w.Write([]byte("line1\nline2\nline3"))
+	if err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+
+	got := buf.String()
+	want := "line1\r\nline2\r\nline3"
+	if got != want {
+		t.Errorf("crlfWriter output = %q, want %q", got, want)
+	}
+}
+
+func TestCrlfWriter_NoNewlines(t *testing.T) {
+	var buf bytes.Buffer
+	w := &crlfWriter{w: &buf}
+
+	_, err := w.Write([]byte("no newlines here"))
+	if err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+
+	if buf.String() != "no newlines here" {
+		t.Errorf("crlfWriter output = %q, want original", buf.String())
+	}
+}
+
+func TestCrlfWriter_Empty(t *testing.T) {
+	var buf bytes.Buffer
+	w := &crlfWriter{w: &buf}
+
+	n, err := w.Write([]byte{})
+	if err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("Write(empty) = %d, want 0", n)
+	}
+}
+
+func TestCrlfWriter_ReportsOriginalLength(t *testing.T) {
+	var buf bytes.Buffer
+	w := &crlfWriter{w: &buf}
+
+	input := []byte("a\nb\nc")
+	n, err := w.Write(input)
+	if err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	if n != len(input) {
+		t.Errorf("Write returned %d, want %d (original length)", n, len(input))
 	}
 }
 
