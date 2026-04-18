@@ -1,5 +1,19 @@
 # ephemerd
 
+<p align="center">
+  <a href="https://github.com/ephpm/ephemerd/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ephpm/ephemerd/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=white&label=CI" alt="CI"></a>
+  <a href="https://github.com/ephpm/ephemerd/releases/latest"><img src="https://img.shields.io/github/v/release/ephpm/ephemerd?style=flat-square&logo=github&label=Release" alt="Release"></a>
+  <a href="https://github.com/ephpm/ephemerd/blob/main/LICENSE"><img src="https://img.shields.io/github/license/ephpm/ephemerd?style=flat-square" alt="License"></a>
+  <a href="https://pkg.go.dev/github.com/ephpm/ephemerd"><img src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go"></a>
+</p>
+<p align="center">
+  <img src="https://img.shields.io/badge/Linux-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux">
+  <img src="https://img.shields.io/badge/Windows-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Windows">
+  <img src="https://img.shields.io/badge/macOS-000000?style=flat-square&logo=apple&logoColor=white" alt="macOS">
+  <img src="https://img.shields.io/badge/x86__64-grey?style=flat-square" alt="x86_64">
+  <img src="https://img.shields.io/badge/ARM64-grey?style=flat-square" alt="ARM64">
+</p>
+
 Ephemeral GitHub Actions runner daemon. One binary, every platform. Secure by default.
 
 ephemerd manages self-hosted GitHub Actions runners that are isolated, disposable, and automatic. Every job gets a fresh environment. When it's done, everything is destroyed. No leftover state, no security risk from untrusted PRs.
