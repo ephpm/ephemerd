@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"time"
 
 	"golang.ngrok.com/ngrok"
 	ngrokconfig "golang.ngrok.com/ngrok/config"
 )
+
+const ngrokConnectTimeout = 30 * time.Second
 
 // Ngrok implements Provider using ngrok-go.
 type Ngrok struct {
@@ -29,7 +32,10 @@ func NewNgrok(authtoken string) (*Ngrok, error) {
 }
 
 func (n *Ngrok) Listen(ctx context.Context) (net.Listener, error) {
-	ln, err := ngrok.Listen(ctx,
+	connectCtx, cancel := context.WithTimeout(ctx, ngrokConnectTimeout)
+	defer cancel()
+
+	ln, err := ngrok.Listen(connectCtx,
 		ngrokconfig.HTTPEndpoint(),
 		ngrok.WithAuthtoken(n.authtoken),
 	)

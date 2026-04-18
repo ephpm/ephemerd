@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"syscall"
 
+	apiv1 "github.com/ephpm/ephemerd/api/v1"
 	"github.com/ephpm/ephemerd/pkg/artifacts"
 	"github.com/ephpm/ephemerd/pkg/cni"
 	"github.com/ephpm/ephemerd/pkg/config"
@@ -30,9 +31,10 @@ var (
 
 func main() {
 	app := &cli.Command{
-		Name:    "ephemerd",
-		Usage:   "Ephemeral GitHub Actions runner daemon",
-		Version: version,
+		Name:           "ephemerd",
+		Usage:          "Ephemeral GitHub Actions runner daemon",
+		Version:        version,
+		DefaultCommand: "serve",
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:        "data-dir",
@@ -92,6 +94,16 @@ func serveCmd() *cli.Command {
 }
 
 func serve(ctx context.Context, configFile string, containerdTCPPort uint32, containerdOnly bool, dindFlag bool) error {
+	// Check if another instance is already running.
+	if cc, err := dialControl(ctx); err == nil {
+		if resp, err := cc.Status(ctx, &apiv1.StatusRequest{}); err == nil {
+			cc.Close()
+			return fmt.Errorf("ephemerd is already running (status: %s, active jobs: %d, uptime: %s)",
+				resp.Status, resp.ActiveJobs, resp.Uptime)
+		}
+		cc.Close()
+	}
+
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -327,8 +339,9 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		WebhookSecret:   cfg.Webhook.Secret,
 		TLSCert:         cfg.Webhook.TLSCert,
 		TLSKey:          cfg.Webhook.TLSKey,
-		Tunnel:          tunnelProvider,
-		JobTimeout:      cfg.Runner.ParsedJobTimeout(),
+		Tunnel:            tunnelProvider,
+		TunnelMaxRetries:  cfg.Webhook.TunnelMaxRetries,
+		JobTimeout:        cfg.Runner.ParsedJobTimeout(),
 		ShutdownTimeout: cfg.Runner.ParsedShutdownTimeout(),
 		LogRetention:    cfg.Log.LogRetentionDuration(),
 		Log:             log,

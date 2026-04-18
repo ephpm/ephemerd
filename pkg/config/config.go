@@ -59,13 +59,14 @@ type MetricsConfig struct {
 // By default, ephemerd uses polling (tunnel = "none").
 // Set tunnel = "localtunnel" or "ngrok" for instant webhook delivery.
 type WebhookConfig struct {
-	Secret         string `toml:"secret"`          // webhook HMAC secret (auto-generated if empty)
-	Port           int    `toml:"port"`            // listen port for health endpoint (default 8080)
-	TLSCert        string `toml:"tls_cert"`        // TLS certificate path (direct TLS, no tunnel)
-	TLSKey         string `toml:"tls_key"`         // TLS private key path
-	Tunnel         string `toml:"tunnel"`          // "none" (default, polling), "localtunnel", or "ngrok"
-	TunnelURL      string `toml:"tunnel_url"`      // localtunnel: self-hosted server URL
-	NgrokAuthtoken string `toml:"ngrok_authtoken"` // ngrok auth token (or use NGROK_AUTHTOKEN env)
+	Secret            string `toml:"secret"`             // webhook HMAC secret (auto-generated if empty)
+	Port              int    `toml:"port"`               // listen port for health endpoint (default 8080)
+	TLSCert           string `toml:"tls_cert"`           // TLS certificate path (direct TLS, no tunnel)
+	TLSKey            string `toml:"tls_key"`            // TLS private key path
+	Tunnel            string `toml:"tunnel"`             // "none" (default, polling), "localtunnel", or "ngrok"
+	TunnelURL         string `toml:"tunnel_url"`         // localtunnel: self-hosted server URL
+	NgrokAuthtoken    string `toml:"ngrok_authtoken"`    // ngrok auth token (or use NGROK_AUTHTOKEN env)
+	TunnelMaxRetries  int    `toml:"tunnel_max_retries"` // max consecutive reconnect failures before falling back to polling (default 5)
 }
 
 // NetworkConfig configures container networking.
