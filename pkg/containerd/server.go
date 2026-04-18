@@ -26,6 +26,7 @@ import (
 type Config struct {
 	DataDir string
 	TCPPort uint32 // optional: also listen on TCP for remote access (e.g. from WSL host)
+	TCPAddr string // optional bind address for TCP listener (default "127.0.0.1")
 	Log     *slog.Logger
 }
 
@@ -212,7 +213,11 @@ func (s *Server) start() error {
 
 	// Optionally listen on TCP for remote containerd access (e.g. Windows host → WSL)
 	if s.cfg.TCPPort > 0 {
-		tcpAddr := fmt.Sprintf("127.0.0.1:%d", s.cfg.TCPPort)
+		bindHost := s.cfg.TCPAddr
+		if bindHost == "" {
+			bindHost = "127.0.0.1"
+		}
+		tcpAddr := fmt.Sprintf("%s:%d", bindHost, s.cfg.TCPPort)
 		tcpL, err := net.Listen("tcp", tcpAddr)
 		if err != nil {
 			s.cfg.Log.Error("failed to start TCP listener for containerd", "addr", tcpAddr, "error", err)

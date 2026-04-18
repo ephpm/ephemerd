@@ -30,9 +30,10 @@ type Config struct {
 	GitHub          *github.Client
 	Artifacts       *artifacts.Extractor  // OCI image layer extractor for macOS VM jobs (nil if not available)
 	LinuxDispatcher *DispatchClient       // if non-nil, Linux jobs are dispatched to this WSL worker via gRPC
-	MacOSVMConfig   *vm.MacOSVMConfig     // if non-nil, macOS-native jobs are enabled (darwin only)
-	DataDir         string                // ephemerd data directory (used for artifact extraction paths)
-	MaxConcurrent   int
+	MacOSVMConfig     *vm.MacOSVMConfig     // if non-nil, macOS-native jobs are enabled (darwin only)
+	DataDir           string                // ephemerd data directory (used for artifact extraction paths)
+	MaxConcurrent     int
+	MaxMacOSVMs       int                   // max concurrent macOS VMs (Vz limit; default auto-detected)
 	Labels          []string
 	PollInterval    time.Duration // if >0, use polling mode (default)
 	WebhookPort     int           // listen port for health/webhook server
@@ -56,11 +57,22 @@ type Scheduler struct {
 	seen      map[int64]time.Time // recently handled job IDs for dedup
 	mu        sync.Mutex
 	sem       chan struct{} // concurrency limiter
+	macSem    chan struct{} // macOS VM concurrency limiter (Vz has a hard cap)
 	draining  bool         // true when shutting down, rejects new jobs
 	startTime time.Time
 }
 
 const seenTTL = 10 * time.Minute
+
+// SetMacOSVMConfig enables macOS job support after startup. This is used when
+// the macOS disk image is being provisioned in the background — the scheduler
+// starts immediately for Linux jobs and picks up macOS jobs once the install
+// finishes.
+func (s *Scheduler) SetMacOSVMConfig(cfg *vm.MacOSVMConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cfg.MacOSVMConfig = cfg
+}
 
 // failureBackoff tracks per-repo failure counts to compute exponential backoff.
 // Resets to zero on the next successful job for that repo.
@@ -113,11 +125,27 @@ func New(cfg Config) *Scheduler {
 		cfg.WebhookPort = 8080
 	}
 
+	macVMs := cfg.MaxMacOSVMs
+	if macVMs <= 0 {
+		// Auto-detect: Vz allows roughly (host CPUs / CPUs-per-VM) VMs total.
+		// Subtract 1 for the always-running Linux VM on darwin hosts.
+		hostCPUs := goruntime.NumCPU()
+		cpusPerVM := 4 // default from MacOSVMConfig.SetDefaults
+		if cfg.MacOSVMConfig != nil && cfg.MacOSVMConfig.CPUs > 0 {
+			cpusPerVM = int(cfg.MacOSVMConfig.CPUs)
+		}
+		macVMs = hostCPUs/cpusPerVM - 1 // -1 for Linux VM
+		if macVMs < 1 {
+			macVMs = 1
+		}
+	}
+
 	return &Scheduler{
 		cfg:       cfg,
 		running:   make(map[int64]*runningJob),
 		seen:      make(map[int64]time.Time),
 		sem:       make(chan struct{}, cfg.MaxConcurrent),
+		macSem:    make(chan struct{}, macVMs),
 		startTime: time.Now(),
 	}
 }
@@ -171,6 +199,15 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		return fmt.Errorf("starting control server: %w", err)
 	}
 	defer grpcCleanup()
+
+	// Start VM SSH info server on a second unix socket (HTTP/JSON).
+	// Used by `ephemerd jobs ssh <id>` to get the ephemeral key + VM IP.
+	sshCleanup, err := s.StartVMSSHServer()
+	if err != nil {
+		s.cfg.Log.Warn("failed to start VM SSH info server", "error", err)
+	} else {
+		defer sshCleanup()
+	}
 
 	// Start health/webhook HTTP server
 	mux := http.NewServeMux()
@@ -308,21 +345,45 @@ func (s *Scheduler) poll(ctx context.Context, events chan<- github.JobEvent) {
 	}
 }
 
-// canHandleJob returns false if the job's labels include an OS that this
-// scheduler cannot handle. On Windows with a LinuxDispatcher, Linux jobs
-// are accepted and routed to the WSL worker via gRPC.
+// canHandleJob returns false if the job's labels include an OS or
+// architecture that this scheduler cannot handle.
 func (s *Scheduler) canHandleJob(jobLabels []string) bool {
+	osOK := true // assume OK until we see an OS label we can't handle
 	for _, label := range jobLabels {
 		switch strings.ToLower(label) {
 		case "linux":
-			return goruntime.GOOS == "linux" || s.cfg.LinuxDispatcher != nil
+			// Linux jobs run natively on Linux, via WSL dispatch on Windows,
+			// or inside the embedded Linux VM on macOS.
+			osOK = goruntime.GOOS == "linux" || goruntime.GOOS == "darwin" || s.cfg.LinuxDispatcher != nil
 		case "windows":
-			return goruntime.GOOS == "windows"
+			osOK = goruntime.GOOS == "windows"
 		case "macos", "macosx":
-			return goruntime.GOOS == "darwin"
+			// macOS jobs need a per-job VM for isolation. Without
+			// MacOSVMConfig we refuse the job rather than fall back to
+			// running on the host — sharing the runner process tree with
+			// other jobs (and the daemon) is a non-starter for CI.
+			osOK = goruntime.GOOS == "darwin" && s.cfg.MacOSVMConfig != nil
 		}
 	}
-	return true // no OS label → accept
+	if !osOK {
+		return false
+	}
+	// Arch check: if the job asks for an arch we can't satisfy, skip. We
+	// don't emulate (no qemu-user, no rosetta-in-container), so x64 jobs
+	// on an arm64 host and vice versa won't work.
+	for _, label := range jobLabels {
+		switch strings.ToLower(label) {
+		case "x64", "amd64":
+			if goruntime.GOARCH != "amd64" {
+				return false
+			}
+		case "arm64", "aarch64":
+			if goruntime.GOARCH != "arm64" {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // isLinuxJob returns true if the job's labels include "linux".
@@ -386,9 +447,21 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 		return
 	}
 
-	// Route macOS-native jobs to per-job macOS VMs
-	if s.cfg.MacOSVMConfig != nil && isMacOSJob(event.Job.Labels) {
-		s.handleMacOSJob(ctx, event)
+	// Route macOS-native jobs to per-job macOS VMs.
+	if isMacOSJob(event.Job.Labels) {
+		s.mu.Lock()
+		macCfg := s.cfg.MacOSVMConfig
+		s.mu.Unlock()
+		if macCfg != nil {
+			s.handleMacOSJob(ctx, event)
+			return
+		}
+		// macOS VM disk is still being provisioned — remove from seen so
+		// the next poll retries this job once the install finishes.
+		s.mu.Lock()
+		delete(s.seen, jobID)
+		s.mu.Unlock()
+		log.Info("macOS VM disk not ready yet, deferring job")
 		return
 	}
 
@@ -516,10 +589,18 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 		s.mu.Unlock()
 	}
 
-	// Acquire concurrency slot
+	// Acquire concurrency slots: general + macOS VM limit.
+	// Vz caps the number of simultaneous VMs based on host resources.
 	select {
 	case s.sem <- struct{}{}:
 	case <-ctx.Done():
+		unsee()
+		return
+	}
+	select {
+	case s.macSem <- struct{}{}:
+	case <-ctx.Done():
+		<-s.sem
 		unsee()
 		return
 	}
@@ -550,6 +631,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 		}
 		unsee()
 		time.Sleep(backoffDuration(event.Repo))
+		<-s.macSem
 		<-s.sem
 		return
 	}
@@ -568,6 +650,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
 		unsee()
+		<-s.macSem
 		<-s.sem
 		return
 	}
@@ -583,6 +666,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
 		unsee()
+		<-s.macSem
 		<-s.sem
 		return
 	}
@@ -607,6 +691,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 		}
 		unsee()
 		cancel()
+		<-s.macSem
 		<-s.sem
 		return
 	}
@@ -624,6 +709,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 		}
 		unsee()
 		cancel()
+		<-s.macSem
 		<-s.sem
 		return
 	}
@@ -646,7 +732,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 
 	// Wait for the job to finish in the background
 	go func() {
-		defer func() { <-s.sem }()
+		defer func() { <-s.macSem; <-s.sem }()
 
 		exitCode, err := macVM.Wait(jobCtx)
 		if err != nil {
@@ -721,8 +807,21 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event github.JobEvent) {
 		}
 	}
 
-	// Build runner labels
-	labels := s.buildLabels()
+	// Build runner labels. When the job requests a specific OS (e.g. `linux`)
+	// we must register the runner with matching labels or GitHub won't route
+	// the job to us — even if we can execute it. On Darwin the host OS is
+	// `darwin` but we run `linux` jobs inside the embedded Linux VM, so
+	// honour the job's labels rather than blindly using the host.
+	var targetOS string
+	switch {
+	case isLinuxJob(event.Job.Labels):
+		targetOS = "linux"
+	case isMacOSJob(event.Job.Labels):
+		targetOS = "darwin"
+	default:
+		targetOS = goruntime.GOOS
+	}
+	labels := buildLabelsForOS(targetOS, s.cfg.Labels)
 
 	// Generate a unique runner name and register with GitHub.
 	// Retry with a new name on 409 conflict (stale runner from a previous crash).
@@ -968,10 +1067,6 @@ func (s *Scheduler) cleanSeen() {
 			delete(s.seen, id)
 		}
 	}
-}
-
-func (s *Scheduler) buildLabels() []string {
-	return buildLabelsForOS(goruntime.GOOS, s.cfg.Labels)
 }
 
 // buildLabelsForOS builds runner labels for a given target OS.

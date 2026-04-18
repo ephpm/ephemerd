@@ -15,10 +15,12 @@ require (
 	github.com/magefile/mage v1.17.1
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/opencontainers/runtime-spec v1.3.0
+	github.com/pierrec/lz4/v4 v4.1.26
 	github.com/prometheus/client_golang v1.23.2
 	github.com/sirupsen/logrus v1.9.3
 	github.com/urfave/cli/v3 v3.8.0
 	golang.ngrok.com/ngrok v1.13.0
+	golang.org/x/crypto v0.45.0
 	golang.org/x/sys v0.38.0
 	google.golang.org/grpc v1.78.0
 	google.golang.org/protobuf v1.36.10
@@ -142,7 +144,6 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.ngrok.com/muxado/v2 v2.0.1 // indirect
-	golang.org/x/crypto v0.45.0 // indirect
 	golang.org/x/exp v0.0.0-20241108190413-2d47ceb2692f // indirect
 	golang.org/x/mod v0.29.0 // indirect
 	golang.org/x/net v0.47.0 // indirect

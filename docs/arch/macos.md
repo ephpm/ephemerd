@@ -111,22 +111,83 @@ No disk image means no first-boot formatting step, no cleanup, and no leftover s
 
 ### How It Works
 
-macOS-native jobs (Xcode builds, Swift tests, etc.) run inside ephemeral macOS VMs. Each job gets a fresh VM cloned from a provisioned base image.
+macOS-native jobs (Xcode builds, Swift tests, etc.) run inside ephemeral macOS VMs. Each job gets a fresh VM APFS-cloned from a provisioned macOS **disk image**.
+
+Two images are involved in each job — don't confuse them:
+
+- **macOS VM disk image** (`<data_dir>/vm/macos/base.img`): a Vz-bootable macOS install pulled from a Tart OCI image. This is what the VM boots from. Configured via `vm.macos.disk_image`.
+- **OCI base image** (per-job): release artifacts / toolchains (Xcode, Swift SDK, whatever the job needs) pulled from a container registry and overlaid onto the running VM via virtio-fs. Configured per job via the workflow's image label.
 
 ```
-Base image (provisioned once):
-  macOS installed via 'ephemerd vm setup-macos'
-  Xcode, CLI tools, GitHub runner pre-installed
-  Stored at vm.macos.base_image config path
+macOS VM disk image (pulled once from Tart registry on first boot):
+  ghcr.io/cirruslabs/macos-<version>-vanilla:latest
+  Pre-configured: SSH enabled, admin user, sudo, auto-login
 
-Per-job:
-  APFS clone (cp -c) of base image → instant, near-zero I/O
-  Boot Vz VM from clone (MacOSBootLoader, Apple Silicon platform)
-  Job runs natively inside macOS
-  VM stops, clone deleted
+Per-job (~36s total):
+  1. APFS clone (cp -c) of base.img         — instant, near-zero I/O
+  2. Mount clone, inject runner + JIT config — ~4s (host-side cp -R)
+  3. Boot Vz VM from clone                   — ~12s to SSH ready
+  4. SSH in: firewall + start runner + harden — ~3s + 3s settle
+  5. Job runs natively inside macOS
+  6. VM stops, clone deleted                 — zero leftover state
 ```
 
-APFS clone-on-write means the per-job copy is nearly instant and only allocates disk space for writes. A 60 GB base image produces a clone in milliseconds.
+APFS clone-on-write means the per-job copy is nearly instant and only allocates disk space for writes. A 40 GB disk image produces a clone in milliseconds.
+
+### Per-job VM boot sequence
+
+Each macOS job goes through these stages:
+
+1. **APFS clone** — `cp -c` of `base.img` to a per-job `.img` file. Copy-on-write, milliseconds.
+2. **Runner injection** — the clone is mounted on the host via `hdiutil`, and the GitHub Actions runner + JIT config are written directly to the filesystem (`/Users/admin/actions-runner/` and `/tmp/ephemerd/.jit_config`). This takes ~4s and avoids the need to copy files over SSH after boot.
+3. **VM boot** — the clone boots with 2 CPUs and 2 GB RAM (configurable). SSH is available in ~12s thanks to the Tart vanilla image having Remote Login pre-enabled.
+4. **SSH setup** — ephemerd SSHes into the VM using the ephemeral key (with `admin/admin` password fallback) and runs a setup script that:
+   - Configures a `pfctl` firewall blocking private networks
+   - Starts the runner in the background (`./run.sh --jitconfig ...`)
+   - Randomizes the admin password (last step, so the session isn't killed mid-setup)
+5. **Job execution** — the runner connects to GitHub and executes the workflow job.
+6. **Cleanup** — the VM is stopped, the APFS clone and aux storage are deleted. No state persists between jobs.
+
+### First-boot base image pull
+
+The first time ephemerd starts on a Mac, it pulls a pre-built macOS VM image from the [Tart](https://github.com/cirruslabs/tart) OCI registry. The image is selected automatically based on the host's macOS version (e.g. macOS 26 → `ghcr.io/cirruslabs/macos-tahoe-vanilla:latest`). This is a one-time operation — subsequent daemon restarts skip it because `base.img` already exists.
+
+The Tart vanilla images ship with Setup Assistant completed, SSH enabled, an `admin` user with passwordless sudo, and auto-login configured. Ephemerd injects a runner startup LaunchDaemon into the image after pulling.
+
+The pull downloads LZ4-compressed disk chunks (~5-8 GB total for a ~40 GB sparse disk) and decompresses them using Apple's Compression framework. Progress is logged per layer. Typical output:
+
+```
+msg="pulling macOS base image from Tart OCI registry" image=ghcr.io/cirruslabs/macos-tahoe-vanilla:latest
+msg="pulling disk layer" layer=1/94 size_mb=3
+msg="pulling disk layer" layer=50/94 size_mb=497
+msg="disk image assembled" path=/var/lib/ephemerd/vm/macos/base.img
+msg="wrote LaunchDaemon for runner startup"
+msg="macOS base image ready"
+```
+
+**Ephemerd will not accept macOS jobs during this window.** Linux jobs still work — the scheduler starts immediately and the pull runs in the background. Subsequent daemon restarts see `base.img` and skip the pull entirely. To re-pull, delete the `vm/macos/` directory.
+
+To supply your own image instead (e.g. one with Xcode pre-installed), set `vm.macos.disk_image` in `config.toml` and the pull is skipped entirely.
+
+### Per-job VM security hardening
+
+Each per-job VM is an APFS clone of the base image. The base image ships with a known default password (`admin/admin` from Tart), but per-job VMs are hardened on every boot by the runner LaunchDaemon before any job code runs:
+
+1. **Password randomized** — the `admin` password is replaced with 32 random bytes from `/dev/urandom`. The default password is never exposed on the network.
+2. **SSH locked to key-only** — password authentication is disabled in `sshd_config`. Only the ephemeral SSH key generated in-memory by this ephemerd session can connect.
+3. **Ephemeral SSH key** — a fresh ed25519 key pair is generated on every ephemerd restart (never written to disk). The public key is injected into the VM's `authorized_keys` via the virtio-fs share. When ephemerd restarts, the old key is gone — no stale keys accumulate.
+4. **VM destroyed after job** — the APFS clone and all per-job state (including the randomized password and SSH key) are deleted when the job completes or times out.
+
+The base image itself retains the default password, but it is never booted directly — only cloned. The clone is hardened before any job code runs.
+
+### Network isolation
+
+Each macOS VM gets a `pfctl` firewall configured via SSH before the runner starts:
+
+- **Blocked**: all RFC 1918 private networks (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) and link-local (169.254.0.0/16). This prevents jobs from reaching the host, other VMs on the same NAT subnet, or the local network.
+- **Allowed**: DNS/DHCP to the Vz NAT gateway (192.168.64.1), and all public internet traffic.
+
+This matches the isolation model for Linux container jobs, which use iptables rules via CNI to block private network access.
 
 ### macOS VM Configuration
 
@@ -137,9 +198,15 @@ APFS clone-on-write means the per-job copy is nearly instant and only allocates 
 
 ### Runner Integration
 
-The base image includes a pre-configured GitHub Actions runner. The JIT config is passed via a virtio-fs shared directory (`.jit_config` file). On boot, the runner reads the config from the share and registers with GitHub.
+The GitHub Actions runner is injected into each per-job VM clone before boot by mounting the APFS clone on the host and copying the extracted runner into `/Users/admin/actions-runner/`. The JIT config is written to `/tmp/ephemerd/.jit_config`. This host-side injection takes ~4s and avoids the overhead of transferring ~500 MB over SSH after boot.
 
-IP discovery uses ARP table lookup — ephemerd records the VM's MAC address at creation time, then probes the Vz NAT subnet and scans `arp -an` output to find the corresponding IP. MAC addresses are normalized (zero-padded) to handle format differences between Vz and macOS ARP output. The guest signals readiness by writing a `.ready` sentinel file to the shared directory; SSH port 22 is used as a fallback.
+After the VM boots and SSH becomes available (~12s), ephemerd SSHes in and starts the runner with the pre-injected JIT config. The host writes a `.ready` file to the job's shared directory once the runner is started. SSH port 22 readiness (Tart vanilla has it pre-enabled) is the primary readiness signal.
+
+IP discovery uses ARP table lookup — ephemerd records the VM's MAC address at creation time, then probes the Vz NAT subnet and scans `arp -an` output to find the corresponding IP. MAC addresses are normalized (zero-padded) to handle format differences between Vz and macOS ARP output.
+
+#### Debugging running VMs
+
+`ephemerd jobs ssh <job-id>` opens an interactive SSH session to a running macOS VM. The command connects to the daemon's control socket, retrieves the ephemeral SSH key and VM IP, and proxies a terminal session. No SSH keys are stored on disk — the key exists only in the daemon's memory for the lifetime of the process.
 
 ## Job Routing
 
@@ -162,15 +229,41 @@ mage build:macos
   3. Build macOS binary             — embeds rootfs + linux binary
 ```
 
-The macOS binary embeds everything needed for Linux jobs. macOS base images are provisioned separately via `ephemerd vm setup-macos` (one-time setup).
+The macOS binary embeds everything needed for Linux jobs. macOS VM disk images are pulled automatically from the Tart OCI registry on first boot.
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `pkg/vm/vm.go` | `LinuxVM` and `MacOSVM` interfaces |
+| `pkg/vm/vm.go` | `LinuxVM` and `MacOSVM` interfaces, ephemeral SSH key generation |
 | `pkg/vm/linuxvm_darwin.go` | Vz Linux VM: boot, virtio-fs, containerd wait |
-| `pkg/vm/macosvm_darwin.go` | Vz macOS VM: APFS clone, per-job lifecycle |
+| `pkg/vm/macosvm_darwin.go` | Vz macOS VM: APFS clone, runner injection, SSH setup, per-job lifecycle |
+| `pkg/vm/macos_install_darwin.go` | Tart OCI image pull, LZ4 decompression, LaunchDaemon injection |
 | `pkg/vm/embed_darwin.go` | `go:embed` directives for rootfs + linux binary |
+| `pkg/scheduler/vmssh.go` | VM SSH info HTTP endpoint for `jobs ssh` command |
+| `cmd/ephemerd/ssh.go` | `jobs ssh <id>` CLI — interactive SSH into running macOS VMs |
 | `cmd/ephemerd/runtime_darwin.go` | `startContainerRuntime()`: boots Linux VM for `serve` |
 | `mage/download/download.go` | `Rootfs()`: builds pre-baked Alpine rootfs |
+
+## Future Work
+
+### Pre-baked runner images (~15s boot target)
+
+The current ~36s boot-to-ready time is dominated by two steps: runner injection (~4s) and SSH setup (~13s, of which 3s is an artificial sleep). Publishing ephemerd-specific Tart images with the runner pre-installed would eliminate the injection step entirely and let us start the runner immediately on boot.
+
+The pipeline would be:
+
+1. Pull the Tart vanilla image monthly (same cadence as Cirrus Labs)
+2. Boot it, install the runner via SSH, shut down
+3. Push to `ghcr.io/ephpm/macos-<version>-runner:latest`
+4. ephemerd pulls this image instead of vanilla
+
+With the runner pre-baked, the per-job flow becomes: clone → boot → SSH → start runner (~15s). The runner start could eventually move to a LaunchDaemon in the baked image, eliminating the SSH step entirely and getting close to ~12s (just boot + runner auto-start).
+
+### OCI layer-level resume
+
+The Tart image pull downloads 94 LZ4 disk layers sequentially. If the daemon restarts mid-pull, all layers are re-downloaded. Adding per-layer tracking (a manifest of completed digests) would allow resuming from the last completed layer.
+
+### Parallel layer downloads
+
+Layers are currently downloaded sequentially. Downloading 2-3 layers concurrently (with sequential disk writes) would cut the initial pull time significantly on high-bandwidth connections.
