@@ -15,6 +15,8 @@ import (
 	"github.com/ephpm/ephemerd/pkg/providers"
 )
 
+const defaultImage = "ghcr.io/actions/actions-runner:latest"
+
 // Provider implements providers.Poll and providers.Webhook for GitHub Actions.
 type Provider struct {
 	client   *github.Client
@@ -41,7 +43,9 @@ func New(client *github.Client, log *slog.Logger) *Provider {
 	}
 }
 
-func (p *Provider) Name() string { return "github" }
+func (p *Provider) Name() string            { return "github" }
+func (p *Provider) DefaultImage() string    { return defaultImage }
+func (p *Provider) DefaultJobImage() string { return "" }
 
 func (p *Provider) Start(ctx context.Context, cfg providers.PollConfig) (<-chan providers.JobEvent, error) {
 	ctx, p.cancel = context.WithCancel(ctx)

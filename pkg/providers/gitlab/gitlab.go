@@ -34,6 +34,8 @@ import (
 	"github.com/ephpm/ephemerd/pkg/providers"
 )
 
+const defaultImage = "ghcr.io/ephpm/runner-gitlab:latest"
+
 // Compile-time interface check.
 var _ providers.Poll = (*Provider)(nil)
 
@@ -83,7 +85,9 @@ func New(cfg Config) (*Provider, error) {
 	}, nil
 }
 
-func (p *Provider) Name() string { return "gitlab" }
+func (p *Provider) Name() string            { return "gitlab" }
+func (p *Provider) DefaultImage() string    { return defaultImage }
+func (p *Provider) DefaultJobImage() string { return "" }
 
 func (p *Provider) Start(ctx context.Context, cfg providers.PollConfig) (<-chan providers.JobEvent, error) {
 	ctx, p.cancel = context.WithCancel(ctx)

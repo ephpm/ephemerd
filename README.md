@@ -284,6 +284,18 @@ instance_url = "https://codeberg.org"
 token = "runner-registration-token"   # from Forgejo admin > Actions > Runners
 owner = "your-org"
 # repos = ["repo1", "repo2"]         # optional — omit for all repos
+# job_image = "gitea/runner-images:ubuntu-24.04"  # default job execution image
+```
+
+### Gitea
+
+```toml
+[gitea]
+instance_url = "https://gitea.example.com"
+token = "runner-registration-token"   # from Gitea admin > Actions > Runners
+owner = "your-org"
+# repos = ["repo1", "repo2"]         # optional — omit for all repos
+# job_image = "gitea/runner-images:ubuntu-24.04"  # default job execution image
 ```
 
 ### GitLab

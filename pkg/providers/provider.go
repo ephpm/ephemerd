@@ -22,14 +22,40 @@ import (
 // Provider is the base interface that all platform integrations implement.
 // It handles runner registration, job claiming, and cleanup.
 type Provider interface {
-	// Name returns the provider identifier (e.g., "github", "forgejo", "gitlab").
+	// Name returns the provider identifier (e.g., "github", "forgejo", "gitea", "gitlab").
 	Name() string
+
+	// DefaultImage returns the default OCI container image for this provider.
+	// This is the image that contains the runner binary/daemon:
+	//   - GitHub:  ghcr.io/actions/actions-runner:latest  (runner inside container)
+	//   - Forgejo: data.forgejo.org/forgejo/runner:12     (runner daemon)
+	//   - Gitea:   docker.io/gitea/act_runner:latest      (runner daemon)
+	//   - GitLab:  ghcr.io/ephpm/runner-gitlab:latest     (gitlab-runner)
+	//
+	// For Forgejo/Gitea, this is the runner daemon container. The runner
+	// creates separate job containers via the fake Docker socket (pkg/dind).
+	// See DefaultJobImage() for the job execution environment.
+	DefaultImage() string
+
+	// DefaultJobImage returns the default OCI image for job execution.
+	// This is the environment where workflow steps actually run.
+	//   - GitHub:  "" (runner and job share the same container)
+	//   - Forgejo: gitea/runner-images:ubuntu-24.04 (runner creates via Docker API)
+	//   - Gitea:   gitea/runner-images:ubuntu-24.04 (runner creates via Docker API)
+	//   - GitLab:  "" (gitlab-runner manages job containers)
+	//
+	// For GitHub, this returns "" because the runner executes steps directly
+	// inside its own container. For Forgejo/Gitea, the runner daemon uses
+	// the Docker API (intercepted by pkg/dind) to create a separate job
+	// container from this image.
+	DefaultJobImage() string
 
 	// ClaimJob accepts a queued job and returns the configuration needed
 	// to start a runner inside the container.
-	//   - GitHub: registers a per-job JIT runner, returns encoded --jitconfig
-	//   - Forgejo: returns runner token + instance URL for forgejo-runner
-	//   - GitLab: may be a no-op (gitlab-runner handles its own registration)
+	//   - GitHub:  registers a per-job JIT runner, returns encoded --jitconfig
+	//   - Forgejo: returns instance URL + token for forgejo-runner one-job
+	//   - Gitea:   returns instance URL + token for act_runner --ephemeral
+	//   - GitLab:  may be a no-op (gitlab-runner handles its own registration)
 	ClaimJob(ctx context.Context, event *JobEvent, runnerName string, labels []string) (*Claim, error)
 
 	// ReleaseJob cleans up after a job completes or fails.
@@ -38,8 +64,7 @@ type Provider interface {
 
 	// FetchJobImage returns a custom container image for the job, if specified
 	// in the workflow/pipeline definition.
-	//   - GitHub: fetches workflow YAML and reads EPHEMERD_IMAGE env var
-	//   - Forgejo: reads EPHEMERD_IMAGE from workflow YAML
+	//   - GitHub/Forgejo/Gitea: fetches workflow YAML and reads EPHEMERD_IMAGE env var
 	//   - GitLab: reads the image: field from the job payload directly
 	// Returns empty string if none.
 	FetchJobImage(ctx context.Context, event *JobEvent) string

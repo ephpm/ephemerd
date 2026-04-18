@@ -14,7 +14,9 @@ import (
 type Config struct {
 	GitHub     GitHubConfig     `toml:"github"`
 	Forgejo    ForgejoConfig    `toml:"forgejo"`
+	Gitea      GiteaConfig      `toml:"gitea"`
 	GitLab     GitLabConfig     `toml:"gitlab"`
+	Woodpecker WoodpeckerConfig `toml:"woodpecker"`
 	Webhook    WebhookConfig    `toml:"webhook"`
 	Containerd ContainerdConfig `toml:"containerd"`
 	Network    NetworkConfig    `toml:"network"`
@@ -26,14 +28,18 @@ type Config struct {
 }
 
 // Provider returns the name of the configured forge provider.
-// Exactly one of [github], [forgejo], or [gitlab] should have credentials set.
+// Exactly one provider section should have credentials set.
 // Returns "github" by default for backward compatibility.
 func (c *Config) Provider() string {
 	switch {
 	case c.Forgejo.InstanceURL != "":
 		return "forgejo"
+	case c.Gitea.InstanceURL != "":
+		return "gitea"
 	case c.GitLab.InstanceURL != "":
 		return "gitlab"
+	case c.Woodpecker.ServerURL != "":
+		return "woodpecker"
 	default:
 		return "github"
 	}
@@ -117,11 +123,24 @@ type GitHubConfig struct {
 
 // ForgejoConfig configures the Forgejo Actions provider.
 // Set instance_url and token to enable Forgejo instead of GitHub.
+// Uses forgejo-runner binary with one-job --handle mode.
 type ForgejoConfig struct {
-	InstanceURL string   `toml:"instance_url"`  // Forgejo instance URL (e.g., "https://codeberg.org")
-	Token       string   `toml:"token"`         // runner registration token from Forgejo admin
-	Owner       string   `toml:"owner"`         // org or user (empty = instance-level runner)
-	Repos       []string `toml:"repos"`         // limit to specific repos (empty = all)
+	InstanceURL string   `toml:"instance_url"` // Forgejo instance URL (e.g., "https://codeberg.org")
+	Token       string   `toml:"token"`        // runner registration token from Forgejo admin
+	Owner       string   `toml:"owner"`        // org or user (empty = instance-level runner)
+	Repos       []string `toml:"repos"`        // limit to specific repos (empty = all)
+	JobImage    string   `toml:"job_image"`    // default job execution image (default: "gitea/runner-images:ubuntu-24.04")
+}
+
+// GiteaConfig configures the Gitea Actions provider.
+// Set instance_url and token to enable Gitea instead of GitHub.
+// Uses act_runner binary with --ephemeral mode.
+type GiteaConfig struct {
+	InstanceURL string   `toml:"instance_url"` // Gitea instance URL (e.g., "https://gitea.example.com")
+	Token       string   `toml:"token"`        // runner registration token from Gitea admin
+	Owner       string   `toml:"owner"`        // org or user (empty = instance-level runner)
+	Repos       []string `toml:"repos"`        // limit to specific repos (empty = all)
+	JobImage    string   `toml:"job_image"`    // default job execution image (default: "gitea/runner-images:ubuntu-24.04")
 }
 
 // GitLabConfig configures the GitLab CI provider.
@@ -130,6 +149,15 @@ type GitLabConfig struct {
 	InstanceURL string   `toml:"instance_url"` // GitLab instance URL (e.g., "https://gitlab.com")
 	Token       string   `toml:"token"`        // runner authentication token (glrt-xxx for GitLab 16+)
 	Tags        []string `toml:"tags"`         // runner tags for job matching
+}
+
+// WoodpeckerConfig configures the Woodpecker CI provider.
+// Set server_url and agent_secret to enable Woodpecker instead of GitHub.
+// Woodpecker requires a forge backend (Gitea/Forgejo) for repo management;
+// ephemerd manages the agent lifecycle, not the server.
+type WoodpeckerConfig struct {
+	ServerURL   string `toml:"server_url"`   // Woodpecker server gRPC URL (e.g., "woodpecker.example.com:9000")
+	AgentSecret string `toml:"agent_secret"` // shared secret for agent authentication
 }
 
 type RunnerConfig struct {
@@ -239,6 +267,42 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) validate() error {
+	switch c.Provider() {
+	case "github":
+		if err := c.validateGitHub(); err != nil {
+			return err
+		}
+	case "forgejo":
+		if c.Forgejo.Token == "" {
+			return fmt.Errorf("forgejo.token is required")
+		}
+	case "gitea":
+		if c.Gitea.Token == "" {
+			return fmt.Errorf("gitea.token is required")
+		}
+	case "gitlab":
+		if c.GitLab.Token == "" {
+			return fmt.Errorf("gitlab.token is required")
+		}
+	case "woodpecker":
+		if c.Woodpecker.AgentSecret == "" {
+			return fmt.Errorf("woodpecker.agent_secret is required")
+		}
+	}
+
+	// Generate a random webhook secret if not explicitly set and tunnel is active
+	if c.Webhook.Secret == "" && c.Webhook.Tunnel != "none" {
+		b := make([]byte, 32)
+		if _, err := rand.Read(b); err != nil {
+			return fmt.Errorf("generating webhook secret: %w", err)
+		}
+		c.Webhook.Secret = hex.EncodeToString(b)
+	}
+
+	return nil
+}
+
+func (c *Config) validateGitHub() error {
 	// Fall back to GITHUB_TOKEN env var if no token is configured
 	if c.GitHub.Token == "" {
 		c.GitHub.Token = os.Getenv("GITHUB_TOKEN")
@@ -258,16 +322,6 @@ func (c *Config) validate() error {
 		return fmt.Errorf("github.owner is required")
 	}
 	// repos is optional — if empty, ephemerd registers org-level runners
-
-	// Generate a random webhook secret if not explicitly set and tunnel is active
-	if c.Webhook.Secret == "" && c.Webhook.Tunnel != "none" {
-		b := make([]byte, 32)
-		if _, err := rand.Read(b); err != nil {
-			return fmt.Errorf("generating webhook secret: %w", err)
-		}
-		c.Webhook.Secret = hex.EncodeToString(b)
-	}
-
 	return nil
 }
 

@@ -1,6 +1,6 @@
 # Providers: Multi-Forge CI Integration
 
-> **Status: Interface defined, GitHub adapter complete, Forgejo and GitLab are stubs.**
+> **Status: Interface defined, GitHub adapter complete. Forgejo, Gitea, and GitLab are stubs.**
 
 ## Overview
 
@@ -8,11 +8,14 @@ ephemerd uses a **Provider** interface (`pkg/providers/provider.go`) to abstract
 
 This allows ephemerd to support:
 
-| Provider | Status | Runner Model | Job Discovery |
-|----------|--------|--------------|---------------|
-| **GitHub** | Working | JIT runner per job | Poll or webhook |
-| **Forgejo** | Stub | Persistent runner + FetchTask | Poll |
-| **GitLab** | Stub | Custom executor scripts | gitlab-runner polls |
+| Provider | Status | Runner Binary | Runner Image | Job Image | Job Discovery |
+|----------|--------|---------------|--------------|-----------|---------------|
+| **GitHub** | Working | `actions/runner` | `ghcr.io/actions/actions-runner:latest` | same container | Poll or webhook |
+| **Forgejo** | Stub | `forgejo-runner` | `data.forgejo.org/forgejo/runner:12` | `gitea/runner-images:ubuntu-24.04` | Poll (ConnectRPC FetchTask) |
+| **Gitea** | Stub | `act_runner` | `docker.io/gitea/act_runner:latest` | `gitea/runner-images:ubuntu-24.04` | Poll (ConnectRPC FetchTask) |
+| **GitLab** | Stub | `gitlab-runner` | `ghcr.io/ephpm/runner-gitlab:latest` | managed by gitlab-runner | gitlab-runner custom executor |
+
+**Two-image model (Forgejo/Gitea):** The runner daemon runs in one container and creates job execution containers via the Docker API. ephemerd's fake Docker socket (`pkg/dind`) intercepts these calls. The `job_image` config controls the default execution environment.
 
 ## Architecture
 
@@ -24,17 +27,18 @@ This allows ephemerd to support:
 │  Works with providers.Provider — forge-agnostic   │
 └──────────────────┬───────────────────────────────┘
                    │
-         ┌─────────┼─────────┐
-         │         │         │
-         ▼         ▼         ▼
-┌─────────────┐ ┌────────┐ ┌────────┐
-│   GitHub    │ │Forgejo │ │ GitLab │
-│  Provider   │ │Provider│ │Provider│
-└──────┬──────┘ └───┬────┘ └───┬────┘
-       │            │          │
-       ▼            ▼          ▼
-   GitHub API   Forgejo API  gitlab-runner
-                             custom executor
+         ┌─────────┼──────────┬─────────┐
+         │         │          │         │
+         ▼         ▼          ▼         ▼
+┌─────────────┐ ┌────────┐ ┌───────┐ ┌────────┐
+│   GitHub    │ │Forgejo │ │ Gitea │ │ GitLab │
+│  Provider   │ │Provider│ │Provider│ │Provider│
+└──────┬──────┘ └───┬────┘ └───┬───┘ └───┬────┘
+       │            │          │         │
+       ▼            ▼          ▼         ▼
+   GitHub API  ConnectRPC  ConnectRPC  gitlab-runner
+               (forgejo-   (act_runner  custom executor
+                runner)     binary)
 ```
 
 ## Interfaces
@@ -45,6 +49,8 @@ There are three interfaces, split by capability:
 // Provider is the base — all platforms implement this.
 type Provider interface {
     Name() string
+    DefaultImage() string       // runner container image
+    DefaultJobImage() string    // job execution image ("" if same container)
     ClaimJob(ctx, event, name, labels) (*Claim, error)
     ReleaseJob(ctx, claim) error
     FetchJobImage(ctx, event) string
@@ -71,6 +77,7 @@ type Webhook interface {
 |----------|:-:|:-:|
 | GitHub   | Yes | Yes |
 | Forgejo  | Yes | No  |
+| Gitea    | Yes | No  |
 | GitLab   | Yes | No  |
 
 The scheduler type-asserts for `Webhook` when tunnel/TLS is configured:
@@ -102,20 +109,45 @@ The existing integration, adapted into the Provider interface.
 - **FetchJobImage**: Fetch workflow YAML from GitHub Contents API, parse `EPHEMERD_IMAGE` env var
 - **Runner binary**: Official GitHub Actions runner (`actions/runner`), embedded by ephemerd
 
-### Forgejo (and Gitea)
+### Forgejo
 
-Forgejo Actions uses GitHub Actions workflow syntax but a different runner protocol. Gitea uses the same protocol (Forgejo forked from Gitea; both use `runner.v1.RunnerService`).
+Forgejo Actions uses GitHub Actions workflow syntax but a different runner: `forgejo-runner`, a hard fork of Gitea's `act_runner`. It embeds a fork of nektos/act and talks to the Forgejo instance over ConnectRPC.
 
-Rather than reimplement the protocol or embed a new runner binary, ephemerd runs the official `forgejo-runner` inside an ephemerd-managed container with the fake Docker socket (`pkg/dind`) mounted. The runner polls Forgejo, act (inside the runner) creates job containers via the fake socket, and ephemerd destroys everything when done.
+ephemerd polls for tasks via the ConnectRPC FetchTask endpoint. When a job arrives, it spins up a container from the default runner image (`ghcr.io/ephpm/runner-forgejo:latest`) and launches:
 
-See [forgejo.md](forgejo.md) for the full architecture, including the two-level container model and mermaid diagrams.
+```
+forgejo-runner one-job \
+    --url <instance_url> \
+    --token-url file:///run/secrets/token \
+    --label <labels> \
+    --handle <task-uuid>
+```
 
-- **Discovery**: `forgejo-runner` (inside the container) polls Forgejo via FetchTask. Ephemerd maintains a pool of N ephemeral runner containers.
-- **ClaimJob**: Returns the `forgejo-runner` image, registration token, and fake Docker socket mount. No protocol client in ephemerd.
-- **ReleaseJob**: Destroys the runner container and all sibling containers it spawned (job container + services). No API call to Forgejo needed — forgejo-runner reports completion via UpdateTask.
-- **FetchJobImage**: N/A — act handles image selection based on `runs-on:` labels.
-- **Runner binary**: `code.forgejo.org/forgejo/runner:6` (image-based, not embedded). Same approach works for Gitea by swapping to `gitea/act_runner`.
-- **Key advantage**: Zero reimplementation. Everything works via the existing fake Docker socket that already exists for `docker run` support in jobs.
+The `one-job --handle` command was designed for autoscalers: the runner claims the specific task, executes it, streams logs via UpdateLog, reports completion via UpdateTask, and exits.
+
+- **Discovery**: ephemerd polls via ConnectRPC `FetchTask` (5 RPC service: Register, Declare, FetchTask, UpdateTask, UpdateLog)
+- **ClaimJob**: No per-job registration. Injects `FORGEJO_INSTANCE_URL`, `FORGEJO_RUNNER_TOKEN`, `FORGEJO_RUNNER_UUID` into the container
+- **ReleaseJob**: No-op — forgejo-runner handles UpdateTask
+- **FetchJobImage**: Parse `workflow_payload` from task proto for `EPHEMERD_IMAGE` env var
+- **Runner binary**: `forgejo-runner` (pre-installed in default image)
+- **Proto package**: `code.forgejo.org/forgejo/actions-proto`
+- **Key feature**: `--handle <uuid>` binds the runner to a specific task, preventing race conditions
+
+See [forgejo-gitea.md](forgejo-gitea.md) for the full architecture, including the fake Docker socket deep-dive and Windows/macOS roadmap.
+
+### Gitea
+
+Gitea Actions shares the same workflow syntax and ConnectRPC protocol as Forgejo (both descend from the same codebase), but uses `act_runner` with different proto packages and a different ephemeral mode.
+
+ephemerd polls for tasks via ConnectRPC FetchTask. When a job arrives, it spins up a container from the default runner image (`ghcr.io/ephpm/runner-gitea:latest`) and launches `act_runner daemon --ephemeral`, which runs one job and exits.
+
+- **Discovery**: ephemerd polls via ConnectRPC `FetchTask` (same 5 RPC service as Forgejo)
+- **ClaimJob**: No per-job registration. Injects `GITEA_INSTANCE_URL` and `GITEA_RUNNER_TOKEN` into the container
+- **ReleaseJob**: No-op — act_runner handles UpdateTask
+- **FetchJobImage**: Parse `workflow_payload` from task proto for `EPHEMERD_IMAGE` env var
+- **Runner binary**: `act_runner` (pre-installed in default image)
+- **Proto package**: `code.gitea.io/actions-proto-go`
+- **Key difference from Forgejo**: No `--handle` flag — `--ephemeral` mode picks up the next available task rather than binding to a specific one. Single-task FetchTask (no batch support).
 
 ### GitLab
 
@@ -165,6 +197,15 @@ instance_url = "https://codeberg.org"
 token = "runner-registration-token"
 owner = "your-org"
 # repos = ["repo1", "repo2"]  # optional, omit for all repos
+# job_image = "gitea/runner-images:ubuntu-24.04"  # default job execution image
+
+# === Gitea ===
+[gitea]
+instance_url = "https://gitea.example.com"
+token = "runner-registration-token"
+owner = "your-org"
+# repos = ["repo1", "repo2"]  # optional, omit for all repos
+# job_image = "gitea/runner-images:ubuntu-24.04"  # default job execution image
 
 # === GitLab ===
 [gitlab]
@@ -173,7 +214,7 @@ token = "glrt-xxxxxxxxxxxx"
 tags = ["linux", "docker", "ephemerd"]
 ```
 
-Only one provider should be configured at a time. If multiple sections have credentials, the precedence is: Forgejo > GitLab > GitHub (GitHub is the default when nothing else is set).
+Only one provider should be configured at a time. If multiple sections have credentials, the precedence is: Forgejo > Gitea > GitLab > GitHub (GitHub is the default when nothing else is set).
 
 ## What Stays the Same Across Providers
 
@@ -193,7 +234,9 @@ pkg/providers/
     github/
         github.go            # wraps existing pkg/github.Client
     forgejo/
-        forgejo.go           # Forgejo Actions integration (stub)
+        forgejo.go           # Forgejo Actions via forgejo-runner (stub)
+    gitea/
+        gitea.go             # Gitea Actions via act_runner (stub)
     gitlab/
         gitlab.go            # GitLab CI custom executor (stub)
 ```

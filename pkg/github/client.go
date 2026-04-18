@@ -72,6 +72,12 @@ func (t *appAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	return http.DefaultTransport.RoundTrip(req)
 }
 
+// SetHTTPClient replaces the underlying go-github client.
+// Used by test infrastructure to point at a fake server.
+func (c *Client) SetHTTPClient(ghClient *gh.Client) {
+	c.client = ghClient
+}
+
 // IsOrgLevel returns true when no repos are configured, meaning ephemerd
 // registers runners at the organization level (available to all repos).
 func (c *Client) IsOrgLevel() bool {
