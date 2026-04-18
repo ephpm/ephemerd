@@ -1,6 +1,6 @@
 # Multi-Platform CI: JobProvider Interface for GitLab (and Beyond)
 
-> **Status: Design document only.** No code exists for GitLab integration yet. This describes the planned architecture for when we add support.
+> **Status: Superseded by [providers.md](providers.md).** The Provider interface and stub implementations now exist in `pkg/providers/`. This document is preserved as historical context for the design decisions.
 
 ## Context
 

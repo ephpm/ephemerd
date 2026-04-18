@@ -398,6 +398,345 @@ func TestLogRetentionDuration_Invalid(t *testing.T) {
 	}
 }
 
+// --- Provider() detection ---
+
+func TestProvider_Default(t *testing.T) {
+	cfg := &Config{}
+	if p := cfg.Provider(); p != "github" {
+		t.Errorf("Provider() = %q, want %q", p, "github")
+	}
+}
+
+func TestProvider_Forgejo(t *testing.T) {
+	cfg := &Config{
+		Forgejo: ForgejoConfig{InstanceURL: "https://codeberg.org"},
+	}
+	if p := cfg.Provider(); p != "forgejo" {
+		t.Errorf("Provider() = %q, want %q", p, "forgejo")
+	}
+}
+
+func TestProvider_Gitea(t *testing.T) {
+	cfg := &Config{
+		Gitea: GiteaConfig{InstanceURL: "https://gitea.example.com"},
+	}
+	if p := cfg.Provider(); p != "gitea" {
+		t.Errorf("Provider() = %q, want %q", p, "gitea")
+	}
+}
+
+func TestProvider_GitLab(t *testing.T) {
+	cfg := &Config{
+		GitLab: GitLabConfig{InstanceURL: "https://gitlab.com"},
+	}
+	if p := cfg.Provider(); p != "gitlab" {
+		t.Errorf("Provider() = %q, want %q", p, "gitlab")
+	}
+}
+
+func TestProvider_Precedence_ForgejoOverGitea(t *testing.T) {
+	cfg := &Config{
+		Forgejo: ForgejoConfig{InstanceURL: "https://codeberg.org"},
+		Gitea:   GiteaConfig{InstanceURL: "https://gitea.example.com"},
+	}
+	if p := cfg.Provider(); p != "forgejo" {
+		t.Errorf("Provider() = %q, want %q (forgejo takes precedence over gitea)", p, "forgejo")
+	}
+}
+
+func TestProvider_Precedence_GiteaOverGitLab(t *testing.T) {
+	cfg := &Config{
+		Gitea:  GiteaConfig{InstanceURL: "https://gitea.example.com"},
+		GitLab: GitLabConfig{InstanceURL: "https://gitlab.com"},
+	}
+	if p := cfg.Provider(); p != "gitea" {
+		t.Errorf("Provider() = %q, want %q (gitea takes precedence over gitlab)", p, "gitea")
+	}
+}
+
+func TestProvider_Precedence_GitLabOverGitHub(t *testing.T) {
+	cfg := &Config{
+		GitHub: GitHubConfig{Token: "ghp_test", Owner: "org"},
+		GitLab: GitLabConfig{InstanceURL: "https://gitlab.com"},
+	}
+	if p := cfg.Provider(); p != "gitlab" {
+		t.Errorf("Provider() = %q, want %q (gitlab takes precedence over github)", p, "gitlab")
+	}
+}
+
+func TestProvider_Woodpecker(t *testing.T) {
+	cfg := &Config{
+		Woodpecker: WoodpeckerConfig{ServerURL: "woodpecker:9000"},
+	}
+	if p := cfg.Provider(); p != "woodpecker" {
+		t.Errorf("Provider() = %q, want %q", p, "woodpecker")
+	}
+}
+
+func TestProvider_Precedence_GitLabOverWoodpecker(t *testing.T) {
+	cfg := &Config{
+		GitLab:     GitLabConfig{InstanceURL: "https://gitlab.com"},
+		Woodpecker: WoodpeckerConfig{ServerURL: "woodpecker:9000"},
+	}
+	if p := cfg.Provider(); p != "gitlab" {
+		t.Errorf("Provider() = %q, want %q (gitlab takes precedence over woodpecker)", p, "gitlab")
+	}
+}
+
+func TestProvider_Precedence_WoodpeckerOverGitHub(t *testing.T) {
+	cfg := &Config{
+		GitHub:     GitHubConfig{Token: "ghp_test", Owner: "org"},
+		Woodpecker: WoodpeckerConfig{ServerURL: "woodpecker:9000"},
+	}
+	if p := cfg.Provider(); p != "woodpecker" {
+		t.Errorf("Provider() = %q, want %q (woodpecker takes precedence over github)", p, "woodpecker")
+	}
+}
+
+// --- Per-provider validation ---
+
+func TestValidate_ForgejoRequiresToken(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{
+		Forgejo: ForgejoConfig{InstanceURL: "https://codeberg.org"},
+	}
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("expected error for missing forgejo token")
+	}
+}
+
+func TestValidate_ForgejoValid(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{
+		Forgejo: ForgejoConfig{InstanceURL: "https://codeberg.org", Token: "tok"},
+		Webhook: WebhookConfig{Tunnel: "none"},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidate_GiteaRequiresToken(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{
+		Gitea: GiteaConfig{InstanceURL: "https://gitea.example.com"},
+	}
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("expected error for missing gitea token")
+	}
+}
+
+func TestValidate_GiteaValid(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{
+		Gitea:   GiteaConfig{InstanceURL: "https://gitea.example.com", Token: "tok"},
+		Webhook: WebhookConfig{Tunnel: "none"},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidate_GitLabRequiresToken(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{
+		GitLab: GitLabConfig{InstanceURL: "https://gitlab.com"},
+	}
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("expected error for missing gitlab token")
+	}
+}
+
+func TestValidate_GitLabValid(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{
+		GitLab:  GitLabConfig{InstanceURL: "https://gitlab.com", Token: "glrt-xxx"},
+		Webhook: WebhookConfig{Tunnel: "none"},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidate_WoodpeckerRequiresAgentSecret(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{
+		Woodpecker: WoodpeckerConfig{ServerURL: "woodpecker:9000"},
+	}
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("expected error for missing woodpecker agent_secret")
+	}
+}
+
+func TestValidate_WoodpeckerValid(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{
+		Woodpecker: WoodpeckerConfig{ServerURL: "woodpecker:9000", AgentSecret: "secret"},
+		Webhook:    WebhookConfig{Tunnel: "none"},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidate_ForgejoSkipsGitHubValidation(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{
+		Forgejo: ForgejoConfig{InstanceURL: "https://codeberg.org", Token: "tok"},
+		Webhook: WebhookConfig{Tunnel: "none"},
+	}
+	// Should NOT fail even though no GitHub token/owner are set.
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("forgejo config should not require github credentials: %v", err)
+	}
+}
+
+// --- TOML parsing for new provider sections ---
+
+func TestLoad_ForgejoConfig(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[forgejo]
+instance_url = "https://codeberg.org"
+token = "my-token"
+owner = "myorg"
+repos = ["repo1", "repo2"]
+job_image = "custom/image:latest"
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	if cfg.Provider() != "forgejo" {
+		t.Errorf("Provider() = %q, want %q", cfg.Provider(), "forgejo")
+	}
+	if cfg.Forgejo.InstanceURL != "https://codeberg.org" {
+		t.Errorf("InstanceURL = %q, want %q", cfg.Forgejo.InstanceURL, "https://codeberg.org")
+	}
+	if cfg.Forgejo.Token != "my-token" {
+		t.Errorf("Token = %q, want %q", cfg.Forgejo.Token, "my-token")
+	}
+	if cfg.Forgejo.Owner != "myorg" {
+		t.Errorf("Owner = %q, want %q", cfg.Forgejo.Owner, "myorg")
+	}
+	if len(cfg.Forgejo.Repos) != 2 || cfg.Forgejo.Repos[0] != "repo1" {
+		t.Errorf("Repos = %v, want [repo1, repo2]", cfg.Forgejo.Repos)
+	}
+	if cfg.Forgejo.JobImage != "custom/image:latest" {
+		t.Errorf("JobImage = %q, want %q", cfg.Forgejo.JobImage, "custom/image:latest")
+	}
+}
+
+func TestLoad_GiteaConfig(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[gitea]
+instance_url = "https://gitea.example.com"
+token = "gitea-tok"
+owner = "org"
+repos = ["r1"]
+job_image = "gitea/runner-images:ubuntu-22.04"
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	if cfg.Provider() != "gitea" {
+		t.Errorf("Provider() = %q, want %q", cfg.Provider(), "gitea")
+	}
+	if cfg.Gitea.InstanceURL != "https://gitea.example.com" {
+		t.Errorf("InstanceURL = %q, want %q", cfg.Gitea.InstanceURL, "https://gitea.example.com")
+	}
+	if cfg.Gitea.Token != "gitea-tok" {
+		t.Errorf("Token = %q, want %q", cfg.Gitea.Token, "gitea-tok")
+	}
+	if cfg.Gitea.Owner != "org" {
+		t.Errorf("Owner = %q, want %q", cfg.Gitea.Owner, "org")
+	}
+	if len(cfg.Gitea.Repos) != 1 || cfg.Gitea.Repos[0] != "r1" {
+		t.Errorf("Repos = %v, want [r1]", cfg.Gitea.Repos)
+	}
+	if cfg.Gitea.JobImage != "gitea/runner-images:ubuntu-22.04" {
+		t.Errorf("JobImage = %q, want %q", cfg.Gitea.JobImage, "gitea/runner-images:ubuntu-22.04")
+	}
+}
+
+func TestLoad_GitLabConfig(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[gitlab]
+instance_url = "https://gitlab.com"
+token = "glrt-xxxxxxxxxxxx"
+tags = ["linux", "docker", "ephemerd"]
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	if cfg.Provider() != "gitlab" {
+		t.Errorf("Provider() = %q, want %q", cfg.Provider(), "gitlab")
+	}
+	if cfg.GitLab.InstanceURL != "https://gitlab.com" {
+		t.Errorf("InstanceURL = %q, want %q", cfg.GitLab.InstanceURL, "https://gitlab.com")
+	}
+	if cfg.GitLab.Token != "glrt-xxxxxxxxxxxx" {
+		t.Errorf("Token = %q, want %q", cfg.GitLab.Token, "glrt-xxxxxxxxxxxx")
+	}
+	if len(cfg.GitLab.Tags) != 3 || cfg.GitLab.Tags[2] != "ephemerd" {
+		t.Errorf("Tags = %v, want [linux, docker, ephemerd]", cfg.GitLab.Tags)
+	}
+}
+
+func TestLoad_WoodpeckerConfig(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[woodpecker]
+server_url = "woodpecker.example.com:9000"
+agent_secret = "my-secret"
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	if cfg.Provider() != "woodpecker" {
+		t.Errorf("Provider() = %q, want %q", cfg.Provider(), "woodpecker")
+	}
+	if cfg.Woodpecker.ServerURL != "woodpecker.example.com:9000" {
+		t.Errorf("ServerURL = %q, want %q", cfg.Woodpecker.ServerURL, "woodpecker.example.com:9000")
+	}
+	if cfg.Woodpecker.AgentSecret != "my-secret" {
+		t.Errorf("AgentSecret = %q, want %q", cfg.Woodpecker.AgentSecret, "my-secret")
+	}
+}
+
 // --- VM config TOML parsing ---
 
 func TestLoad_VMConfig(t *testing.T) {

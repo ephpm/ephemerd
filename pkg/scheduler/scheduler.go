@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"path/filepath"
 	goruntime "runtime"
@@ -38,8 +39,9 @@ type Config struct {
 	WebhookSecret   string        // webhook signature secret
 	TLSCert         string        // TLS certificate path
 	TLSKey          string        // TLS private key path
-	Tunnel          tunnel.Provider // if non-nil, creates a public tunnel for webhooks
-	JobTimeout      time.Duration
+	Tunnel            tunnel.Provider // if non-nil, creates a public tunnel for webhooks
+	TunnelMaxRetries  int             // max consecutive reconnect failures before fallback to polling (0 = default 5)
+	JobTimeout        time.Duration
 	ShutdownTimeout time.Duration
 	LogRetention    time.Duration // max age for job log files (default 7d)
 	Log             *slog.Logger
@@ -196,6 +198,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 
 	// Start HTTP server: via tunnel, TLS, or plain HTTP
 	if s.cfg.Tunnel != nil && useWebhook {
+		// Initial tunnel connection.
 		ln, err := s.cfg.Tunnel.Listen(ctx)
 		if err != nil {
 			return fmt.Errorf("starting webhook tunnel: %w", err)
@@ -203,18 +206,14 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		webhookURL := s.cfg.Tunnel.PublicURL() + "/webhook"
 		s.cfg.Log.Info("webhook tunnel ready", "url", webhookURL)
 
-		// Register webhooks with GitHub automatically
 		hooks, err := s.cfg.GitHub.RegisterWebhooks(ctx, webhookURL, s.cfg.WebhookSecret)
 		if err != nil {
 			return fmt.Errorf("registering webhooks: %w", err)
 		}
-		defer s.cfg.GitHub.DeregisterWebhooks(context.Background(), hooks)
 
-		go func() {
-			if err := server.Serve(ln); err != http.ErrServerClosed {
-				s.cfg.Log.Error("webhook server error", "error", err)
-			}
-		}()
+		// Serve with automatic reconnect on tunnel drops.
+		go s.serveTunnelWithReconnect(ctx, server, ln, hooks, events)
+		defer s.cfg.GitHub.DeregisterWebhooks(context.Background(), hooks)
 	} else if useTLS {
 		go func() {
 			s.cfg.Log.Info("webhook server listening (TLS)", "port", s.cfg.WebhookPort)
@@ -1029,4 +1028,85 @@ func isConflict(err error) bool {
 	}
 	// The error may be wrapped in a way errors.As can't unwrap — fall back to string match.
 	return strings.Contains(err.Error(), "409")
+}
+
+const (
+	tunnelReconnectDelay    = 5 * time.Second
+	tunnelMaxReconnectDelay = 60 * time.Second
+	defaultTunnelMaxRetries = 5
+)
+
+// serveTunnelWithReconnect serves the webhook HTTP server on a tunnel listener,
+// automatically re-establishing the tunnel and re-registering webhooks when the
+// connection drops. Falls back to polling after maxRetries consecutive failures.
+func (s *Scheduler) serveTunnelWithReconnect(ctx context.Context, server *http.Server, ln net.Listener, hooks []github.ManagedWebhook, events chan<- github.JobEvent) {
+	maxRetries := s.cfg.TunnelMaxRetries
+	if maxRetries <= 0 {
+		maxRetries = defaultTunnelMaxRetries
+	}
+
+	consecutiveFailures := 0
+	delay := tunnelReconnectDelay
+
+	for {
+		err := server.Serve(ln)
+		if errors.Is(err, http.ErrServerClosed) || ctx.Err() != nil {
+			return
+		}
+		consecutiveFailures++
+		s.cfg.Log.Warn("tunnel connection lost, reconnecting",
+			"error", err,
+			"failure", consecutiveFailures,
+			"max_retries", maxRetries,
+		)
+
+		if consecutiveFailures >= maxRetries {
+			s.cfg.Log.Warn("tunnel max retries exceeded, falling back to polling",
+				"failures", consecutiveFailures,
+			)
+			// Best-effort cleanup of last webhook.
+			s.cfg.GitHub.DeregisterWebhooks(ctx, hooks)
+
+			interval := s.cfg.PollInterval
+			if interval <= 0 {
+				interval = 10 * time.Second
+			}
+			s.cfg.Log.Info("polling mode enabled (tunnel fallback)", "interval", interval)
+			go s.pollLoop(ctx, interval, events)
+			return
+		}
+
+		// Deregister old webhooks (best-effort — URL is dead anyway).
+		s.cfg.GitHub.DeregisterWebhooks(ctx, hooks)
+
+		// Exponential backoff reconnect.
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+
+		newLn, err := s.cfg.Tunnel.Listen(ctx)
+		if err != nil {
+			s.cfg.Log.Warn("tunnel reconnect failed", "error", err, "next_delay", delay)
+			delay = min(delay*2, tunnelMaxReconnectDelay)
+			continue
+		}
+
+		// Tunnel is back — re-register webhooks with the new URL.
+		webhookURL := s.cfg.Tunnel.PublicURL() + "/webhook"
+		newHooks, err := s.cfg.GitHub.RegisterWebhooks(ctx, webhookURL, s.cfg.WebhookSecret)
+		if err != nil {
+			s.cfg.Log.Error("failed to re-register webhooks after tunnel reconnect", "error", err)
+			_ = newLn.Close()
+			delay = min(delay*2, tunnelMaxReconnectDelay)
+			continue
+		}
+
+		s.cfg.Log.Info("tunnel reconnected", "url", webhookURL)
+		ln = newLn
+		hooks = newHooks
+		consecutiveFailures = 0
+		delay = tunnelReconnectDelay
+	}
 }

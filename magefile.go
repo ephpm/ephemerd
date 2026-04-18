@@ -47,6 +47,40 @@ func E2eall() error {
 	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "5m", "./test/e2e/...")
 }
 
+// E2EForgejo runs the Forgejo provider e2e test.
+// Boots a Forgejo instance via docker-compose, runs a full workflow, and tears down.
+// Requires: docker with compose support.
+func E2eforgejo() error {
+	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "3m", "-run", "TestForgejo_E2E", "./test/e2e/forgejo/")
+}
+
+// E2EGitea runs the Gitea provider e2e test.
+// Boots a Gitea instance via docker-compose, runs a full workflow, and tears down.
+// Requires: docker with compose support.
+func E2egitea() error {
+	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "3m", "-run", "TestGitea_E2E", "./test/e2e/gitea/")
+}
+
+// E2EGitLab runs the GitLab CE provider e2e test.
+// Boots a GitLab CE instance via docker-compose, runs a full CI pipeline, and tears down.
+// Requires: docker with compose support. GitLab CE is resource-heavy (~3GB image, 2-4 min boot).
+func E2egitlab() error {
+	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "10m", "-run", "TestGitLab_E2E", "./test/e2e/gitlab/")
+}
+
+// E2EGitHub runs the GitHub provider e2e test using a fake in-process API server.
+// No GitHub account, GITHUB_TOKEN, Docker, or containerd required.
+func E2egithub() error {
+	return sh.RunV("go", "test", "-tags", "e2e", "-v", "-timeout", "1m", "-run", "TestGitHub_E2E", "./test/e2e/github/")
+}
+
+// E2EWoodpecker runs the Woodpecker CI provider e2e test.
+// Boots Gitea + Woodpecker Server + Agent via docker-compose, runs a full pipeline, and tears down.
+// Requires: docker with compose support.
+func E2ewoodpecker() error {
+	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "8m", "-run", "TestWoodpecker_E2E", "./test/e2e/woodpecker/")
+}
+
 // CI runs download, lint, test, and build.
 func CI() {
 	mg.SerialDeps(Lint, Test, build.Build)
