@@ -22,7 +22,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ephpm/ephemerd/pkg/modproxy"
+	goproxy "github.com/ephpm/ephemerd/pkg/proxies/go"
 )
 
 func TestModProxy_E2E_CacheRoundTrip(t *testing.T) {
@@ -31,7 +31,7 @@ func TestModProxy_E2E_CacheRoundTrip(t *testing.T) {
 	}
 
 	cacheDir := t.TempDir()
-	p := modproxy.NewGo(modproxy.GoConfig{
+	p := goproxy.New(goproxy.Config{
 		CacheDir:   cacheDir,
 		ListenAddr: "127.0.0.1:0",
 		Cleanup:    false, // keep cache for inspection
@@ -104,7 +104,7 @@ func TestModProxy_E2E_GoToolchain(t *testing.T) {
 	}
 
 	cacheDir := t.TempDir()
-	p := modproxy.NewGo(modproxy.GoConfig{
+	p := goproxy.New(goproxy.Config{
 		CacheDir:   cacheDir,
 		ListenAddr: "127.0.0.1:0",
 		Cleanup:    false,

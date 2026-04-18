@@ -16,7 +16,8 @@ import (
 	"github.com/ephpm/ephemerd/pkg/containerd"
 	"github.com/ephpm/ephemerd/pkg/github"
 	"github.com/ephpm/ephemerd/pkg/metrics"
-	"github.com/ephpm/ephemerd/pkg/modproxy"
+	goproxy "github.com/ephpm/ephemerd/pkg/proxies/go"
+	"github.com/ephpm/ephemerd/pkg/proxies"
 	"github.com/ephpm/ephemerd/pkg/networking"
 	"github.com/ephpm/ephemerd/pkg/runner"
 	"github.com/ephpm/ephemerd/pkg/runtime"
@@ -267,7 +268,7 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	defer net.Cleanup()
 
 	// Start Go module caching proxy if enabled
-	var cacheProxies []modproxy.CacheProxy
+	var cacheProxies []proxies.CacheProxy
 	if cfg.ModuleProxy.Enabled {
 		upstream := cfg.ModuleProxy.Upstream
 		if upstream == "" {
@@ -278,7 +279,7 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 			cleanup = true
 		}
 
-		goProxy := modproxy.NewGo(modproxy.GoConfig{
+		goProxy := goproxy.New(goproxy.Config{
 			CacheDir:   joinPath(configDir, "cache", "gomod"),
 			Upstream:   upstream,
 			ListenAddr: fmt.Sprintf("%s:%d", net.GatewayIP(), modProxyPort),

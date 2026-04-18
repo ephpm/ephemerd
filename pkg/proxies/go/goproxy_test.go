@@ -1,4 +1,4 @@
-package modproxy
+package goproxy
 
 import (
 	"io"
@@ -21,9 +21,8 @@ func TestCacheMiss_FetchesFromUpstream(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cacheDir := t.TempDir()
-	p := NewGo(GoConfig{
-		CacheDir:   cacheDir,
+	p := New(Config{
+		CacheDir:   t.TempDir(),
 		Upstream:   upstream.URL,
 		ListenAddr: "127.0.0.1:0",
 		Log:        testLogger(),
@@ -56,9 +55,8 @@ func TestCacheHit_ServesFromDisk(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cacheDir := t.TempDir()
-	p := NewGo(GoConfig{
-		CacheDir:   cacheDir,
+	p := New(Config{
+		CacheDir:   t.TempDir(),
 		Upstream:   upstream.URL,
 		ListenAddr: "127.0.0.1:0",
 		Log:        testLogger(),
@@ -70,7 +68,6 @@ func TestCacheHit_ServesFromDisk(t *testing.T) {
 
 	url := "http://" + p.Addr() + "/example.com/mod/@v/v1.0.0.mod"
 
-	// First request: cache miss, hits upstream.
 	resp, err := http.Get(url)
 	if err != nil {
 		t.Fatalf("first GET error: %v", err)
@@ -82,7 +79,6 @@ func TestCacheHit_ServesFromDisk(t *testing.T) {
 		t.Fatalf("expected 1 upstream fetch after first request, got %d", fetchCount.Load())
 	}
 
-	// Second request: cache hit, should NOT hit upstream.
 	resp, err = http.Get(url)
 	if err != nil {
 		t.Fatalf("second GET error: %v", err)
@@ -106,7 +102,7 @@ func TestMutableEndpoints_NotCached(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p := NewGo(GoConfig{
+	p := New(Config{
 		CacheDir:   t.TempDir(),
 		Upstream:   upstream.URL,
 		ListenAddr: "127.0.0.1:0",
@@ -117,7 +113,6 @@ func TestMutableEndpoints_NotCached(t *testing.T) {
 	}
 	defer p.Stop()
 
-	// /@v/list and /@latest should always hit upstream.
 	for _, path := range []string{"/@v/list", "/@latest"} {
 		fetchCount.Store(0)
 		url := "http://" + p.Addr() + "/example.com/mod" + path
@@ -145,7 +140,7 @@ func TestConcurrentRequests_SingleUpstreamFetch(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p := NewGo(GoConfig{
+	p := New(Config{
 		CacheDir:   t.TempDir(),
 		Upstream:   upstream.URL,
 		ListenAddr: "127.0.0.1:0",
@@ -158,7 +153,6 @@ func TestConcurrentRequests_SingleUpstreamFetch(t *testing.T) {
 
 	url := "http://" + p.Addr() + "/example.com/mod/@v/v2.0.0.zip"
 
-	// Fire 10 concurrent requests for the same module.
 	var wg sync.WaitGroup
 	for range 10 {
 		wg.Add(1)
@@ -175,7 +169,6 @@ func TestConcurrentRequests_SingleUpstreamFetch(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Should have at most 1 upstream fetch (the rest wait on the lock then serve from cache).
 	if fetchCount.Load() > 1 {
 		t.Errorf("expected at most 1 upstream fetch for concurrent requests, got %d", fetchCount.Load())
 	}
@@ -187,7 +180,7 @@ func TestUpstreamError_ForwardsStatus(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p := NewGo(GoConfig{
+	p := New(Config{
 		CacheDir:   t.TempDir(),
 		Upstream:   upstream.URL,
 		ListenAddr: "127.0.0.1:0",
@@ -211,8 +204,6 @@ func TestUpstreamError_ForwardsStatus(t *testing.T) {
 
 func TestCleanup_WipesCacheDir(t *testing.T) {
 	cacheDir := t.TempDir()
-
-	// Create a dummy cache file.
 	if err := os.MkdirAll(cacheDir+"/test", 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +211,7 @@ func TestCleanup_WipesCacheDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	p := NewGo(GoConfig{
+	p := New(Config{
 		CacheDir:   cacheDir,
 		Upstream:   "http://unused",
 		ListenAddr: "127.0.0.1:0",
@@ -230,7 +221,6 @@ func TestCleanup_WipesCacheDir(t *testing.T) {
 	if err := p.Start(); err != nil {
 		t.Fatalf("Start() error: %v", err)
 	}
-
 	if err := p.Stop(); err != nil {
 		t.Fatalf("Stop() error: %v", err)
 	}
@@ -243,7 +233,7 @@ func TestCleanup_WipesCacheDir(t *testing.T) {
 func TestNoCleanup_PreservesCacheDir(t *testing.T) {
 	cacheDir := t.TempDir()
 
-	p := NewGo(GoConfig{
+	p := New(Config{
 		CacheDir:   cacheDir,
 		Upstream:   "http://unused",
 		ListenAddr: "127.0.0.1:0",

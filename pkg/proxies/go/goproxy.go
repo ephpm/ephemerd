@@ -1,10 +1,13 @@
-// Package modproxy implements caching reverse proxies for language package
-// managers. Each proxy sits on the bridge gateway so job containers can
-// reach it, caches downloads on disk, and injects the appropriate env var
-// (e.g., GOPROXY for Go, NPM_CONFIG_REGISTRY for npm) into containers.
+// Package goproxy implements proxies.CacheProxy for Go modules.
 //
-// Currently implemented: Go (GOPROXY spec).
-package modproxy
+// It implements the Go module proxy protocol (GOPROXY spec) and caches
+// immutable responses (.info, .mod, .zip) on disk. Mutable endpoints
+// (list, @latest) are passed through to the upstream proxy without caching.
+//
+// ephemerd runs one shared instance on the bridge gateway IP so all
+// job containers can reach it. Containers see it as GOPROXY=http://<gateway>:<port>.
+// Jobs have no write access to the cache — they just make HTTP requests.
+package goproxy
 
 import (
 	"context"
@@ -19,31 +22,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ephpm/ephemerd/pkg/proxies"
 )
 
-// CacheProxy is a language-specific caching proxy that sits between
-// job containers and an upstream package registry. Implementations
-// handle protocol-specific caching (e.g., Go module proxy, npm registry).
-type CacheProxy interface {
-	// Start begins serving the proxy. Returns after the listener is bound.
-	Start() error
-
-	// Stop shuts down the proxy and optionally cleans up the cache.
-	Stop() error
-
-	// Addr returns the address the proxy is listening on (host:port).
-	Addr() string
-
-	// EnvVars returns environment variables to inject into job containers
-	// so they use this proxy (e.g., GOPROXY=http://10.88.0.1:8082,direct).
-	EnvVars() []string
-
-	// Name returns a human-readable name for logging (e.g., "go", "npm").
-	Name() string
-}
-
-// GoConfig configures the Go module caching proxy.
-type GoConfig struct {
+// Config for the Go module caching proxy.
+type Config struct {
 	CacheDir   string       // on-disk cache directory
 	Upstream   string       // upstream proxy URL (default: https://proxy.golang.org)
 	ListenAddr string       // address to listen on (e.g., "10.88.0.1:8082")
@@ -52,25 +36,25 @@ type GoConfig struct {
 }
 
 // Compile-time interface check.
-var _ CacheProxy = (*GoProxy)(nil)
+var _ proxies.CacheProxy = (*Proxy)(nil)
 
-// GoProxy is a caching Go module proxy server.
-type GoProxy struct {
-	cfg      GoConfig
+// Proxy is a caching Go module proxy server.
+type Proxy struct {
+	cfg      Config
 	server   *http.Server
 	listener net.Listener
 	client   *http.Client
 	inflight sync.Map // prevents duplicate upstream fetches for the same path
 }
 
-// NewGo creates a Go module caching proxy. Call Start() to begin serving.
-func NewGo(cfg GoConfig) *GoProxy {
+// New creates a Go module caching proxy. Call Start() to begin serving.
+func New(cfg Config) *Proxy {
 	if cfg.Upstream == "" {
 		cfg.Upstream = "https://proxy.golang.org"
 	}
 	cfg.Upstream = strings.TrimRight(cfg.Upstream, "/")
 
-	return &GoProxy{
+	return &Proxy{
 		cfg: cfg,
 		client: &http.Client{
 			Timeout: 60 * time.Second,
@@ -79,7 +63,7 @@ func NewGo(cfg GoConfig) *GoProxy {
 }
 
 // Start begins serving the proxy. Returns after the listener is bound.
-func (p *GoProxy) Start() error {
+func (p *Proxy) Start() error {
 	if err := os.MkdirAll(p.cfg.CacheDir, 0o755); err != nil {
 		return fmt.Errorf("creating cache dir: %w", err)
 	}
@@ -97,16 +81,16 @@ func (p *GoProxy) Start() error {
 
 	go func() {
 		if err := p.server.Serve(ln); err != nil && err != http.ErrServerClosed {
-			p.cfg.Log.Error("module proxy server error", "error", err)
+			p.cfg.Log.Error("go module proxy server error", "error", err)
 		}
 	}()
 
-	p.cfg.Log.Info("module proxy started", "addr", ln.Addr().String(), "cache", p.cfg.CacheDir)
+	p.cfg.Log.Info("go module proxy started", "addr", ln.Addr().String(), "cache", p.cfg.CacheDir)
 	return nil
 }
 
 // Stop shuts down the proxy and optionally wipes the cache.
-func (p *GoProxy) Stop() error {
+func (p *Proxy) Stop() error {
 	var errs []error
 
 	if p.server != nil {
@@ -118,7 +102,7 @@ func (p *GoProxy) Stop() error {
 	}
 
 	if p.cfg.Cleanup {
-		p.cfg.Log.Info("cleaning up module cache", "dir", p.cfg.CacheDir)
+		p.cfg.Log.Info("cleaning up go module cache", "dir", p.cfg.CacheDir)
 		if err := os.RemoveAll(p.cfg.CacheDir); err != nil {
 			errs = append(errs, fmt.Errorf("cleaning cache: %w", err))
 		}
@@ -131,7 +115,7 @@ func (p *GoProxy) Stop() error {
 }
 
 // Addr returns the address the proxy is listening on.
-func (p *GoProxy) Addr() string {
+func (p *Proxy) Addr() string {
 	if p.listener != nil {
 		return p.listener.Addr().String()
 	}
@@ -139,16 +123,16 @@ func (p *GoProxy) Addr() string {
 }
 
 // EnvVars returns the environment variables to inject into job containers.
-func (p *GoProxy) EnvVars() []string {
+func (p *Proxy) EnvVars() []string {
 	return []string{
 		"GOPROXY=http://" + p.Addr() + ",direct",
 	}
 }
 
 // Name returns the proxy name for logging.
-func (p *GoProxy) Name() string { return "go" }
+func (p *Proxy) Name() string { return "go" }
 
-func (p *GoProxy) handle(w http.ResponseWriter, r *http.Request) {
+func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
 	// sumdb requests: always pass through, never cache.
@@ -158,7 +142,6 @@ func (p *GoProxy) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Mutable endpoints: pass through without caching.
-	// /{module}/@v/list and /{module}/@latest change over time.
 	if strings.HasSuffix(path, "/@v/list") || strings.HasSuffix(path, "/@latest") {
 		p.reverseProxy(w, r)
 		return
@@ -174,31 +157,25 @@ func (p *GoProxy) handle(w http.ResponseWriter, r *http.Request) {
 	p.reverseProxy(w, r)
 }
 
-// cacheAndServe serves from disk cache or fetches from upstream and caches.
-func (p *GoProxy) cacheAndServe(w http.ResponseWriter, r *http.Request) {
+func (p *Proxy) cacheAndServe(w http.ResponseWriter, r *http.Request) {
 	cachePath := p.cachePath(r.URL.Path)
 
-	// Serve from cache if available.
 	if info, err := os.Stat(cachePath); err == nil && info.Size() > 0 {
 		p.cfg.Log.Debug("cache hit", "path", r.URL.Path)
 		http.ServeFile(w, r, cachePath)
 		return
 	}
 
-	// Deduplicate concurrent requests for the same path.
-	// Use a per-path mutex so only one goroutine fetches from upstream.
 	mu := p.getInflightMutex(r.URL.Path)
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Check again after acquiring lock — another goroutine may have cached it.
 	if info, err := os.Stat(cachePath); err == nil && info.Size() > 0 {
 		p.cfg.Log.Debug("cache hit (after lock)", "path", r.URL.Path)
 		http.ServeFile(w, r, cachePath)
 		return
 	}
 
-	// Fetch from upstream.
 	p.cfg.Log.Debug("cache miss", "path", r.URL.Path)
 	upstreamURL := p.cfg.Upstream + r.URL.Path
 	resp, err := p.client.Get(upstreamURL)
@@ -210,7 +187,6 @@ func (p *GoProxy) cacheAndServe(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		// Forward the error status from upstream.
 		w.WriteHeader(resp.StatusCode)
 		if _, err := io.Copy(w, resp.Body); err != nil {
 			p.cfg.Log.Debug("error forwarding upstream error response", "error", err)
@@ -218,10 +194,8 @@ func (p *GoProxy) cacheAndServe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write to cache file and serve simultaneously.
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
 		p.cfg.Log.Warn("creating cache dir", "error", err)
-		// Fall back to just proxying without caching.
 		w.WriteHeader(http.StatusOK)
 		if _, err := io.Copy(w, resp.Body); err != nil {
 			p.cfg.Log.Debug("error proxying response", "error", err)
@@ -229,8 +203,7 @@ func (p *GoProxy) cacheAndServe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write to a temp file first, then rename to avoid partial reads.
-	tmpFile, err := os.CreateTemp(filepath.Dir(cachePath), ".modproxy-*")
+	tmpFile, err := os.CreateTemp(filepath.Dir(cachePath), ".goproxy-*")
 	if err != nil {
 		p.cfg.Log.Warn("creating temp file", "error", err)
 		w.WriteHeader(http.StatusOK)
@@ -240,7 +213,6 @@ func (p *GoProxy) cacheAndServe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Tee: write to both temp file and response.
 	w.WriteHeader(http.StatusOK)
 	mw := io.MultiWriter(tmpFile, w)
 	if _, err := io.Copy(mw, resp.Body); err != nil {
@@ -264,8 +236,7 @@ func (p *GoProxy) cacheAndServe(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// reverseProxy forwards a request to the upstream proxy without caching.
-func (p *GoProxy) reverseProxy(w http.ResponseWriter, r *http.Request) {
+func (p *Proxy) reverseProxy(w http.ResponseWriter, r *http.Request) {
 	upstreamURL := p.cfg.Upstream + r.URL.Path
 	resp, err := p.client.Get(upstreamURL)
 	if err != nil {
@@ -274,7 +245,6 @@ func (p *GoProxy) reverseProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// Copy headers.
 	for k, vs := range resp.Header {
 		for _, v := range vs {
 			w.Header().Add(k, v)
@@ -286,22 +256,14 @@ func (p *GoProxy) reverseProxy(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// cachePath maps a URL path to a file path on disk.
-// Escapes module paths to be filesystem-safe.
-func (p *GoProxy) cachePath(urlPath string) string {
-	// URL paths look like: /golang.org/x/text/@v/v0.14.0.zip
-	// Use a hash-based layout to avoid filesystem path length issues
-	// and special characters in module paths.
+func (p *Proxy) cachePath(urlPath string) string {
 	clean := strings.TrimPrefix(urlPath, "/")
-	// Split into module + version file for readability.
-	// Cache layout: <cacheDir>/<sha256-prefix>/<clean-path>
 	h := sha256.Sum256([]byte(clean))
-	prefix := fmt.Sprintf("%x", h[:2]) // 4-char hex prefix for directory fan-out
+	prefix := fmt.Sprintf("%x", h[:2])
 	return filepath.Join(p.cfg.CacheDir, prefix, filepath.FromSlash(clean))
 }
 
-// getInflightMutex returns a per-path mutex for deduplicating concurrent fetches.
-func (p *GoProxy) getInflightMutex(path string) *sync.Mutex {
+func (p *Proxy) getInflightMutex(path string) *sync.Mutex {
 	v, _ := p.inflight.LoadOrStore(path, &sync.Mutex{})
 	return v.(*sync.Mutex)
 }
