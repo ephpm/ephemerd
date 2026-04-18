@@ -2,7 +2,12 @@ version: 2
 
 before:
   hooks:
+    # Download assets for ALL platforms (Linux runner/CNI/shim come from download:all).
     - cmd: mage download:all
+    # Windows cross-compile needs the real Linux binary, Alpine rootfs, and Windows runner.
+    - cmd: mage download:runnerwindows
+    - cmd: mage download:rootfs
+    - cmd: mage build:linuxembed
 
 builds:
   - id: ephemerd
@@ -14,6 +19,7 @@ builds:
       - -s -w
       - -X main.version={{.Version}}
       - -X github.com/ephpm/ephemerd/pkg/runner.Version=2.333.1
+      - -X github.com/ephpm/ephemerd/pkg/cni.Version=1.6.2
     goos:
       - linux
       - windows
@@ -21,6 +27,11 @@ builds:
     goarch:
       - amd64
       - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+      - goos: darwin
+        goarch: amd64
 
 archives:
   - id: default
