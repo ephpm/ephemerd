@@ -542,6 +542,68 @@ func (m *darwinMacOSVM) setupRunnerViaSSH(ctx context.Context, ip string) error 
 		return fmt.Errorf("reading JIT config: %w", err)
 	}
 
+	// Check if the runner exists in the VM. If not (host-side injection
+	// failed due to APFS isolation), copy it via SSH tar pipe.
+	checkSession, err := client.NewSession()
+	if err != nil {
+		return fmt.Errorf("SSH session for check: %w", err)
+	}
+	out, checkErr := checkSession.CombinedOutput("test -f /Library/ephemerd/runner/run.sh && echo found || echo missing")
+	if closeErr := checkSession.Close(); closeErr != nil {
+		m.cfg.Log.Debug("closing check session", "error", closeErr)
+	}
+
+	if checkErr != nil || strings.TrimSpace(string(out)) != "found" {
+		// Runner not in clone — copy via SSH (uncompressed tar for speed)
+		m.cfg.Log.Info("runner not in clone, copying via SSH", "id", m.id)
+		runnerDir := ""
+		matches, _ := filepath.Glob(filepath.Join(m.cfg.DataDir, "runners", "*"))
+		for _, d := range matches {
+			if _, sErr := os.Stat(filepath.Join(d, "run.sh")); sErr == nil {
+				runnerDir = d
+				break
+			}
+		}
+		if runnerDir == "" {
+			return fmt.Errorf("no extracted runner found in %s/runners/", m.cfg.DataDir)
+		}
+
+		tarSession, err := client.NewSession()
+		if err != nil {
+			return fmt.Errorf("SSH session for tar: %w", err)
+		}
+		stdin, err := tarSession.StdinPipe()
+		if err != nil {
+			if closeErr := tarSession.Close(); closeErr != nil {
+				m.cfg.Log.Debug("closing tar session", "error", closeErr)
+			}
+			return fmt.Errorf("stdin pipe: %w", err)
+		}
+
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- tarSession.Run("sudo mkdir -p /Library/ephemerd/runner && sudo tar xf - -C /Library/ephemerd/runner")
+		}()
+
+		// Uncompressed tar (no -z) is faster — CPU isn't the bottleneck on localhost
+		tarCmd := exec.CommandContext(ctx, "tar", "cf", "-", "-C", runnerDir, ".")
+		tarCmd.Stdout = stdin
+		if err := tarCmd.Run(); err != nil {
+			if closeErr := stdin.Close(); closeErr != nil {
+				m.cfg.Log.Debug("closing stdin after tar error", "error", closeErr)
+			}
+			return fmt.Errorf("tar runner: %w", err)
+		}
+		if err := stdin.Close(); err != nil {
+			m.cfg.Log.Debug("closing tar stdin", "error", err)
+		}
+
+		if err := <-errCh; err != nil {
+			return fmt.Errorf("untar on VM: %w", err)
+		}
+		m.cfg.Log.Info("runner copied to VM via SSH", "id", m.id)
+	}
+
 	// Start the runner + firewall in the background (fire and forget).
 	// Runner binary is pre-installed in the base image (inherited by clone).
 	// Only JIT config is per-job, passed inline.
@@ -557,8 +619,14 @@ pass out all
 PFEOF
 sudo pfctl -f /tmp/pf-ephemerd.conf -e 2>/dev/null || true
 
-# Start runner (pre-installed in base image)
+# Runner is pre-installed at /Library/ephemerd/runner/ (Data volume).
+# Copy to home dir so the runner has a writable work directory.
+RUNNER_SRC="/Library/ephemerd/runner"
 RUNNER_DIR="/Users/admin/actions-runner"
+if [ ! -f "$RUNNER_DIR/run.sh" ] && [ -f "$RUNNER_SRC/run.sh" ]; then
+  cp -R "$RUNNER_SRC" "$RUNNER_DIR"
+  chown -R admin:staff "$RUNNER_DIR"
+fi
 cd "$RUNNER_DIR"
 ./run.sh --jitconfig '%s' </dev/null >/tmp/runner.log 2>&1 &
 RUNNER_PID=$!

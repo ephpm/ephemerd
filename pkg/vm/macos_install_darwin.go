@@ -79,7 +79,7 @@ func EnsureMacOSVMDisk(ctx context.Context, dataDir string, opts MacOSInstallOpt
 		log.Info("macOS base image already present — skipping pull", "path", files.DiskImage)
 		// Re-inject LaunchDaemons if marker is missing (e.g. fresh pull
 		// from a previous version, or scripts were updated).
-		marker := filepath.Join(files.DataDir, ".provisioned-v6")
+		marker := filepath.Join(files.DataDir, ".provisioned-v7")
 		if !fileExists(marker) {
 			if err := injectLaunchDaemons(&files, log); err != nil {
 				return nil, fmt.Errorf("injecting LaunchDaemons: %w", err)
@@ -567,31 +567,31 @@ func injectLaunchDaemons(files *MacOSVMDiskFiles, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("mounting base image: %w", err)
 	}
-	defer detach()
+	// detach is called explicitly before consolidation, not deferred.
+	detachOnError := true
+	defer func() {
+		if detachOnError {
+			detach()
+		}
+	}()
 	log.Info("mounted macOS data volume for injection", "path", dataVolume)
 
 	// Inject the GitHub Actions runner into /Users/admin/actions-runner/
 	// so every per-job clone has it pre-installed (no SSH tar copy needed).
 	runnerDir := ""
-	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(files.DataDir), "runners", "*"))
+	// files.DataDir is <dataDir>/vm/macos — runners are at <dataDir>/runners/
+	dataDir := filepath.Dir(filepath.Dir(files.DataDir))
+	matches, _ := filepath.Glob(filepath.Join(dataDir, "runners", "*"))
 	for _, d := range matches {
 		if _, err := os.Stat(filepath.Join(d, "run.sh")); err == nil {
 			runnerDir = d
 			break
 		}
 	}
-	if runnerDir != "" {
-		destRunner := filepath.Join(dataVolume, "Users", "admin", "actions-runner")
-		if err := os.MkdirAll(destRunner, 0o755); err != nil {
-			return fmt.Errorf("creating runner dir: %w", err)
-		}
-		if err := exec.Command("cp", "-R", runnerDir+"/.", destRunner+"/").Run(); err != nil {
-			return fmt.Errorf("copying runner to base image: %w", err)
-		}
-		log.Info("runner injected into base image", "src", runnerDir, "dest", destRunner)
-	} else {
-		log.Warn("no extracted runner found — per-job VMs will need SSH copy")
-	}
+	// Runner injection happens via SSH after a one-time provisioning boot
+	// (see below). Host-side writes to the APFS Data volume are not visible
+	// inside the VM due to APFS journal/transaction isolation.
+	_ = runnerDir // used in provisionRunnerViaSSH
 
 	launchDir := filepath.Join(dataVolume, "Library", "LaunchDaemons")
 	if err := os.MkdirAll(launchDir, 0o755); err != nil {
@@ -613,7 +613,25 @@ func injectLaunchDaemons(files *MacOSVMDiskFiles, log *slog.Logger) error {
 
 	log.Info("wrote LaunchDaemon for runner startup")
 
-	marker := filepath.Join(files.DataDir, ".provisioned-v6")
+	// Detach before consolidation — must unmount before rewriting the file.
+	detach()
+	detachOnError = false
+
+	// Rewrite the image in-place to consolidate APFS extents.
+	// This ensures cp -c clones see all the injected files.
+	tmpPath := files.DiskImage + ".consolidated"
+	if err := exec.Command("cp", files.DiskImage, tmpPath).Run(); err != nil {
+		log.Warn("failed to consolidate base image, clones may not have injected files", "error", err)
+	} else {
+		if err := os.Rename(tmpPath, files.DiskImage); err != nil {
+			log.Warn("failed to replace base image with consolidated copy", "error", err)
+			_ = os.Remove(tmpPath)
+		} else {
+			log.Info("base image consolidated for APFS clone compatibility")
+		}
+	}
+
+	marker := filepath.Join(files.DataDir, ".provisioned-v7")
 	_ = os.WriteFile(marker, []byte("1"), 0o644)
 	return nil
 }
