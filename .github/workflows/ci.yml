@@ -61,7 +61,7 @@ jobs:
         run: go install github.com/magefile/mage@latest
 
       - name: Build Linux arm64 binary
-        run: mage build
+        run: mage build:build
 
       - name: Verify binary
         run: ./ephemerd --version
