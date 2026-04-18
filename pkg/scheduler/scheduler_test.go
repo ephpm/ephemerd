@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	vmPkg "github.com/ephpm/ephemerd/pkg/vm"
 	gh "github.com/google/go-github/v72/github"
 )
 
@@ -537,4 +539,143 @@ func TestResetBackoff(t *testing.T) {
 func TestResetBackoff_NonexistentRepo(t *testing.T) {
 	// Should not panic
 	resetBackoff("never-seen-before")
+}
+
+// --- registerVMSSHHandler tests ---
+
+// mockMacOSVM is a minimal mock for vm.MacOSVM used by vmssh tests.
+type mockMacOSVM struct {
+	ip string
+}
+
+func (m *mockMacOSVM) WriteJITConfig(string) error                          { return nil }
+func (m *mockMacOSVM) Start(ctx context.Context) error                      { return nil }
+func (m *mockMacOSVM) WaitForRunner(ctx context.Context) (string, error)    { return m.ip, nil }
+func (m *mockMacOSVM) RunnerAddress() string                                { return m.ip }
+func (m *mockMacOSVM) Wait(ctx context.Context) (int, error)                { return 0, nil }
+func (m *mockMacOSVM) Stop()                                                {}
+
+func newVMSSHTestMux(s *Scheduler) *http.ServeMux {
+	mux := http.NewServeMux()
+	s.registerVMSSHHandler(mux)
+	return mux
+}
+
+func TestVMSSH_MissingJobID(t *testing.T) {
+	s := New(Config{Log: testLogger()})
+	mux := newVMSSHTestMux(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestVMSSH_InvalidJobID(t *testing.T) {
+	s := New(Config{Log: testLogger()})
+	mux := newVMSSHTestMux(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info?job_id=abc", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestVMSSH_UnknownJob(t *testing.T) {
+	s := New(Config{Log: testLogger()})
+	mux := newVMSSHTestMux(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info?job_id=999", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestVMSSH_NonMacOSJob(t *testing.T) {
+	s := New(Config{Log: testLogger()})
+	// Add a running job WITHOUT a macosVM
+	s.running[100] = &runningJob{repo: "test", startedAt: time.Now()}
+	mux := newVMSSHTestMux(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info?job_id=100", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestVMSSH_VMIPNotReady(t *testing.T) {
+	s := New(Config{Log: testLogger()})
+	s.running[200] = &runningJob{
+		repo:      "test",
+		macosVM:   &mockMacOSVM{ip: ""}, // IP not yet discovered
+		startedAt: time.Now(),
+	}
+	mux := newVMSSHTestMux(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info?job_id=200", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestVMSSH_ValidMacOSJob(t *testing.T) {
+	priv, _, err := vmPkg.GenerateEphemeralSSHKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(Config{
+		Log: testLogger(),
+		MacOSVMConfig: &vmPkg.MacOSVMConfig{
+			SSHSigner: priv,
+		},
+	})
+	s.running[300] = &runningJob{
+		repo:      "test",
+		macosVM:   &mockMacOSVM{ip: "192.168.64.5"},
+		startedAt: time.Now(),
+	}
+	mux := newVMSSHTestMux(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info?job_id=300", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	ct := w.Header().Get("Content-Type")
+	if ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+
+	var info VMSSHInfo
+	if err := json.NewDecoder(w.Body).Decode(&info); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if info.IP != "192.168.64.5" {
+		t.Errorf("IP = %q, want 192.168.64.5", info.IP)
+	}
+	if info.User != "admin" {
+		t.Errorf("User = %q, want admin", info.User)
+	}
+	if len(info.PrivateKey) == 0 {
+		t.Error("PrivateKey is empty, want PEM-encoded key")
+	}
 }

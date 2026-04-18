@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -245,6 +246,140 @@ func TestImagePullMissingFromImage(t *testing.T) {
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// --- writeJSON tests ---
+
+func TestWriteJSON(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeJSON(w, http.StatusOK, map[string]string{"key": "val"})
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+
+	var body map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["key"] != "val" {
+		t.Errorf("key = %q, want val", body["key"])
+	}
+}
+
+func TestWriteJSON_CustomStatus(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeJSON(w, http.StatusNotFound, map[string]string{"message": "not found"})
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestWriteJSON_Array(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeJSON(w, http.StatusOK, []string{"a", "b"})
+
+	var body []string
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body) != 2 || body[0] != "a" {
+		t.Errorf("body = %v, want [a b]", body)
+	}
+}
+
+// --- handleImageList with pre-populated images ---
+
+func TestImageList(t *testing.T) {
+	s := newTestServer(t)
+
+	// Pre-populate the in-memory image store
+	s.mu.Lock()
+	s.images["alpine:latest"] = &imageEntry{
+		ID:   "sha256:abc123",
+		Ref:  "alpine:latest",
+		Size: 5000000,
+	}
+	s.images["ubuntu:22.04"] = &imageEntry{
+		ID:   "sha256:def456",
+		Ref:  "ubuntu:22.04",
+		Size: 30000000,
+	}
+	s.mu.Unlock()
+
+	client := dialSocket(s.SocketPath())
+	resp, err := client.Get("http://docker/images/json")
+	if err != nil {
+		t.Fatalf("GET /images/json: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var images []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&images); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(images) != 2 {
+		t.Fatalf("expected 2 images, got %d", len(images))
+	}
+
+	// Verify each image has expected fields
+	for _, img := range images {
+		if _, ok := img["Id"]; !ok {
+			t.Error("image missing Id field")
+		}
+		if tags, ok := img["RepoTags"]; !ok {
+			t.Error("image missing RepoTags field")
+		} else {
+			tagList, ok := tags.([]any)
+			if !ok || len(tagList) == 0 {
+				t.Error("RepoTags should be a non-empty array")
+			}
+		}
+		if _, ok := img["Size"]; !ok {
+			t.Error("image missing Size field")
+		}
+	}
+}
+
+// --- handleInfo reflects image count ---
+
+func TestInfoCount(t *testing.T) {
+	s := newTestServer(t)
+
+	// Add images to verify count is reflected
+	s.mu.Lock()
+	s.images["img1"] = &imageEntry{ID: "sha256:1", Ref: "img1", Size: 100}
+	s.images["img2"] = &imageEntry{ID: "sha256:2", Ref: "img2", Size: 200}
+	s.images["img3"] = &imageEntry{ID: "sha256:3", Ref: "img3", Size: 300}
+	s.mu.Unlock()
+
+	client := dialSocket(s.SocketPath())
+	resp, err := client.Get("http://docker/info")
+	if err != nil {
+		t.Fatalf("GET /info: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var info map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	imageCount, ok := info["Images"].(float64)
+	if !ok {
+		t.Fatalf("Images field missing or not a number: %v", info["Images"])
+	}
+	if imageCount != 3 {
+		t.Errorf("Images = %v, want 3", imageCount)
 	}
 }
 
