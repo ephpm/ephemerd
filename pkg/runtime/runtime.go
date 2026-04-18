@@ -52,7 +52,7 @@ type Config struct {
 	LogDir          string // directory for per-job container logs
 	DataDir         string // ephemerd data directory (used for dind socket paths)
 	DindEnabled     bool   // mount a fake Docker socket into each container
-	ModuleProxyAddr string // if set, inject GOPROXY env var pointing at this address
+	CacheProxyEnv []string // extra env vars from cache proxies (e.g., GOPROXY=...)
 	Network         *networking.Manager
 	Log             *slog.Logger
 }
@@ -233,9 +233,7 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 
 	// Build container spec
 	envVars := []string{"RUNNER_ALLOW_RUNASROOT=1"}
-	if r.cfg.ModuleProxyAddr != "" {
-		envVars = append(envVars, "GOPROXY=http://"+r.cfg.ModuleProxyAddr+",direct")
-	}
+	envVars = append(envVars, r.cfg.CacheProxyEnv...)
 
 	opts := []oci.SpecOpts{
 		oci.WithImageConfig(img),

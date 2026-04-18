@@ -31,7 +31,7 @@ func TestModProxy_E2E_CacheRoundTrip(t *testing.T) {
 	}
 
 	cacheDir := t.TempDir()
-	p := modproxy.New(modproxy.Config{
+	p := modproxy.NewGo(modproxy.GoConfig{
 		CacheDir:   cacheDir,
 		ListenAddr: "127.0.0.1:0",
 		Cleanup:    false, // keep cache for inspection
@@ -104,7 +104,7 @@ func TestModProxy_E2E_GoToolchain(t *testing.T) {
 	}
 
 	cacheDir := t.TempDir()
-	p := modproxy.New(modproxy.Config{
+	p := modproxy.NewGo(modproxy.GoConfig{
 		CacheDir:   cacheDir,
 		ListenAddr: "127.0.0.1:0",
 		Cleanup:    false,

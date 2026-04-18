@@ -252,37 +252,40 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	defer net.Cleanup()
 
 	// Start Go module caching proxy if enabled
-	var moduleProxyAddr string
+	var cacheProxies []modproxy.CacheProxy
 	if cfg.ModuleProxy.Enabled {
 		upstream := cfg.ModuleProxy.Upstream
 		if upstream == "" {
 			upstream = "https://proxy.golang.org"
 		}
 		cleanup := cfg.ModuleProxy.Cleanup
-		// Default cleanup to true when not explicitly set in config.
-		// TOML zero value for bool is false, so we check if the entire
-		// section was present by checking Enabled (which must be true here).
 		if !cleanup {
 			cleanup = true
 		}
 
-		proxy := modproxy.New(modproxy.Config{
+		goProxy := modproxy.NewGo(modproxy.GoConfig{
 			CacheDir:   joinPath(configDir, "cache", "gomod"),
 			Upstream:   upstream,
 			ListenAddr: fmt.Sprintf("%s:%d", net.GatewayIP(), modProxyPort),
 			Cleanup:    cleanup,
 			Log:        log,
 		})
-		if err := proxy.Start(); err != nil {
-			log.Warn("failed to start module proxy, continuing without it", "error", err)
+		if err := goProxy.Start(); err != nil {
+			log.Warn("failed to start Go module proxy, continuing without it", "error", err)
 		} else {
-			moduleProxyAddr = proxy.Addr()
+			cacheProxies = append(cacheProxies, goProxy)
 			defer func() {
-				if err := proxy.Stop(); err != nil {
-					log.Warn("error stopping module proxy", "error", err)
+				if err := goProxy.Stop(); err != nil {
+					log.Warn("error stopping Go module proxy", "error", err)
 				}
 			}()
 		}
+	}
+
+	// Collect env vars from all cache proxies for injection into containers.
+	var cacheProxyEnvVars []string
+	for _, cp := range cacheProxies {
+		cacheProxyEnvVars = append(cacheProxyEnvVars, cp.EnvVars()...)
 	}
 
 	// Create runtime (container lifecycle manager)
@@ -294,7 +297,7 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		LogDir:          joinPath(configDir, "logs"),
 		DataDir:         configDir,
 		DindEnabled:     cfg.Dind.Enabled,
-		ModuleProxyAddr: moduleProxyAddr,
+		CacheProxyEnv:   cacheProxyEnvVars,
 		Network:         net,
 		Log:             log,
 	})

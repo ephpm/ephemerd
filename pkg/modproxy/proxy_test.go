@@ -22,7 +22,7 @@ func TestCacheMiss_FetchesFromUpstream(t *testing.T) {
 	defer upstream.Close()
 
 	cacheDir := t.TempDir()
-	p := New(Config{
+	p := NewGo(GoConfig{
 		CacheDir:   cacheDir,
 		Upstream:   upstream.URL,
 		ListenAddr: "127.0.0.1:0",
@@ -57,7 +57,7 @@ func TestCacheHit_ServesFromDisk(t *testing.T) {
 	defer upstream.Close()
 
 	cacheDir := t.TempDir()
-	p := New(Config{
+	p := NewGo(GoConfig{
 		CacheDir:   cacheDir,
 		Upstream:   upstream.URL,
 		ListenAddr: "127.0.0.1:0",
@@ -106,7 +106,7 @@ func TestMutableEndpoints_NotCached(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p := New(Config{
+	p := NewGo(GoConfig{
 		CacheDir:   t.TempDir(),
 		Upstream:   upstream.URL,
 		ListenAddr: "127.0.0.1:0",
@@ -145,7 +145,7 @@ func TestConcurrentRequests_SingleUpstreamFetch(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p := New(Config{
+	p := NewGo(GoConfig{
 		CacheDir:   t.TempDir(),
 		Upstream:   upstream.URL,
 		ListenAddr: "127.0.0.1:0",
@@ -187,7 +187,7 @@ func TestUpstreamError_ForwardsStatus(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p := New(Config{
+	p := NewGo(GoConfig{
 		CacheDir:   t.TempDir(),
 		Upstream:   upstream.URL,
 		ListenAddr: "127.0.0.1:0",
@@ -220,7 +220,7 @@ func TestCleanup_WipesCacheDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	p := New(Config{
+	p := NewGo(GoConfig{
 		CacheDir:   cacheDir,
 		Upstream:   "http://unused",
 		ListenAddr: "127.0.0.1:0",
@@ -243,7 +243,7 @@ func TestCleanup_WipesCacheDir(t *testing.T) {
 func TestNoCleanup_PreservesCacheDir(t *testing.T) {
 	cacheDir := t.TempDir()
 
-	p := New(Config{
+	p := NewGo(GoConfig{
 		CacheDir:   cacheDir,
 		Upstream:   "http://unused",
 		ListenAddr: "127.0.0.1:0",
