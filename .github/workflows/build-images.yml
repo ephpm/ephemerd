@@ -21,7 +21,7 @@ env:
 jobs:
   linux:
     name: Build Linux CI Runner
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
 
@@ -48,7 +48,7 @@ jobs:
 
   macos-deps:
     name: Build macOS Deps
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
 
@@ -68,19 +68,23 @@ jobs:
             ${{ env.IMAGE_REPO }}:runner-ci-macos-deps
             ${{ env.IMAGE_REPO }}:runner-ci-macos-deps-${{ env.DATE_TAG }}
 
-  # Windows image must be built on a Windows runner.
-  # windows:
-  #   name: Build Windows CI Runner
-  #   runs-on: windows-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Set date tag
-  #       run: echo "DATE_TAG=$(Get-Date -Format 'yyyyMMdd')" >> $env:GITHUB_ENV
-  #     - uses: docker/login-action@v3
-  #       with:
-  #         username: ${{ secrets.DOCKER_USERNAME }}
-  #         password: ${{ secrets.DOCKER_PASSWORD }}
-  #     - run: |
-  #         docker build -t ${{ env.IMAGE_REPO }}:runner-ci-windows -t ${{ env.IMAGE_REPO }}:runner-ci-windows-${{ env.DATE_TAG }} images/runner-ci-windows
-  #         docker push ${{ env.IMAGE_REPO }}:runner-ci-windows
-  #         docker push ${{ env.IMAGE_REPO }}:runner-ci-windows-${{ env.DATE_TAG }}
+  windows:
+    name: Build Windows CI Runner
+    runs-on: [self-hosted, windows, x64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set date tag
+        shell: pwsh
+        run: echo "DATE_TAG=$(Get-Date -Format 'yyyyMMdd')" >> $env:GITHUB_ENV
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push
+        run: |
+          docker build -t ${{ env.IMAGE_REPO }}:runner-ci-windows -t ${{ env.IMAGE_REPO }}:runner-ci-windows-${{ env.DATE_TAG }} images/runner-ci-windows
+          docker push ${{ env.IMAGE_REPO }}:runner-ci-windows
+          docker push ${{ env.IMAGE_REPO }}:runner-ci-windows-${{ env.DATE_TAG }}
