@@ -79,7 +79,7 @@ func EnsureMacOSVMDisk(ctx context.Context, dataDir string, opts MacOSInstallOpt
 		log.Info("macOS base image already present — skipping pull", "path", files.DiskImage)
 		// Re-inject LaunchDaemons if marker is missing (e.g. fresh pull
 		// from a previous version, or scripts were updated).
-		marker := filepath.Join(files.DataDir, ".provisioned-v5")
+		marker := filepath.Join(files.DataDir, ".provisioned-v6")
 		if !fileExists(marker) {
 			if err := injectLaunchDaemons(&files, log); err != nil {
 				return nil, fmt.Errorf("injecting LaunchDaemons: %w", err)
@@ -558,15 +558,40 @@ func fetchBlob(ctx context.Context, registry, repo, digest, token string) ([]byt
 	return io.ReadAll(resp.Body)
 }
 
-// injectLaunchDaemons mounts the base image and writes the runner startup
-// LaunchDaemon + script so per-job VMs auto-start the GitHub Actions runner.
+// injectLaunchDaemons mounts the base image and writes the runner + scripts
+// so per-job VMs have everything pre-installed. This runs once against the
+// base image — clones inherit all files via APFS copy-on-write.
+// We NEVER mount clones (hdiutil modifies APFS journal, breaking Vz boot).
 func injectLaunchDaemons(files *MacOSVMDiskFiles, log *slog.Logger) error {
 	dataVolume, detach, err := mountBaseImage(files.DiskImage, log)
 	if err != nil {
 		return fmt.Errorf("mounting base image: %w", err)
 	}
 	defer detach()
-	log.Info("mounted macOS data volume for LaunchDaemon injection", "path", dataVolume)
+	log.Info("mounted macOS data volume for injection", "path", dataVolume)
+
+	// Inject the GitHub Actions runner into /Users/admin/actions-runner/
+	// so every per-job clone has it pre-installed (no SSH tar copy needed).
+	runnerDir := ""
+	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(files.DataDir), "runners", "*"))
+	for _, d := range matches {
+		if _, err := os.Stat(filepath.Join(d, "run.sh")); err == nil {
+			runnerDir = d
+			break
+		}
+	}
+	if runnerDir != "" {
+		destRunner := filepath.Join(dataVolume, "Users", "admin", "actions-runner")
+		if err := os.MkdirAll(destRunner, 0o755); err != nil {
+			return fmt.Errorf("creating runner dir: %w", err)
+		}
+		if err := exec.Command("cp", "-R", runnerDir+"/.", destRunner+"/").Run(); err != nil {
+			return fmt.Errorf("copying runner to base image: %w", err)
+		}
+		log.Info("runner injected into base image", "src", runnerDir, "dest", destRunner)
+	} else {
+		log.Warn("no extracted runner found — per-job VMs will need SSH copy")
+	}
 
 	launchDir := filepath.Join(dataVolume, "Library", "LaunchDaemons")
 	if err := os.MkdirAll(launchDir, 0o755); err != nil {
@@ -588,7 +613,7 @@ func injectLaunchDaemons(files *MacOSVMDiskFiles, log *slog.Logger) error {
 
 	log.Info("wrote LaunchDaemon for runner startup")
 
-	marker := filepath.Join(files.DataDir, ".provisioned-v5")
+	marker := filepath.Join(files.DataDir, ".provisioned-v6")
 	_ = os.WriteFile(marker, []byte("1"), 0o644)
 	return nil
 }

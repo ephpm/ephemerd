@@ -103,13 +103,6 @@ func (m *darwinMacOSVM) Start(ctx context.Context) error {
 		return fmt.Errorf("creating job shared directory: %w", err)
 	}
 
-	// Pre-inject runner + JIT config into the clone BEFORE booting.
-	// This avoids the slow SSH tar copy (60s) — the runner is already
-	// on disk when macOS boots, so we just start it via SSH (~3s).
-	if err := m.injectRunnerIntoClone(ctx); err != nil {
-		m.cfg.Log.Warn("failed to pre-inject runner into clone, will fall back to SSH copy", "error", err)
-	}
-
 	bootCtx, cancel := context.WithCancel(ctx)
 	m.cancel = cancel
 
@@ -543,8 +536,16 @@ func (m *darwinMacOSVM) setupRunnerViaSSH(ctx context.Context, ip string) error 
 		m.cfg.Log.Debug("closing fix session", "error", err)
 	}
 
-	// Now start the runner + firewall in the background (fire and forget).
-	setupScript := `
+	// Read JIT config to pass inline via SSH
+	jitData, err := os.ReadFile(filepath.Join(m.jobDir, ".jit_config"))
+	if err != nil {
+		return fmt.Errorf("reading JIT config: %w", err)
+	}
+
+	// Start the runner + firewall in the background (fire and forget).
+	// Runner binary is pre-installed in the base image (inherited by clone).
+	// Only JIT config is per-job, passed inline.
+	setupScript := fmt.Sprintf(`
 # Firewall: block private networks EXCEPT the Vz NAT subnet
 cat > /tmp/pf-ephemerd.conf << 'PFEOF'
 pass quick to 192.168.64.0/24
@@ -556,11 +557,10 @@ pass out all
 PFEOF
 sudo pfctl -f /tmp/pf-ephemerd.conf -e 2>/dev/null || true
 
-# Start runner from pre-injected files
+# Start runner (pre-installed in base image)
 RUNNER_DIR="/Users/admin/actions-runner"
-JIT_CONFIG="/tmp/ephemerd/.jit_config"
 cd "$RUNNER_DIR"
-./run.sh --jitconfig "$(cat $JIT_CONFIG)" </dev/null >/tmp/runner.log 2>&1 &
+./run.sh --jitconfig '%s' </dev/null >/tmp/runner.log 2>&1 &
 RUNNER_PID=$!
 disown $RUNNER_PID 2>/dev/null || true
 
@@ -569,7 +569,7 @@ RAND_PASS=$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)
 dscl . -passwd /Users/admin admin "$RAND_PASS" 2>/dev/null || true
 
 echo "runner started (pid=$RUNNER_PID)"
-`
+`, strings.TrimSpace(string(jitData)))
 
 	session, err := client.NewSession()
 	if err != nil {
