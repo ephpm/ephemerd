@@ -10,9 +10,11 @@ Users hit this when:
 - Workflows call `docker run` to test images they just built
 - Users install Docker themselves inside the job and expect it to work
 
+Additionally, Forgejo/Gitea runners (`forgejo-runner`, `act_runner`) embed nektos/act which uses the Docker API to create **job containers** — the two-container model where the runner daemon spawns a separate container for each job via `docker create` + `docker exec`. This is a hard requirement for the forge integration, not just a nice-to-have for user workflows.
+
 ## Solution: Fake Docker Daemon in ephemerd
 
-ephemerd serves a Docker Engine API on a Unix socket mounted into each job container at `/var/run/docker.sock`. The job's Docker CLI (pre-installed or user-installed) talks to this socket. ephemerd translates API calls into containerd/buildah operations on the host.
+ephemerd serves a Docker Engine API on a Unix socket mounted into each job container at `/var/run/docker.sock`. The job's Docker CLI (pre-installed or user-installed) talks to this socket. ephemerd translates API calls into containerd operations on the host.
 
 No actual Docker daemon runs. No privileged containers. No `CAP_SYS_ADMIN`.
 
@@ -51,90 +53,192 @@ No actual Docker daemon runs. No privileged containers. No `CAP_SYS_ADMIN`.
 └─────────────────────────────────┘
 ```
 
-## API Translation
+## API Coverage
 
-Each job gets its own fake daemon instance. The daemon maintains an in-memory image store (`map[string]*image`) and a temp directory for OCI layers. All state is scoped to the job and destroyed when the job exits.
+There are two consumers of the fake socket with different needs:
 
-### Image builds
+1. **nektos/act** (inside forgejo-runner / act_runner) — needs exec, copy-to-container, and networking to run workflow steps inside job containers. This is the critical path for the Forgejo/Gitea integration.
+2. **User workflows** — `docker run`, `docker build`, etc. called explicitly in `run:` steps. Nice-to-have for power users.
+
+### What act calls during a job (in order)
+
+```
+1. GET  /_ping                              # health check
+2. POST /images/create                      # pull job image (e.g. node:20-bookworm)
+3. POST /containers/create                  # create job container
+4. POST /containers/{id}/start              # start it
+5. PUT  /containers/{id}/archive            # copy step script into container
+6. POST /containers/{id}/exec               # create exec for step
+7. POST /exec/{id}/start                    # attach + stream stdout/stderr
+8. GET  /exec/{id}/json                     # get exit code
+   ... repeat 5-8 for each workflow step ...
+9. GET  /containers/{id}/archive            # copy artifacts out (optional)
+10. POST /containers/{id}/stop              # stop container
+11. DELETE /containers/{id}                 # remove container
+```
+
+For workflows with `services:` (databases, caches):
+
+```
+    POST /networks/create                   # bridge network for job + services
+    POST /containers/create                 # per-service container
+    POST /containers/{id}/start             # start service
+    POST /networks/{id}/connect             # connect job + service to network
+    ... job runs ...
+    DELETE /containers/{id}                 # remove service containers
+    DELETE /networks/{id}                   # remove network
+```
+
+### Implementation status
+
+| Endpoint | Status | Consumer | Notes |
+|---|---|---|---|
+| `GET /_ping` | **Done** | act, CLI | Returns `OK` with API version headers |
+| `GET /version` | **Done** | act, CLI | Returns `27.0.0-ephemerd` |
+| `GET /info` | **Done** | act, CLI | Reports container/image counts |
+| `GET /images/json` | **Done** | CLI | Lists pulled images |
+| `POST /images/create` (pull) | **Done** | act, CLI | Pulls via containerd, streams progress JSON |
+| `POST /containers/create` | **Done** | act, CLI | Creates containerd container with OCI spec |
+| `POST /containers/{id}/start` | **Done** | act, CLI | Creates task, attaches CNI, starts process |
+| `GET /containers/{id}/json` (inspect) | **Done** | act, CLI | Returns state, IP, config |
+| `POST /containers/{id}/stop` | **Done** | act, CLI | SIGTERM → SIGKILL with timeout |
+| `POST /containers/{id}/wait` | **Done** | act, CLI | Blocks until exit, returns status code |
+| `GET /containers/{id}/logs` | **Done** | CLI | Returns stdout/stderr from log file |
+| `DELETE /containers/{id}` | **Done** | act, CLI | Full cleanup: task, network, snapshot |
+| `GET /containers/json` (list) | **Done** | CLI | Lists all containers with state |
+| `POST /containers/{id}/exec` | **TODO** | act | **Critical for act** — create exec session |
+| `POST /exec/{id}/start` | **TODO** | act | **Critical for act** — attach + stream I/O |
+| `GET /exec/{id}/json` | **TODO** | act | **Critical for act** — get exit code |
+| `PUT /containers/{id}/archive` | **TODO** | act | **Critical for act** — copy files into container |
+| `GET /containers/{id}/archive` | **TODO** | act | Copy files out (artifacts) |
+| `GET /images/{name}/json` | **TODO** | act | Check if image exists before pulling |
+| `POST /networks/create` | **TODO** | act | Needed for `services:` |
+| `POST /networks/{id}/connect` | **TODO** | act | Needed for `services:` |
+| `DELETE /networks/{id}` | **TODO** | act | Cleanup |
+| `POST /build` | **TODO** | CLI | Needs buildah integration |
+| `POST /images/{name}/push` | **TODO** | CLI | Needs buildah + registry auth |
+| `POST /images/{name}/tag` | **TODO** | CLI | Alias in in-memory map |
+| `DELETE /images/{name}` | **TODO** | CLI | Remove from map |
+
+### Priority tiers
+
+**Tier 1 — Required for act job execution** (without these, no workflow steps run):
+- `POST /containers/{id}/exec` + `POST /exec/{id}/start` + `GET /exec/{id}/json` — step execution
+- `PUT /containers/{id}/archive` — copy step scripts into container
+
+**Tier 2 — Required for `services:` support** (databases, caches as sidecars):
+- `POST /networks/create` + `POST /networks/{id}/connect` + `DELETE /networks/{id}`
+
+**Tier 3 — User workflow convenience** (explicit `docker` commands in `run:` steps):
+- `GET /images/{name}/json` — check local image before pull
+- `GET /containers/{id}/archive` — copy files out
+- `POST /build` — image builds via buildah
+- `POST /images/{name}/push` — push to registry
+
+**Tier 4 — Nice to have**:
+- `POST /images/{name}/tag`
+- `DELETE /images/{name}`
+- `docker compose` (client-side tool, may work if it only uses implemented endpoints)
+- `docker volume create` (use bind mounts instead)
+
+### Not planned
+
+| Docker API | Reason |
+|---|---|
+| Swarm APIs | Not applicable |
+| Kubernetes APIs | Not applicable |
+| Plugin APIs | Not applicable |
+| `docker checkpoint` | Requires CRIU, not useful for CI |
+
+## API Translation Details
+
+Each job gets its own fake daemon instance. The daemon maintains an in-memory image store (`map[string]*image`) and a container map (`map[string]*containerEntry`). All state is scoped to the job and destroyed when the job exits.
+
+### Image operations
 
 | Docker API | ephemerd action |
 |---|---|
-| `POST /build` | Stream build context to a temp dir. Run `buildah bud` with the context. Store resulting OCI image in temp storage. Register image name in the in-memory map. Return image ID. |
-| `POST /build` with `--target` | Buildah handles multi-stage natively via `bud --target`. |
-
-### Image management
-
-| Docker API | ephemerd action |
-|---|---|
-| `POST /images/create` (pull) | Pull via containerd's content store. Register in the in-memory map. |
-| `POST /images/{name}/push` | Push to real remote registry via `buildah push`. Uses registry credentials from the job's environment or `~/.docker/config.json` if present. |
-| `POST /images/{name}/tag` | Add an alias in the in-memory map. No data copied. |
+| `POST /images/create` (pull) | Pull via containerd's content store. Register in the in-memory map. Stream progress JSON. |
 | `GET /images/json` | Return entries from the in-memory map. |
-| `GET /images/{name}/json` | Inspect from the in-memory map. |
-| `DELETE /images/{name}` | Remove from map, optionally clean layers from temp dir. |
+| `POST /build` | *(planned)* Stream build context to temp dir. Run `buildah bud`. Register result. |
+| `POST /images/{name}/push` | *(planned)* Push via `buildah push` with registry credentials. |
 
-### Container operations (sidecars)
+### Container lifecycle
 
 | Docker API | ephemerd action |
 |---|---|
-| `POST /containers/create` | Look up image in the in-memory map (local build) or pull via containerd (remote image). Create a sibling container on the same CNI network as the job. Apply the same firewall rules and capability restrictions. Return container ID. |
-| `POST /containers/{id}/start` | Start the containerd task. |
-| `POST /containers/{id}/stop` | Send SIGTERM, then SIGKILL after grace period. |
-| `DELETE /containers/{id}` | Destroy container and snapshot via containerd. |
-| `GET /containers/{id}/json` | Return container state from containerd. |
-| `GET /containers/{id}/logs` | Stream logs from containerd's log pipe. |
-| `POST /containers/{id}/wait` | Block until containerd task exits. |
+| `POST /containers/create` | Resolve image (pull if needed). Build OCI spec from request body (Cmd, Env, WorkingDir, Binds). Create containerd container with overlayfs snapshot. Return 64-char hex ID. |
+| `POST /containers/{id}/start` | Create containerd task with log capture (`cio.LogFile`). Attach CNI networking to task's network namespace. Start task. Container gets IP on the ephemerd bridge. |
+| `GET /containers/{id}/json` | Return state (created/running/exited), exit code, IP address, config. Status refreshed from containerd task on each call. |
+| `POST /containers/{id}/stop` | Send SIGTERM, wait up to 10s, then SIGKILL. Update status to exited. |
+| `POST /containers/{id}/wait` | Block on containerd task exit channel. Return `{"StatusCode": N}`. |
+| `GET /containers/{id}/logs` | Read and return the log file written by `cio.LogFile`. |
+| `DELETE /containers/{id}` | Kill task if running, delete task, teardown CNI, delete container + snapshot, remove log files. |
+| `GET /containers/json` | List all containers with state and network info. |
+
+### Exec operations (planned)
+
+| Docker API | ephemerd action |
+|---|---|
+| `POST /containers/{id}/exec` | *(planned)* Create exec spec with Cmd, Env, WorkingDir. Return exec ID. Will use containerd's `task.Exec()` to create an additional process in the container's namespaces. |
+| `POST /exec/{id}/start` | *(planned)* Start the exec process, stream stdout/stderr via hijacked connection. Act expects a raw TCP stream after the HTTP upgrade. |
+| `GET /exec/{id}/json` | *(planned)* Return `{"ExitCode": N, "Running": false}` from the completed exec process. |
+
+### Copy operations (planned)
+
+| Docker API | ephemerd action |
+|---|---|
+| `PUT /containers/{id}/archive` | *(planned)* Accept a tar stream, extract into the container's rootfs at the specified path. Requires access to the container's mount namespace or snapshot mount point. |
+| `GET /containers/{id}/archive` | *(planned)* Tar up files from the container's rootfs and stream back. |
 
 ### Health / metadata
 
 | Docker API | ephemerd action |
 |---|---|
-| `GET /_ping` | Return `OK`. |
-| `GET /version` | Return a fake version response (buildah version as `ApiVersion`). |
-| `GET /info` | Return minimal system info. |
-
-### Not supported
-
-| Docker API | Reason |
-|---|---|
-| `docker compose` | Too complex — compose is a client-side tool that makes many API calls. Basic `docker compose up` may work if it only uses `create` + `start`, but no guarantees. |
-| `docker exec` | Requires `CAP_SYS_PTRACE` or direct task access. Could be supported later via containerd's exec API. |
-| `docker network create` | Jobs share the ephemerd CNI network. Custom networks are not supported. Containers are reachable by IP on the shared subnet. |
-| `docker volume create` | Use bind mounts from the job's workspace instead. |
-| Swarm / Kubernetes APIs | Not applicable. |
+| `GET /_ping` | Return `OK` with `API-Version: 1.45` header. |
+| `GET /version` | Return version info (`27.0.0-ephemerd`, API `1.45`). |
+| `GET /info` | Return system info with live container/image counts. |
 
 ## Socket Lifecycle
 
-1. **Job starts**: ephemerd creates a Unix socket at a temp path, starts the fake daemon goroutine, mounts the socket into the container at `/var/run/docker.sock`.
-2. **Job runs**: Docker CLI in the container talks to the socket. ephemerd handles requests, creates sidecars as sibling containers, tracks everything in the per-job state.
-3. **Job finishes**: ephemerd destroys all sibling containers created by this job, deletes the temp OCI layer directory, closes the socket. No leaked state.
+1. **Job starts**: ephemerd creates a Unix socket at `<DataDir>/jobs/<JobID>/docker/d.sock`, starts the fake daemon goroutine, mounts the socket into the container at `/var/run/docker.sock`.
+2. **Job runs**: Docker CLI / act inside the container talks to the socket. ephemerd handles requests, creates sibling containers on the CNI bridge, tracks all state per-job.
+3. **Job finishes**: ephemerd calls `destroyAllContainers()` — kills tasks, tears down CNI, deletes snapshots, removes log directories. Then closes the socket and removes the docker directory. No leaked state.
 
 ## Sibling Containers
 
-Sidecars created via `docker run` are **sibling containers** — they run alongside the job container, not inside it. They share the same CNI network and firewall rules. From the job's perspective, sidecars are reachable at their container IP.
+Containers created via the fake socket are **sibling containers** — they run alongside the job container as first-class containerd containers, not nested. They share the same CNI bridge (`ephemerd0`) and firewall rules. From the job's perspective, siblings are reachable at their container IP (10.88.x.x).
 
-For service discovery, ephemerd can inject environment variables or `/etc/hosts` entries into the job container when a sidecar is created with `--name`. For example, `docker run -d --name mysql mysql:8` would add `mysql → 10.88.x.x` to the job's `/etc/hosts`.
+Name resolution for `--name` containers (e.g. `docker run -d --name postgres postgres:16`) can be supported by injecting `/etc/hosts` entries into the job container, mapping the name to the sibling's IP.
 
-This also enables `services:` in workflow YAML to work — the GitHub runner binary calls `docker` under the hood to manage service containers, and those calls would hit our fake daemon.
+This is also how `services:` in workflow YAML works — act calls `docker create` + `docker start` for each service, and those calls hit the fake daemon which creates sibling containers on the shared network.
 
 ## Storage
 
-- **Build layers**: stored as OCI directories under `<data-dir>/jobs/<job-id>/layers/`. Buildah's `--root` and `--runroot` flags point here.
-- **Pulled images**: stored in containerd's normal content store (shared across jobs for caching).
-- **Garbage collection**: when the job is destroyed, `os.RemoveAll` on the job's layer directory. Pulled images remain in containerd's store for future jobs.
+- **Pulled images**: stored in containerd's content store (shared across jobs for caching).
+- **Container snapshots**: one overlayfs snapshot per container, named `{containerID}-snapshot`. Cleaned up on container removal.
+- **Container logs**: per-container log files at `<DataDir>/jobs/<JobID>/docker/containers/<containerID>/output.log`. Cleaned up on removal.
+- **Build layers** *(planned)*: OCI directories under `<DataDir>/jobs/<JobID>/layers/`. Buildah's `--root` and `--runroot` flags point here.
+- **Garbage collection**: on job cleanup, `destroyAllContainers()` handles everything. Pulled images remain in containerd's store for future jobs.
 
 ## Dependencies
 
-- **buildah**: embedded or downloaded at build time (like golangci-lint). Statically linked binary, ~30MB.
+- **containerd**: embedded, provides image pull and container lifecycle.
+- **CNI plugins**: bridge + host-local + portmap, extracted at build time. Provide networking for sibling containers.
+- **buildah** *(planned)*: embedded or downloaded at build time. Statically linked binary, ~30MB. Required for `docker build`.
 - **No Docker daemon**: the entire point.
-- **No additional capabilities**: buildah runs rootless. Sidecar containers get the same restricted capability set as job containers.
+- **No additional capabilities**: sibling containers get the same restricted capability set as job containers.
 
 ## Implementation Order
 
-1. **Socket server + health endpoints** (`/_ping`, `/version`) — proves the socket mount works
-2. **Image pull** (`POST /images/create`) — containerd integration
-3. **Container create/start/stop/delete** — sidecar lifecycle via containerd
-4. **Image build** (`POST /build`) — embed buildah, wire up build context streaming
-5. **Image push** — registry auth + `buildah push`
-6. **`/etc/hosts` injection** — service discovery for sidecars
-7. **`services:` YAML support** — test that the runner binary's service management works through the shim
+1. ~~Socket server + health endpoints (`/_ping`, `/version`)~~ — done
+2. ~~Image pull (`POST /images/create`)~~ — done
+3. ~~Container create/start/stop/wait/inspect/delete~~ — done
+4. ~~CNI networking for sibling containers~~ — done
+5. **Exec (create/start/inspect)** — next, required for act step execution
+6. **Copy to/from container** — required for act to inject step scripts
+7. **Image inspect** (`GET /images/{name}/json`) — act checks before pulling
+8. **Network create/connect** — required for `services:` support
+9. **Image build** (`POST /build`) — embed buildah, wire up build context streaming
+10. **Image push** — registry auth + `buildah push`
+11. **`/etc/hosts` injection** — service discovery for named sidecars
