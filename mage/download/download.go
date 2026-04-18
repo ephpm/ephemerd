@@ -27,6 +27,7 @@ const (
 	AlpineVersion        = "3.21.3"
 	LinuxVirtVersion     = "6.12.83-r0"
 	GolangCILintVersion  = "2.11.4"
+	HugoVersion          = "0.160.1"
 
 	// Alpine prunes superseded packages from dl-cdn.alpinelinux.org as soon
 	// as a new revision lands, so any pinned upstream URL goes 404 within
@@ -1857,6 +1858,77 @@ func Golangcilint() error {
 
 	// zip extraction for Windows
 	return extractZipBinary(data, prefix+binName, dest)
+}
+
+// Hugo downloads Hugo extended for the docs site.
+func Hugo() error {
+	goos := runtime.GOOS
+	goarch := runtime.GOARCH
+
+	dest := filepath.Join(toolBinDir, "hugo")
+	if goos == "windows" {
+		dest += ".exe"
+	}
+
+	if fileExists(dest) {
+		fmt.Printf("  %s already exists, skipping\n", dest)
+		return nil
+	}
+
+	if err := os.MkdirAll(toolBinDir, 0o755); err != nil {
+		return err
+	}
+
+	ext := "tar.gz"
+	if goos == "windows" {
+		ext = "zip"
+	}
+
+	filename := fmt.Sprintf("hugo_extended_%s_%s-%s.%s", HugoVersion, goos, goarch, ext)
+	url := fmt.Sprintf("https://github.com/gohugoio/hugo/releases/download/v%s/%s", HugoVersion, filename)
+	fmt.Printf("  Downloading hugo %s...\n", HugoVersion)
+
+	data, err := httpGetBytes(url)
+	if err != nil {
+		return fmt.Errorf("downloading hugo: %w", err)
+	}
+
+	binName := "hugo"
+	if goos == "windows" {
+		binName = "hugo.exe"
+	}
+
+	if ext == "tar.gz" {
+		gr, gerr := gzip.NewReader(bytes.NewReader(data))
+		if gerr != nil {
+			return fmt.Errorf("gzip hugo: %w", gerr)
+		}
+		defer func() { _ = gr.Close() }()
+
+		tr := tar.NewReader(gr)
+		for {
+			hdr, terr := tr.Next()
+			if terr == io.EOF {
+				return fmt.Errorf("hugo binary not found in tarball")
+			}
+			if terr != nil {
+				return fmt.Errorf("tar hugo: %w", terr)
+			}
+			if hdr.Name == binName {
+				f, ferr := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+				if ferr != nil {
+					return ferr
+				}
+				if _, ferr = io.Copy(f, tr); ferr != nil {
+					_ = f.Close()
+					return ferr
+				}
+				return f.Close()
+			}
+		}
+	}
+
+	return extractZipBinary(data, binName, dest)
 }
 
 // extractZipBinary extracts a single file from a zip archive in memory.

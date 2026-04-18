@@ -93,6 +93,61 @@ Platform code uses build tags:
 - `*_darwin.go` — macOS-only (Virtualization.framework)
 - `*_stub.go` / `*_other.go` — fallback stubs for other platforms
 
+## Docs site
+
+The docs site lives in `website/` and uses [Hugo](https://gohugo.io/) with the [Hextra](https://imfing.github.io/hextra/) theme.
+
+```bash
+# Install Hugo extended (v0.156+)
+# https://gohugo.io/installation/
+
+# Preview locally
+cd website
+hugo server
+
+# Build static site (output in website/public/)
+hugo
+```
+
+Content is organized under `website/content/`:
+
+- `docs/` — user-facing guides (getting started, configuration, providers, etc.)
+- `architecture/` — design docs (adapted from `docs/arch/`)
+- `cli/` — CLI command reference (adapted from `docs/cli/`)
+
+When adding new architecture or CLI docs, add the markdown to both `docs/` (the canonical source) and `website/content/` (the Hugo site). The Hugo pages just need front matter added:
+
+```yaml
+---
+title: "Your Page Title"
+weight: 5  # optional, controls sidebar order
+---
+```
+
+## Docs site
+
+The docs site lives in `website/` and uses [Hugo](https://gohugo.io/) with the [Hextra](https://imfing.github.io/hextra/) theme.
+
+```bash
+mage docsServe    # download Hugo + start dev server at http://localhost:1313
+mage docs         # build static site (output in website/public/)
+```
+
+Content is organized under `website/content/`:
+
+- `docs/` — user-facing guides (getting started, configuration, providers, etc.)
+- `architecture/` — design docs (adapted from `docs/arch/`)
+- `cli/` — CLI command reference (adapted from `docs/cli/`)
+
+When adding new architecture or CLI docs, add the markdown to both `docs/` (the canonical source) and `website/content/` (the Hugo site). The Hugo pages just need front matter added:
+
+```yaml
+---
+title: "Your Page Title"
+weight: 5  # optional, controls sidebar order
+---
+```
+
 ## Architecture docs
 
 Design decisions and future plans are documented in `docs/arch/`:
