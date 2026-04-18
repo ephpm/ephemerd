@@ -31,8 +31,8 @@ RUN GOOS=darwin GOARCH=arm64 go build -o /deps/bin/mage-darwin-arm64 github.com/
 
 RUN touch /deps/pkg/vm/embed/ephemerd-linux
 
-COPY restore-cache.sh /deps/restore-cache.sh
-RUN chmod +x /deps/restore-cache.sh
+COPY entrypoint-cache.sh /deps/entrypoint-cache.sh
+RUN chmod +x /deps/entrypoint-cache.sh
 
 FROM scratch
 COPY --from=builder /deps /deps
