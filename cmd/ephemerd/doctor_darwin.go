@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"syscall"
 )
@@ -30,7 +31,6 @@ func platformChecks(pass, warn, fail func(string)) {
 	}
 
 	// Virtualization.framework entitlement check
-	// The binary needs com.apple.security.virtualization entitlement for VMs
 	exe, err := os.Executable()
 	if err == nil {
 		out, err := exec.Command("codesign", "-d", "--entitlements", "-", exe).CombinedOutput()
@@ -43,23 +43,64 @@ func platformChecks(pass, warn, fail func(string)) {
 		}
 	}
 
-	// Check for macOS VM base image (if configured)
-	// This is config-dependent, so just check the common location
+	// macOS VM disk image check
 	commonImagePaths := []string{
-		"/var/lib/ephemerd/vm/macos/base.ipsw",
-		os.ExpandEnv("$HOME/.ephemerd/vm/macos/base.ipsw"),
+		"/var/lib/ephemerd/vm/macos/base.img",
+		os.ExpandEnv("$HOME/.ephemerd/vm/macos/base.img"),
 	}
 	found := false
 	for _, p := range commonImagePaths {
-		if _, err := os.Stat(p); err == nil {
-			pass(fmt.Sprintf("macOS VM base image found (%s)", p))
+		if info, err := os.Stat(p); err == nil {
+			sizeGB := float64(info.Size()) / (1024 * 1024 * 1024)
+			pass(fmt.Sprintf("macOS VM disk image found (%s, %.1f GB)", p, sizeGB))
 			found = true
 			break
 		}
 	}
 	if !found {
-		warn("no macOS VM base image found — macOS-native jobs require a base image (see docs)")
+		pass("no macOS VM disk image yet — ephemerd will download the Apple IPSW and install on first boot (~30 min, one-time)")
 	}
+
+	// VM capacity guidance
+	hostCPUs := runtime.NumCPU()
+	hostMem := getHostMemoryGB()
+	// Linux VM always takes 1 slot (1 CPU, 1 GB default)
+	macVMCPUs := 2  // default
+	macVMMem := 2   // default GB
+	maxMacVMs := hostCPUs/macVMCPUs - 1 // -1 for Linux VM
+	if maxMacVMs < 1 {
+		maxMacVMs = 1
+	}
+	memLimit := (int(hostMem) - 2) / macVMMem // -2 GB for Linux VM + host overhead
+	if memLimit < maxMacVMs {
+		maxMacVMs = memLimit
+	}
+	if maxMacVMs < 1 {
+		maxMacVMs = 1
+	}
+
+	pass(fmt.Sprintf("host: %d CPUs, %.0f GB RAM", hostCPUs, hostMem))
+	if maxMacVMs <= 1 {
+		warn(fmt.Sprintf("this host can run ~%d macOS VM at a time (1 Linux VM + %d macOS VM = %d/%d CPUs, %d/%d GB RAM)",
+			maxMacVMs, maxMacVMs,
+			1+maxMacVMs*macVMCPUs, hostCPUs,
+			1+maxMacVMs*macVMMem, int(hostMem)))
+		warn("macOS jobs will queue and run one at a time — consider a host with more CPUs/RAM for parallel macOS jobs")
+	} else {
+		pass(fmt.Sprintf("can run up to %d concurrent macOS VMs (1 Linux VM @ 1 CPU + %d macOS VMs @ %d CPUs each)",
+			maxMacVMs, maxMacVMs, macVMCPUs))
+	}
+	pass("tip: tune with [vm.macos] cpus, memory_mb, and max_concurrent in config.toml")
+}
+
+func getHostMemoryGB() float64 {
+	out, err := exec.Command("sysctl", "-n", "hw.memsize").CombinedOutput()
+	if err != nil {
+		return 0
+	}
+	var bytes uint64
+	fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &bytes)
+	return float64(bytes) / (1024 * 1024 * 1024)
 }
 
 func checkDiskSpace(dataDir string, pass, warn, fail func(string)) {
@@ -85,7 +126,7 @@ func checkEmbeddedAssets(pass, warn, fail func(string)) {
 
 func platformCleanup(dataDir string, pass, warn, fail func(string)) {
 	// Clean stale VM clone directories
-	clonesDir := fmt.Sprintf("%s/vm/macos/clones", dataDir)
+	clonesDir := fmt.Sprintf("%s/vm/macos/jobs", dataDir)
 	if entries, err := os.ReadDir(clonesDir); err == nil {
 		removed := 0
 		for _, e := range entries {

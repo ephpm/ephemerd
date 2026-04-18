@@ -1,0 +1,114 @@
+name: Smoke Test (all platforms)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/test-smoke.yml'
+
+jobs:
+  linux-x64:
+    name: Linux x64
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: System info
+        run: |
+          echo "=== Linux x64 smoke test ==="
+          uname -a
+          echo "User: $(whoami)"
+          cat /etc/os-release 2>/dev/null | head -3
+
+      - name: Network
+        run: |
+          curl -sI --max-time 10 https://github.com | head -3 || echo "no internet"
+          echo "DNS:"
+          nslookup github.com 2>&1 | head -3 || echo "DNS failed"
+
+      - name: LAN isolation
+        run: |
+          for target in 10.0.0.1 172.16.0.1 192.168.1.1; do
+            curl -s --connect-timeout 3 http://$target > /dev/null 2>&1 \
+              && echo "FAIL: reached $target" \
+              || echo "PASS: $target blocked"
+          done
+
+      - uses: actions/checkout@v4
+
+      - name: Verify checkout
+        run: ls -la | head -10 && git log --oneline -3
+
+  linux-arm64:
+    name: Linux arm64
+    runs-on: [self-hosted, linux, arm64]
+    steps:
+      - name: System info
+        run: |
+          echo "=== Linux arm64 smoke test ==="
+          uname -a
+          echo "User: $(whoami)"
+          cat /etc/os-release 2>/dev/null | head -3
+
+      - name: Network
+        run: |
+          curl -sI --max-time 10 https://github.com | head -3 || echo "no internet"
+
+      - uses: actions/checkout@v4
+
+      - name: Verify checkout
+        run: ls -la | head -10 && git log --oneline -3
+
+  macos-arm64:
+    name: macOS arm64
+    runs-on: [self-hosted, macos, arm64]
+    steps:
+      - name: System info
+        run: |
+          echo "=== macOS arm64 smoke test ==="
+          sw_vers
+          uname -a
+          echo "User: $(whoami)"
+
+      - name: Network
+        run: |
+          curl -sI --max-time 10 https://github.com | head -3 || echo "no internet"
+
+      - name: LAN isolation
+        run: |
+          for target in 10.0.0.1 172.16.0.1; do
+            curl -s --connect-timeout 3 http://$target > /dev/null 2>&1 \
+              && echo "FAIL: reached $target" \
+              || echo "PASS: $target blocked"
+          done
+
+      - uses: actions/checkout@v4
+
+      - name: Verify checkout
+        run: ls -la | head -10 && git log --oneline -3
+
+  windows-x64:
+    name: Windows x64
+    runs-on: [self-hosted, windows, x64]
+    steps:
+      - name: System info
+        run: |
+          Write-Host "=== Windows x64 smoke test ==="
+          Write-Host "Hostname: $env:COMPUTERNAME"
+          Write-Host "User: $env:USERNAME"
+          Write-Host "OS: $([System.Environment]::OSVersion)"
+          systeminfo | Select-String "OS Name","OS Version","System Type"
+
+      - name: Network
+        run: |
+          try {
+            $r = Invoke-WebRequest -Uri "https://github.com" -UseBasicParsing -TimeoutSec 10
+            Write-Host "PASS: internet ($($r.StatusCode))"
+          } catch {
+            Write-Host "FAIL: no internet"
+          }
+
+      - uses: actions/checkout@v4
+
+      - name: Verify checkout
+        run: |
+          Get-ChildItem | Select-Object Name | Select-Object -First 10
+          git log --oneline -3

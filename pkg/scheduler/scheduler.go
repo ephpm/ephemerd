@@ -30,9 +30,10 @@ type Config struct {
 	GitHub          *github.Client
 	Artifacts       *artifacts.Extractor  // OCI image layer extractor for macOS VM jobs (nil if not available)
 	LinuxDispatcher *DispatchClient       // if non-nil, Linux jobs are dispatched to this WSL worker via gRPC
-	MacOSVMConfig   *vm.MacOSVMConfig     // if non-nil, macOS-native jobs are enabled (darwin only)
-	DataDir         string                // ephemerd data directory (used for artifact extraction paths)
-	MaxConcurrent   int
+	MacOSVMConfig     *vm.MacOSVMConfig     // if non-nil, macOS-native jobs are enabled (darwin only)
+	DataDir           string                // ephemerd data directory (used for artifact extraction paths)
+	MaxConcurrent     int
+	MaxMacOSVMs       int                   // max concurrent macOS VMs (Vz limit; default auto-detected)
 	Labels          []string
 	PollInterval    time.Duration // if >0, use polling mode (default)
 	WebhookPort     int           // listen port for health/webhook server
@@ -56,6 +57,7 @@ type Scheduler struct {
 	seen      map[int64]time.Time // recently handled job IDs for dedup
 	mu        sync.Mutex
 	sem       chan struct{} // concurrency limiter
+	macSem    chan struct{} // macOS VM concurrency limiter (Vz has a hard cap)
 	draining  bool         // true when shutting down, rejects new jobs
 	startTime time.Time
 }
@@ -123,11 +125,27 @@ func New(cfg Config) *Scheduler {
 		cfg.WebhookPort = 8080
 	}
 
+	macVMs := cfg.MaxMacOSVMs
+	if macVMs <= 0 {
+		// Auto-detect: Vz allows roughly (host CPUs / CPUs-per-VM) VMs total.
+		// Subtract 1 for the always-running Linux VM on darwin hosts.
+		hostCPUs := goruntime.NumCPU()
+		cpusPerVM := 4 // default from MacOSVMConfig.SetDefaults
+		if cfg.MacOSVMConfig != nil && cfg.MacOSVMConfig.CPUs > 0 {
+			cpusPerVM = int(cfg.MacOSVMConfig.CPUs)
+		}
+		macVMs = hostCPUs/cpusPerVM - 1 // -1 for Linux VM
+		if macVMs < 1 {
+			macVMs = 1
+		}
+	}
+
 	return &Scheduler{
 		cfg:       cfg,
 		running:   make(map[int64]*runningJob),
 		seen:      make(map[int64]time.Time),
 		sem:       make(chan struct{}, cfg.MaxConcurrent),
+		macSem:    make(chan struct{}, macVMs),
 		startTime: time.Now(),
 	}
 }
@@ -181,6 +199,15 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		return fmt.Errorf("starting control server: %w", err)
 	}
 	defer grpcCleanup()
+
+	// Start VM SSH info server on a second unix socket (HTTP/JSON).
+	// Used by `ephemerd jobs ssh <id>` to get the ephemeral key + VM IP.
+	sshCleanup, err := s.StartVMSSHServer()
+	if err != nil {
+		s.cfg.Log.Warn("failed to start VM SSH info server", "error", err)
+	} else {
+		defer sshCleanup()
+	}
 
 	// Start health/webhook HTTP server
 	mux := http.NewServeMux()
@@ -562,10 +589,18 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 		s.mu.Unlock()
 	}
 
-	// Acquire concurrency slot
+	// Acquire concurrency slots: general + macOS VM limit.
+	// Vz caps the number of simultaneous VMs based on host resources.
 	select {
 	case s.sem <- struct{}{}:
 	case <-ctx.Done():
+		unsee()
+		return
+	}
+	select {
+	case s.macSem <- struct{}{}:
+	case <-ctx.Done():
+		<-s.sem
 		unsee()
 		return
 	}
@@ -596,6 +631,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 		}
 		unsee()
 		time.Sleep(backoffDuration(event.Repo))
+		<-s.macSem
 		<-s.sem
 		return
 	}
@@ -614,6 +650,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
 		unsee()
+		<-s.macSem
 		<-s.sem
 		return
 	}
@@ -629,6 +666,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
 		unsee()
+		<-s.macSem
 		<-s.sem
 		return
 	}
@@ -653,6 +691,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 		}
 		unsee()
 		cancel()
+		<-s.macSem
 		<-s.sem
 		return
 	}
@@ -670,6 +709,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 		}
 		unsee()
 		cancel()
+		<-s.macSem
 		<-s.sem
 		return
 	}
@@ -692,7 +732,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 
 	// Wait for the job to finish in the background
 	go func() {
-		defer func() { <-s.sem }()
+		defer func() { <-s.macSem; <-s.sem }()
 
 		exitCode, err := macVM.Wait(jobCtx)
 		if err != nil {

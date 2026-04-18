@@ -337,6 +337,7 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		LinuxDispatcher: linuxDispatcher,
 		DataDir:         configDir,
 		MaxConcurrent:   cfg.Runner.MaxConcurrent,
+		MaxMacOSVMs:     cfg.VM.MacOS.MaxConcurrent,
 		Labels:          cfg.Runner.ExtraLabels,
 		PollInterval:    cfg.GitHub.ParsedPollInterval(),
 		WebhookPort:     cfg.Webhook.Port,
@@ -363,10 +364,16 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		defer metricsCleanup()
 	}
 
-	// Provision the macOS VM disk in the background so the scheduler can
-	// start accepting Linux jobs immediately. macOS jobs are rejected
-	// (MacOSVMConfig == nil) until the install finishes.
-	if runtime_.GOOS == "darwin" {
+	// Pull the macOS base image (Tart OCI) in the background so the
+	// scheduler can start accepting Linux jobs immediately.
+	// Skipped when cross_platform = false (e.g. Gitea/Forgejo).
+	if runtime_.GOOS == "darwin" && cfg.VM.CrossPlatformEnabled() {
+		sshSigner, sshPubKey, err := vm.GenerateEphemeralSSHKey()
+		if err != nil {
+			return fmt.Errorf("generating ephemeral SSH key: %w", err)
+		}
+		log.Info("generated ephemeral SSH key for macOS VM access (in-memory only, rotates on restart)")
+
 		go func() {
 			files, err := vm.EnsureMacOSVMDisk(ctx, configDir, vm.MacOSInstallOptions{
 				CustomDiskImage: cfg.VM.MacOS.DiskImage,
@@ -378,6 +385,8 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 			sched.SetMacOSVMConfig(&vm.MacOSVMConfig{
 				DataDir:   configDir,
 				DiskImage: files.DiskImage,
+				SSHSigner: sshSigner,
+				SSHPubKey: sshPubKey,
 				CPUs:      cfg.VM.MacOS.CPUs,
 				MemoryMB:  cfg.VM.MacOS.MemoryMB,
 				Log:       log,

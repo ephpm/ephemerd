@@ -89,8 +89,21 @@ type DindConfig struct {
 
 // VMConfig configures virtual machines for cross-OS job execution.
 type VMConfig struct {
-	Linux LinuxVMToml `toml:"linux"`
-	MacOS MacOSVMToml `toml:"macos"`
+	// CrossPlatform enables macOS and Windows VM support. Default true.
+	// Set to false for platforms like Gitea/Forgejo that only support
+	// Linux runners — this skips macOS image pulls and Windows VM setup.
+	CrossPlatform *bool        `toml:"cross_platform"`
+	Linux         LinuxVMToml  `toml:"linux"`
+	MacOS         MacOSVMToml  `toml:"macos"`
+}
+
+// CrossPlatformEnabled returns whether macOS/Windows VM support is enabled.
+// Defaults to true when not set.
+func (v *VMConfig) CrossPlatformEnabled() bool {
+	if v.CrossPlatform == nil {
+		return true
+	}
+	return *v.CrossPlatform
 }
 
 // LinuxVMToml configures the long-running Linux VM for Linux jobs
@@ -113,9 +126,10 @@ type MacOSVMToml struct {
 	// Apple-signed IPSW on first boot and installs stock macOS into
 	// <data_dir>/vm/macos/base.img. Distinct from the OCI base image
 	// overlaid per job — that's fetched from the job's image label.
-	DiskImage string `toml:"disk_image"`
-	CPUs      uint   `toml:"cpus"`       // CPUs per VM (default: 4)
-	MemoryMB  uint64 `toml:"memory_mb"`  // memory per VM in MB (default: 8192)
+	DiskImage    string `toml:"disk_image"`
+	CPUs         uint   `toml:"cpus"`          // CPUs per VM (default: 4)
+	MemoryMB     uint64 `toml:"memory_mb"`     // memory per VM in MB (default: 8192)
+	MaxConcurrent int   `toml:"max_concurrent"` // max simultaneous macOS VMs (default: auto-detected from host CPUs)
 }
 
 type GitHubConfig struct {
@@ -129,7 +143,7 @@ type GitHubConfig struct {
 	Owner string   `toml:"owner"`
 	Repos []string `toml:"repos"`
 
-	// Job discovery: polling interval (default "10s")
+	// Job discovery: polling interval (default "30s")
 	PollInterval string `toml:"poll_interval"`
 }
 
@@ -183,11 +197,11 @@ type RunnerConfig struct {
 // ParsedPollInterval returns the poll interval as a time.Duration.
 func (g *GitHubConfig) ParsedPollInterval() time.Duration {
 	if g.PollInterval == "" {
-		return 10 * time.Second
+		return 30 * time.Second
 	}
 	d, err := time.ParseDuration(g.PollInterval)
 	if err != nil {
-		return 10 * time.Second
+		return 30 * time.Second
 	}
 	return d
 }

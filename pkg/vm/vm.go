@@ -16,10 +16,13 @@ package vm
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"log/slog"
 	"strings"
 
 	"github.com/containerd/containerd/v2/client"
+	"golang.org/x/crypto/ssh"
 )
 
 // LinuxVMConfig configures the long-running Linux VM for Linux jobs on non-Linux hosts.
@@ -49,10 +52,10 @@ type LinuxVMConfig struct {
 // SetDefaults applies default values for unconfigured fields.
 func (c *LinuxVMConfig) SetDefaults() {
 	if c.CPUs == 0 {
-		c.CPUs = 2
+		c.CPUs = 1
 	}
 	if c.MemoryMB == 0 {
-		c.MemoryMB = 2048
+		c.MemoryMB = 1024
 	}
 	if c.DiskSizeGB == 0 {
 		c.DiskSizeGB = 50
@@ -87,6 +90,14 @@ type MacOSVMConfig struct {
 	// that jobs overlay onto the VM at runtime.
 	DiskImage string
 
+	// SSHSigner is the ephemeral SSH private key for guest access.
+	// Generated fresh on each ephemerd startup — never persisted to disk.
+	SSHSigner interface{} // crypto.Signer (ed25519.PrivateKey)
+
+	// SSHPubKey is the authorized_keys-format public key to inject into
+	// each job's virtio-fs share. The guest picks it up on boot.
+	SSHPubKey string
+
 	// CPUs per macOS VM. Defaults to 4.
 	CPUs uint
 
@@ -99,10 +110,10 @@ type MacOSVMConfig struct {
 // SetDefaults applies default values for unconfigured fields.
 func (c *MacOSVMConfig) SetDefaults() {
 	if c.CPUs == 0 {
-		c.CPUs = 4
+		c.CPUs = 2
 	}
 	if c.MemoryMB == 0 {
-		c.MemoryMB = 8192
+		c.MemoryMB = 2048
 	}
 }
 
@@ -129,6 +140,24 @@ type MacOSVM interface {
 
 	// Stop forcefully stops the VM and deletes the clone.
 	Stop()
+}
+
+// GenerateEphemeralSSHKey creates an in-memory ed25519 key pair for SSH
+// access to macOS VMs. The private key is never written to disk — it lives
+// only for the lifetime of this ephemerd process and rotates on restart.
+// Returns the private key (as crypto.Signer) and the public key in
+// authorized_keys format.
+func GenerateEphemeralSSHKey() (ed25519.PrivateKey, string, error) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, "", err
+	}
+	sshPub, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		return nil, "", err
+	}
+	pubLine := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPub))) + " ephemerd\n"
+	return priv, pubLine, nil
 }
 
 // normalizeMAC converts a MAC address to a canonical lowercase form with

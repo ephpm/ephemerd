@@ -5,6 +5,7 @@ package vm
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	"log/slog"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Code-Hex/vz/v3"
+	"golang.org/x/crypto/ssh"
 )
 
 // darwinMacOSVM is an ephemeral macOS VM for a single job on macOS hosts.
@@ -27,6 +29,7 @@ type darwinMacOSVM struct {
 	auxPath   string // per-job copy of aux storage (Vz locks it exclusively)
 	jobDir    string // shared directory for JIT config exchange
 	macAddr   string // VM's MAC address for ARP-based IP discovery
+	vmPass    string // randomized admin password (generated host-side, in memory only)
 	cancel    context.CancelFunc
 	done      chan struct{}
 }
@@ -53,15 +56,25 @@ func NewMacOSVM(cfg MacOSVMConfig, jobID string) (MacOSVM, error) {
 }
 
 // WriteJITConfig writes the encoded JIT runner config to the job's shared
-// directory so the macOS guest can pick it up on boot.
+// directory so the macOS guest can pick it up on boot. Also links the
+// runner tarball into the share so the guest can extract it.
 func (m *darwinMacOSVM) WriteJITConfig(encodedJIT string) error {
 	if err := os.MkdirAll(m.jobDir, 0o755); err != nil {
 		return fmt.Errorf("creating job directory: %w", err)
 	}
 	jitPath := filepath.Join(m.jobDir, ".jit_config")
-	if err := os.WriteFile(jitPath, []byte(encodedJIT), 0o600); err != nil {
+	if err := os.WriteFile(jitPath, []byte(encodedJIT), 0o644); err != nil {
 		return fmt.Errorf("writing JIT config: %w", err)
 	}
+
+	// Write the ephemeral SSH public key so the guest can install it
+	// into authorized_keys on boot. Rotated every daemon restart.
+	if m.cfg.SSHPubKey != "" {
+		if err := os.WriteFile(filepath.Join(m.jobDir, ".ssh_pubkey"), []byte(m.cfg.SSHPubKey), 0o644); err != nil {
+			return fmt.Errorf("writing SSH public key to share: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -89,6 +102,13 @@ func (m *darwinMacOSVM) Start(ctx context.Context) error {
 	// Ensure job shared directory exists for JIT config exchange
 	if err := os.MkdirAll(m.jobDir, 0o755); err != nil {
 		return fmt.Errorf("creating job shared directory: %w", err)
+	}
+
+	// Pre-inject runner + JIT config into the clone BEFORE booting.
+	// This avoids the slow SSH tar copy (60s) — the runner is already
+	// on disk when macOS boots, so we just start it via SSH (~3s).
+	if err := m.injectRunnerIntoClone(ctx); err != nil {
+		m.cfg.Log.Warn("failed to pre-inject runner into clone, will fall back to SSH copy", "error", err)
 	}
 
 	bootCtx, cancel := context.WithCancel(ctx)
@@ -198,25 +218,31 @@ func (m *darwinMacOSVM) Start(ctx context.Context) error {
 	}
 	vmConfig.SetStorageDevicesVirtualMachineConfiguration([]vz.StorageDeviceConfiguration{blockDevice})
 
-	// Shared directory: job data dir → /Volumes/ephemerd in guest
-	// The guest reads .jit_config from this share to start the GitHub runner.
-	shareDir, err := vz.NewSharedDirectory(m.jobDir, false)
+	// Shared directories:
+	// 1. "ephemerd" → job dir (.jit_config, .ssh_pubkey, .ready sentinel)
+	// 2. "runner"   → extracted GHA runner (run.sh, etc.)
+	// Two shares avoid symlinks escaping the virtio-fs sandbox.
+	var fsConfigs []vz.DirectorySharingDeviceConfiguration
+
+	jobShare, err := vz.NewSharedDirectory(m.jobDir, false)
 	if err != nil {
 		cancel()
-		return fmt.Errorf("creating shared directory: %w", err)
+		return fmt.Errorf("creating job share: %w", err)
 	}
-	singleShare, err := vz.NewSingleDirectoryShare(shareDir)
+	jobSingle, err := vz.NewSingleDirectoryShare(jobShare)
 	if err != nil {
 		cancel()
-		return fmt.Errorf("creating directory share: %w", err)
+		return fmt.Errorf("creating job directory share: %w", err)
 	}
-	fsConfig, err := vz.NewVirtioFileSystemDeviceConfiguration("ephemerd")
+	jobFS, err := vz.NewVirtioFileSystemDeviceConfiguration("ephemerd")
 	if err != nil {
 		cancel()
-		return fmt.Errorf("creating filesystem device: %w", err)
+		return fmt.Errorf("creating job filesystem device: %w", err)
 	}
-	fsConfig.SetDirectoryShare(singleShare)
-	vmConfig.SetDirectorySharingDevicesVirtualMachineConfiguration([]vz.DirectorySharingDeviceConfiguration{fsConfig})
+	jobFS.SetDirectoryShare(jobSingle)
+	fsConfigs = append(fsConfigs, jobFS)
+
+	vmConfig.SetDirectorySharingDevicesVirtualMachineConfiguration(fsConfigs)
 
 	ok, err := vmConfig.Validate()
 	if err != nil || !ok {
@@ -272,7 +298,11 @@ func (m *darwinMacOSVM) RunnerAddress() string {
 func (m *darwinMacOSVM) WaitForRunner(ctx context.Context) (string, error) {
 	m.cfg.Log.Info("waiting for macOS VM runner to become reachable", "id", m.id)
 
+	// Remove stale .ready from a previous run of this job ID
 	readyPath := filepath.Join(m.jobDir, ".ready")
+	if err := os.Remove(readyPath); err != nil && !os.IsNotExist(err) {
+		m.cfg.Log.Warn("failed to remove stale .ready file", "path", readyPath, "error", err)
+	}
 
 	for i := range 120 { // up to ~2 minutes
 		select {
@@ -311,8 +341,9 @@ func (m *darwinMacOSVM) WaitForRunner(ctx context.Context) (string, error) {
 			continue
 		}
 
-		// Fallback: check if SSH is reachable as a proxy for the VM being booted.
-		// This covers base images that don't write .ready but have SSH enabled.
+		// SSH fallback: once port 22 is open, SSH in using the ephemeral
+		// key and start the runner directly from the host. This is more
+		// reliable than LaunchDaemons (which may be blocked by SIP/SSV).
 		conn, err := net.DialTimeout("tcp", ip+":22", 2*time.Second)
 		if err != nil {
 			if i%15 == 0 && i > 0 {
@@ -322,7 +353,13 @@ func (m *darwinMacOSVM) WaitForRunner(ctx context.Context) (string, error) {
 		}
 		conn.Close()
 
-		m.cfg.Log.Info("macOS VM runner reachable (SSH fallback)", "id", m.id, "ip", ip)
+		m.cfg.Log.Info("SSH reachable, setting up runner via SSH", "id", m.id, "ip", ip)
+		if err := m.setupRunnerViaSSH(ctx, ip); err != nil {
+			m.cfg.Log.Warn("SSH runner setup failed, will retry", "id", m.id, "error", err)
+			continue
+		}
+
+		m.cfg.Log.Info("macOS VM runner reachable", "id", m.id, "ip", ip)
 		return ip, nil
 	}
 
@@ -392,6 +429,165 @@ func (m *darwinMacOSVM) Wait(ctx context.Context) (int, error) {
 	case <-ctx.Done():
 		return 1, ctx.Err()
 	}
+}
+
+// injectRunnerIntoClone mounts the APFS clone on the host and writes the
+// runner files + JIT config directly to the filesystem. This eliminates the
+// 60s SSH tar copy — the runner is already in place when the VM boots.
+func (m *darwinMacOSVM) injectRunnerIntoClone(ctx context.Context) error {
+	m.cfg.Log.Info("injecting runner into VM clone before boot", "id", m.id)
+
+	dataVolume, detach, err := mountBaseImage(m.clonePath, m.cfg.Log)
+	if err != nil {
+		return fmt.Errorf("mounting clone: %w", err)
+	}
+	defer detach()
+
+	// Copy the runner into /Users/admin/actions-runner/
+	runnerDir := ""
+	matches, _ := filepath.Glob(filepath.Join(m.cfg.DataDir, "runners", "*"))
+	for _, d := range matches {
+		if _, err := os.Stat(filepath.Join(d, "run.sh")); err == nil {
+			runnerDir = d
+			break
+		}
+	}
+	if runnerDir == "" {
+		return fmt.Errorf("no extracted runner found")
+	}
+
+	destRunner := filepath.Join(dataVolume, "Users", "admin", "actions-runner")
+	if err := os.MkdirAll(destRunner, 0o755); err != nil {
+		return fmt.Errorf("creating runner dir: %w", err)
+	}
+
+	// Use cp -R to copy the runner (faster than tar for local disk)
+	if err := exec.CommandContext(ctx, "cp", "-R", runnerDir+"/.", destRunner+"/").Run(); err != nil {
+		return fmt.Errorf("copying runner: %w", err)
+	}
+
+	// Write JIT config
+	jitData, err := os.ReadFile(filepath.Join(m.jobDir, ".jit_config"))
+	if err != nil {
+		return fmt.Errorf("reading JIT config: %w", err)
+	}
+	jitDir := filepath.Join(dataVolume, "tmp", "ephemerd")
+	if err := os.MkdirAll(jitDir, 0o755); err != nil {
+		return fmt.Errorf("creating JIT dir: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(jitDir, ".jit_config"), jitData, 0o644); err != nil {
+		return fmt.Errorf("writing JIT config: %w", err)
+	}
+
+	// Install ephemeral SSH public key for post-boot access (jobs ssh command)
+	if m.cfg.SSHPubKey != "" {
+		sshDir := filepath.Join(dataVolume, "Users", "admin", ".ssh")
+		if err := os.MkdirAll(sshDir, 0o700); err != nil {
+			return fmt.Errorf("creating .ssh dir: %w", err)
+		}
+		if err := os.WriteFile(filepath.Join(sshDir, "authorized_keys"), []byte(m.cfg.SSHPubKey), 0o600); err != nil {
+			return fmt.Errorf("writing authorized_keys: %w", err)
+		}
+	}
+
+	m.cfg.Log.Info("runner injected into clone", "id", m.id)
+	return nil
+}
+
+// setupRunnerViaSSH connects to the VM using the Tart default credentials
+// (admin/admin) and starts the GitHub Actions runner. This is more reliable
+// than LaunchDaemons which may be blocked by SIP/SSV on modern macOS.
+func (m *darwinMacOSVM) setupRunnerViaSSH(ctx context.Context, ip string) error {
+	// Try ephemeral key first, fall back to password auth
+	var authMethods []ssh.AuthMethod
+	if m.cfg.SSHSigner != nil {
+		if key, ok := m.cfg.SSHSigner.(ed25519.PrivateKey); ok {
+			signer, err := ssh.NewSignerFromKey(key)
+			if err == nil {
+				authMethods = append(authMethods, ssh.PublicKeys(signer))
+			}
+		}
+	}
+	authMethods = append(authMethods, ssh.Password("admin"))
+
+	sshCfg := &ssh.ClientConfig{
+		User:            "admin",
+		Auth:            authMethods,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         10 * time.Second,
+	}
+
+	client, err := ssh.Dial("tcp", ip+":22", sshCfg)
+	if err != nil {
+		return fmt.Errorf("SSH dial: %w", err)
+	}
+	defer client.Close()
+
+	m.cfg.Log.Info("SSH connected to macOS VM", "id", m.id, "ip", ip)
+
+	// Fix ownership FIRST as a blocking command — SSH strict mode rejects
+	// key auth if /Users/admin or .ssh are owned by root (host injection).
+	fixSession, err := client.NewSession()
+	if err != nil {
+		return fmt.Errorf("SSH session for chown: %w", err)
+	}
+	// Fix ownership AND re-install the SSH key in case the host-side injection
+	// landed in the wrong place. This runs as a blocking command with password
+	// auth (before password is randomized).
+	fixCmd := fmt.Sprintf(`sudo chown admin:staff /Users/admin && sudo chown -R admin:staff /Users/admin/.ssh /Users/admin/actions-runner 2>/dev/null; mkdir -p ~/.ssh && echo '%s' > ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys; echo ok`, strings.TrimSpace(m.cfg.SSHPubKey))
+	if out, err := fixSession.CombinedOutput(fixCmd); err != nil {
+		m.cfg.Log.Warn("chown failed", "output", string(out), "error", err)
+	}
+	fixSession.Close()
+
+	// Now start the runner + firewall in the background (fire and forget).
+	setupScript := `
+# Firewall: block private networks EXCEPT the Vz NAT subnet
+cat > /tmp/pf-ephemerd.conf << 'PFEOF'
+pass quick to 192.168.64.0/24
+block out quick to 10.0.0.0/8
+block out quick to 172.16.0.0/12
+block out quick to 192.168.0.0/16
+block out quick to 169.254.0.0/16
+pass out all
+PFEOF
+sudo pfctl -f /tmp/pf-ephemerd.conf -e 2>/dev/null || true
+
+# Start runner from pre-injected files
+RUNNER_DIR="/Users/admin/actions-runner"
+JIT_CONFIG="/tmp/ephemerd/.jit_config"
+cd "$RUNNER_DIR"
+./run.sh --jitconfig "$(cat $JIT_CONFIG)" </dev/null >/tmp/runner.log 2>&1 &
+RUNNER_PID=$!
+disown $RUNNER_PID 2>/dev/null || true
+
+# Randomize password LAST
+RAND_PASS=$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)
+dscl . -passwd /Users/admin admin "$RAND_PASS" 2>/dev/null || true
+
+echo "runner started (pid=$RUNNER_PID)"
+`
+
+	session, err := client.NewSession()
+	if err != nil {
+		return fmt.Errorf("SSH session for setup: %w", err)
+	}
+
+	if err := session.Start(setupScript); err != nil {
+		session.Close()
+		return fmt.Errorf("starting setup script: %w", err)
+	}
+
+	time.Sleep(3 * time.Second)
+	session.Close()
+
+	// Write .ready on the host side
+	readyPath := filepath.Join(m.jobDir, ".ready")
+	if err := os.WriteFile(readyPath, []byte("1"), 0o644); err != nil {
+		return fmt.Errorf("writing .ready: %w", err)
+	}
+
+	return nil
 }
 
 func (m *darwinMacOSVM) Stop() {
