@@ -18,11 +18,7 @@ Ephemeral GitHub Actions runner daemon. One binary, every platform. Secure by de
 
 ephemerd manages self-hosted GitHub Actions runners that are isolated, disposable, and automatic. Every job gets a fresh environment. When it's done, everything is destroyed. No leftover state, no security risk from untrusted PRs.
 
-<p align="center">
-  Built by <a href="https://github.com/luthermonson">@luthermonson</a> using <a href="https://claude.ai">Claude Opus 4.6</a>
-  <br/>
-  <a href="https://github.com/luthermonson">GitHub</a> · <a href="https://x.com/luthermonson">Twitter</a> · <a href="https://claude.ai">claude.ai</a>
-</p>
+Built by [@luthermonson](https://github.com/luthermonson) using [Claude Opus 4.6](https://claude.ai) · [GitHub](https://github.com/luthermonson) · [Twitter](https://x.com/luthermonson)
 
 ## Why
 
