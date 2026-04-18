@@ -35,6 +35,7 @@ type Server struct {
 	mu         sync.Mutex
 	images     map[string]*imageEntry    // in-memory image store scoped to this job
 	containers map[string]*containerEntry // containers created through this socket
+	execs      map[string]*execEntry      // exec processes inside containers
 }
 
 type imageEntry struct {
@@ -85,6 +86,7 @@ func New(cfg Config) (*Server, error) {
 		log:        cfg.Log.With("component", "dind", "job_id", cfg.JobID),
 		images:     make(map[string]*imageEntry),
 		containers: make(map[string]*containerEntry),
+		execs:      make(map[string]*execEntry),
 	}, nil
 }
 
@@ -122,7 +124,8 @@ func (s *Server) Start() error {
 func (s *Server) Stop() {
 	s.log.Info("stopping fake docker daemon")
 
-	// Destroy all containers created through this socket.
+	// Destroy all exec processes and containers created through this socket.
+	s.destroyAllExecs()
 	s.destroyAllContainers()
 
 	if s.server != nil {
@@ -179,6 +182,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.handleContainerList(w, r)
 	case strings.HasPrefix(path, "/containers/"):
 		s.routeContainer(w, r, path)
+	case strings.HasPrefix(path, "/exec/"):
+		s.routeExec(w, r, path)
 	default:
 		s.handleNotImplemented(w, r)
 	}

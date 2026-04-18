@@ -106,11 +106,11 @@ For workflows with `services:` (databases, caches):
 | `GET /containers/{id}/logs` | **Done** | CLI | Returns stdout/stderr from log file |
 | `DELETE /containers/{id}` | **Done** | act, CLI | Full cleanup: task, network, snapshot |
 | `GET /containers/json` (list) | **Done** | CLI | Lists all containers with state |
-| `POST /containers/{id}/exec` | **TODO** | act | **Critical for act** — create exec session |
-| `POST /exec/{id}/start` | **TODO** | act | **Critical for act** — attach + stream I/O |
-| `GET /exec/{id}/json` | **TODO** | act | **Critical for act** — get exit code |
-| `PUT /containers/{id}/archive` | **TODO** | act | **Critical for act** — copy files into container |
-| `GET /containers/{id}/archive` | **TODO** | act | Copy files out (artifacts) |
+| `POST /containers/{id}/exec` | **Done** | act | Create exec process via containerd task.Exec() |
+| `POST /exec/{id}/start` | **Done** | act | Start exec, block until exit, return output |
+| `GET /exec/{id}/json` | **Done** | act | Return running state and exit code |
+| `PUT /containers/{id}/archive` | **Done** | act | Copy tar into container (via exec tar or upperdir) |
+| `GET /containers/{id}/archive` | **Done** | act | Copy tar out from container rootfs layers |
 | `GET /images/{name}/json` | **TODO** | act | Check if image exists before pulling |
 | `POST /networks/create` | **TODO** | act | Needed for `services:` |
 | `POST /networks/{id}/connect` | **TODO** | act | Needed for `services:` |
@@ -122,9 +122,9 @@ For workflows with `services:` (databases, caches):
 
 ### Priority tiers
 
-**Tier 1 — Required for act job execution** (without these, no workflow steps run):
-- `POST /containers/{id}/exec` + `POST /exec/{id}/start` + `GET /exec/{id}/json` — step execution
-- `PUT /containers/{id}/archive` — copy step scripts into container
+**Tier 1 — Required for act job execution** (done):
+- ~~`POST /containers/{id}/exec` + `POST /exec/{id}/start` + `GET /exec/{id}/json`~~ — step execution
+- ~~`PUT /containers/{id}/archive`~~ — copy step scripts into container
 
 **Tier 2 — Required for `services:` support** (databases, caches as sidecars):
 - `POST /networks/create` + `POST /networks/{id}/connect` + `DELETE /networks/{id}`
@@ -176,20 +176,20 @@ Each job gets its own fake daemon instance. The daemon maintains an in-memory im
 | `DELETE /containers/{id}` | Kill task if running, delete task, teardown CNI, delete container + snapshot, remove log files. |
 | `GET /containers/json` | List all containers with state and network info. |
 
-### Exec operations (planned)
+### Exec operations
 
 | Docker API | ephemerd action |
 |---|---|
-| `POST /containers/{id}/exec` | *(planned)* Create exec spec with Cmd, Env, WorkingDir. Return exec ID. Will use containerd's `task.Exec()` to create an additional process in the container's namespaces. |
-| `POST /exec/{id}/start` | *(planned)* Start the exec process, stream stdout/stderr via hijacked connection. Act expects a raw TCP stream after the HTTP upgrade. |
-| `GET /exec/{id}/json` | *(planned)* Return `{"ExitCode": N, "Running": false}` from the completed exec process. |
+| `POST /containers/{id}/exec` | Build OCI process spec from request (Cmd, Env, WorkingDir). Inherit container env. Create exec via `task.Exec()` with `cio.LogFile`. Return exec ID. |
+| `POST /exec/{id}/start` | Register `Wait()` channel, call `Start()`, block until process exits. Return stdout/stderr from log file as response body. Does not use Docker's connection hijacking — sufficient for act's usage pattern. |
+| `GET /exec/{id}/json` | Return `{"ExitCode": N, "Running": bool}`. Refreshes state from containerd on each call. |
 
-### Copy operations (planned)
+### Copy operations
 
 | Docker API | ephemerd action |
 |---|---|
-| `PUT /containers/{id}/archive` | *(planned)* Accept a tar stream, extract into the container's rootfs at the specified path. Requires access to the container's mount namespace or snapshot mount point. |
-| `GET /containers/{id}/archive` | *(planned)* Tar up files from the container's rootfs and stream back. |
+| `PUT /containers/{id}/archive` | For running containers: write tar to overlay upperdir, then exec `tar xf` inside the container. For stopped containers: extract directly into the overlay upperdir. Path traversal prevention via `filepath.Clean`. |
+| `GET /containers/{id}/archive` | Search overlay upperdir then lowerdirs for the requested path. Tar up matching files and stream back. |
 
 ### Health / metadata
 
@@ -235,8 +235,8 @@ This is also how `services:` in workflow YAML works — act calls `docker create
 2. ~~Image pull (`POST /images/create`)~~ — done
 3. ~~Container create/start/stop/wait/inspect/delete~~ — done
 4. ~~CNI networking for sibling containers~~ — done
-5. **Exec (create/start/inspect)** — next, required for act step execution
-6. **Copy to/from container** — required for act to inject step scripts
+5. ~~Exec (create/start/inspect)~~ — done
+6. ~~Copy to/from container~~ — done
 7. **Image inspect** (`GET /images/{name}/json`) — act checks before pulling
 8. **Network create/connect** — required for `services:` support
 9. **Image build** (`POST /build`) — embed buildah, wire up build context streaming

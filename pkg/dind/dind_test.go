@@ -395,6 +395,103 @@ func TestImagePullMissingFromImage(t *testing.T) {
 	}
 }
 
+func TestExecCreateNoContainer(t *testing.T) {
+	s := newTestServer(t)
+	client := dialSocket(s.SocketPath())
+
+	body, _ := json.Marshal(map[string]any{"Cmd": []string{"echo", "hi"}})
+	resp, err := client.Post("http://docker/containers/nonexistent/exec", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /containers/nonexistent/exec: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestExecStartNotFound(t *testing.T) {
+	s := newTestServer(t)
+	client := dialSocket(s.SocketPath())
+
+	resp, err := client.Post("http://docker/exec/nonexistent/start", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /exec/nonexistent/start: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestExecInspectNotFound(t *testing.T) {
+	s := newTestServer(t)
+	client := dialSocket(s.SocketPath())
+
+	resp, err := client.Get("http://docker/exec/nonexistent/json")
+	if err != nil {
+		t.Fatalf("GET /exec/nonexistent/json: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestCopyToContainerNotFound(t *testing.T) {
+	s := newTestServer(t)
+	client := dialSocket(s.SocketPath())
+
+	req, _ := http.NewRequest("PUT", "http://docker/containers/nonexistent/archive?path=/tmp", nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("PUT /containers/nonexistent/archive: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestCopyFromContainerNotFound(t *testing.T) {
+	s := newTestServer(t)
+	client := dialSocket(s.SocketPath())
+
+	resp, err := client.Get("http://docker/containers/nonexistent/archive?path=/tmp")
+	if err != nil {
+		t.Fatalf("GET /containers/nonexistent/archive: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
 func TestVersionedContainerRoutes(t *testing.T) {
 	s := newTestServer(t)
 	client := dialSocket(s.SocketPath())

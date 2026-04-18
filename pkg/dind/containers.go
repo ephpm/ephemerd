@@ -82,6 +82,12 @@ func (s *Server) routeContainer(w http.ResponseWriter, r *http.Request, path str
 		s.handleContainerInspect(w, r, id)
 	case action == "logs" && r.Method == http.MethodGet:
 		s.handleContainerLogs(w, r, id)
+	case action == "exec" && r.Method == http.MethodPost:
+		s.handleExecCreate(w, r, id)
+	case action == "archive" && r.Method == http.MethodPut:
+		s.handleContainerCopyTo(w, r, id)
+	case action == "archive" && r.Method == http.MethodGet:
+		s.handleContainerCopyFrom(w, r, id)
 	default:
 		s.handleNotImplemented(w, r)
 	}
