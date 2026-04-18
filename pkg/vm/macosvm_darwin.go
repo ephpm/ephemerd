@@ -417,11 +417,96 @@ func (m *darwinMacOSVM) discoverIP() (string, error) {
 
 
 func (m *darwinMacOSVM) Wait(ctx context.Context) (int, error) {
+	// The macOS VM stays alive after the runner process exits (unlike
+	// containers which exit with PID 1). Poll via SSH to detect when
+	// the runner is done.
+	ip := m.RunnerAddress()
+	if ip != "" {
+		go m.monitorRunner(ctx, ip)
+	}
+
 	select {
 	case <-m.done:
 		return 0, nil
 	case <-ctx.Done():
 		return 1, ctx.Err()
+	}
+}
+
+// monitorRunner polls the VM via SSH to detect when the GitHub Actions
+// runner process exits. When it does, stops the VM so Wait() returns.
+func (m *darwinMacOSVM) monitorRunner(ctx context.Context, ip string) {
+	// Build SSH config — try key first, fall back to password
+	var authMethods []ssh.AuthMethod
+	if m.cfg.SSHSigner != nil {
+		if key, ok := m.cfg.SSHSigner.(ed25519.PrivateKey); ok {
+			if signer, err := ssh.NewSignerFromKey(key); err == nil {
+				authMethods = append(authMethods, ssh.PublicKeys(signer))
+			}
+		}
+	}
+	authMethods = append(authMethods, ssh.Password("admin"))
+
+	sshCfg := &ssh.ClientConfig{
+		User:            "admin",
+		Auth:            authMethods,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	}
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-m.done:
+			return
+		case <-ticker.C:
+		}
+
+		client, err := ssh.Dial("tcp", ip+":22", sshCfg)
+		if err != nil {
+			// SSH failed — VM may have crashed or been stopped
+			m.cfg.Log.Info("runner monitor: SSH unreachable, stopping VM", "id", m.id)
+			m.Stop()
+			return
+		}
+
+		session, err := client.NewSession()
+		if err != nil {
+			if closeErr := client.Close(); closeErr != nil {
+				m.cfg.Log.Debug("closing monitor SSH client", "error", closeErr)
+			}
+			continue
+		}
+
+		out, err := session.CombinedOutput("pgrep -f Runner.Listener || echo EXITED")
+		if closeErr := session.Close(); closeErr != nil {
+			m.cfg.Log.Debug("closing monitor session", "error", closeErr)
+		}
+		if closeErr := client.Close(); closeErr != nil {
+			m.cfg.Log.Debug("closing monitor client", "error", closeErr)
+		}
+
+		if err != nil {
+			continue
+		}
+
+		if strings.TrimSpace(string(out)) == "EXITED" {
+			// Give the runner a grace period to report results to GitHub
+			// before we tear down the VM and network.
+			m.cfg.Log.Info("runner process exited, waiting 30s for result upload", "id", m.id)
+			select {
+			case <-time.After(30 * time.Second):
+			case <-ctx.Done():
+			case <-m.done:
+			}
+			m.cfg.Log.Info("grace period complete, stopping VM", "id", m.id)
+			m.Stop()
+			return
+		}
 	}
 }
 
