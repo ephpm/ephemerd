@@ -81,6 +81,14 @@ func E2ewoodpecker() error {
 	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "8m", "-run", "TestWoodpecker_E2E", "./test/e2e/woodpecker/")
 }
 
+// E2EDind runs the DinD (fake Docker socket) container lifecycle e2e test.
+// Boots Forgejo via docker-compose, runs workflows that exercise container
+// create/start/inspect via the runner's Docker socket.
+// Requires: docker with compose support.
+func E2edind() error {
+	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "6m", "./test/e2e/dind/")
+}
+
 // CI runs download, lint, test, and build.
 func CI() {
 	mg.SerialDeps(Lint, Test, build.Build)

@@ -69,8 +69,20 @@ func (l *linuxNetworking) setup(ctx context.Context, id string, netns string) (*
 		return nil, fmt.Errorf("CNI setup for %s: %w", id, err)
 	}
 
-	l.cfg.Log.Debug("network attached", "id", id, "ips", result.Interfaces)
-	return &SetupResult{NetNS: netns}, nil
+	// Extract container IP from the CNI result.
+	var ip string
+	for _, iface := range result.Interfaces {
+		for _, ipCfg := range iface.IPConfigs {
+			ip = ipCfg.IP.String()
+			break
+		}
+		if ip != "" {
+			break
+		}
+	}
+
+	l.cfg.Log.Debug("network attached", "id", id, "ip", ip)
+	return &SetupResult{NetNS: netns, IP: ip}, nil
 }
 
 func (l *linuxNetworking) teardown(ctx context.Context, id string, netns string) error {

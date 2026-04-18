@@ -1,6 +1,7 @@
 package dind
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -81,10 +82,10 @@ func TestVersion(t *testing.T) {
 			t.Fatalf("GET %s: %v", path, err)
 		}
 		defer func() {
-		if err := resp.Body.Close(); err != nil {
-			t.Logf("closing response body: %v", err)
-		}
-	}()
+			if err := resp.Body.Close(); err != nil {
+				t.Logf("closing response body: %v", err)
+			}
+		}()
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("%s: status = %d, want 200", path, resp.StatusCode)
@@ -157,13 +158,159 @@ func TestImageListEmpty(t *testing.T) {
 	}
 }
 
-func TestNotImplemented(t *testing.T) {
+func TestContainerListEmpty(t *testing.T) {
 	s := newTestServer(t)
 	client := dialSocket(s.SocketPath())
 
 	resp, err := client.Get("http://docker/containers/json")
 	if err != nil {
 		t.Fatalf("GET /containers/json: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var containers []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&containers); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(containers) != 0 {
+		t.Errorf("expected empty container list, got %d", len(containers))
+	}
+}
+
+func TestContainerCreateNoClient(t *testing.T) {
+	s := newTestServer(t)
+	client := dialSocket(s.SocketPath())
+
+	body, _ := json.Marshal(map[string]any{"Image": "alpine:latest"})
+	resp, err := client.Post("http://docker/containers/create", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /containers/create: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500 (no containerd client)", resp.StatusCode)
+	}
+}
+
+func TestContainerCreateNoImage(t *testing.T) {
+	s := newTestServer(t)
+	client := dialSocket(s.SocketPath())
+
+	body, _ := json.Marshal(map[string]any{"Cmd": []string{"echo", "hello"}})
+	resp, err := client.Post("http://docker/containers/create", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /containers/create: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
+
+	// No containerd client → 500 before image check.
+	// This validates that the request parsing works.
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", resp.StatusCode)
+	}
+}
+
+func TestContainerInspectNotFound(t *testing.T) {
+	s := newTestServer(t)
+	client := dialSocket(s.SocketPath())
+
+	resp, err := client.Get("http://docker/containers/nonexistent/json")
+	if err != nil {
+		t.Fatalf("GET /containers/nonexistent/json: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestContainerStartNotFound(t *testing.T) {
+	s := newTestServer(t)
+	client := dialSocket(s.SocketPath())
+
+	resp, err := client.Post("http://docker/containers/nonexistent/start", "", nil)
+	if err != nil {
+		t.Fatalf("POST /containers/nonexistent/start: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestContainerWaitNotFound(t *testing.T) {
+	s := newTestServer(t)
+	client := dialSocket(s.SocketPath())
+
+	resp, err := client.Post("http://docker/containers/nonexistent/wait", "", nil)
+	if err != nil {
+		t.Fatalf("POST /containers/nonexistent/wait: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestContainerLogsNotFound(t *testing.T) {
+	s := newTestServer(t)
+	client := dialSocket(s.SocketPath())
+
+	resp, err := client.Get("http://docker/containers/nonexistent/logs")
+	if err != nil {
+		t.Fatalf("GET /containers/nonexistent/logs: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestNotImplemented(t *testing.T) {
+	s := newTestServer(t)
+	client := dialSocket(s.SocketPath())
+
+	// networks endpoint is not implemented
+	resp, err := client.Get("http://docker/networks")
+	if err != nil {
+		t.Fatalf("GET /networks: %v", err)
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
@@ -245,5 +392,25 @@ func TestImagePullMissingFromImage(t *testing.T) {
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestVersionedContainerRoutes(t *testing.T) {
+	s := newTestServer(t)
+	client := dialSocket(s.SocketPath())
+
+	// Versioned path should route correctly.
+	resp, err := client.Get("http://docker/v1.45/containers/json")
+	if err != nil {
+		t.Fatalf("GET /v1.45/containers/json: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
 	}
 }

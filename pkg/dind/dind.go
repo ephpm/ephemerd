@@ -15,9 +15,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/containerd/containerd/v2/client"
+	"github.com/ephpm/ephemerd/pkg/networking"
 )
 
 // Server is a per-job fake Docker daemon.
@@ -27,10 +29,12 @@ type Server struct {
 	listener net.Listener
 	server   *http.Server
 	client   *client.Client
+	network  *networking.Manager
 	log      *slog.Logger
 
-	mu     sync.Mutex
-	images map[string]*imageEntry // in-memory image store scoped to this job
+	mu         sync.Mutex
+	images     map[string]*imageEntry    // in-memory image store scoped to this job
+	containers map[string]*containerEntry // containers created through this socket
 }
 
 type imageEntry struct {
@@ -51,6 +55,10 @@ type Config struct {
 	// Client is the containerd client for image pulls and container ops.
 	Client *client.Client
 
+	// Network is the networking manager for attaching sibling containers
+	// to the CNI bridge. May be nil if networking is not available.
+	Network *networking.Manager
+
 	Log *slog.Logger
 }
 
@@ -70,11 +78,13 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	return &Server{
-		jobID:    cfg.JobID,
-		sockPath: sockPath,
-		client:   cfg.Client,
-		log:      cfg.Log.With("component", "dind", "job_id", cfg.JobID),
-		images:   make(map[string]*imageEntry),
+		jobID:      cfg.JobID,
+		sockPath:   sockPath,
+		client:     cfg.Client,
+		network:    cfg.Network,
+		log:        cfg.Log.With("component", "dind", "job_id", cfg.JobID),
+		images:     make(map[string]*imageEntry),
+		containers: make(map[string]*containerEntry),
 	}, nil
 }
 
@@ -107,9 +117,13 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// Stop shuts down the server and cleans up all per-job state.
+// Stop shuts down the server and cleans up all per-job state,
+// including any containers created through this socket.
 func (s *Server) Stop() {
 	s.log.Info("stopping fake docker daemon")
+
+	// Destroy all containers created through this socket.
+	s.destroyAllContainers()
 
 	if s.server != nil {
 		if err := s.server.Shutdown(context.Background()); err != nil {
@@ -159,6 +173,12 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.handleImageList(w, r)
 	case path == "/images/create" && r.Method == http.MethodPost:
 		s.handleImagePull(w, r)
+	case path == "/containers/create" && r.Method == http.MethodPost:
+		s.handleContainerCreate(w, r)
+	case path == "/containers/json" && r.Method == http.MethodGet:
+		s.handleContainerList(w, r)
+	case strings.HasPrefix(path, "/containers/"):
+		s.routeContainer(w, r, path)
 	default:
 		s.handleNotImplemented(w, r)
 	}
@@ -220,10 +240,10 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		"DockerRootDir":     "/var/lib/docker",
 		"RegistryConfig":    map[string]any{"InsecureRegistryCIDRs": []string{}, "IndexConfigs": map[string]any{}},
 		"SecurityOptions":   []string{},
-		"Containers":        0,
-		"ContainersRunning": 0,
+		"Containers":        s.countContainers(),
+		"ContainersRunning": s.countContainersByStatus("running"),
 		"ContainersPaused":  0,
-		"ContainersStopped": 0,
+		"ContainersStopped": s.countContainersByStatus("exited"),
 		"Images":            len(s.images),
 	}
 	writeJSON(w, http.StatusOK, resp)

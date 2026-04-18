@@ -86,6 +86,9 @@ type SetupResult struct {
 	// EndpointID is the HCN endpoint ID (Windows only). Used to attach
 	// the network to the container via the OCI spec.
 	EndpointID string
+	// IP is the container's IP address on the bridge network.
+	// Populated on Linux from the CNI result; empty on other platforms.
+	IP string
 }
 
 // platformNetworking is implemented per-OS.
