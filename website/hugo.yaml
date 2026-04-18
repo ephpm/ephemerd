@@ -32,8 +32,8 @@ params:
     width: normal
 
   theme:
-    default: system
-    displayToggle: true
+    default: light
+    displayToggle: false
 
   search:
     enable: true
