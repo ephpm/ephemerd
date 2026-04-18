@@ -1,0 +1,57 @@
+baseURL: https://ephpm.github.io/ephemerd/
+title: ephemerd
+locale: en-us
+
+enableGitInfo: true
+
+module:
+  imports:
+    - path: github.com/imfing/hextra
+
+menu:
+  main:
+    - name: Docs
+      pageRef: /docs
+      weight: 1
+    - name: Architecture
+      pageRef: /architecture
+      weight: 2
+    - name: CLI
+      pageRef: /cli
+      weight: 3
+    - name: GitHub
+      url: https://github.com/ephpm/ephemerd
+      weight: 10
+      params:
+        icon: github
+
+params:
+  navbar:
+    displayTitle: true
+    displayLogo: false
+    width: normal
+
+  theme:
+    default: system
+    displayToggle: true
+
+  search:
+    enable: true
+    type: flexsearch
+    flexsearch:
+      index: content
+      tokenize: forward
+
+  footer:
+    displayCopyright: true
+    displayPoweredBy: false
+
+  page:
+    width: normal
+
+markup:
+  goldmark:
+    renderer:
+      unsafe: true
+  highlight:
+    noClasses: false
