@@ -54,6 +54,33 @@ jobs:
           name: ephemerd-darwin-arm64
           path: ephemerd
 
+  build-linux-arm64:
+    name: Build (Linux arm64)
+    runs-on: [self-hosted, linux, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install mage
+        run: go install github.com/magefile/mage@latest
+
+      - name: Build Linux arm64 binary
+        run: mage build
+
+      - name: Verify binary
+        run: |
+          ./ephemerd --version
+          file ./ephemerd
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephemerd-linux-arm64
+          path: ephemerd
+
   build-windows:
     name: Build (Windows amd64)
     runs-on: [self-hosted, linux, x64]
