@@ -106,9 +106,7 @@ jobs:
             Write-Host "FAIL: no internet"
           }
 
-      - uses: actions/checkout@v4
-
-      - name: Verify checkout
+      - name: Filesystem
         run: |
+          Write-Host "Working directory: $(Get-Location)"
           Get-ChildItem | Select-Object Name | Select-Object -First 10
-          git log --oneline -3
