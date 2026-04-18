@@ -45,15 +45,16 @@ var containerCapabilities = []string{
 
 // Config for the container runtime.
 type Config struct {
-	Client       *client.Client
-	RunnerDir    string // host path to extracted runner binary
-	RunnerMount  string // container path to mount runner at
-	DefaultImage string // override default container image (auto-detected if empty)
-	LogDir       string // directory for per-job container logs
-	DataDir      string // ephemerd data directory (used for dind socket paths)
-	DindEnabled  bool   // mount a fake Docker socket into each container
-	Network      *networking.Manager
-	Log          *slog.Logger
+	Client          *client.Client
+	RunnerDir       string // host path to extracted runner binary
+	RunnerMount     string // container path to mount runner at
+	DefaultImage    string // override default container image (auto-detected if empty)
+	LogDir          string // directory for per-job container logs
+	DataDir         string // ephemerd data directory (used for dind socket paths)
+	DindEnabled     bool   // mount a fake Docker socket into each container
+	ModuleProxyAddr string // if set, inject GOPROXY env var pointing at this address
+	Network         *networking.Manager
+	Log             *slog.Logger
 }
 
 // Runtime manages container lifecycle for runner environments.
@@ -231,11 +232,14 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 	}
 
 	// Build container spec
+	envVars := []string{"RUNNER_ALLOW_RUNASROOT=1"}
+	if r.cfg.ModuleProxyAddr != "" {
+		envVars = append(envVars, "GOPROXY=http://"+r.cfg.ModuleProxyAddr+",direct")
+	}
+
 	opts := []oci.SpecOpts{
 		oci.WithImageConfig(img),
-		oci.WithEnv([]string{
-			"RUNNER_ALLOW_RUNASROOT=1",
-		}),
+		oci.WithEnv(envVars),
 		// Allow sudo inside the container. The default OCI spec sets
 		// NoNewPrivileges=true which blocks privilege escalation, but
 		// jobs need sudo for apt-get install and similar operations.

@@ -81,6 +81,13 @@ func E2ewoodpecker() error {
 	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "8m", "-run", "TestWoodpecker_E2E", "./test/e2e/woodpecker/")
 }
 
+// E2EModProxy runs the Go module proxy e2e test.
+// Starts a local proxy, fetches real modules, and builds a small Go app through it.
+// Requires: internet access, go toolchain.
+func E2emodproxy() error {
+	return sh.RunV("go", "test", "-tags", "e2e", "-v", "-timeout", "2m", "-run", "TestModProxy_E2E", "./test/e2e/modproxy/")
+}
+
 // CI runs download, lint, test, and build.
 func CI() {
 	mg.SerialDeps(Lint, Test, build.Build)

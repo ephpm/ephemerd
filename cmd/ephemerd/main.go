@@ -15,6 +15,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/containerd"
 	"github.com/ephpm/ephemerd/pkg/github"
 	"github.com/ephpm/ephemerd/pkg/metrics"
+	"github.com/ephpm/ephemerd/pkg/modproxy"
 	"github.com/ephpm/ephemerd/pkg/networking"
 	"github.com/ephpm/ephemerd/pkg/runner"
 	"github.com/ephpm/ephemerd/pkg/runtime"
@@ -221,13 +222,24 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		return fmt.Errorf("extracting CNI plugins: %w", err)
 	}
 
+	// Determine extra gateway ports for firewall (e.g., module proxy)
+	var gatewayPorts []int
+	modProxyPort := cfg.ModuleProxy.Port
+	if modProxyPort == 0 {
+		modProxyPort = 8082
+	}
+	if cfg.ModuleProxy.Enabled {
+		gatewayPorts = append(gatewayPorts, modProxyPort)
+	}
+
 	// Initialize container networking
 	net, err := networking.New(networking.Config{
-		DataDir:   configDir,
-		Subnet:    cfg.Network.Subnet,
-		MTU:       cfg.Network.MTU,
-		CNIBinDir: cm.Dir(),
-		Log:       log,
+		DataDir:      configDir,
+		Subnet:       cfg.Network.Subnet,
+		MTU:          cfg.Network.MTU,
+		CNIBinDir:    cm.Dir(),
+		GatewayPorts: gatewayPorts,
+		Log:          log,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing networking: %w", err)
@@ -239,17 +251,52 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	}
 	defer net.Cleanup()
 
+	// Start Go module caching proxy if enabled
+	var moduleProxyAddr string
+	if cfg.ModuleProxy.Enabled {
+		upstream := cfg.ModuleProxy.Upstream
+		if upstream == "" {
+			upstream = "https://proxy.golang.org"
+		}
+		cleanup := cfg.ModuleProxy.Cleanup
+		// Default cleanup to true when not explicitly set in config.
+		// TOML zero value for bool is false, so we check if the entire
+		// section was present by checking Enabled (which must be true here).
+		if !cleanup {
+			cleanup = true
+		}
+
+		proxy := modproxy.New(modproxy.Config{
+			CacheDir:   joinPath(configDir, "cache", "gomod"),
+			Upstream:   upstream,
+			ListenAddr: fmt.Sprintf("%s:%d", net.GatewayIP(), modProxyPort),
+			Cleanup:    cleanup,
+			Log:        log,
+		})
+		if err := proxy.Start(); err != nil {
+			log.Warn("failed to start module proxy, continuing without it", "error", err)
+		} else {
+			moduleProxyAddr = proxy.Addr()
+			defer func() {
+				if err := proxy.Stop(); err != nil {
+					log.Warn("error stopping module proxy", "error", err)
+				}
+			}()
+		}
+	}
+
 	// Create runtime (container lifecycle manager)
 	rt, err := runtime.New(runtime.Config{
-		Client:       ctrdClient,
-		RunnerDir:    rm.Dir(),
-		RunnerMount:  rm.ContainerDir(),
-		DefaultImage: cfg.Runner.DefaultImage,
-		LogDir:       joinPath(configDir, "logs"),
-		DataDir:      configDir,
-		DindEnabled:  cfg.Dind.Enabled,
-		Network:      net,
-		Log:          log,
+		Client:          ctrdClient,
+		RunnerDir:       rm.Dir(),
+		RunnerMount:     rm.ContainerDir(),
+		DefaultImage:    cfg.Runner.DefaultImage,
+		LogDir:          joinPath(configDir, "logs"),
+		DataDir:         configDir,
+		DindEnabled:     cfg.Dind.Enabled,
+		ModuleProxyAddr: moduleProxyAddr,
+		Network:         net,
+		Log:             log,
 	})
 	if err != nil {
 		return fmt.Errorf("creating runtime: %w", err)

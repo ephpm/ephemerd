@@ -69,6 +69,14 @@ func (l *linuxNetworking) installFirewallRules() error {
 		}
 	}
 
+	// 3b. Allow extra gateway ports (e.g., Go module proxy)
+	for _, port := range l.cfg.GatewayPorts {
+		l.cfg.Log.Info("adding firewall rule", "rule", fmt.Sprintf("allow tcp/%d to gateway", port))
+		if err := iptables("-A", chainName, "-p", "tcp", "-d", gateway, "--dport", fmt.Sprintf("%d", port), "-j", "ACCEPT"); err != nil {
+			return fmt.Errorf("adding gateway port rule (tcp/%d): %w", port, err)
+		}
+	}
+
 	// 4. Deny private ranges
 	for _, cidr := range deniedRanges {
 		l.cfg.Log.Info("adding firewall rule", "rule", "deny "+cidr)
