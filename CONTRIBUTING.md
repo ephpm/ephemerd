@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **Go 1.23+**
+- **Go 1.26+**
 - **[Mage](https://magefile.org/)** — `go install github.com/magefile/mage@latest`
 - **Linux, macOS (Apple Silicon), or Windows** — ephemerd builds on all three
 
@@ -42,11 +42,16 @@ cmd/ephemerd/       CLI entry point (urfave-cli/v3)
 pkg/                library packages
   config/           TOML config parsing
   containerd/       in-process containerd server
-  dind/             fake Docker daemon (not yet merged)
+  dind/             fake Docker daemon
   github/           GitHub API client + webhook handler
   networking/       CNI (Linux), HCN (Windows), passthrough (macOS)
   runtime/          container lifecycle (create/wait/destroy)
   scheduler/        job discovery, routing, dispatch
+  tunnel/           webhook tunnel providers (localtunnel, ngrok)
+  providers/        multi-forge provider interface (GitHub, Forgejo, Gitea, GitLab, Woodpecker)
+  metrics/          Prometheus metrics endpoint
+  artifacts/        OCI artifact extraction for macOS VM jobs
+  workflow/         local workflow parser and runner (ephemerd run)
   vm/               Linux VM (WSL/Vz) and macOS VM (Vz)
 api/v1/             gRPC protobuf definitions
 mage/               Mage build and download targets
@@ -95,7 +100,10 @@ Design decisions and future plans are documented in `docs/arch/`:
 - `overview.md` — full system architecture
 - `macos.md` — macOS Linux VM + per-job macOS VMs
 - `windows-single-scheduler.md` — Windows WSL dispatch model
-- `dind.md` — fake Docker daemon design (not yet implemented)
-- `gitlab.md` — GitLab integration design (not yet implemented)
+- `dind.md` — fake Docker daemon design
+- `gitlab.md` — GitLab integration design (superseded by providers.md)
 - `webhooks.md` — webhook tunnel architecture
 - `rootfs.md` — pre-baked Alpine rootfs for Linux VMs
+- `providers.md` — multi-forge provider interface
+- `forgejo-gitea.md` — Forgejo/Gitea Actions integration
+- `forge-runner.md` — forge-runner design spec (future)

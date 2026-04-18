@@ -9,22 +9,9 @@
 - [ ] Verify macOS VM jobs: APFS clone-on-write boot, runner picks up job, VM destroyed after
 - [ ] Verify OCI artifact extraction: EPHEMERD_IMAGE pulls image, layers unpacked, files available in macOS VM via virtio-fs
 
-### Windows Linux VM
-- [ ] Complete and verify `linuxvm_windows.go` — Hyper-V Linux VM for cross-OS Linux jobs on Windows hosts
-- [ ] Document how to create the Linux VHDX image with containerd pre-installed
-
 ## Should Do (Production Hardening)
 
-### Windows service integration
-- [ ] Install/uninstall as Windows service via sc.exe or NSSM
-- [ ] Document Windows setup (enable Hyper-V, install ephemerd, configure service)
-
-### Metrics
-- [ ] Prometheus/OpenMetrics endpoint (active jobs, total completed, container startup latency, job duration)
-- [ ] Currently only basic counters in `/healthz` JSON response
-
 ### Log management
-- [ ] Log rotation for per-job logs in `<dataDir>/logs/` — files accumulate with no cleanup
 - [ ] Optional journald integration on Linux
 - [ ] Optional Windows Event Log integration
 
@@ -34,23 +21,24 @@
 ## Nice to Have (Future)
 
 ### Docker-in-Docker (dind) shim
-- [ ] Fake Docker Engine API server on Unix socket in each container (architecture in `docs/arch/dind.md`)
+- [x] Fake Docker Engine API server on Unix socket in each container (`pkg/dind`)
+- [x] Health endpoints (`/_ping`, `/version`, `/info`)
+- [x] Image listing and pulling via containerd
 - [ ] Container create/start/stop/delete (sidecars via containerd)
 - [ ] Image build via embedded buildah
 - [ ] `/etc/hosts` injection for service discovery
 - [ ] `services:` YAML support via the runner's Docker API calls
 
 ### GitLab CI integration
-- [ ] Architecture designed in `docs/arch/gitlab.md` — custom executor model
+- [x] Architecture designed in `docs/arch/gitlab.md` — custom executor model
+- [x] Provider stub with e2e test (`pkg/providers/gitlab/`, `test/e2e/gitlab/`)
 - [ ] Embed `gitlab-runner` binary
 - [ ] Generate custom executor config (prepare/run/cleanup scripts)
-- [ ] Runner registration with GitLab instance
-- [ ] No code exists yet — fully greenfield
 
 ### Gitea/Forgejo Actions
-- [ ] Near-free since runner protocol is GitHub Actions compatible
-- [ ] `act_runner` binary embedding
-- [ ] Minimal changes to GitHub client for Gitea API differences
+- [x] Provider stubs with e2e tests (`pkg/providers/forgejo/`, `pkg/providers/gitea/`)
+- [x] E2E test boots Forgejo in Docker, creates repo, runs workflow end-to-end
+- [ ] Full integration with upstream runners in containers
 
 ### Configuration enhancements
 - [ ] Per-repo image overrides
@@ -63,9 +51,8 @@
 - [ ] No code exists
 
 ### macOS base image tooling
-- [ ] `ephemerd vm setup-macos` CLI command to provision base macOS VM image
-- [ ] Download IPSW, boot VM, interactive or scripted provisioning, snapshot
-- [ ] Currently users must create the base image manually
+- [x] Automatic Tart OCI image pull on first boot (`EnsureMacOSVMDisk()`)
+- [ ] `ephemerd vm setup-macos` CLI command for interactive provisioning (optional — auto-pull covers most cases)
 
 ### Documentation
 - [ ] Windows setup guide (Hyper-V, VHDX image, service install)
@@ -85,7 +72,7 @@
 - [x] OCI artifact extraction for macOS VM jobs (pull image, extract layers to shared directory, cleanup)
 
 ### Job discovery
-- [x] Polling mode (default, 10s interval, zero config)
+- [x] Polling mode (default, 30s interval, zero config)
 - [x] Webhook mode (TLS, HMAC-SHA256 signature verification)
 - [x] Localtunnel integration (vendored, opt-in via `tunnel = "localtunnel"`)
 - [x] Org-level runners when `repos` config is omitted
@@ -128,11 +115,31 @@
 
 ### CLI
 - [x] `ephemerd serve` — daemon with signal handling
+- [x] `ephemerd run` — run workflows locally without pushing to GitHub
+- [x] `ephemerd start/stop/restart/logs` — system service management
 - [x] `ephemerd status` — query health endpoint
 - [x] `ephemerd drain` — trigger graceful shutdown
+- [x] `ephemerd jobs` — list/kill/logs/ssh for running jobs
 - [x] `ephemerd images` — list cached OCI images via containerd
 - [x] `ephemerd config` — validate and display config
+- [x] `ephemerd doctor` — system readiness checks and cleanup
+- [x] `ephemerd install/uninstall` — binary + system service registration (Linux, macOS, Windows)
 - [x] `ephemerd ctrctl` — containerd debug passthrough
+
+### Windows
+- [x] WSL2 Linux VM for cross-OS Linux jobs (`linuxvm_windows.go`)
+- [x] Single-poller dispatch architecture (Windows host dispatches Linux jobs to WSL via gRPC)
+- [x] Install/uninstall as Windows service via `sc.exe`
+- [x] Pre-baked Alpine rootfs with gcompat + iptables for WSL
+
+### Metrics & log management
+- [x] Prometheus/OpenMetrics endpoint (`pkg/metrics/`, configurable via `[metrics]`)
+- [x] Log retention with configurable max age (`log_retention` config, default 7d)
+
+### Providers
+- [x] Multi-forge provider interface (`pkg/providers/provider.go`)
+- [x] Woodpecker CI provider (`pkg/providers/woodpecker/`)
+- [x] E2E tests for Forgejo, Gitea, GitLab, GitHub, Woodpecker
 
 ### Build system
 - [x] Mage build system with download, lint, test, build targets

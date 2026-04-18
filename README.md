@@ -307,7 +307,15 @@ token = "glrt-xxxxxxxxxxxx"           # runner auth token (GitLab 16+)
 tags = ["linux", "docker", "ephemerd"]
 ```
 
-The provider is auto-detected from which section has credentials set. See [docs/arch/providers.md](docs/arch/providers.md) for the full architecture.
+### Woodpecker CI
+
+```toml
+[woodpecker]
+server_url = "woodpecker.example.com:9000"   # Woodpecker server gRPC URL
+agent_secret = "your-shared-secret"          # agent authentication secret
+```
+
+The provider is auto-detected from which section has credentials set. Precedence: Forgejo > Gitea > GitLab > Woodpecker > GitHub (default). See [docs/arch/providers.md](docs/arch/providers.md) for the full architecture.
 
 ## Configuration
 
@@ -319,10 +327,11 @@ owner = "your-org"                    # org or user
 # repos = ["repo1", "repo2"]         # optional — omit for org-level runners
 
 [webhook]
-# Default: localtunnel webhook delivery (instant, zero config)
+# Default: none (polling). Set to "localtunnel" or "ngrok" for instant delivery.
+# tunnel = "localtunnel"             # zero-config tunnel (recommended)
+# tunnel_url = "http://tunnels.example.com"  # self-hosted localtunnel server
 # tunnel = "ngrok"                   # use ngrok instead (requires auth token)
 # ngrok_authtoken = "..."            # or set NGROK_AUTHTOKEN env var
-# tunnel = "none"                    # disable tunnel, fall back to polling
 
 [runner]
 max_concurrent = 4                    # parallel jobs
@@ -338,11 +347,24 @@ memory_mb = 2048
 disk_size_gb = 50                     # sparse — only uses space as needed
 
 # macOS-native jobs (macOS hosts only)
+# No enable/disable toggle — macOS VMs always run on darwin hosts.
 [vm.macos]
-enabled = false                       # enable macOS VM per-job
-base_image = "/path/to/macos.img"    # provisioned base image
+disk_image = "/path/to/macos.img"    # base disk image (or auto-pulled from Tart OCI registry)
 cpus = 4
 memory_mb = 8192
+max_concurrent = 2                    # max simultaneous macOS VMs (default: auto-detected)
+
+[network]
+# subnet = "10.88.0.0/16"           # container network subnet
+# mtu = 1500
+
+[dind]
+# enabled = false                    # mount fake Docker socket into containers
+
+[metrics]
+# enabled = false                    # Prometheus metrics endpoint
+# port = 9090
+# path = "/metrics"
 
 # Go module caching proxy — speeds up `go mod download` across jobs
 [module_proxy]
@@ -354,6 +376,7 @@ enabled = true                        # run a GOPROXY on the bridge gateway
 [log]
 level = "info"                        # debug, info, warn, error
 format = "text"                       # text or json
+log_retention = "7d"                  # max age for job log files
 ```
 
 ## Job Discovery
@@ -367,7 +390,7 @@ sequenceDiagram
     participant E as ephemerd
     participant GH as GitHub
 
-    loop Every 10 seconds
+    loop Every 30 seconds
         E->>GH: GET /repos/.../actions/runs?status=queued
         GH-->>E: Queued jobs (if any)
     end
@@ -377,16 +400,16 @@ sequenceDiagram
     E->>E: Create container, run job
 ```
 
-Jobs start within 10 seconds of being queued. Tune the interval in the config:
+Jobs start within 30 seconds of being queued (default poll interval). Tune it in the config:
 
 ```toml
 [github]
-poll_interval = "5s"   # faster polling, uses more API quota
+poll_interval = "10s"   # faster polling, uses more API quota
 ```
 
 #### Rate limits and GitHub App authentication
 
-A personal access token (PAT) gets 5,000 API requests per hour. At the default 10s poll interval, ephemerd uses ~360 requests/hour per repo — fine for a few repos, but it adds up.
+A personal access token (PAT) gets 5,000 API requests per hour. At the default 30s poll interval, ephemerd uses ~120 requests/hour per repo — fine for many repos, but it adds up.
 
 For higher limits, use a [GitHub App](https://docs.github.com/en/apps/creating-github-apps/about-creating-github-apps/about-creating-github-apps) instead of a PAT. GitHub Apps get 15,000 requests per hour per installation and don't count against your personal quota.
 
@@ -486,8 +509,14 @@ Every job runs in full isolation:
 
 ```
 ephemerd serve          Start the daemon
+ephemerd run            Run a workflow locally without pushing to GitHub
+ephemerd start          Start the ephemerd system service
+ephemerd stop           Stop the ephemerd system service
+ephemerd restart        Restart the ephemerd system service
+ephemerd logs           Tail the ephemerd system service logs
 ephemerd status         Show running jobs, health, uptime
 ephemerd drain          Stop accepting new jobs, wait for running jobs
+ephemerd jobs           List and manage running jobs (kill, logs, ssh)
 ephemerd images         List cached container images
 ephemerd config         Validate configuration
 ephemerd doctor         Check system readiness and clean up stale state

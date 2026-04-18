@@ -129,7 +129,7 @@ Previously just blocked on `<-ctx.Done()`. Now also:
 ## What Stays the Same
 
 - WSL distro lifecycle (import, terminate, unregister)
-- gcompat + iptables installation
+- gcompat + iptables (pre-baked in rootfs, see `docs/arch/rootfs.md`)
 - UTF-16LE WSL output decoding
 - Binary copy (still needed - containerd runs in-process)
 - `canHandleJob()` for macOS/other OS filtering

@@ -16,7 +16,9 @@ ephemerd is a single binary with several subcommands.
 | [drain](drain.md) | Gracefully stop accepting new jobs |
 | [jobs](jobs.md) | List and manage running jobs |
 | [config](config.md) | Validate the configuration file |
+| [images](images.md) | List cached container images |
 | [doctor](doctor.md) | Check system readiness and clean up stale state |
+| [ctrctl](ctrctl.md) | Debug the embedded containerd (passthrough to ctr) |
 
 ## Global flags
 

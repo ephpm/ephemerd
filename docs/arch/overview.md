@@ -180,12 +180,17 @@ Two options for receiving jobs:
 - Zero inbound port requirements — works behind NAT, no TLS certs needed
 - Simple to set up, ideal for homelab
 
-**Option B: Webhook + JIT Runners**
-- Listen for `workflow_job` webhook events over TLS
+**Option B: Webhook via Tunnel**
+- ephemerd creates a tunnel (localtunnel or ngrok) and registers webhooks automatically
 - Instant job delivery, no polling delay
-- Requires inbound port + TLS certificate
+- No inbound ports needed — tunnels work behind NAT
+- On shutdown, webhooks are deregistered
 
-Start with polling for simplicity. Enable webhooks by adding TLS cert/key to config.
+**Option C: Webhook via Direct TLS**
+- For hosts with a public IP and TLS certificate
+- Requires inbound port + TLS certificate + manual webhook setup
+
+Start with polling for simplicity. Enable tunnels for instant delivery.
 
 ### GitLab Integration
 
@@ -267,7 +272,7 @@ owner = "ephpm"
 repos = ["ephpm", "php-sdk", "litewire"]
 
 # Job discovery: polling (default) or webhook
-poll_interval = "10s"
+poll_interval = "30s"
 # Webhook mode (optional): set tls_cert + tls_key to enable
 # webhook_port = 8080
 # webhook_secret = "your_secret"
@@ -323,9 +328,9 @@ GitHub's runner binary blocks container operations (`services:`, `container:`) o
 
 This is functionally identical — `services:` is syntactic sugar. Document this for users and move on.
 
-### macOS: No macOS-native jobs (initial release)
+### macOS: Implemented
 
-ephemerd on macOS runs Linux jobs inside a Virtualization.framework VM. macOS-native jobs (Xcode, Swift, code signing) require macOS VM snapshots with a completely different provisioning pipeline. This is deferred — use Tart or Anka for macOS-native CI if needed.
+macOS-native jobs are fully supported. Per-job ephemeral macOS VMs boot from a base image via APFS clone-on-write. Base images are automatically pulled from the Tart OCI registry (e.g., `ghcr.io/cirruslabs/macos-tahoe-vanilla:latest`) on first use, or provisioned manually via a disk image path in `[vm.macos] disk_image`.
 
 ### ARM64 Windows
 
@@ -339,7 +344,7 @@ PHP and its toolchain don't support Windows ARM64 yet. ephemerd can support it a
 - **GitHub API:** go-github + runner scale set client module
 - **Config:** TOML (BurntSushi/toml)
 - **Logging:** slog (stdlib structured logging)
-- **CLI:** cobra
+- **CLI:** urfave-cli/v3
 
 ## Project Structure
 
@@ -347,28 +352,46 @@ PHP and its toolchain don't support Windows ARM64 yet. ephemerd can support it a
 ephemerd/
   cmd/
     ephemerd/
-      main.go             -- CLI entry point, config loading, daemon lifecycle
+      main.go             -- CLI entry point (urfave-cli/v3), daemon lifecycle
+      commands.go         -- Subcommand implementations (jobs, images, ctrctl)
+      run.go              -- Local workflow runner (ephemerd run)
+      install.go          -- Install/uninstall as system service
+      doctor.go           -- System readiness checks
+      ssh.go              -- SSH into macOS VM jobs
+      service.go          -- Start/stop/restart/logs for system service
   pkg/
     config/
       config.go           -- Configuration structs, TOML parsing
     containerd/
       server.go           -- Embedded containerd server lifecycle
     github/
-      client.go           -- GitHub API client, webhook/polling
+      client.go           -- GitHub API client
       runner.go           -- JIT runner registration/deregistration
+    providers/
+      provider.go         -- Multi-forge provider interface
+      github/             -- GitHub provider
+      forgejo/            -- Forgejo provider
+      gitea/              -- Gitea provider
+      gitlab/             -- GitLab provider
+      woodpecker/         -- Woodpecker CI provider
     runtime/
-      runtime.go          -- Backend interface: Create/Wait/Destroy
-      containerd.go       -- Linux/Windows: direct containerd containers
-      hyperv.go           -- Windows: Hyper-V isolation options
-      vm.go               -- macOS: Virtualization.framework Linux VM
+      runtime.go          -- Container lifecycle: Create/Wait/Destroy
     networking/
       networking.go       -- CNI bridge (Linux), HCN NAT (Windows), VM NAT (macOS)
     runner/
-      embed.go            -- Embedded GitHub Actions runner binary (go:embed)
-      extract.go          -- Extract/cache runner to data dir
+      runner.go           -- Embedded GitHub Actions runner binary (go:embed)
     scheduler/
       scheduler.go        -- Job queue, concurrency limits, lifecycle
-  Makefile
+      dispatch.go         -- gRPC dispatch for WSL Linux jobs
+    tunnel/               -- Webhook tunnel providers (localtunnel, ngrok)
+    dind/                 -- Fake Docker daemon (Docker API → containerd)
+    artifacts/            -- OCI artifact extraction for macOS VM jobs
+    metrics/              -- Prometheus metrics endpoint
+    workflow/             -- Local workflow parser (ephemerd run)
+    vm/                   -- Linux VM (WSL/Vz) and macOS VM (Vz)
+  api/v1/                 -- gRPC protobuf definitions
+  mage/                   -- Mage build and download targets
+  magefile.go             -- Build system entry point (Mage, not Make)
   go.mod
   go.sum
 ```
