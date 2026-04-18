@@ -265,7 +265,11 @@ func pullTartImage(ctx context.Context, imageRef string, files *MacOSVMDiskFiles
 	if err != nil {
 		return fmt.Errorf("creating disk image: %w", err)
 	}
-	defer diskFile.Close()
+	defer func() {
+		if err := diskFile.Close(); err != nil {
+			log.Warn("closing disk image file", "error", err)
+		}
+	}()
 
 	for i, layer := range diskLayers {
 		log.Info("pulling disk layer",
@@ -274,7 +278,9 @@ func pullTartImage(ctx context.Context, imageRef string, files *MacOSVMDiskFiles
 			"digest", layer.Digest[:19])
 
 		if err := pullAndDecompressDiskLayer(ctx, registry, repo, layer.Digest, token, diskFile, log); err != nil {
-			os.Remove(files.DiskImage) // clean up partial
+			if rmErr := os.Remove(files.DiskImage); rmErr != nil {
+				log.Warn("removing partial disk image", "error", rmErr)
+			}
 			return fmt.Errorf("pulling disk layer %d: %w", i+1, err)
 		}
 	}
@@ -291,14 +297,21 @@ func pullAndDecompressDiskLayer(ctx context.Context, registry, repo, digest, tok
 	var lastErr error
 
 	// Remember file position so we can rewind on retry
-	startPos, _ := out.Seek(0, io.SeekCurrent)
+	startPos, err := out.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
 
 	for attempt := range maxRetries {
 		if attempt > 0 {
 			log.Info("retrying disk layer", "digest", digest[:19], "attempt", attempt+1)
 			// Rewind to start of this layer
-			out.Seek(startPos, io.SeekStart)
-			out.Truncate(startPos)
+			if _, seekErr := out.Seek(startPos, io.SeekStart); seekErr != nil {
+				log.Warn("seeking disk image for retry", "error", seekErr)
+			}
+			if truncErr := out.Truncate(startPos); truncErr != nil {
+				log.Warn("truncating disk image for retry", "error", truncErr)
+			}
 		}
 		lastErr = pullAndDecompressDiskLayerOnce(ctx, registry, repo, digest, token, out, log)
 		if lastErr == nil {
@@ -328,7 +341,7 @@ func pullAndDecompressDiskLayerOnce(ctx context.Context, registry, repo, digest,
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %s fetching blob", resp.Status)
@@ -407,7 +420,7 @@ func appleDecompressLZ4Stream(r io.Reader, w io.Writer) (int64, error) {
 			if err == io.EOF {
 				stream.dst_ptr = (*C.uint8_t)(dstBuf)
 				stream.dst_size = dstBufSize
-				status = C.compression_stream_process(&stream, C.COMPRESSION_STREAM_FINALIZE)
+				_ = C.compression_stream_process(&stream, C.COMPRESSION_STREAM_FINALIZE)
 				produced := dstBufSize - int(stream.dst_size)
 				if produced > 0 {
 					if _, err := w.Write(C.GoBytes(dstBuf, C.int(produced))); err != nil {
@@ -479,7 +492,7 @@ func getRegistryToken(ctx context.Context, registry, repo string) (string, error
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -509,7 +522,7 @@ func fetchManifest(ctx context.Context, registry, repo, tag, token string) (*oci
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -536,7 +549,7 @@ func fetchBlob(ctx context.Context, registry, repo, digest, token string) ([]byt
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)

@@ -70,25 +70,6 @@ type Runtime struct {
 	pullMu sync.Mutex // serializes image pulls to avoid content store contention
 }
 
-// hostToContainerPath rewrites a host filesystem path that lives under
-// cfg.DataDir into the equivalent path as seen by containerd/runc. On
-// Linux and Windows this is a no-op. On Darwin the host's DataDir is
-// shared into the VM via virtio-fs, so the container-side path is
-// ContainerDataDir + the suffix.
-func (r *Runtime) hostToContainerPath(hostPath string) string {
-	if r.cfg.ContainerDataDir == "" || r.cfg.ContainerDataDir == r.cfg.DataDir {
-		return hostPath
-	}
-	if r.cfg.DataDir == "" {
-		return hostPath
-	}
-	rel, err := filepath.Rel(r.cfg.DataDir, hostPath)
-	if err != nil || strings.HasPrefix(rel, "..") {
-		return hostPath
-	}
-	return filepath.Join(r.cfg.ContainerDataDir, rel)
-}
-
 // RunnerEnv represents a running runner environment.
 type RunnerEnv struct {
 	ID        string

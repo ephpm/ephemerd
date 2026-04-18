@@ -1069,10 +1069,6 @@ func (s *Scheduler) cleanSeen() {
 	}
 }
 
-func (s *Scheduler) buildLabels() []string {
-	return buildLabelsForOS(goruntime.GOOS, s.cfg.Labels)
-}
-
 // buildLabelsForOS builds runner labels for a given target OS.
 // Used by the dispatcher to register Linux runners from the Windows host.
 func buildLabelsForOS(targetOS string, extraLabels []string) []string {

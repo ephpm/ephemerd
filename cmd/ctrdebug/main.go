@@ -57,7 +57,7 @@ func main() {
 	}
 
 	c := newClient()
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	ctx := namespaces.WithNamespace(context.Background(), *ns)
 
 	switch args[0] {
@@ -150,7 +150,7 @@ func runExec(ctx context.Context, c *client.Client, id string, cmd []string) {
 		fmt.Printf("exec create: %v\n", err)
 		return
 	}
-	defer proc.Delete(ctx)
+	defer func() { _, _ = proc.Delete(ctx) }()
 	statusC, err := proc.Wait(ctx)
 	if err != nil {
 		fmt.Printf("exec wait: %v\n", err)
@@ -163,7 +163,7 @@ func runExec(ctx context.Context, c *client.Client, id string, cmd []string) {
 	status := <-statusC
 	// Print captured log
 	if data, err := os.ReadFile(hostLogPath); err == nil {
-		os.Stdout.Write(data)
+		_, _ = os.Stdout.Write(data)
 	} else {
 		fmt.Fprintf(os.Stderr, "(no log at %s: %v)\n", hostLogPath, err)
 	}

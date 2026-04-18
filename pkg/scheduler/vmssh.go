@@ -73,7 +73,9 @@ func (s *Scheduler) registerVMSSHHandler(mux *http.ServeMux) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(info)
+		if err := json.NewEncoder(w).Encode(info); err != nil {
+			s.cfg.Log.Warn("failed to encode SSH info response", "error", err)
+		}
 	})
 }
 
@@ -97,10 +99,10 @@ func (s *Scheduler) StartVMSSHServer() (func(), error) {
 	s.registerVMSSHHandler(mux)
 
 	srv := &http.Server{Handler: mux}
-	go srv.Serve(lis)
+	go func() { _ = srv.Serve(lis) }()
 
 	return func() {
-		srv.Close()
-		os.Remove(socketPath)
+		_ = srv.Close()
+		_ = os.Remove(socketPath)
 	}, nil
 }

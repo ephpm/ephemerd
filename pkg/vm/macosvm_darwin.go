@@ -29,7 +29,6 @@ type darwinMacOSVM struct {
 	auxPath   string // per-job copy of aux storage (Vz locks it exclusively)
 	jobDir    string // shared directory for JIT config exchange
 	macAddr   string // VM's MAC address for ARP-based IP discovery
-	vmPass    string // randomized admin password (generated host-side, in memory only)
 	cancel    context.CancelFunc
 	done      chan struct{}
 }
@@ -351,7 +350,9 @@ func (m *darwinMacOSVM) WaitForRunner(ctx context.Context) (string, error) {
 			}
 			continue
 		}
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			m.cfg.Log.Debug("closing SSH probe connection", "error", err)
+		}
 
 		m.cfg.Log.Info("SSH reachable, setting up runner via SSH", "id", m.id, "ip", ip)
 		if err := m.setupRunnerViaSSH(ctx, ip); err != nil {
@@ -378,7 +379,7 @@ func (m *darwinMacOSVM) probeSubnet() {
 		// triggering ARP, not about the reply.
 		go func(addr string) {
 			cmd := exec.Command("ping", "-c", "1", "-W", "100", addr)
-			cmd.Run() // ignore errors — host may not respond
+			_ = cmd.Run() // ignore errors — host may not respond
 		}(ip)
 	}
 }
@@ -521,7 +522,7 @@ func (m *darwinMacOSVM) setupRunnerViaSSH(ctx context.Context, ip string) error 
 	if err != nil {
 		return fmt.Errorf("SSH dial: %w", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	m.cfg.Log.Info("SSH connected to macOS VM", "id", m.id, "ip", ip)
 
@@ -538,7 +539,9 @@ func (m *darwinMacOSVM) setupRunnerViaSSH(ctx context.Context, ip string) error 
 	if out, err := fixSession.CombinedOutput(fixCmd); err != nil {
 		m.cfg.Log.Warn("chown failed", "output", string(out), "error", err)
 	}
-	fixSession.Close()
+	if err := fixSession.Close(); err != nil {
+		m.cfg.Log.Debug("closing fix session", "error", err)
+	}
 
 	// Now start the runner + firewall in the background (fire and forget).
 	setupScript := `
@@ -574,12 +577,16 @@ echo "runner started (pid=$RUNNER_PID)"
 	}
 
 	if err := session.Start(setupScript); err != nil {
-		session.Close()
+		if closeErr := session.Close(); closeErr != nil {
+			m.cfg.Log.Debug("closing failed setup session", "error", closeErr)
+		}
 		return fmt.Errorf("starting setup script: %w", err)
 	}
 
 	time.Sleep(3 * time.Second)
-	session.Close()
+	if err := session.Close(); err != nil {
+		m.cfg.Log.Debug("closing setup session", "error", err)
+	}
 
 	// Write .ready on the host side
 	readyPath := filepath.Join(m.jobDir, ".ready")
@@ -595,14 +602,18 @@ func (m *darwinMacOSVM) Stop() {
 
 	if m.vm != nil {
 		if m.vm.CanRequestStop() {
-			m.vm.RequestStop()
+			if _, err := m.vm.RequestStop(); err != nil {
+				m.cfg.Log.Debug("RequestStop failed", "id", m.id, "error", err)
+			}
 		}
 
 		select {
 		case <-m.done:
 		case <-time.After(15 * time.Second):
 			m.cfg.Log.Warn("macOS VM did not stop gracefully, forcing", "id", m.id)
-			m.vm.Stop()
+			if err := m.vm.Stop(); err != nil {
+				m.cfg.Log.Warn("force stop failed", "id", m.id, "error", err)
+			}
 		}
 	}
 

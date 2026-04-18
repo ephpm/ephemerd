@@ -46,7 +46,7 @@ func jobSSHCmd() *cli.Command {
 			if err != nil {
 				return fmt.Errorf("cannot connect to ephemerd (is it running?): %w", err)
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 
 			if resp.StatusCode != http.StatusOK {
 				body, _ := io.ReadAll(resp.Body)
@@ -81,13 +81,13 @@ func jobSSHCmd() *cli.Command {
 			if err != nil {
 				return fmt.Errorf("SSH dial %s: %w", info.IP, err)
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			session, err := client.NewSession()
 			if err != nil {
 				return fmt.Errorf("SSH session: %w", err)
 			}
-			defer session.Close()
+			defer func() { _ = session.Close() }()
 
 			// Set up terminal
 			session.Stdin = os.Stdin
@@ -99,15 +99,17 @@ func jobSSHCmd() *cli.Command {
 			if term.IsTerminal(fd) {
 				oldState, err := term.MakeRaw(fd)
 				if err == nil {
-					defer term.Restore(fd, oldState)
+					defer func() { _ = term.Restore(fd, oldState) }()
 				}
 
 				w, h, _ := term.GetSize(fd)
-				session.RequestPty("xterm-256color", h, w, ssh.TerminalModes{
+				if err := session.RequestPty("xterm-256color", h, w, ssh.TerminalModes{
 					ssh.ECHO:          1,
 					ssh.TTY_OP_ISPEED: 14400,
 					ssh.TTY_OP_OSPEED: 14400,
-				})
+				}); err != nil {
+					return fmt.Errorf("requesting PTY: %w", err)
+				}
 
 				// Handle window resize
 				sigCh := make(chan os.Signal, 1)
@@ -115,7 +117,7 @@ func jobSSHCmd() *cli.Command {
 				go func() {
 					for range sigCh {
 						w, h, _ := term.GetSize(fd)
-						session.WindowChange(h, w)
+						_ = session.WindowChange(h, w)
 					}
 				}()
 			}

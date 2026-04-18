@@ -99,7 +99,7 @@ func getHostMemoryGB() float64 {
 		return 0
 	}
 	var bytes uint64
-	fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &bytes)
+	_, _ = fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &bytes)
 	return float64(bytes) / (1024 * 1024 * 1024)
 }
 
