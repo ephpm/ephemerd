@@ -45,14 +45,7 @@ jobs:
       - name: Verify binary
         run: |
           ./ephemerd --version
-          file ./ephemerd
           codesign -v ./ephemerd && echo "codesigned" || echo "not codesigned"
-
-      - name: Upload binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: ephemerd-darwin-arm64
-          path: ephemerd
 
   build-linux-arm64:
     name: Build (Linux arm64)
@@ -73,12 +66,6 @@ jobs:
       - name: Verify binary
         run: ./ephemerd --version
 
-      - name: Upload binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: ephemerd-linux-arm64
-          path: ephemerd
-
   build-windows:
     name: Build (Windows amd64)
     runs-on: [self-hosted, linux, x64]
@@ -97,9 +84,3 @@ jobs:
 
       - name: Verify binary
         run: ls -lh ./ephemerd.exe
-
-      - name: Upload binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: ephemerd-windows-amd64
-          path: ephemerd.exe
