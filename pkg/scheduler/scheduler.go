@@ -305,6 +305,14 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		go s.pollLoop(ctx, interval, events)
 	}
 
+	// One-time poll on startup to catch jobs that queued while ephemerd
+	// was down. Webhook events only fire at the moment a job transitions
+	// to "queued" — they aren't replayed for jobs already in that state.
+	if s.cfg.GitHub != nil {
+		s.cfg.Log.Info("startup poll: checking for queued jobs")
+		s.poll(ctx, events)
+	}
+
 	// Periodically clean up the seen-jobs dedup map
 	cleanupTicker := time.NewTicker(5 * time.Minute)
 	defer cleanupTicker.Stop()
