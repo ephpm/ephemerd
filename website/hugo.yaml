@@ -21,7 +21,7 @@ menu:
       pageRef: /getting-started
       weight: 1
     - name: Guides
-      pageRef: /guides
+      pageRef: /guides/how-it-works
       weight: 2
     - name: CLI
       pageRef: /cli
