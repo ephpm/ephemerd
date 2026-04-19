@@ -1,41 +1,80 @@
-# ephemerd start / stop / restart / logs
+---
+title: Service Management
+weight: 3
+---
 
-Manage the ephemerd system service. These commands wrap the OS-specific service manager so you don't need to remember `systemctl`, `launchctl`, or `sc.exe`.
+Ephemerd provides four commands for managing the system service: `start`, `stop`, `restart`, and `logs`. Each command delegates to the platform's native service manager.
 
-## Usage
+## start
+
+Start the ephemerd system service.
 
 ```
-ephemerd start          Start the service
-ephemerd stop           Stop the service
-ephemerd restart        Restart the service
-ephemerd logs           Show recent logs (last 100 lines)
-ephemerd logs -f        Follow log output in real-time
-ephemerd logs --lines 500  Show more lines
+ephemerd start
 ```
 
-## Prerequisites
+## stop
 
-Run `ephemerd install` first to register the system service. These commands operate on the installed service — they don't start ephemerd in the foreground (use `ephemerd serve` for that).
+Stop the ephemerd system service.
 
-## Platform details
+```
+ephemerd stop
+```
 
-| OS | Service manager | Log source |
-|----|----------------|------------|
-| Linux | `systemctl start/stop ephemerd` | `journalctl -u ephemerd` |
-| macOS | `launchctl load/unload` the LaunchDaemon plist | `log show/stream` with subsystem filter |
-| Windows | `sc.exe start/stop ephemerd` | `wevtutil.exe` Application event log |
+## restart
 
-## Examples
+Restart the ephemerd system service. Internally this runs `stop` followed by `start`. If the stop fails (e.g., the service was not running), it prints a note and proceeds with start.
+
+```
+ephemerd restart
+```
+
+## logs
+
+Tail the ephemerd system service logs.
+
+```
+ephemerd logs [flags]
+```
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--lines` | `100` | Number of lines to show |
+| `--follow`, `-f` | `false` | Follow log output (stream new entries) |
+
+### Examples
 
 ```bash
-# Install, start, and follow logs
-sudo ephemerd install
-sudo ephemerd start
-sudo ephemerd logs -f
+# Show last 100 lines
+ephemerd logs
 
-# Restart after config change
-sudo ephemerd restart
+# Show last 500 lines
+ephemerd logs --lines 500
 
-# Stop for maintenance
-sudo ephemerd stop
+# Follow logs in real time
+ephemerd logs -f
+
+# Show last 50 lines then follow
+ephemerd logs --lines 50 -f
 ```
+
+## Platform behavior
+
+### Linux (systemd)
+
+- `start` / `stop` / `restart`: runs `systemctl <action> ephemerd`.
+- `logs`: runs `journalctl -u ephemerd -n <lines> --no-pager`. With `--follow`, appends `-f`.
+
+### macOS (launchd)
+
+- `start`: runs `launchctl load -w /Library/LaunchDaemons/dev.ephpm.ephemerd.plist`.
+- `stop`: runs `launchctl unload /Library/LaunchDaemons/dev.ephpm.ephemerd.plist`.
+- `logs` without `--follow`: runs `log show --predicate 'subsystem == "dev.ephpm.ephemerd"'`.
+- `logs` with `--follow`: runs `log stream --predicate 'subsystem == "dev.ephpm.ephemerd"'`.
+
+### Windows (sc.exe)
+
+- `start` / `stop`: runs `sc.exe <action> ephemerd`.
+- `logs`: runs `wevtutil.exe qe Application` filtered to the `ephemerd` provider, formatted as text.

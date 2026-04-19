@@ -1,75 +1,124 @@
-# ephemerd doctor
+---
+title: doctor
+weight: 9
+---
 
-Validates that the system has everything needed to run ephemerd and cleans up stale state from crashes or unclean shutdowns.
-
-## Usage
+Check system readiness and clean up stale runtime state. By default, runs both checks and cleanup. Use `--check` or `--clean` to run only one phase.
 
 ```
-ephemerd doctor [--check] [--clean]
+ephemerd doctor [flags]
 ```
 
 ## Flags
 
-- `--check` — run checks only, skip cleanup
-- `--clean` — run cleanup only, skip checks
-
-With no flags, runs both checks and cleanup.
+| Flag | Description |
+|------|-------------|
+| `--check` | Run checks only, skip cleanup |
+| `--clean` | Run cleanup only, skip checks |
 
 ## System checks
 
-### All platforms
+### Cross-platform checks
 
-- **Config file** — looks for `<data-dir>/config.toml`, validates it parses correctly
-- **GitHub token** — checks `GITHUB_TOKEN` environment variable is set
-- **Data directory** — verifies the directory is writable
-- **Disk space** — warns below 20 GB, fails below 5 GB (10 GB thresholds on Windows/macOS due to larger images)
-- **Embedded assets** — verifies the binary was built with embedded runner/CNI/shim assets
+These checks run on all platforms:
 
-### Linux
+- **Config file** -- looks for `config.toml` in the data directory, `/etc/ephemerd/`, or `<data-dir>/ephemerd.toml`. Validates the config if found.
+- **GITHUB_TOKEN** -- checks whether the environment variable is set.
+- **Data directory** -- verifies the data directory exists and is writable.
+- **Disk space** -- checks free disk space. Warns below 20 GB (Linux) or 30 GB (macOS/Windows). Fails below 5 GB (Linux) or 10 GB (macOS/Windows).
+- **Embedded assets** -- confirms assets were compiled into the binary at build time.
 
-- **iptables** — required for container network isolation
-- **Kernel namespaces** — checks `/proc/self/ns/{net,pid,mnt,uts,ipc}`
-- **cgroups** — checks for v2 (recommended), warns on v1
-- **Filesystem** — warns if the data directory is on ZFS or NFS (overlayfs not supported, containerd falls back to the native snapshotter which copies full images per container instead of using copy-on-write layers)
-- **Root** — ephemerd requires root for container management
+### Linux checks
 
-### Windows
+- **iptables** -- verifies `iptables` is in `PATH`.
+- **Kernel namespaces** -- checks for `net`, `pid`, `mnt`, `uts`, and `ipc` namespaces in `/proc/self/ns/`.
+- **cgroups** -- detects cgroups v2 (preferred) or v1.
+- **Filesystem** -- checks the root filesystem type. Warns if NFS or ZFS (overlayfs not supported on these).
+- **Root privileges** -- verifies the process is running as root.
 
-- **WSL2** — required for Linux jobs on Windows hosts
-- **Hyper-V** — required for Windows container isolation
-- **Windows Containers feature** — must be enabled
-- **Windows build version** — informational
+### macOS checks
 
-### macOS
+- **macOS version** -- reports the OS version.
+- **Architecture** -- verifies Apple Silicon (arm64). Virtualization.framework requires it.
+- **Virtualization entitlement** -- checks the binary's code signature for the `com.apple.security.virtualization` entitlement.
+- **macOS VM disk image** -- looks for an existing disk image. If not found, notes that ephemerd will download and install the Apple IPSW on first boot.
+- **VM capacity** -- calculates how many concurrent macOS VMs the host can support based on CPU and memory.
 
-- **Apple Silicon** — Virtualization.framework requires arm64
-- **Virtualization entitlement** — binary must be code-signed with `com.apple.security.virtualization`
-- **Base image** — checks for a macOS VM base image (required for macOS-native jobs)
+### Windows checks
+
+- **WSL** -- checks for `wsl.exe` in `PATH` and verifies WSL2 is available.
+- **Hyper-V** -- checks whether the Hyper-V hypervisor feature is enabled.
+- **Windows version** -- reports the OS version.
+- **Containers feature** -- checks whether the Windows Containers optional feature is enabled.
 
 ## Cleanup
 
-### All platforms
+Cleanup runs as the second phase (requires `sudo` on Linux/macOS for full cleanup). Operations performed:
 
-- **Stale control socket** — removes `<data-dir>/ephemerd.sock` left by a crashed daemon
-- **Stale PID file** — removes `<data-dir>/ephemerd.pid`
-- **Old job logs** — removes logs older than 7 days from `<data-dir>/logs/`
+- **Orphan containers** -- checks for stale container state directories.
+- **Stale network bridge** -- on Linux, removes the `ephemerd0` bridge if it exists.
+- **Control socket** -- removes the stale `ephemerd.sock` file.
+- **PID file** -- removes the stale `ephemerd.pid` file.
+- **Old job logs** -- removes log files older than 7 days from `<data-dir>/logs/`.
 
-### Linux
+### Linux-specific cleanup
 
-- **Stale CNI state** — removes IP allocations and network config from previous runs
-- **Stale DNS config** — removes `<data-dir>/dns/` directory
-- **Stale network bridge** — deletes the `ephemerd0` bridge interface if it exists
+- Removes stale CNI state (preserving `bin/` and `conf/` directories).
+- Removes stale DNS configuration directory.
+- Deletes the `ephemerd0` network bridge if present.
 
-### Windows
+### macOS-specific cleanup
 
-- **Stale WSL distros** — unregisters any `ephemerd-*` WSL distros left by crashed runs
-- **Stale VM directories** — removes `<data-dir>/vm/` subdirectories (except embedded assets)
+- Removes stale macOS VM clone directories from `<data-dir>/vm/macos/jobs/`.
 
-### macOS
+### Windows-specific cleanup
 
-- **Stale VM clones** — removes APFS clone directories from `<data-dir>/vm/macos/clones/`
+- Unregisters stale WSL distros matching the `ephemerd-*` prefix.
+- Removes stale VM directories (preserving `embed/`).
 
-## Exit codes
+## Output
 
-- `0` — all checks passed (warnings are OK)
-- `1` — one or more checks failed
+```
+System checks:
+
+  ✓ config file valid (/var/lib/ephemerd/config.toml)
+  ✓ GITHUB_TOKEN is set
+  ✓ data directory writable (/var/lib/ephemerd)
+  ✓ 85.2 GB free disk space
+  ✓ embedded assets compiled in (verified at build time)
+
+Platform checks (linux/amd64):
+
+  ✓ iptables available
+  ✓ kernel namespaces available (net, pid, mnt, uts, ipc)
+  ✓ cgroups v2 available
+  ✓ filesystem supports overlayfs
+  ✓ running as root
+
+Cleanup:
+
+  ✓ no orphan containers
+  ✓ cleaned stale network bridge (if any)
+  ✓ no stale control socket
+  ✓ no stale PID file
+  ✓ cleaned old job logs (>7 days)
+  ✓ cleaned stale CNI state
+  ✓ no stale DNS config
+
+Results: 12 passed, 0 warnings, 0 failed
+```
+
+The command exits with a non-zero status if any checks fail.
+
+## Examples
+
+```bash
+# Run all checks and cleanup
+sudo ephemerd doctor
+
+# Check system readiness without modifying anything
+ephemerd doctor --check
+
+# Clean up stale state only
+sudo ephemerd doctor --clean
+```

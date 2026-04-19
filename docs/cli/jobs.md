@@ -1,44 +1,83 @@
-# ephemerd jobs
+---
+title: jobs
+weight: 6
+---
 
-List and manage currently running jobs.
-
-## Usage
+List and manage running jobs. When called without a subcommand, lists all active jobs. When called with a job ID as an argument, shows detailed information about that job.
 
 ```
-ephemerd jobs                List running jobs
-ephemerd jobs kill <id>      Force-kill a running job
-ephemerd jobs logs <id>      Stream logs from a running job
-ephemerd jobs ssh <id>       SSH into a running macOS VM job
+ephemerd jobs [job-id]
+ephemerd jobs <subcommand> <job-id>
+```
+
+## List jobs
+
+Running `ephemerd jobs` with no arguments lists all active jobs.
+
+```bash
+$ ephemerd jobs
+JOB ID         NAME                                     REPO                      STATUS     UPTIME
+12345678       build                                    myorg/myrepo              running    5m32s
+12345679       test                                     myorg/myrepo              running    3m10s
+```
+
+If no jobs are running, prints "No running jobs."
+
+## Inspect a job
+
+Pass a job ID as an argument to get detailed JSON output.
+
+```bash
+$ ephemerd jobs 12345678
+{
+  "id": 12345678,
+  "name": "build",
+  "repo": "myorg/myrepo",
+  "image": "ghcr.io/actions/actions-runner:latest",
+  "runner_id": 42,
+  "status": "running",
+  "pid": 9876,
+  "started_at": "2025-01-15T10:30:00Z",
+  "uptime": "5m32s"
+}
 ```
 
 ## Subcommands
 
-### jobs (list)
+### kill
 
-Shows all currently running jobs with their ID, repo, image, and duration.
-
-### jobs kill
-
-Force-kills a running job by ID. The container is destroyed immediately without waiting for the runner to finish gracefully. The runner is deregistered from GitHub.
-
-### jobs logs
-
-Streams container logs from a running job. Logs are read from `<data-dir>/logs/<job-id>.log`.
-
-### jobs ssh
-
-Opens an interactive SSH session to a running macOS VM job. This is useful for debugging — you get a shell inside the VM where the job is executing.
+Force-kill a running job and deregister its runner.
 
 ```
-sudo ephemerd jobs ssh 71765854232
+ephemerd jobs kill <job-id>
 ```
 
-The command retrieves the VM's IP address and the ephemeral SSH key from the running daemon (via a unix socket), then opens an SSH session with full PTY support. No SSH keys are stored on disk — the key exists only in the daemon's memory and rotates on every restart.
+Sends a `KillJob` request to the daemon via gRPC. The daemon destroys the container, tears down networking, and deregisters the GitHub runner.
 
-Only works for macOS VM jobs (not Linux container jobs).
+### logs
 
-## How it works
+Show the log output for a running job.
 
-`list`, `kill`, and `logs` connect to the daemon's gRPC control socket (`<data-dir>/ephemerd.sock`) and call the `ListJobs`, `KillJob`, or `GetJobLogs` RPCs.
+```
+ephemerd jobs logs <job-id>
+```
 
-`ssh` connects to a separate HTTP unix socket (`<data-dir>/ephemerd.sock.http`) to retrieve the VM's IP and the ephemeral SSH private key, then opens a direct SSH connection to the VM using Go's `x/crypto/ssh` library.
+Streams the job's log data from the daemon via the `GetJobLogs` gRPC call. The output is written to stdout and the command exits when the log stream ends.
+
+### ssh
+
+Open an interactive SSH session to a running macOS VM job. This subcommand is only available on Linux and macOS (not Windows).
+
+```
+ephemerd jobs ssh <job-id>
+```
+
+The command:
+
+1. Connects to the daemon's HTTP unix socket at `<data-dir>/ephemerd.sock.http`.
+2. Retrieves the VM's IP address and ephemeral SSH private key from the `/vm/ssh-info` endpoint.
+3. Opens an SSH connection to the VM on port 22 using the ephemeral key.
+4. Allocates a PTY with `xterm-256color` and starts an interactive shell.
+5. Handles terminal window resize events (`SIGWINCH`).
+
+The SSH key is generated in-memory when the daemon starts and rotates on each restart. No password authentication is used.

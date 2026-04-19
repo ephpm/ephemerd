@@ -1,42 +1,62 @@
-# ephemerd run
+---
+title: run
+weight: 2
+---
 
-Run a GitHub Actions workflow locally without pushing to GitHub. Executes workflow steps in an isolated container on your machine.
-
-## Usage
+Run a GitHub Actions workflow locally in an ephemeral container. This is useful for testing workflows without pushing to GitHub.
 
 ```
-ephemerd run [workflow-file] [--job <name>]
+ephemerd run [workflow-file] [flags]
 ```
 
 ## Arguments
 
-- `workflow-file` — path to the workflow YAML file (positional, optional — default: auto-detect from `.github/workflows/`)
+The workflow file is a **positional argument**, not a flag. If omitted, ephemerd searches the current directory's `.github/workflows/` for a workflow file.
 
 ## Flags
 
-- `--job`, `-j` — run only a specific job from the workflow (default: run the first job)
+| Flag | Description |
+|------|-------------|
+| `--job`, `-j` | Run a specific job by name. If omitted, runs the first job in the workflow. |
 
-## What it does
+## Behavior
 
-1. Parses the workflow YAML file
-2. Creates an isolated container with the same image ephemerd uses for CI
-3. Bind-mounts the current repository into the container
-4. Executes each `run:` step in sequence
-5. Destroys the container when done
+1. **Locate workflow** -- if no file is specified, calls `workflow.FindWorkflow()` to auto-detect a workflow in `.github/workflows/`.
+2. **Parse workflow** -- reads the YAML workflow file and extracts job definitions.
+3. **Select job** -- uses `--job` to pick a specific job, or defaults to the first job found.
+4. **Detect platform** -- inspects the job's `runs-on` labels to determine the target OS (linux, windows, or macos).
+5. **Execute** -- runs the job in a local container using the container runtime.
 
-## Platform delegation
+## WSL delegation on Windows
 
-On Windows, when the workflow targets Linux, `ephemerd run` automatically creates a WSL distro via `vm.NewRunDistro()` and delegates execution there. This is transparent — the workflow runs in a Linux environment inside WSL.
+When running on a Windows host and the workflow targets Linux (based on `runs-on` labels), ephemerd automatically delegates execution to WSL. It:
+
+1. Creates a temporary WSL distro (`vm.NewRunDistro`).
+2. Translates the workflow path to an absolute path.
+3. Runs the Linux ephemerd binary inside WSL with the same workflow and job arguments.
+4. Destroys the WSL distro when the job completes.
 
 ## Limitations
 
-- `uses:` steps (GitHub Actions) are not supported — only `run:` steps execute
-- `services:` blocks are not supported
-- Environment secrets from GitHub are not available
-- Matrix strategies are not expanded
+The local runner is a simplified execution environment. It does not support:
 
-## When to use it
+- **`uses:` steps** -- action references are not resolved or downloaded.
+- **`services:`** -- service containers are not started.
+- **`secrets`** -- GitHub secrets are not available.
+- **`matrix`** -- matrix strategies are not expanded.
 
-- Quick local testing of shell-based CI steps before pushing
-- Debugging failing CI in an environment identical to what ephemerd provisions
-- Running build scripts in isolation without Docker
+## Examples
+
+```bash
+# Run the default workflow in the current repo
+ephemerd run
+
+# Run a specific workflow file
+ephemerd run .github/workflows/ci.yml
+
+# Run a specific job from a workflow
+ephemerd run .github/workflows/ci.yml --job build
+
+# Short flag form
+ephemerd run .github/workflows/ci.yml -j test
+```

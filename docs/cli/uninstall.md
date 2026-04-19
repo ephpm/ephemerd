@@ -1,56 +1,50 @@
-# ephemerd uninstall
+---
+title: uninstall
+weight: 11
+---
 
-Completely removes ephemerd from the system — binary, service, and all data.
-
-## Usage
+Remove the ephemerd binary, system service, and optionally all data.
 
 ```
-ephemerd uninstall [--keep-data]
+ephemerd uninstall [flags]
 ```
 
 ## Flags
 
-- `--keep-data` — preserve the data directory (config, logs, container state). Useful if you plan to reinstall.
+| Flag | Description |
+|------|-------------|
+| `--keep-data` | Keep the data directory (config, logs, container state) |
 
-## What it removes
+## Steps
 
-### 1. Runtime state cleanup
+### 1. Clean up runtime state
 
-Before removing files, uninstall runs the same cleanup as `ephemerd doctor --clean`:
+Runs the same cleanup as `ephemerd doctor --clean` to remove stale containers, network bridges, WSL distros, and other runtime state before removing the data directory.
 
-- Stale control socket (`<data-dir>/ephemerd.sock`)
-- Stale PID file (`<data-dir>/ephemerd.pid`)
-- **Linux:** stale CNI state, DNS config, `ephemerd0` network bridge
-- **Windows:** stale `ephemerd-*` WSL distros, VM directories
-- **macOS:** stale VM clone directories
+### 2. Stop and remove the service
 
-### 2. System service
+Platform-specific service removal:
 
-- **Linux:** stops and disables `ephemerd.service`, removes `/etc/systemd/system/ephemerd.service`, runs `systemctl daemon-reload`
-- **macOS:** unloads and removes `/Library/LaunchDaemons/dev.ephpm.ephemerd.plist`
-- **Windows:** stops and deletes the `ephemerd` Windows service via `sc.exe`
+- **Linux**: `systemctl stop ephemerd`, `systemctl disable ephemerd`, removes `/etc/systemd/system/ephemerd.service`, runs `systemctl daemon-reload`.
+- **macOS**: `launchctl unload /Library/LaunchDaemons/dev.ephpm.ephemerd.plist`, removes the plist file.
+- **Windows**: `sc.exe stop ephemerd`, `sc.exe delete ephemerd`.
 
-### 3. Binary
+### 3. Remove the binary
 
-- Removes the `ephemerd` binary from its installed location (resolved via `os.Executable()`)
-- On Windows, the binary can't be deleted while running — prints a message to delete manually after exit
+Removes the ephemerd binary from its installed location. On Windows, the running binary cannot be deleted -- a message is printed asking you to delete it manually after the process exits.
 
-### 4. Data directory (unless --keep-data)
+### 4. Remove the data directory
 
-- Removes the entire data directory (default `/var/lib/ephemerd` on Linux, `C:\ProgramData\ephemerd` on Windows)
-- This includes: config file, job logs, containerd state, cached images, extracted binaries
+Unless `--keep-data` is set, removes the entire data directory (`/var/lib/ephemerd` or `C:\ProgramData\ephemerd`) including config, logs, and all container state.
 
-### 5. Environment files (unless --keep-data)
+Also removes environment files at `/etc/default/ephemerd` and `/etc/sysconfig/ephemerd` if they exist.
 
-- `/etc/default/ephemerd` — systemd environment file containing `GITHUB_TOKEN`
-- `/etc/sysconfig/ephemerd` — alternative location (RHEL/CentOS)
-
-## Reinstalling after uninstall
-
-If you used `--keep-data`, your config and logs are preserved. Just run the install script again:
+## Examples
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ephpm/ephemerd/main/install.sh | sudo bash
-```
+# Full uninstall (remove everything)
+sudo ephemerd uninstall
 
-The installer will detect the existing config and skip creating a new one.
+# Uninstall but keep config and logs
+sudo ephemerd uninstall --keep-data
+```

@@ -1,19 +1,31 @@
-# ephemerd images
+---
+title: images
+weight: 7
+---
 
-List OCI container images cached by the embedded containerd.
-
-## Usage
+List cached OCI container images from the embedded containerd instance.
 
 ```
-ephemerd images [--data-dir <path>]
+ephemerd images
 ```
 
-## What it does
+## Behavior
 
-Connects to the embedded containerd socket and lists all images in the content store. Shows the image reference (registry/repo:tag) and size.
+Connects directly to containerd's socket (not via the daemon's gRPC control API) and lists all images in the `ephemerd` namespace.
 
-This is useful for checking which runner and job images are cached locally — cached images don't need to be pulled on the next job, reducing startup time.
+### Example output
 
-## How it works
+```
+IMAGE                                                        SIZE
+ghcr.io/actions/actions-runner:latest                        1.2 GB
+mcr.microsoft.com/windows/servercore:ltsc2022                5.8 GB
+```
 
-Connects directly to the containerd socket (`<data-dir>/containerd.sock` on Linux, `\\.\pipe\ephemerd-containerd` on Windows) using the containerd Go client. Does not require the ephemerd daemon to be running — only containerd's data directory.
+If no images are cached, prints "No cached images."
+
+## Notes
+
+- The containerd socket path is derived from the data directory (set via `--data-dir` or `EPHEMERD_DATA_DIR`).
+- On Linux, the socket is a Unix domain socket.
+- On Windows, the socket is a named pipe (`\\.\pipe\ephemerd-containerd`).
+- Images are pulled automatically when a job starts if not already cached. This command shows what is currently available locally.

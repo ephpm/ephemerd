@@ -1,38 +1,56 @@
-# ephemerd config
+---
+title: config
+weight: 8
+---
 
-Validates the configuration file without starting the daemon. Useful for checking config syntax after editing.
-
-## Usage
-
-```
-ephemerd config [--data-dir <path>] [--config <path>]
-```
-
-## What it does
-
-1. Loads and parses `<data-dir>/config.toml`
-2. Validates required fields (github.owner, authentication)
-3. Checks default values are applied correctly
-4. Prints the resolved configuration (with secrets redacted)
-5. Exits with code 0 if valid, 1 if invalid
-
-## Example output
+Validate the configuration file without starting the daemon. Prints a summary of the parsed configuration and reports any errors.
 
 ```
-Config file: /var/lib/ephemerd/config.toml
+ephemerd config [flags]
+```
 
-[github]
-  owner = "myorg"
-  token = (set)
-  repos = [repo1, repo2]
-  poll_interval = "30s"
+## Flags
 
-[webhook]
-  tunnel = "none"
-  port = 8080
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config`, `-c` | `<data-dir>/config.toml` | Path to config file |
 
-[runner]
-  max_concurrent = 4
-  job_timeout = "2h"
-  shutdown_timeout = "5m"
+## Output
+
+On success, prints a summary of the parsed configuration:
+
+```
+Config: /var/lib/ephemerd/config.toml
+  GitHub owner:    myorg
+  Repos:           [repo1 repo2]
+  Max concurrent:  4
+  Job timeout:     6h0m0s
+  Poll interval:   30s
+  Log level:       info
+  Mode:            webhook (tunnel: localtunnel)
+  Auth:            token (set)
+
+Config OK
+```
+
+The summary includes:
+
+- GitHub owner and repository list
+- Runner concurrency and timeout settings
+- Poll interval
+- Log level
+- Job discovery mode (polling, webhook with tunnel, or webhook with TLS)
+- Authentication method (token or GitHub App)
+
+On failure, prints the parse or validation error and exits with a non-zero status.
+
+## Examples
+
+```bash
+# Validate the default config
+ephemerd config
+
+# Validate a specific config file
+ephemerd config --config /etc/ephemerd/config.toml
+ephemerd config -c ./config.toml
 ```

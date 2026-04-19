@@ -1,31 +1,41 @@
-# ephemerd ctrctl
+---
+title: ctrctl
+weight: 12
+---
 
-Debug the embedded containerd by passing commands through to `ctr`. Similar to `rke2 ctr` from the rke2 world.
-
-## Usage
+Passthrough to containerd's `ctr` CLI. All arguments after `ctrctl` are forwarded directly to `ctr` with the correct containerd socket path automatically configured.
 
 ```
 ephemerd ctrctl [ctr-args...]
 ```
 
-All arguments after `ctrctl` are passed directly to `ctr` with the correct socket path pre-configured.
+This is similar to how `rke2 ctr` works -- it provides direct access to the embedded containerd instance for debugging and inspection. Flag parsing is skipped; everything after `ctrctl` is passed through verbatim.
 
 ## Examples
 
 ```bash
-# List all containers
-ephemerd ctrctl containers list
+# List running containers
+ephemerd ctrctl -n ephemerd containers list
 
 # List snapshots
-ephemerd ctrctl snapshots ls
+ephemerd ctrctl -n ephemerd snapshots ls
 
-# Inspect an image
-ephemerd ctrctl images check
+# Check image status
+ephemerd ctrctl -n ephemerd images check
 
-# List tasks (running containers)
-ephemerd ctrctl tasks list
+# List running tasks
+ephemerd ctrctl -n ephemerd tasks list
+
+# Pull an image manually
+ephemerd ctrctl -n ephemerd images pull ghcr.io/actions/actions-runner:latest
+
+# Get containerd version info
+ephemerd ctrctl version
 ```
 
-## How it works
+## Notes
 
-Runs the `ctr` binary (containerd CLI) with the `--address` flag pointing to ephemerd's containerd socket. Does not require the ephemerd daemon to be running — only the containerd socket.
+- The `-n ephemerd` flag selects the `ephemerd` namespace, which is where all job containers and images live.
+- The socket path is derived from the data directory. Use `--data-dir` (before `ctrctl`) to target a different instance.
+- On Linux, the socket is a Unix domain socket at `<data-dir>/containerd/containerd.sock`.
+- On Windows, the socket is a named pipe at `\\.\pipe\ephemerd-containerd`.

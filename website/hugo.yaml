@@ -7,18 +7,31 @@ enableGitInfo: true
 module:
   imports:
     - path: github.com/imfing/hextra
+  mounts:
+    - source: content
+      target: content
+    - source: ../docs
+      target: content
+      files:
+        - "! _archived/*"
 
 menu:
   main:
     - name: Docs
-      pageRef: /docs
+      pageRef: /getting-started
       weight: 1
-    - name: Architecture
-      pageRef: /architecture
+    - name: Guides
+      pageRef: /guides
       weight: 2
     - name: CLI
       pageRef: /cli
       weight: 3
+    - name: Architecture
+      pageRef: /architecture
+      weight: 4
+    - name: Contributing
+      pageRef: /contributing
+      weight: 5
     - name: GitHub
       url: https://github.com/ephpm/ephemerd
       weight: 10
