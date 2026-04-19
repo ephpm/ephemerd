@@ -31,7 +31,7 @@ type Config struct {
 	GitHub          *github.Client        // used when Provider is nil (GitHub mode)
 	Provider        providers.Poll        // if non-nil, used instead of GitHub for job discovery + lifecycle
 	Artifacts       *artifacts.Extractor  // OCI image layer extractor for macOS VM jobs (nil if not available)
-	LinuxDispatcher *DispatchClient       // if non-nil, Linux jobs are dispatched to this WSL worker via gRPC
+	LinuxDispatcher *DispatchClient       // if non-nil, Linux jobs are dispatched to a Linux VM worker via gRPC
 	MacOSVMConfig     *vm.MacOSVMConfig     // if non-nil, macOS-native jobs are enabled (darwin only)
 	DataDir           string                // ephemerd data directory (used for artifact extraction paths)
 	MaxConcurrent     int
@@ -111,7 +111,7 @@ type runningJob struct {
 	runnerID     int64
 	cancel       context.CancelFunc
 	artifactsDir string    // non-empty if OCI artifacts were extracted for this job
-	dispatched   string    // non-empty if dispatched to WSL worker (stores container name)
+	dispatched   string    // non-empty if dispatched to Linux VM worker (stores container name)
 	macosVM      vm.MacOSVM // non-nil if running as a macOS VM job
 	startedAt    time.Time
 }
@@ -271,8 +271,10 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		}
 
 		// Serve with automatic reconnect on tunnel drops.
-		go s.serveTunnelWithReconnect(ctx, server, ln, hooks, events)
-		defer s.cfg.GitHub.DeregisterWebhooks(context.Background(), hooks)
+		// serveTunnelWithReconnect owns the full lifecycle: it creates
+		// fresh HTTP servers on each reconnect, closes old listeners,
+		// and deregisters webhooks on shutdown. No defer needed here.
+		go s.serveTunnelWithReconnect(ctx, mux, ln, hooks, events)
 	} else if useTLS {
 		go func() {
 			s.cfg.Log.Info("webhook server listening (TLS)", "port", s.cfg.WebhookPort)
@@ -388,7 +390,7 @@ func (s *Scheduler) canHandleJob(jobLabels []string) bool {
 	for _, label := range jobLabels {
 		switch strings.ToLower(label) {
 		case "linux":
-			// Linux jobs run natively on Linux, via WSL dispatch on Windows,
+			// Linux jobs run natively on Linux, via VM dispatch on Windows/macOS,
 			// or inside the embedded Linux VM on macOS.
 			osOK = goruntime.GOOS == "linux" || goruntime.GOOS == "darwin" || s.cfg.LinuxDispatcher != nil
 		case "windows":
@@ -477,7 +479,7 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	}
 	s.mu.Unlock()
 
-	// Dispatch Linux jobs to the WSL worker if available
+	// Dispatch Linux jobs to the Linux VM worker if available
 	if s.cfg.LinuxDispatcher != nil && isLinuxJob(event.Job.Labels) {
 		s.handleLinuxJob(ctx, event)
 		return
@@ -504,9 +506,10 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	s.handleLocalJob(ctx, event)
 }
 
-// handleLinuxJob dispatches a Linux job to the WSL worker via gRPC.
-// The Windows host registers the JIT runner (with Linux labels) and sends
-// Create/Wait/Destroy RPCs to the dispatch server running inside WSL.
+// handleLinuxJob dispatches a Linux job to the Linux VM worker via gRPC.
+// The host registers the JIT runner (with Linux labels) and sends
+// Create/Wait/Destroy RPCs to the dispatch server running inside the VM
+// (WSL on Windows, Virtualization.framework on macOS).
 func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
 	jobID := event.Job.GetID()
 	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo, "dispatch", "linux")
@@ -525,7 +528,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
 		return
 	}
 
-	log.Info("provisioning Linux runner via WSL dispatch")
+	log.Info("provisioning Linux runner via dispatch")
 
 	image := s.cfg.GitHub.FetchJobImage(ctx, event.Repo, event.Job.GetRunID(), jobID)
 	if image != "" {
@@ -566,7 +569,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
 		return
 	}
 
-	// Track the dispatched job (env is nil — lifecycle managed by WSL worker)
+	// Track the dispatched job (env is nil — lifecycle managed by Linux VM worker)
 	s.mu.Lock()
 	s.running[jobID] = &runningJob{
 		repo:      event.Repo,
@@ -579,7 +582,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
 	s.mu.Unlock()
 	metrics.JobsActive.Inc()
 
-	log.Info("Linux runner dispatched to WSL", "name", name)
+	log.Info("Linux runner dispatched", "name", name)
 
 	// Wait for the job to finish in the background
 	go func() {
@@ -1307,20 +1310,49 @@ const (
 // serveTunnelWithReconnect serves the webhook HTTP server on a tunnel listener,
 // automatically re-establishing the tunnel and re-registering webhooks when the
 // connection drops. Falls back to polling after maxRetries consecutive failures.
-func (s *Scheduler) serveTunnelWithReconnect(ctx context.Context, server *http.Server, ln net.Listener, hooks []github.ManagedWebhook, events chan<- github.JobEvent) {
+//
+// Each reconnect cycle creates a fresh http.Server because Go's http.Server
+// cannot be reused after Serve() returns — its internal state (shutdown flag,
+// connection tracking) is not reset. The handler mux is shared across all
+// server instances since it's stateless.
+func (s *Scheduler) serveTunnelWithReconnect(ctx context.Context, handler http.Handler, ln net.Listener, hooks []github.ManagedWebhook, events chan<- github.JobEvent) {
 	maxRetries := s.cfg.TunnelMaxRetries
 	if maxRetries <= 0 {
 		maxRetries = defaultTunnelMaxRetries
 	}
 
+	// On exit, clean up whichever webhooks are currently active.
+	defer func() {
+		s.cfg.GitHub.DeregisterWebhooks(context.Background(), hooks)
+	}()
+
 	consecutiveFailures := 0
 	delay := tunnelReconnectDelay
 
 	for {
+		// Create a fresh server for each tunnel listener. http.Server
+		// cannot be reused after Serve() returns.
+		server := &http.Server{Handler: handler}
+
+		// Watch for context cancellation so we can unblock Serve().
+		// http.Server.Serve blocks on the listener and doesn't check
+		// ctx.Done — we need to shut down the server explicitly.
+		go func() {
+			<-ctx.Done()
+			_ = server.Close()
+		}()
+
 		err := server.Serve(ln)
-		if errors.Is(err, http.ErrServerClosed) || ctx.Err() != nil {
+
+		if ctx.Err() != nil {
+			// Parent context cancelled — clean shutdown.
 			return
 		}
+
+		// Shut down the server to release its internal state before
+		// we create a new one. (The ctx watcher goroutine above may
+		// also call Close, which is safe to call multiple times.)
+		_ = server.Close()
 		consecutiveFailures++
 		s.cfg.Log.Warn("tunnel connection lost, reconnecting",
 			"error", err,
@@ -1328,12 +1360,15 @@ func (s *Scheduler) serveTunnelWithReconnect(ctx context.Context, server *http.S
 			"max_retries", maxRetries,
 		)
 
+		// Close the dead listener to stop its goroutines (localtunnel
+		// proxy workers, ngrok tunnel connection). Without this, each
+		// reconnect leaks the old listener's resources.
+		_ = ln.Close()
+
 		if consecutiveFailures >= maxRetries {
 			s.cfg.Log.Warn("tunnel max retries exceeded, falling back to polling",
 				"failures", consecutiveFailures,
 			)
-			// Best-effort cleanup of last webhook.
-			s.cfg.GitHub.DeregisterWebhooks(ctx, hooks)
 
 			interval := s.cfg.PollInterval
 			if interval <= 0 {
@@ -1346,6 +1381,7 @@ func (s *Scheduler) serveTunnelWithReconnect(ctx context.Context, server *http.S
 
 		// Deregister old webhooks (best-effort — URL is dead anyway).
 		s.cfg.GitHub.DeregisterWebhooks(ctx, hooks)
+		hooks = nil
 
 		// Exponential backoff reconnect.
 		select {
