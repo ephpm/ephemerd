@@ -66,7 +66,7 @@ Streams the job's log data from the daemon via the `GetJobLogs` gRPC call. The o
 
 ### ssh
 
-Open an interactive SSH session to a running macOS VM job. This subcommand is only available on Linux and macOS (not Windows).
+Open an interactive SSH session to a running macOS VM job. Only works for macOS VM jobs — Linux container jobs don't have SSH access.
 
 ```
 ephemerd jobs ssh <job-id>
