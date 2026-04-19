@@ -16,7 +16,7 @@ ephemerd serve --data-dir /opt/ephemerd
 
 ## Provider auto-detection
 
-Only one provider section should be configured. ephemerd detects the active provider based on which section has credentials set, in this order:
+Currently only one provider can be configured. ephemerd detects the active provider based on which section has credentials set, in this order:
 
 1. **Forgejo** -- if `forgejo.instance_url` is set
 2. **Gitea** -- if `gitea.instance_url` is set

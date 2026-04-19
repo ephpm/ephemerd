@@ -119,7 +119,7 @@ Woodpecker CI uses a server/agent architecture where agents connect to the serve
 
 ## Configuration
 
-Provider is auto-detected from which config section has credentials:
+Currently only one provider can be configured. The provider is auto-detected from which config section has credentials:
 
 ```toml
 # GitHub (default when nothing else is set)

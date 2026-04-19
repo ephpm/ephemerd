@@ -7,7 +7,7 @@ ephemerd supports five CI providers. The provider determines how jobs are discov
 
 ## Auto-Detection
 
-The provider is auto-detected from which configuration section has credentials set. The precedence order is:
+Currently only one provider can be configured. The provider is auto-detected from which configuration section has credentials set. The precedence order is:
 
 **Forgejo > Gitea > GitLab > Woodpecker > GitHub**
 
