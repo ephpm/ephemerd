@@ -184,7 +184,11 @@ func (p *Proxy) cacheAndServe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			p.cfg.Log.Debug("closing upstream response body", "error", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		w.WriteHeader(resp.StatusCode)
@@ -220,19 +224,25 @@ func (p *Proxy) cacheAndServe(w http.ResponseWriter, r *http.Request) {
 		if err := tmpFile.Close(); err != nil {
 			p.cfg.Log.Debug("closing temp file after error", "error", err)
 		}
-		os.Remove(tmpFile.Name())
+		if err := os.Remove(tmpFile.Name()); err != nil {
+			p.cfg.Log.Debug("removing temp file after write error", "error", err)
+		}
 		return
 	}
 
 	if err := tmpFile.Close(); err != nil {
 		p.cfg.Log.Warn("closing temp file", "error", err)
-		os.Remove(tmpFile.Name())
+		if err := os.Remove(tmpFile.Name()); err != nil {
+			p.cfg.Log.Debug("removing temp file after close error", "error", err)
+		}
 		return
 	}
 
 	if err := os.Rename(tmpFile.Name(), cachePath); err != nil {
 		p.cfg.Log.Warn("renaming cache file", "error", err)
-		os.Remove(tmpFile.Name())
+		if err := os.Remove(tmpFile.Name()); err != nil {
+			p.cfg.Log.Debug("removing temp file after rename error", "error", err)
+		}
 	}
 }
 
@@ -243,7 +253,11 @@ func (p *Proxy) reverseProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			p.cfg.Log.Debug("closing upstream response body", "error", err)
+		}
+	}()
 
 	for k, vs := range resp.Header {
 		for _, v := range vs {
