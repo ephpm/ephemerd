@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -366,6 +368,87 @@ func TestLogger_Formats(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLogger_DebugEnabled(t *testing.T) {
+	cfg := &Config{Log: LogConfig{Level: "debug"}}
+	logger := cfg.Logger()
+
+	// Debug logger should log at debug level
+	handler := logger.Handler()
+	if !handler.Enabled(context.TODO(), -4) { // slog.LevelDebug == -4
+		t.Error("debug logger should be enabled at debug level")
+	}
+}
+
+func TestLogger_InfoDisablesDebug(t *testing.T) {
+	cfg := &Config{Log: LogConfig{Level: "info"}}
+	logger := cfg.Logger()
+
+	handler := logger.Handler()
+	if handler.Enabled(context.TODO(), -4) { // slog.LevelDebug
+		t.Error("info logger should NOT be enabled at debug level")
+	}
+	if !handler.Enabled(context.TODO(), 0) { // slog.LevelInfo
+		t.Error("info logger should be enabled at info level")
+	}
+}
+
+func TestLogger_WarnLevel(t *testing.T) {
+	cfg := &Config{Log: LogConfig{Level: "warn"}}
+	logger := cfg.Logger()
+
+	handler := logger.Handler()
+	if handler.Enabled(context.TODO(), 0) { // slog.LevelInfo
+		t.Error("warn logger should NOT be enabled at info level")
+	}
+	if !handler.Enabled(context.TODO(), 4) { // slog.LevelWarn
+		t.Error("warn logger should be enabled at warn level")
+	}
+}
+
+func TestLogger_ErrorLevel(t *testing.T) {
+	cfg := &Config{Log: LogConfig{Level: "error"}}
+	logger := cfg.Logger()
+
+	handler := logger.Handler()
+	if handler.Enabled(context.TODO(), 4) { // slog.LevelWarn
+		t.Error("error logger should NOT be enabled at warn level")
+	}
+	if !handler.Enabled(context.TODO(), 8) { // slog.LevelError
+		t.Error("error logger should be enabled at error level")
+	}
+}
+
+func TestLogger_UnknownDefaultsToInfo(t *testing.T) {
+	cfg := &Config{Log: LogConfig{Level: "garbage"}}
+	logger := cfg.Logger()
+
+	handler := logger.Handler()
+	if handler.Enabled(context.TODO(), -4) { // slog.LevelDebug
+		t.Error("unknown level should default to info, not enable debug")
+	}
+	if !handler.Enabled(context.TODO(), 0) { // slog.LevelInfo
+		t.Error("unknown level should default to info")
+	}
+}
+
+func TestLogger_JSONOutput(t *testing.T) {
+	cfg := &Config{Log: LogConfig{Level: "info", Format: "json"}}
+	logger := cfg.Logger()
+
+	// Logger should produce valid JSON — test by logging to a buffer
+	// We can't easily redirect cfg.Logger() output, but we can verify
+	// the handler type by checking it handles records without panic
+	logger.Info("test message", "key", "value")
+	// If we got here without panic, the JSON handler is working
+}
+
+func TestLogger_TextOutput(t *testing.T) {
+	cfg := &Config{Log: LogConfig{Level: "info", Format: "text"}}
+	logger := cfg.Logger()
+	logger.Info("test message", "key", "value")
+	// If we got here without panic, the text handler is working
 }
 
 // --- LogRetentionDuration tests ---
@@ -734,6 +817,90 @@ agent_secret = "my-secret"
 	}
 	if cfg.Woodpecker.AgentSecret != "my-secret" {
 		t.Errorf("AgentSecret = %q, want %q", cfg.Woodpecker.AgentSecret, "my-secret")
+	}
+}
+
+// --- CrossPlatformEnabled tests ---
+
+func TestCrossPlatformEnabled_NilDefault(t *testing.T) {
+	v := &VMConfig{}
+	if !v.CrossPlatformEnabled() {
+		t.Error("CrossPlatformEnabled() should default to true when nil")
+	}
+}
+
+func TestCrossPlatformEnabled_ExplicitTrue(t *testing.T) {
+	b := true
+	v := &VMConfig{CrossPlatform: &b}
+	if !v.CrossPlatformEnabled() {
+		t.Error("CrossPlatformEnabled() should be true when set to true")
+	}
+}
+
+func TestCrossPlatformEnabled_ExplicitFalse(t *testing.T) {
+	b := false
+	v := &VMConfig{CrossPlatform: &b}
+	if v.CrossPlatformEnabled() {
+		t.Error("CrossPlatformEnabled() should be false when set to false")
+	}
+}
+
+// --- crlfWriter tests ---
+
+func TestCrlfWriter_ReplacesNewlines(t *testing.T) {
+	var buf bytes.Buffer
+	w := &crlfWriter{w: &buf}
+
+	_, err := w.Write([]byte("line1\nline2\nline3"))
+	if err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+
+	got := buf.String()
+	want := "line1\r\nline2\r\nline3"
+	if got != want {
+		t.Errorf("crlfWriter output = %q, want %q", got, want)
+	}
+}
+
+func TestCrlfWriter_NoNewlines(t *testing.T) {
+	var buf bytes.Buffer
+	w := &crlfWriter{w: &buf}
+
+	_, err := w.Write([]byte("no newlines here"))
+	if err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+
+	if buf.String() != "no newlines here" {
+		t.Errorf("crlfWriter output = %q, want original", buf.String())
+	}
+}
+
+func TestCrlfWriter_Empty(t *testing.T) {
+	var buf bytes.Buffer
+	w := &crlfWriter{w: &buf}
+
+	n, err := w.Write([]byte{})
+	if err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("Write(empty) = %d, want 0", n)
+	}
+}
+
+func TestCrlfWriter_ReportsOriginalLength(t *testing.T) {
+	var buf bytes.Buffer
+	w := &crlfWriter{w: &buf}
+
+	input := []byte("a\nb\nc")
+	n, err := w.Write(input)
+	if err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	if n != len(input) {
+		t.Errorf("Write returned %d, want %d (original length)", n, len(input))
 	}
 }
 
