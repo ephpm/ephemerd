@@ -13,13 +13,13 @@ layout: hextra-home
 {{< /hextra/hero-headline >}}
 </div>
 
-<div class="hx-mb-12">
+<div class="hx-pb-16">
 {{< hextra/hero-subtitle >}}
   Secure, isolated, disposable CI environments on Linux, Windows, and macOS.&nbsp;<br class="sm:hx-block hx-hidden" />No Kubernetes. No Docker Desktop. Just one binary.
 {{< /hextra/hero-subtitle >}}
 </div>
 
-<div class="hx-mt-16 hx-mb-6">
+<div class="hx-mb-6">
 {{< hextra/hero-button text="Get Started" link="getting-started/" >}}
 {{< hextra/hero-button text="GitHub" link="https://github.com/ephpm/ephemerd" style="alt" >}}
 </div>
