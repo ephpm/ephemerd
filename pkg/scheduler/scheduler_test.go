@@ -318,19 +318,19 @@ func TestIsConflict_NoConflict(t *testing.T) {
 func TestCleanSeen_RemovesExpired(t *testing.T) {
 	s := New(Config{Log: testLogger()})
 
-	s.seen[1] = time.Now()
-	s.seen[2] = time.Now().Add(-seenTTL - time.Minute)
-	s.seen[3] = time.Now().Add(-seenTTL - time.Hour)
+	s.seen[jobKey{JobID: 1}] = time.Now()
+	s.seen[jobKey{JobID: 2}] = time.Now().Add(-seenTTL - time.Minute)
+	s.seen[jobKey{JobID: 3}] = time.Now().Add(-seenTTL - time.Hour)
 
 	s.cleanSeen()
 
-	if _, exists := s.seen[1]; !exists {
+	if _, exists := s.seen[jobKey{JobID: 1}]; !exists {
 		t.Error("fresh entry should not be cleaned")
 	}
-	if _, exists := s.seen[2]; exists {
+	if _, exists := s.seen[jobKey{JobID: 2}]; exists {
 		t.Error("expired entry should be cleaned")
 	}
-	if _, exists := s.seen[3]; exists {
+	if _, exists := s.seen[jobKey{JobID: 3}]; exists {
 		t.Error("old entry should be cleaned")
 	}
 }
@@ -345,9 +345,9 @@ func TestCleanSeen_EmptyMap(t *testing.T) {
 
 func TestCleanSeen_AllFresh(t *testing.T) {
 	s := New(Config{Log: testLogger()})
-	s.seen[1] = time.Now()
-	s.seen[2] = time.Now()
-	s.seen[3] = time.Now()
+	s.seen[jobKey{JobID: 1}] = time.Now()
+	s.seen[jobKey{JobID: 2}] = time.Now()
+	s.seen[jobKey{JobID: 3}] = time.Now()
 
 	s.cleanSeen()
 
@@ -359,9 +359,9 @@ func TestCleanSeen_AllFresh(t *testing.T) {
 func TestCleanSeen_AllExpired(t *testing.T) {
 	s := New(Config{Log: testLogger()})
 	old := time.Now().Add(-seenTTL - time.Minute)
-	s.seen[1] = old
-	s.seen[2] = old
-	s.seen[3] = old
+	s.seen[jobKey{JobID: 1}] = old
+	s.seen[jobKey{JobID: 2}] = old
+	s.seen[jobKey{JobID: 3}] = old
 
 	s.cleanSeen()
 
@@ -415,8 +415,8 @@ func TestHandleHealthz(t *testing.T) {
 
 func TestHandleHealthz_WithRunningJobs(t *testing.T) {
 	s := New(Config{MaxConcurrent: 2, Log: testLogger()})
-	s.running[123] = &runningJob{repo: "test", startedAt: time.Now()}
-	s.running[456] = &runningJob{repo: "test", startedAt: time.Now()}
+	s.running[jobKey{JobID: 123}] = &runningJob{repo: "test", startedAt: time.Now()}
+	s.running[jobKey{JobID: 456}] = &runningJob{repo: "test", startedAt: time.Now()}
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	w := httptest.NewRecorder()
@@ -610,7 +610,7 @@ func TestVMSSH_UnknownJob(t *testing.T) {
 func TestVMSSH_NonMacOSJob(t *testing.T) {
 	s := New(Config{Log: testLogger()})
 	// Add a running job WITHOUT a macosVM
-	s.running[100] = &runningJob{repo: "test", startedAt: time.Now()}
+	s.running[jobKey{JobID: 100}] = &runningJob{repo: "test", startedAt: time.Now()}
 	mux := newVMSSHTestMux(s)
 
 	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info?job_id=100", nil)
@@ -624,7 +624,7 @@ func TestVMSSH_NonMacOSJob(t *testing.T) {
 
 func TestVMSSH_VMIPNotReady(t *testing.T) {
 	s := New(Config{Log: testLogger()})
-	s.running[200] = &runningJob{
+	s.running[jobKey{JobID: 200}] = &runningJob{
 		repo:      "test",
 		macosVM:   &mockMacOSVM{ip: ""}, // IP not yet discovered
 		startedAt: time.Now(),
@@ -652,7 +652,7 @@ func TestVMSSH_ValidMacOSJob(t *testing.T) {
 			SSHSigner: priv,
 		},
 	})
-	s.running[300] = &runningJob{
+	s.running[jobKey{JobID: 300}] = &runningJob{
 		repo:      "test",
 		macosVM:   &mockMacOSVM{ip: "192.168.64.5"},
 		startedAt: time.Now(),

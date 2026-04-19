@@ -109,6 +109,11 @@ type PollConfig struct {
 
 // JobEvent represents a CI job state change from the forge.
 type JobEvent struct {
+	// Provider is the provider that emitted this event.
+	// Used by the scheduler to route ClaimJob/ReleaseJob to the correct provider
+	// when multiple providers are active simultaneously.
+	Provider Provider
+
 	Action     string   // "queued" or "completed"
 	Repo       string   // repository identifier (e.g., "myrepo" or "group/project")
 	JobID      int64    // forge-specific job ID

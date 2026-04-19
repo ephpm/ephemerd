@@ -80,11 +80,24 @@ func (c *controlServer) Status(ctx context.Context, req *apiv1.StatusRequest) (*
 	}, nil
 }
 
+// findJob looks up a running job by its int64 ID. When multiple providers are
+// active, different providers could theoretically have the same job ID, so this
+// returns the first match. The gRPC proto will gain a provider field in Phase 2
+// to disambiguate.
+func (c *controlServer) findJob(id int64) (jobKey, *runningJob, bool) {
+	for key, rj := range c.sched.running {
+		if key.JobID == id {
+			return key, rj, true
+		}
+	}
+	return jobKey{}, nil, false
+}
+
 func (c *controlServer) ListJobs(ctx context.Context, req *apiv1.ListJobsRequest) (*apiv1.ListJobsResponse, error) {
 	c.sched.mu.Lock()
 	jobs := make([]*apiv1.Job, 0, len(c.sched.running))
-	for id, rj := range c.sched.running {
-		jobs = append(jobs, c.toProto(id, rj))
+	for key, rj := range c.sched.running {
+		jobs = append(jobs, c.toProto(key, rj))
 	}
 	c.sched.mu.Unlock()
 
@@ -93,12 +106,12 @@ func (c *controlServer) ListJobs(ctx context.Context, req *apiv1.ListJobsRequest
 
 func (c *controlServer) GetJob(ctx context.Context, req *apiv1.GetJobRequest) (*apiv1.Job, error) {
 	c.sched.mu.Lock()
-	rj, exists := c.sched.running[req.Id]
+	key, rj, exists := c.findJob(req.Id)
 	if !exists {
 		c.sched.mu.Unlock()
 		return nil, status.Errorf(codes.NotFound, "job %d not found", req.Id)
 	}
-	job := c.toProto(req.Id, rj)
+	job := c.toProto(key, rj)
 	c.sched.mu.Unlock()
 
 	return job, nil
@@ -106,7 +119,7 @@ func (c *controlServer) GetJob(ctx context.Context, req *apiv1.GetJobRequest) (*
 
 func (c *controlServer) KillJob(ctx context.Context, req *apiv1.KillJobRequest) (*apiv1.KillJobResponse, error) {
 	c.sched.mu.Lock()
-	rj, exists := c.sched.running[req.Id]
+	_, rj, exists := c.findJob(req.Id)
 	if !exists {
 		c.sched.mu.Unlock()
 		return nil, status.Errorf(codes.NotFound, "job %d not found", req.Id)
@@ -121,7 +134,7 @@ func (c *controlServer) KillJob(ctx context.Context, req *apiv1.KillJobRequest) 
 
 func (c *controlServer) GetJobLogs(req *apiv1.GetJobLogsRequest, stream grpc.ServerStreamingServer[apiv1.LogChunk]) error {
 	c.sched.mu.Lock()
-	rj, exists := c.sched.running[req.Id]
+	_, rj, exists := c.findJob(req.Id)
 	if !exists {
 		c.sched.mu.Unlock()
 		return status.Errorf(codes.NotFound, "job %d not found", req.Id)
@@ -161,12 +174,16 @@ func (c *controlServer) GetJobLogs(req *apiv1.GetJobLogsRequest, stream grpc.Ser
 	}
 }
 
-func (c *controlServer) toProto(jobID int64, rj *runningJob) *apiv1.Job {
+func (c *controlServer) toProto(key jobKey, rj *runningJob) *apiv1.Job {
+	var runnerID int64
+	if rj.claim != nil {
+		runnerID = rj.claim.RunnerID
+	}
 	job := &apiv1.Job{
-		Id:        jobID,
+		Id:        key.JobID,
 		Repo:      rj.repo,
 		Image:     rj.image,
-		RunnerId:  rj.runnerID,
+		RunnerId:  runnerID,
 		Status:    "running",
 		StartedAt: rj.startedAt.Format(time.RFC3339),
 		Uptime:    time.Since(rj.startedAt).Truncate(time.Second).String(),

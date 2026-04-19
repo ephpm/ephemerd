@@ -19,13 +19,14 @@ const defaultImage = "ghcr.io/actions/actions-runner:latest"
 
 // Provider implements providers.Poll and providers.Webhook for GitHub Actions.
 type Provider struct {
-	client   *github.Client
-	log      *slog.Logger
-	events   chan providers.JobEvent
-	webhooks []github.ManagedWebhook
-	whHandler http.Handler
-	whEvents  <-chan providers.JobEvent
-	cancel   context.CancelFunc
+	client       *github.Client
+	log          *slog.Logger
+	events       chan providers.JobEvent
+	webhooks     []github.ManagedWebhook
+	whHandler    http.Handler
+	whEvents     <-chan providers.JobEvent
+	cancel       context.CancelFunc
+	defaultImage string // config override for the runner container image
 }
 
 // Compile-time interface checks.
@@ -35,16 +36,23 @@ var (
 )
 
 // New creates a GitHub provider wrapping an existing GitHub client.
-func New(client *github.Client, log *slog.Logger) *Provider {
+// imageOverride, if non-empty, replaces the default runner container image.
+func New(client *github.Client, log *slog.Logger, imageOverride string) *Provider {
 	return &Provider{
-		client: client,
-		log:    log,
-		events: make(chan providers.JobEvent, 64),
+		client:       client,
+		log:          log,
+		events:       make(chan providers.JobEvent, 64),
+		defaultImage: imageOverride,
 	}
 }
 
-func (p *Provider) Name() string            { return "github" }
-func (p *Provider) DefaultImage() string    { return defaultImage }
+func (p *Provider) Name() string { return "github" }
+func (p *Provider) DefaultImage() string {
+	if p.defaultImage != "" {
+		return p.defaultImage
+	}
+	return defaultImage
+}
 func (p *Provider) DefaultJobImage() string { return "" }
 
 func (p *Provider) Start(ctx context.Context, cfg providers.PollConfig) (<-chan providers.JobEvent, error) {
@@ -75,7 +83,7 @@ func (p *Provider) pollLoop(ctx context.Context, interval time.Duration) {
 			}
 			for _, ev := range events {
 				select {
-				case p.events <- convertEvent(ev):
+				case p.events <- p.convertEvent(ev):
 				case <-ctx.Done():
 					return
 				}
@@ -114,7 +122,7 @@ func (p *Provider) WebhookHandler(secret string) (http.Handler, <-chan providers
 	ch := make(chan providers.JobEvent, 64)
 	go func() {
 		for ev := range ghCh {
-			ch <- convertEvent(ev)
+			ch <- p.convertEvent(ev)
 		}
 		close(ch)
 	}()
@@ -148,17 +156,18 @@ func (p *Provider) Stop(ctx context.Context) error {
 	return nil
 }
 
-func convertEvent(ev github.JobEvent) providers.JobEvent {
+func (p *Provider) convertEvent(ev github.JobEvent) providers.JobEvent {
 	var labels []string
 	if ev.Job != nil {
 		labels = append(labels, ev.Job.Labels...)
 	}
 
 	fe := providers.JobEvent{
-		Action: ev.Action,
-		Repo:   ev.Repo,
-		Labels: labels,
-		Raw:    ev.Job,
+		Provider: p,
+		Action:   ev.Action,
+		Repo:     ev.Repo,
+		Labels:   labels,
+		Raw:      ev.Job,
 	}
 	if ev.Job != nil {
 		fe.JobID = ev.Job.GetID()

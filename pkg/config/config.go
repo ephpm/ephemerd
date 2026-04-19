@@ -31,22 +31,36 @@ type Config struct {
 	Log        LogConfig        `toml:"log"`
 }
 
-// Provider returns the name of the configured forge provider.
-// Exactly one provider section should have credentials set.
+// Provider returns the name of the first configured forge provider.
 // Returns "github" by default for backward compatibility.
 func (c *Config) Provider() string {
-	switch {
-	case c.Forgejo.InstanceURL != "":
-		return "forgejo"
-	case c.Gitea.InstanceURL != "":
-		return "gitea"
-	case c.GitLab.InstanceURL != "":
-		return "gitlab"
-	case c.Woodpecker.ServerURL != "":
-		return "woodpecker"
-	default:
-		return "github"
+	ps := c.Providers()
+	if len(ps) > 0 {
+		return ps[0]
 	}
+	return "github"
+}
+
+// Providers returns all configured provider names.
+// A provider is "configured" if its credential/URL fields are set.
+func (c *Config) Providers() []string {
+	var ps []string
+	if c.GitHub.Owner != "" || c.GitHub.Token != "" || c.GitHub.AppID != 0 {
+		ps = append(ps, "github")
+	}
+	if c.Forgejo.InstanceURL != "" {
+		ps = append(ps, "forgejo")
+	}
+	if c.Gitea.InstanceURL != "" {
+		ps = append(ps, "gitea")
+	}
+	if c.GitLab.InstanceURL != "" {
+		ps = append(ps, "gitlab")
+	}
+	if c.Woodpecker.ServerURL != "" {
+		ps = append(ps, "woodpecker")
+	}
+	return ps
 }
 
 // MetricsConfig configures the Prometheus metrics endpoint.
@@ -156,38 +170,43 @@ type GitHubConfig struct {
 
 	// Job discovery: polling interval (default "30s")
 	PollInterval string `toml:"poll_interval"`
+
+	// DefaultImage overrides the runner container image.
+	// Default: "ghcr.io/actions/actions-runner:latest"
+	DefaultImage string `toml:"default_image"`
 }
 
 // ForgejoConfig configures the Forgejo Actions provider.
 // Set instance_url and token to enable Forgejo instead of GitHub.
 // Uses forgejo-runner binary with one-job --handle mode.
 type ForgejoConfig struct {
-	InstanceURL string   `toml:"instance_url"` // Forgejo instance URL (e.g., "https://codeberg.org")
-	Token       string   `toml:"token"`        // runner registration token from Forgejo admin
-	Owner       string   `toml:"owner"`        // org or user (empty = instance-level runner)
-	Repos       []string `toml:"repos"`        // limit to specific repos (empty = all)
-	Labels      []string `toml:"labels"`       // runner labels (default: ["ubuntu-latest:docker://<job_image>"])
-	JobImage    string   `toml:"job_image"`    // default job execution image (default: "gitea/runner-images:ubuntu-24.04")
+	InstanceURL  string   `toml:"instance_url"`  // Forgejo instance URL (e.g., "https://codeberg.org")
+	Token        string   `toml:"token"`         // runner registration token from Forgejo admin
+	Owner        string   `toml:"owner"`         // org or user (empty = instance-level runner)
+	Repos        []string `toml:"repos"`         // limit to specific repos (empty = all)
+	DefaultImage string   `toml:"default_image"` // runner daemon image (default: "data.forgejo.org/forgejo/runner:12")
+	JobImage     string   `toml:"job_image"`     // job execution image (default: "gitea/runner-images:ubuntu-24.04")
 }
 
 // GiteaConfig configures the Gitea Actions provider.
 // Set instance_url and token to enable Gitea instead of GitHub.
 // Uses act_runner binary with --ephemeral mode.
 type GiteaConfig struct {
-	InstanceURL string   `toml:"instance_url"` // Gitea instance URL (e.g., "https://gitea.example.com")
-	Token       string   `toml:"token"`        // runner registration token from Gitea admin
-	Owner       string   `toml:"owner"`        // org or user (empty = instance-level runner)
-	Repos       []string `toml:"repos"`        // limit to specific repos (empty = all)
-	Labels      []string `toml:"labels"`       // runner labels (default: ["ubuntu-latest:docker://<job_image>"])
-	JobImage    string   `toml:"job_image"`    // default job execution image (default: "gitea/runner-images:ubuntu-24.04")
+	InstanceURL  string   `toml:"instance_url"`  // Gitea instance URL (e.g., "https://gitea.example.com")
+	Token        string   `toml:"token"`         // runner registration token from Gitea admin
+	Owner        string   `toml:"owner"`         // org or user (empty = instance-level runner)
+	Repos        []string `toml:"repos"`         // limit to specific repos (empty = all)
+	DefaultImage string   `toml:"default_image"` // runner daemon image (default: "docker.io/gitea/act_runner:latest")
+	JobImage     string   `toml:"job_image"`     // job execution image (default: "gitea/runner-images:ubuntu-24.04")
 }
 
 // GitLabConfig configures the GitLab CI provider.
 // Set instance_url and token to enable GitLab instead of GitHub.
 type GitLabConfig struct {
-	InstanceURL string   `toml:"instance_url"` // GitLab instance URL (e.g., "https://gitlab.com")
-	Token       string   `toml:"token"`        // runner authentication token (glrt-xxx for GitLab 16+)
-	Tags        []string `toml:"tags"`         // runner tags for job matching
+	InstanceURL  string   `toml:"instance_url"`  // GitLab instance URL (e.g., "https://gitlab.com")
+	Token        string   `toml:"token"`         // runner authentication token (glrt-xxx for GitLab 16+)
+	Tags         []string `toml:"tags"`          // runner tags for job matching
+	DefaultImage string   `toml:"default_image"` // runner image (default: "ghcr.io/ephpm/runner-gitlab:latest")
 }
 
 // WoodpeckerConfig configures the Woodpecker CI provider.
@@ -306,26 +325,35 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) validate() error {
-	switch c.Provider() {
-	case "github":
-		if err := c.validateGitHub(); err != nil {
-			return err
-		}
-	case "forgejo":
-		if c.Forgejo.Token == "" {
-			return fmt.Errorf("forgejo.token is required")
-		}
-	case "gitea":
-		if c.Gitea.Token == "" {
-			return fmt.Errorf("gitea.token is required")
-		}
-	case "gitlab":
-		if c.GitLab.Token == "" {
-			return fmt.Errorf("gitlab.token is required")
-		}
-	case "woodpecker":
-		if c.Woodpecker.AgentSecret == "" {
-			return fmt.Errorf("woodpecker.agent_secret is required")
+	// Apply GITHUB_TOKEN env fallback before checking which providers are configured.
+	// This ensures Providers() picks up the env-based token.
+	if c.GitHub.Token == "" && os.Getenv("GITHUB_TOKEN") != "" {
+		c.GitHub.Token = os.Getenv("GITHUB_TOKEN")
+	}
+
+	// Validate all configured providers (not just the first one).
+	for _, p := range c.Providers() {
+		switch p {
+		case "github":
+			if err := c.validateGitHub(); err != nil {
+				return err
+			}
+		case "forgejo":
+			if c.Forgejo.Token == "" {
+				return fmt.Errorf("forgejo.token is required")
+			}
+		case "gitea":
+			if c.Gitea.Token == "" {
+				return fmt.Errorf("gitea.token is required")
+			}
+		case "gitlab":
+			if c.GitLab.Token == "" {
+				return fmt.Errorf("gitlab.token is required")
+			}
+		case "woodpecker":
+			if c.Woodpecker.AgentSecret == "" {
+				return fmt.Errorf("woodpecker.agent_secret is required")
+			}
 		}
 	}
 

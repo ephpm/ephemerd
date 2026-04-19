@@ -64,10 +64,9 @@ type Config struct {
 	// If empty, the runner accepts jobs from all repos the owner has access to.
 	Repos []string
 
-	// Labels are the runner labels to register with the forge.
-	// Each label is a string like "ubuntu-latest:docker://image:tag".
-	// If empty, defaults to ["ubuntu-latest:docker://<job_image>"].
-	Labels []string
+	// DefaultImage overrides the runner daemon container image.
+	// Default: "data.forgejo.org/forgejo/runner:12"
+	DefaultImage string
 
 	// JobImage is the default OCI image for job execution containers.
 	// The runner daemon creates job containers via the fake Docker socket;
@@ -113,8 +112,13 @@ func New(cfg Config) (*Provider, error) {
 	}, nil
 }
 
-func (p *Provider) Name() string         { return "forgejo" }
-func (p *Provider) DefaultImage() string { return defaultImage }
+func (p *Provider) Name() string { return "forgejo" }
+func (p *Provider) DefaultImage() string {
+	if p.cfg.DefaultImage != "" {
+		return p.cfg.DefaultImage
+	}
+	return defaultImage
+}
 func (p *Provider) DefaultJobImage() string {
 	if p.cfg.JobImage != "" {
 		return p.cfg.JobImage
@@ -262,9 +266,6 @@ func (p *Provider) Stop(ctx context.Context) error {
 }
 
 func (p *Provider) buildLabels() []string {
-	if len(p.cfg.Labels) > 0 {
-		return p.cfg.Labels
-	}
 	return []string{
 		fmt.Sprintf("ubuntu-latest:docker://%s", p.DefaultJobImage()),
 	}

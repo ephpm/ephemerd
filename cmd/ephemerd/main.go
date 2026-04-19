@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	runtime_ "runtime"
 	"strconv"
 	"syscall"
+	"time"
 
 	apiv1 "github.com/ephpm/ephemerd/api/v1"
 	"github.com/ephpm/ephemerd/pkg/artifacts"
@@ -16,12 +18,12 @@ import (
 	"github.com/ephpm/ephemerd/pkg/containerd"
 	"github.com/ephpm/ephemerd/pkg/github"
 	"github.com/ephpm/ephemerd/pkg/metrics"
-	goproxy "github.com/ephpm/ephemerd/pkg/proxies/go"
-	"github.com/ephpm/ephemerd/pkg/proxies"
 	"github.com/ephpm/ephemerd/pkg/networking"
 	"github.com/ephpm/ephemerd/pkg/providers"
-	forgejoprovider "github.com/ephpm/ephemerd/pkg/providers/forgejo"
-	giteaprovider "github.com/ephpm/ephemerd/pkg/providers/gitea"
+	"github.com/ephpm/ephemerd/pkg/providers/forgejo"
+	githubProv "github.com/ephpm/ephemerd/pkg/providers/github"
+	goproxy "github.com/ephpm/ephemerd/pkg/proxies/go"
+	"github.com/ephpm/ephemerd/pkg/proxies"
 	"github.com/ephpm/ephemerd/pkg/runner"
 	"github.com/ephpm/ephemerd/pkg/runtime"
 	"github.com/ephpm/ephemerd/pkg/scheduler"
@@ -307,73 +309,6 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		cacheProxyEnvVars = append(cacheProxyEnvVars, cp.EnvVars()...)
 	}
 
-	// Create provider based on config. Must happen before runtime creation
-	// because forge providers auto-enable dind.
-	var gh *github.Client
-	var forgeProvider providers.Poll
-
-	switch cfg.Provider() {
-	case "gitea":
-		cfg.Dind.Enabled = true
-		p, err := giteaprovider.New(giteaprovider.Config{
-			InstanceURL: cfg.Gitea.InstanceURL,
-			Token:       cfg.Gitea.Token,
-			Owner:       cfg.Gitea.Owner,
-			Repos:       cfg.Gitea.Repos,
-			Labels:      cfg.Gitea.Labels,
-			JobImage:    cfg.Gitea.JobImage,
-			Log:         log,
-		})
-		if err != nil {
-			return fmt.Errorf("creating gitea provider: %w", err)
-		}
-		forgeProvider = p
-		log.Info("using Gitea provider", "instance", cfg.Gitea.InstanceURL)
-
-	case "forgejo":
-		cfg.Dind.Enabled = true
-		p, err := forgejoprovider.New(forgejoprovider.Config{
-			InstanceURL: cfg.Forgejo.InstanceURL,
-			Token:       cfg.Forgejo.Token,
-			Owner:       cfg.Forgejo.Owner,
-			Repos:       cfg.Forgejo.Repos,
-			Labels:      cfg.Forgejo.Labels,
-			JobImage:    cfg.Forgejo.JobImage,
-			Log:         log,
-		})
-		if err != nil {
-			return fmt.Errorf("creating forgejo provider: %w", err)
-		}
-		forgeProvider = p
-		log.Info("using Forgejo provider", "instance", cfg.Forgejo.InstanceURL)
-
-	default: // "github"
-		ghCfg := github.Config{
-			Token: cfg.GitHub.Token,
-			Owner: cfg.GitHub.Owner,
-			Repos: cfg.GitHub.Repos,
-			Log:   log,
-		}
-		if cfg.GitHub.AppID != 0 {
-			appAuth, err := github.NewAppAuth(
-				cfg.GitHub.AppID,
-				cfg.GitHub.InstallationID,
-				cfg.GitHub.PrivateKeyPath,
-				log,
-			)
-			if err != nil {
-				return fmt.Errorf("initializing github app auth: %w", err)
-			}
-			defer appAuth.Stop()
-			ghCfg.AppAuth = appAuth
-		}
-		var err error
-		gh, err = github.New(ghCfg)
-		if err != nil {
-			return fmt.Errorf("creating github client: %w", err)
-		}
-	}
-
 	// Create runtime (container lifecycle manager).
 	// On Darwin the Linux VM sees the host's DataDir at /mnt/ephemerd.
 	containerDataDir := configDir
@@ -400,7 +335,16 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		log.Warn("failed to clean orphan containers", "error", err)
 	}
 
-	// Create artifact extractor for macOS VM jobs.
+	// Create CI providers (one or more of GitHub, Forgejo, Gitea, etc.)
+	activeProviders, providerCleanup, err := initProviders(cfg, log)
+	if err != nil {
+		return fmt.Errorf("creating providers: %w", err)
+	}
+	defer providerCleanup()
+
+	// Create artifact extractor for macOS VM jobs. On macOS hosts, this
+	// allows EPHEMERD_IMAGE to pull OCI images and extract their layers
+	// into the shared data directory (available inside macOS VMs via virtio-fs).
 	artifactExtractor := artifacts.NewExtractor(ctrdClient, log)
 
 	// Wait for Linux dispatch client if WSL VM is booting in the background.
@@ -409,31 +353,30 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		log.Info("Linux job dispatch enabled via WSL")
 	}
 
-	// Set up webhook tunnel (GitHub mode only)
+	// Set up webhook tunnel if configured
 	var tunnelProvider tunnel.Provider
-	if forgeProvider == nil && cfg.Webhook.Tunnel != "none" {
+	if cfg.Webhook.Tunnel != "none" {
 		var err error
 		tunnelProvider, err = tunnel.New(cfg.Webhook.Tunnel, cfg.Webhook.NgrokAuthtoken, cfg.Webhook.TunnelURL)
 		if err != nil {
 			return fmt.Errorf("creating tunnel provider: %w", err)
 		}
 		log.Info("webhook tunnel configured", "provider", cfg.Webhook.Tunnel)
-	} else if forgeProvider == nil {
+	} else {
 		log.Info("polling mode enabled (tunnel disabled)")
 	}
 
-	// Start scheduler
+	// Start scheduler (ties CI provider jobs to container lifecycle)
 	sched := scheduler.New(scheduler.Config{
 		Runtime:          rt,
-		GitHub:           gh,
-		Provider:         forgeProvider,
+		Providers:        activeProviders,
 		Artifacts:        artifactExtractor,
 		LinuxDispatcher:  linuxDispatcher,
 		DataDir:          configDir,
 		MaxConcurrent:    cfg.Runner.MaxConcurrent,
 		MaxMacOSVMs:      cfg.VM.MacOS.MaxConcurrent,
 		Labels:           cfg.Runner.ExtraLabels,
-		PollInterval:     cfg.GitHub.ParsedPollInterval(),
+		PollInterval:     pollInterval(cfg),
 		WebhookPort:      cfg.Webhook.Port,
 		WebhookSecret:    cfg.Webhook.Secret,
 		TLSCert:          cfg.Webhook.TLSCert,
@@ -492,6 +435,86 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	log.Info("ephemerd ready", "provider", cfg.Provider(), "max_concurrent", cfg.Runner.MaxConcurrent)
 
 	return sched.Run(ctx)
+}
+
+// initProviders constructs all configured CI providers.
+// Multiple providers can be active simultaneously (e.g., GitHub + Forgejo).
+// Returns the providers, a cleanup function, and any error.
+func initProviders(cfg *config.Config, log *slog.Logger) ([]providers.Provider, func(), error) {
+	var active []providers.Provider
+	var cleanups []func()
+
+	cleanup := func() {
+		for _, fn := range cleanups {
+			fn()
+		}
+	}
+
+	// GitHub: configured when owner or token is set
+	if cfg.GitHub.Owner != "" || cfg.GitHub.Token != "" {
+		ghCfg := github.Config{
+			Token: cfg.GitHub.Token,
+			Owner: cfg.GitHub.Owner,
+			Repos: cfg.GitHub.Repos,
+			Log:   log,
+		}
+		if cfg.GitHub.AppID != 0 {
+			appAuth, err := github.NewAppAuth(
+				cfg.GitHub.AppID,
+				cfg.GitHub.InstallationID,
+				cfg.GitHub.PrivateKeyPath,
+				log,
+			)
+			if err != nil {
+				cleanup()
+				return nil, nil, fmt.Errorf("initializing github app auth: %w", err)
+			}
+			ghCfg.AppAuth = appAuth
+			cleanups = append(cleanups, appAuth.Stop)
+		}
+		ghClient, err := github.New(ghCfg)
+		if err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("creating github client: %w", err)
+		}
+		active = append(active, githubProv.New(ghClient, log, cfg.GitHub.DefaultImage))
+		log.Info("provider enabled", "provider", "github", "owner", cfg.GitHub.Owner)
+	}
+
+	// Forgejo: configured when instance_url is set
+	if cfg.Forgejo.InstanceURL != "" {
+		p, err := forgejo.New(forgejo.Config{
+			InstanceURL:  cfg.Forgejo.InstanceURL,
+			Token:        cfg.Forgejo.Token,
+			Owner:        cfg.Forgejo.Owner,
+			Repos:        cfg.Forgejo.Repos,
+			DefaultImage: cfg.Forgejo.DefaultImage,
+			JobImage:     cfg.Forgejo.JobImage,
+			Log:          log,
+		})
+		if err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("creating forgejo provider: %w", err)
+		}
+		active = append(active, p)
+		log.Info("provider enabled", "provider", "forgejo", "instance", cfg.Forgejo.InstanceURL)
+	}
+
+	if len(active) == 0 {
+		return nil, nil, fmt.Errorf("no providers configured — set [github], [forgejo], or another provider section in config")
+	}
+
+	return active, cleanup, nil
+}
+
+// pollInterval returns the poll interval for the configured provider.
+func pollInterval(cfg *config.Config) time.Duration {
+	switch cfg.Provider() {
+	case "github":
+		return cfg.GitHub.ParsedPollInterval()
+	default:
+		return 30 * time.Second
+	}
 }
 
 // ctrctlCmd provides direct access to the embedded containerd for debugging.

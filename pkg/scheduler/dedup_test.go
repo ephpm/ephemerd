@@ -7,19 +7,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ephpm/ephemerd/pkg/github"
-	gh "github.com/google/go-github/v72/github"
+	"github.com/ephpm/ephemerd/pkg/providers"
 )
 
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-func makeEvent(jobID int64, labels []string) github.JobEvent {
-	return github.JobEvent{
+func makeEvent(jobID int64, labels []string) providers.JobEvent {
+	return providers.JobEvent{
 		Action: "queued",
 		Repo:   "test-repo",
-		Job:    &gh.WorkflowJob{ID: gh.Ptr(jobID), Labels: labels},
+		JobID:  jobID,
+		Labels: labels,
 	}
 }
 
@@ -30,7 +30,7 @@ func TestHandleQueued_SkipsAlreadyRunning(t *testing.T) {
 	ctx := context.Background()
 
 	// Simulate a running job
-	s.running[100] = &runningJob{repo: "test", startedAt: time.Now()}
+	s.running[jobKey{JobID: 100}] = &runningJob{repo: "test", startedAt: time.Now()}
 
 	// handleQueued should skip silently (no panic, no new entry in seen)
 	event := makeEvent(100, []string{"self-hosted"})
@@ -38,7 +38,7 @@ func TestHandleQueued_SkipsAlreadyRunning(t *testing.T) {
 
 	// Job should still be in running (not removed)
 	s.mu.Lock()
-	_, stillRunning := s.running[100]
+	_, stillRunning := s.running[jobKey{JobID: 100}]
 	s.mu.Unlock()
 	if !stillRunning {
 		t.Error("running job should not be removed by duplicate queued event")
@@ -52,14 +52,14 @@ func TestHandleQueued_SkipsRecentlySeen(t *testing.T) {
 	ctx := context.Background()
 
 	// Mark job as recently seen
-	s.seen[200] = time.Now()
+	s.seen[jobKey{JobID: 200}] = time.Now()
 
 	event := makeEvent(200, []string{"self-hosted"})
 	s.handleQueued(ctx, event)
 
 	// Should not be added to running
 	s.mu.Lock()
-	_, isRunning := s.running[200]
+	_, isRunning := s.running[jobKey{JobID: 200}]
 	s.mu.Unlock()
 	if isRunning {
 		t.Error("recently seen job should not be started")
@@ -72,11 +72,11 @@ func TestHandleQueued_AllowsExpiredSeen(t *testing.T) {
 	s := New(Config{Log: quietLogger()})
 
 	// Mark job as seen but expired
-	s.seen[300] = time.Now().Add(-seenTTL - time.Minute)
+	s.seen[jobKey{JobID: 300}] = time.Now().Add(-seenTTL - time.Minute)
 
 	// The dedup check should pass, and seen should be updated
 	s.mu.Lock()
-	seenTime := s.seen[300]
+	seenTime := s.seen[jobKey{JobID: 300}]
 	s.mu.Unlock()
 
 	if time.Since(seenTime) < seenTTL {
@@ -97,8 +97,8 @@ func TestHandleQueued_RejectsWhenDraining(t *testing.T) {
 
 	// Job should be in seen (was recorded) but not running
 	s.mu.Lock()
-	_, isRunning := s.running[400]
-	_, isSeen := s.seen[400]
+	_, isRunning := s.running[jobKey{JobID: 400}]
+	_, isSeen := s.seen[jobKey{JobID: 400}]
 	s.mu.Unlock()
 
 	if isRunning {
@@ -149,12 +149,12 @@ func TestDestroyAll_ClearsRunning(t *testing.T) {
 	_, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
 
-	s.running[1] = &runningJob{
+	s.running[jobKey{JobID: 1}] = &runningJob{
 		repo:      "repo1",
 		cancel:    cancel1,
 		startedAt: time.Now(),
 	}
-	s.running[2] = &runningJob{
+	s.running[jobKey{JobID: 2}] = &runningJob{
 		repo:      "repo2",
 		cancel:    cancel2,
 		startedAt: time.Now(),
@@ -180,21 +180,21 @@ func TestHandleCompleted_RemovesJob(t *testing.T) {
 	ctx := context.Background()
 
 	_, cancel := context.WithCancel(ctx)
-	s.running[500] = &runningJob{
+	s.running[jobKey{JobID: 500}] = &runningJob{
 		repo:      "test",
 		cancel:    cancel,
 		startedAt: time.Now(),
 	}
 
-	event := github.JobEvent{
+	event := providers.JobEvent{
 		Action: "completed",
 		Repo:   "test",
-		Job:    &gh.WorkflowJob{ID: gh.Ptr(int64(500))},
+		JobID:  500,
 	}
 	s.handleCompleted(ctx, event)
 
 	s.mu.Lock()
-	_, exists := s.running[500]
+	_, exists := s.running[jobKey{JobID: 500}]
 	s.mu.Unlock()
 
 	if exists {
@@ -208,10 +208,10 @@ func TestHandleCompleted_UnknownJobNoOp(t *testing.T) {
 	s := New(Config{Log: quietLogger()})
 	ctx := context.Background()
 
-	event := github.JobEvent{
+	event := providers.JobEvent{
 		Action: "completed",
 		Repo:   "test",
-		Job:    &gh.WorkflowJob{ID: gh.Ptr(int64(999))},
+		JobID:  999,
 	}
 
 	// Should not panic
