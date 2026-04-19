@@ -50,53 +50,91 @@ When `EPHEMERD_IMAGE` is set, ephemerd pulls the OCI image via containerd and ex
 
 ## Building Custom Images
 
-Custom images start from any base and add your project's dependencies. A simple Dockerfile:
+Custom images extend the upstream GitHub Actions runner image (`ghcr.io/actions/actions-runner:latest`) and add your project's dependencies. This is important -- the runner image includes the GitHub Actions runner binary that ephemerd needs to execute jobs.
+
+### Linux
 
 ```dockerfile
-FROM ubuntu:24.04
+FROM ghcr.io/actions/actions-runner:latest
 
+USER root
+
+# Install your project's build dependencies
 RUN apt-get update && apt-get install -y \
-    build-essential \
-    curl \
-    git \
+    build-essential cmake autoconf automake \
+    git curl wget pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# Install project-specific tools
-RUN curl -fsSL https://go.dev/dl/go1.24.3.linux-amd64.tar.gz | tar -C /usr/local -xz
-ENV PATH="/usr/local/go/bin:${PATH}"
+# Add language runtimes, SDKs, etc.
+# RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y nodejs
+
+USER runner
 ```
 
-Build and push:
+For multi-arch builds (amd64 + arm64):
 
 ```bash
-docker build -t ghcr.io/your-org/ci-image:latest .
-docker push ghcr.io/your-org/ci-image:latest
+docker buildx build --platform linux/amd64,linux/arm64 \
+    -t ghcr.io/your-org/ci-image:latest --push .
 ```
 
-The image is pulled once by ephemerd and cached locally. Subsequent jobs using the same image tag start without a pull delay (unless the tag points to a new digest).
+### Windows
+
+```dockerfile
+# escape=`
+FROM ghcr.io/actions/actions-runner:latest-win
+
+SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop';"]
+
+# Install your build tools
+RUN Invoke-WebRequest -Uri "https://go.dev/dl/go1.26.1.windows-amd64.zip" -OutFile go.zip; `
+    Expand-Archive go.zip -DestinationPath C:\; `
+    Remove-Item go.zip
+ENV PATH="C:\go\bin;${PATH}"
+```
+
+Windows images must be built on a Windows host.
+
+### macOS (artifact image)
+
+macOS VMs don't run containers, so the image is just a way to deliver pre-built tools. Use a `FROM scratch` image with binaries copied from a builder stage:
+
+```dockerfile
+FROM golang:1.26-bookworm AS builder
+RUN GOOS=darwin GOARCH=arm64 go build -o /deps/bin/mage github.com/magefile/mage
+
+FROM scratch
+COPY --from=builder /deps /deps
+```
+
+ephemerd pulls this image, extracts the layers, and mounts them into the macOS VM via virtio-fs. The tools are available immediately without download or compilation.
+
+## Per-Repo Image Overrides
+
+Override the default image for specific repositories in the config:
+
+```toml
+[runner]
+default_image = "ghcr.io/your-org/ci-image:latest"
+
+[runner.repo_images]
+"my-go-project" = "ghcr.io/your-org/go-ci:latest"
+"my-rust-project" = "ghcr.io/your-org/rust-ci:latest"
+```
 
 ## One Image, Every Host
 
 The same Linux container image runs identically on Linux, Windows (via WSL2), and macOS (via Virtualization.framework). In all three cases, containerd is the runtime that pulls and executes the image. There is no need to maintain separate images per host platform.
 
-## OCI Artifact Cache for macOS
+## Reference: ephemerd CI Images
 
-macOS VM jobs can use OCI images as a pre-built artifact cache. Package build outputs, compiled SDKs, or large dependencies into a `FROM scratch` image:
+ephemerd's own CI uses custom runner images that pre-cache all build dependencies. These live in the [`images/`](https://github.com/ephpm/ephemerd/tree/feat/ci-runner-images/images) directory and serve as a real-world example:
 
-```dockerfile
-FROM golang:1.24 AS builder
-RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+| Image | Base | What it caches |
+|-------|------|----------------|
+| `runner-ci-linux` | `ghcr.io/actions/actions-runner:latest` | Go, Mage, runner archive, CNI plugins, containerd shim, runc, golangci-lint |
+| `runner-ci-windows` | `ghcr.io/actions/actions-runner:latest-win` | Go, Mage, runner archive (Windows + Linux), golangci-lint |
+| `runner-ci-macos` | `scratch` | Runner archive (macOS), Mage, golangci-lint (cross-compiled for darwin) |
 
-FROM scratch
-COPY --from=builder /go/bin/golangci-lint /usr/local/bin/
-COPY --from=builder /usr/local/go /usr/local/go
-```
-
-```bash
-docker build -t ghcr.io/your-org/go-tools:latest .
-docker push ghcr.io/your-org/go-tools:latest
-```
-
-When a macOS job references this image via `EPHEMERD_IMAGE`, ephemerd pulls it through containerd (which caches the layers), extracts the filesystem into a host directory, and shares it into the macOS VM via virtio-fs. The tools are available immediately without download or compilation.
-
-This turns any OCI registry into a binary cache for macOS CI jobs.
+The Linux image supports multi-arch (amd64 + arm64) via `docker buildx`. Each image includes an entrypoint script that copies the cached dependencies into the workspace so `mage ci` runs without downloading anything.
