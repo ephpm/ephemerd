@@ -3,6 +3,7 @@ package forgerunner
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -96,7 +97,8 @@ func RunScript(ctx context.Context, step *Step, env map[string]string, workDir s
 	// Wait for process to complete.
 	exitCode := 0
 	if err := cmd.Wait(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
 			exitCode = exitErr.ExitCode()
 		} else {
 			return nil, fmt.Errorf("wait: %w", err)

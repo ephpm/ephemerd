@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -39,7 +40,7 @@ func newTestForge(t *testing.T, handlers map[string]http.HandlerFunc) *httptest.
 
 func jsonResponse(w http.ResponseWriter, body string) {
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprint(w, body)
+	_, _ = fmt.Fprint(w, body) //nolint:errcheck // test helper writing to httptest recorder
 }
 
 // allHandlers returns a handler map with Register, Declare, FetchTask,
@@ -286,7 +287,7 @@ func TestPoll_ContextCancellation(t *testing.T) {
 	defer cancel()
 
 	err = r.Run(ctx)
-	if err == nil || err != context.DeadlineExceeded {
+	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("expected context.DeadlineExceeded, got %v", err)
 	}
 	if fetchCount == 0 {
