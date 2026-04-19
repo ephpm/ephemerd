@@ -16,6 +16,8 @@ import (
 	"github.com/ephpm/ephemerd/pkg/containerd"
 	"github.com/ephpm/ephemerd/pkg/github"
 	"github.com/ephpm/ephemerd/pkg/metrics"
+	goproxy "github.com/ephpm/ephemerd/pkg/proxies/go"
+	"github.com/ephpm/ephemerd/pkg/proxies"
 	"github.com/ephpm/ephemerd/pkg/networking"
 	"github.com/ephpm/ephemerd/pkg/runner"
 	"github.com/ephpm/ephemerd/pkg/runtime"
@@ -236,13 +238,24 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		return fmt.Errorf("extracting CNI plugins: %w", err)
 	}
 
+	// Determine extra gateway ports for firewall (e.g., module proxy)
+	var gatewayPorts []int
+	modProxyPort := cfg.ModuleProxy.Port
+	if modProxyPort == 0 {
+		modProxyPort = 8082
+	}
+	if cfg.ModuleProxy.Enabled {
+		gatewayPorts = append(gatewayPorts, modProxyPort)
+	}
+
 	// Initialize container networking
 	net, err := networking.New(networking.Config{
-		DataDir:   configDir,
-		Subnet:    cfg.Network.Subnet,
-		MTU:       cfg.Network.MTU,
-		CNIBinDir: cm.Dir(),
-		Log:       log,
+		DataDir:      configDir,
+		Subnet:       cfg.Network.Subnet,
+		MTU:          cfg.Network.MTU,
+		CNIBinDir:    cm.Dir(),
+		GatewayPorts: gatewayPorts,
+		Log:          log,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing networking: %w", err)
@@ -253,6 +266,43 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		log.Warn("failed to install firewall rules (containers may access LAN)", "error", err)
 	}
 	defer net.Cleanup()
+
+	// Start Go module caching proxy if enabled
+	var cacheProxies []proxies.CacheProxy
+	if cfg.ModuleProxy.Enabled {
+		upstream := cfg.ModuleProxy.Upstream
+		if upstream == "" {
+			upstream = "https://proxy.golang.org"
+		}
+		cleanup := cfg.ModuleProxy.Cleanup
+		if !cleanup {
+			cleanup = true
+		}
+
+		goProxy := goproxy.New(goproxy.Config{
+			CacheDir:   joinPath(configDir, "cache", "gomod"),
+			Upstream:   upstream,
+			ListenAddr: fmt.Sprintf("%s:%d", net.GatewayIP(), modProxyPort),
+			Cleanup:    cleanup,
+			Log:        log,
+		})
+		if err := goProxy.Start(); err != nil {
+			log.Warn("failed to start Go module proxy, continuing without it", "error", err)
+		} else {
+			cacheProxies = append(cacheProxies, goProxy)
+			defer func() {
+				if err := goProxy.Stop(); err != nil {
+					log.Warn("error stopping Go module proxy", "error", err)
+				}
+			}()
+		}
+	}
+
+	// Collect env vars from all cache proxies for injection into containers.
+	var cacheProxyEnvVars []string
+	for _, cp := range cacheProxies {
+		cacheProxyEnvVars = append(cacheProxyEnvVars, cp.EnvVars()...)
+	}
 
 	// Create runtime (container lifecycle manager)
 	// On Darwin the Linux VM sees the host's DataDir at /mnt/ephemerd
@@ -271,6 +321,7 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		DataDir:          configDir,
 		ContainerDataDir: containerDataDir,
 		DindEnabled:      cfg.Dind.Enabled,
+		CacheProxyEnv:    cacheProxyEnvVars,
 		Network:          net,
 		Log:              log,
 	})

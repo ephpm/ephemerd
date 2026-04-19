@@ -481,6 +481,45 @@ func TestLogRetentionDuration_Invalid(t *testing.T) {
 	}
 }
 
+// --- ModuleProxy config ---
+
+func TestLoad_ModuleProxyConfig(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[github]
+token = "ghp_test"
+owner = "org"
+
+[module_proxy]
+enabled = true
+port = 9000
+upstream = "https://goproxy.io"
+cleanup = false
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	if !cfg.ModuleProxy.Enabled {
+		t.Error("ModuleProxy.Enabled = false, want true")
+	}
+	if cfg.ModuleProxy.Port != 9000 {
+		t.Errorf("ModuleProxy.Port = %d, want 9000", cfg.ModuleProxy.Port)
+	}
+	if cfg.ModuleProxy.Upstream != "https://goproxy.io" {
+		t.Errorf("ModuleProxy.Upstream = %q, want %q", cfg.ModuleProxy.Upstream, "https://goproxy.io")
+	}
+	if cfg.ModuleProxy.Cleanup {
+		t.Error("ModuleProxy.Cleanup = true, want false")
+	}
+}
+
 // --- Provider() detection ---
 
 func TestProvider_Default(t *testing.T) {

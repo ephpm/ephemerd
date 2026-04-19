@@ -24,8 +24,9 @@ type Config struct {
 	Containerd ContainerdConfig `toml:"containerd"`
 	Network    NetworkConfig    `toml:"network"`
 	VM         VMConfig         `toml:"vm"`
-	Dind       DindConfig       `toml:"dind"`
-	Runner     RunnerConfig     `toml:"runner"`
+	Dind        DindConfig        `toml:"dind"`
+	ModuleProxy ModuleProxyConfig `toml:"module_proxy"`
+	Runner      RunnerConfig      `toml:"runner"`
 	Metrics    MetricsConfig    `toml:"metrics"`
 	Log        LogConfig        `toml:"log"`
 }
@@ -85,6 +86,16 @@ type ContainerdConfig struct {
 // DindConfig configures the fake Docker daemon mounted into job containers.
 type DindConfig struct {
 	Enabled bool `toml:"enabled"` // mount /var/run/docker.sock with a fake Docker API
+}
+
+// ModuleProxyConfig configures the Go module caching proxy.
+// When enabled, ephemerd runs a local GOPROXY on the bridge gateway that
+// caches module downloads. Containers receive GOPROXY env var automatically.
+type ModuleProxyConfig struct {
+	Enabled  bool   `toml:"enabled"`  // enable Go module caching proxy
+	Port     int    `toml:"port"`     // listen port on bridge gateway (default 8082)
+	Upstream string `toml:"upstream"` // upstream proxy URL (default "https://proxy.golang.org")
+	Cleanup  bool   `toml:"cleanup"`  // wipe cache on shutdown (default true)
 }
 
 // VMConfig configures virtual machines for cross-OS job execution.

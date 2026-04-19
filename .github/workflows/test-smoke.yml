@@ -32,7 +32,7 @@ jobs:
               || echo "PASS: $target blocked"
           done
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Verify checkout
         run: ls -la | head -10 && git log --oneline -3
@@ -52,7 +52,7 @@ jobs:
         run: |
           curl -sI --max-time 10 https://github.com | head -3 || echo "no internet"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Verify checkout
         run: ls -la | head -10 && git log --oneline -3
@@ -80,7 +80,7 @@ jobs:
               || echo "PASS: $target blocked"
           done
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Verify checkout
         run: ls -la | head -10 && git log --oneline -3
