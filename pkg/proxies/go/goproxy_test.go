@@ -15,30 +15,64 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-func TestCacheMiss_FetchesFromUpstream(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("module-content"))
-	}))
-	defer upstream.Close()
+func mustWrite(t *testing.T, w http.ResponseWriter, data []byte) {
+	t.Helper()
+	if _, err := w.Write(data); err != nil {
+		t.Logf("write error: %v", err)
+	}
+}
 
+func drainAndClose(t *testing.T, resp *http.Response) {
+	t.Helper()
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Logf("drain error: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Logf("close error: %v", err)
+	}
+}
+
+func startProxy(t *testing.T, upstream string) *Proxy {
+	t.Helper()
 	p := New(Config{
 		CacheDir:   t.TempDir(),
-		Upstream:   upstream.URL,
+		Upstream:   upstream,
 		ListenAddr: "127.0.0.1:0",
 		Log:        testLogger(),
 	})
 	if err := p.Start(); err != nil {
 		t.Fatalf("Start() error: %v", err)
 	}
-	defer p.Stop()
+	t.Cleanup(func() {
+		if err := p.Stop(); err != nil {
+			t.Logf("Stop() error: %v", err)
+		}
+	})
+	return p
+}
+
+func TestCacheMiss_FetchesFromUpstream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mustWrite(t, w, []byte("module-content"))
+	}))
+	defer upstream.Close()
+
+	p := startProxy(t, upstream.URL)
 
 	resp, err := http.Get("http://" + p.Addr() + "/example.com/mod/@v/v1.0.0.zip")
 	if err != nil {
 		t.Fatalf("GET error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("close error: %v", err)
+		}
+	}()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
 	if string(body) != "module-content" {
 		t.Errorf("body = %q, want %q", body, "module-content")
 	}
@@ -51,40 +85,36 @@ func TestCacheHit_ServesFromDisk(t *testing.T) {
 	var fetchCount atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fetchCount.Add(1)
-		w.Write([]byte("from-upstream"))
+		mustWrite(t, w, []byte("from-upstream"))
 	}))
 	defer upstream.Close()
 
-	p := New(Config{
-		CacheDir:   t.TempDir(),
-		Upstream:   upstream.URL,
-		ListenAddr: "127.0.0.1:0",
-		Log:        testLogger(),
-	})
-	if err := p.Start(); err != nil {
-		t.Fatalf("Start() error: %v", err)
-	}
-	defer p.Stop()
-
+	p := startProxy(t, upstream.URL)
 	url := "http://" + p.Addr() + "/example.com/mod/@v/v1.0.0.mod"
 
+	// First request: cache miss.
 	resp, err := http.Get(url)
 	if err != nil {
 		t.Fatalf("first GET error: %v", err)
 	}
-	io.ReadAll(resp.Body)
-	resp.Body.Close()
+	drainAndClose(t, resp)
 
 	if fetchCount.Load() != 1 {
 		t.Fatalf("expected 1 upstream fetch after first request, got %d", fetchCount.Load())
 	}
 
+	// Second request: cache hit.
 	resp, err = http.Get(url)
 	if err != nil {
 		t.Fatalf("second GET error: %v", err)
 	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Logf("close error: %v", err)
+	}
 
 	if fetchCount.Load() != 1 {
 		t.Errorf("expected 1 upstream fetch after second request (cache hit), got %d", fetchCount.Load())
@@ -98,20 +128,11 @@ func TestMutableEndpoints_NotCached(t *testing.T) {
 	var fetchCount atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fetchCount.Add(1)
-		w.Write([]byte("version-list"))
+		mustWrite(t, w, []byte("version-list"))
 	}))
 	defer upstream.Close()
 
-	p := New(Config{
-		CacheDir:   t.TempDir(),
-		Upstream:   upstream.URL,
-		ListenAddr: "127.0.0.1:0",
-		Log:        testLogger(),
-	})
-	if err := p.Start(); err != nil {
-		t.Fatalf("Start() error: %v", err)
-	}
-	defer p.Stop()
+	p := startProxy(t, upstream.URL)
 
 	for _, path := range []string{"/@v/list", "/@latest"} {
 		fetchCount.Store(0)
@@ -122,8 +143,7 @@ func TestMutableEndpoints_NotCached(t *testing.T) {
 			if err != nil {
 				t.Fatalf("GET %s error: %v", path, err)
 			}
-			io.ReadAll(resp.Body)
-			resp.Body.Close()
+			drainAndClose(t, resp)
 		}
 
 		if fetchCount.Load() != 3 {
@@ -136,21 +156,11 @@ func TestConcurrentRequests_SingleUpstreamFetch(t *testing.T) {
 	var fetchCount atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fetchCount.Add(1)
-		w.Write([]byte("zip-data"))
+		mustWrite(t, w, []byte("zip-data"))
 	}))
 	defer upstream.Close()
 
-	p := New(Config{
-		CacheDir:   t.TempDir(),
-		Upstream:   upstream.URL,
-		ListenAddr: "127.0.0.1:0",
-		Log:        testLogger(),
-	})
-	if err := p.Start(); err != nil {
-		t.Fatalf("Start() error: %v", err)
-	}
-	defer p.Stop()
-
+	p := startProxy(t, upstream.URL)
 	url := "http://" + p.Addr() + "/example.com/mod/@v/v2.0.0.zip"
 
 	var wg sync.WaitGroup
@@ -163,8 +173,7 @@ func TestConcurrentRequests_SingleUpstreamFetch(t *testing.T) {
 				t.Errorf("GET error: %v", err)
 				return
 			}
-			io.ReadAll(resp.Body)
-			resp.Body.Close()
+			drainAndClose(t, resp)
 		}()
 	}
 	wg.Wait()
@@ -180,22 +189,13 @@ func TestUpstreamError_ForwardsStatus(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p := New(Config{
-		CacheDir:   t.TempDir(),
-		Upstream:   upstream.URL,
-		ListenAddr: "127.0.0.1:0",
-		Log:        testLogger(),
-	})
-	if err := p.Start(); err != nil {
-		t.Fatalf("Start() error: %v", err)
-	}
-	defer p.Stop()
+	p := startProxy(t, upstream.URL)
 
 	resp, err := http.Get("http://" + p.Addr() + "/example.com/mod/@v/v9.9.9.zip")
 	if err != nil {
 		t.Fatalf("GET error: %v", err)
 	}
-	resp.Body.Close()
+	drainAndClose(t, resp)
 
 	if resp.StatusCode != 404 {
 		t.Errorf("status = %d, want 404", resp.StatusCode)
