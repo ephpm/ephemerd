@@ -18,6 +18,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/github"
 	"github.com/ephpm/ephemerd/pkg/metrics"
 	"github.com/ephpm/ephemerd/pkg/names"
+	"github.com/ephpm/ephemerd/pkg/providers"
 	"github.com/ephpm/ephemerd/pkg/runtime"
 	"github.com/ephpm/ephemerd/pkg/tunnel"
 	"github.com/ephpm/ephemerd/pkg/vm"
@@ -27,7 +28,8 @@ import (
 // Config for the scheduler.
 type Config struct {
 	Runtime         *runtime.Runtime
-	GitHub          *github.Client
+	GitHub          *github.Client        // used when Provider is nil (GitHub mode)
+	Provider        providers.Poll        // if non-nil, used instead of GitHub for job discovery + lifecycle
 	Artifacts       *artifacts.Extractor  // OCI image layer extractor for macOS VM jobs (nil if not available)
 	LinuxDispatcher *DispatchClient       // if non-nil, Linux jobs are dispatched to this WSL worker via gRPC
 	MacOSVMConfig     *vm.MacOSVMConfig     // if non-nil, macOS-native jobs are enabled (darwin only)
@@ -213,8 +215,28 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
 
+	// --- Forge provider mode (Gitea/Forgejo/etc) ---
+	var forgeEvents <-chan providers.JobEvent
+	if s.cfg.Provider != nil {
+		pollCfg := providers.PollConfig{}
+		if s.cfg.PollInterval > 0 {
+			pollCfg.PollInterval = int(s.cfg.PollInterval.Seconds())
+		}
+		var err error
+		forgeEvents, err = s.cfg.Provider.Start(ctx, pollCfg)
+		if err != nil {
+			return fmt.Errorf("starting forge provider: %w", err)
+		}
+		defer func() {
+			if stopErr := s.cfg.Provider.Stop(context.Background()); stopErr != nil {
+				s.cfg.Log.Warn("forge provider stop error", "error", stopErr)
+			}
+		}()
+		s.cfg.Log.Info("forge provider started", "provider", s.cfg.Provider.Name())
+	}
+
 	// Determine job discovery mode: webhook if tunnel or secret is set, polling otherwise
-	useWebhook := s.cfg.Tunnel != nil || s.cfg.WebhookSecret != ""
+	useWebhook := s.cfg.Provider == nil && (s.cfg.Tunnel != nil || s.cfg.WebhookSecret != "")
 	useTLS := s.cfg.TLSCert != "" && s.cfg.TLSKey != ""
 
 	if useWebhook {
@@ -272,7 +294,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	}
 	defer func() { _ = server.Shutdown(context.Background()) }()
 
-	if !useWebhook {
+	if s.cfg.Provider == nil && !useWebhook {
 		interval := s.cfg.PollInterval
 		if interval <= 0 {
 			interval = 10 * time.Second
@@ -285,7 +307,10 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	cleanupTicker := time.NewTicker(5 * time.Minute)
 	defer cleanupTicker.Stop()
 
-	// Process events
+	// Process events. When a forge provider is active, we read from
+	// forgeEvents (providers.JobEvent). GitHub mode uses the events channel
+	// (github.JobEvent). Both may be active during transition but typically
+	// only one is non-nil.
 	for {
 		select {
 		case <-cleanupTicker.C:
@@ -303,6 +328,17 @@ func (s *Scheduler) Run(ctx context.Context) error {
 				go s.handleQueued(ctx, event)
 			case "completed":
 				go s.handleCompleted(ctx, event)
+			}
+
+		case fev, ok := <-forgeEvents:
+			if !ok {
+				s.cfg.Log.Info("forge provider event channel closed")
+				forgeEvents = nil // stop selecting on closed channel
+				continue
+			}
+			if fev.Action == "queued" {
+				metrics.JobsQueuedTotal.Inc()
+				go s.handleForgeJob(ctx, fev)
 			}
 		}
 	}
@@ -851,7 +887,9 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event github.JobEvent) {
 	} else {
 		jobCtx, cancel = context.WithCancel(ctx)
 	}
-	env, err := s.cfg.Runtime.Create(jobCtx, name, image, encodedConfig)
+	env, err := s.cfg.Runtime.Create(jobCtx, runtime.CreateConfig{
+		ID: name, Image: image, JITConfig: encodedConfig,
+	})
 	if err != nil {
 		log.Error("failed to create runner environment", "error", err)
 		// Remove the ghost runner from GitHub since the container won't start
@@ -914,6 +952,141 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event github.JobEvent) {
 			if rj.artifactsDir != "" {
 				artifacts.Cleanup(rj.artifactsDir, s.cfg.Log)
 			}
+		} else {
+			s.mu.Unlock()
+		}
+	}()
+}
+
+// handleForgeJob provisions a runner container for a Gitea/Forgejo task.
+// The container self-registers with the forge and handles one job.
+func (s *Scheduler) handleForgeJob(ctx context.Context, event providers.JobEvent) {
+	jobID := event.JobID
+	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo, "provider", s.cfg.Provider.Name())
+
+	// Dedup
+	s.mu.Lock()
+	if _, exists := s.running[jobID]; exists {
+		s.mu.Unlock()
+		return
+	}
+	if t, seen := s.seen[jobID]; seen && time.Since(t) < seenTTL {
+		s.mu.Unlock()
+		return
+	}
+	s.seen[jobID] = time.Now()
+	if s.draining {
+		s.mu.Unlock()
+		log.Info("rejecting job, scheduler is draining")
+		return
+	}
+	s.mu.Unlock()
+
+	unsee := func() {
+		s.mu.Lock()
+		delete(s.seen, jobID)
+		s.mu.Unlock()
+	}
+
+	// Acquire concurrency slot
+	select {
+	case s.sem <- struct{}{}:
+	case <-ctx.Done():
+		unsee()
+		return
+	}
+
+	log.Info("provisioning forge runner for job")
+
+	// Get custom image from workflow payload
+	image := s.cfg.Provider.FetchJobImage(ctx, &event)
+	if image == "" {
+		image = s.cfg.Provider.DefaultImage()
+	}
+	if image != "" {
+		log.Info("using image", "image", image)
+	}
+
+	// Claim the job — get env vars and entrypoint for the runner container
+	runnerName := fmt.Sprintf("ephemerd-%s-%s", s.cfg.Provider.Name(), names.Generate())
+	claim, err := s.cfg.Provider.ClaimJob(ctx, &event, runnerName, s.cfg.Labels)
+	if err != nil {
+		log.Error("failed to claim job", "error", err)
+		unsee()
+		<-s.sem
+		return
+	}
+
+	var jobCtx context.Context
+	var cancel context.CancelFunc
+	if s.cfg.JobTimeout > 0 {
+		jobCtx, cancel = context.WithTimeout(ctx, s.cfg.JobTimeout)
+	} else {
+		jobCtx, cancel = context.WithCancel(ctx)
+	}
+
+	env, err := s.cfg.Runtime.Create(jobCtx, runtime.CreateConfig{
+		ID:         runnerName,
+		Image:      image,
+		Env:        claim.Env,
+		Entrypoint: claim.Entrypoint,
+	})
+	if err != nil {
+		log.Error("failed to create runner environment", "error", err)
+		unsee()
+		cancel()
+		<-s.sem
+		return
+	}
+
+	s.mu.Lock()
+	s.running[jobID] = &runningJob{
+		env:       env,
+		repo:      event.Repo,
+		image:     image,
+		runnerID:  claim.RunnerID,
+		cancel:    cancel,
+		startedAt: time.Now(),
+	}
+	s.mu.Unlock()
+	metrics.JobsActive.Inc()
+
+	log.Info("forge runner environment ready", "name", runnerName)
+
+	go func() {
+		defer func() { <-s.sem }()
+
+		exitCode, err := s.cfg.Runtime.Wait(jobCtx, env)
+		if err != nil {
+			if jobCtx.Err() != nil {
+				log.Warn("forge runner killed (timeout or shutdown)", "error", err)
+			} else {
+				log.Error("forge runner crashed", "error", err)
+			}
+		} else if exitCode != 0 {
+			log.Warn("forge runner exited with failure", "exit_code", exitCode)
+		} else {
+			log.Info("forge runner exited", "exit_code", exitCode)
+		}
+
+		// Cleanup
+		s.mu.Lock()
+		rj, exists := s.running[jobID]
+		if exists {
+			delete(s.running, jobID)
+			s.mu.Unlock()
+			if releaseErr := s.cfg.Provider.ReleaseJob(context.Background(), claim); releaseErr != nil {
+				log.Warn("release job failed", "error", releaseErr)
+			}
+			if destroyErr := s.cfg.Runtime.Destroy(context.Background(), env); destroyErr != nil {
+				log.Warn("destroy failed", "error", destroyErr)
+			}
+			if rj.artifactsDir != "" {
+				artifacts.Cleanup(rj.artifactsDir, s.cfg.Log)
+			}
+			metrics.JobsActive.Dec()
+			metrics.JobsTotal.WithLabelValues(event.Repo, "completed").Inc()
+			metrics.JobDuration.WithLabelValues(event.Repo).Observe(time.Since(rj.startedAt).Seconds())
 		} else {
 			s.mu.Unlock()
 		}

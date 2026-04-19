@@ -177,6 +177,70 @@ func restoreStashed(stashed [][2]string) error {
 	return nil
 }
 
+// ForgeRunner compiles the Forgejo Actions runner for the current OS/arch.
+func ForgeRunner() error {
+	return buildRunner("forge-runner")
+}
+
+// GiteaRunner compiles the Gitea Actions runner for the current OS/arch.
+func GiteaRunner() error {
+	return buildRunner("gitea-runner")
+}
+
+// Runners compiles both forge-runner and gitea-runner for the current OS/arch.
+func Runners() {
+	mg.Deps(ForgeRunner, GiteaRunner)
+}
+
+// RunnersAll cross-compiles forge-runner and gitea-runner for all release platforms.
+// Outputs go to dist/<name>-<os>-<arch>[.exe].
+func RunnersAll() error {
+	type target struct{ goos, goarch string }
+	targets := []target{
+		{"linux", "amd64"},
+		{"linux", "arm64"},
+		{"windows", "amd64"},
+		{"darwin", "arm64"},
+	}
+	for _, t := range targets {
+		for _, name := range []string{"forge-runner", "gitea-runner"} {
+			if err := crossBuildRunner(name, t.goos, t.goarch); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func buildRunner(name string) error {
+	output := name
+	if runtime.GOOS == "windows" {
+		output += ".exe"
+	}
+	return sh.RunV("go", "build", "-ldflags", runnerLdflags(), "-o", output, fmt.Sprintf("./cmd/%s/", name))
+}
+
+func crossBuildRunner(name, goos, goarch string) error {
+	ext := ""
+	if goos == "windows" {
+		ext = ".exe"
+	}
+	output := filepath.Join("dist", fmt.Sprintf("%s-%s-%s%s", name, goos, goarch, ext))
+	fmt.Printf("  Building %s\n", output)
+
+	if err := os.MkdirAll("dist", 0o755); err != nil {
+		return err
+	}
+	return sh.RunWith(
+		map[string]string{"CGO_ENABLED": "0", "GOOS": goos, "GOARCH": goarch},
+		"go", "build", "-ldflags", runnerLdflags(), "-o", output, fmt.Sprintf("./cmd/%s/", name),
+	)
+}
+
+func runnerLdflags() string {
+	return fmt.Sprintf("-s -w -X main.version=%s", gitVersion())
+}
+
 func ldflags() string {
 	version := gitVersion()
 	return fmt.Sprintf("-s -w -X main.version=%s -X github.com/ephpm/ephemerd/pkg/runner.Version=%s -X github.com/ephpm/ephemerd/pkg/cni.Version=%s",
