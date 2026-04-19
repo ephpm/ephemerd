@@ -43,9 +43,29 @@ func (lt *LocalTunnel) Listen(ctx context.Context) (net.Listener, error) {
 	deadline := time.After(listenTimeout)
 	var lastErr error
 	for attempt := 1; ; attempt++ {
-		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
-		ln, err := localtunnel.Listen(attemptCtx, opts)
-		cancel()
+		// localtunnel.Listen stores the context in the Listener and uses
+		// it for the entire session lifetime (proxy goroutines, Accept).
+		// We must NOT cancel it after Listen returns — that would kill
+		// the tunnel immediately. Use a goroutine + timer for the
+		// connect timeout instead.
+		type result struct {
+			ln  *localtunnel.Listener
+			err error
+		}
+		ch := make(chan result, 1)
+		go func() {
+			ln, err := localtunnel.Listen(ctx, opts)
+			ch <- result{ln, err}
+		}()
+
+		var ln *localtunnel.Listener
+		var err error
+		select {
+		case r := <-ch:
+			ln, err = r.ln, r.err
+		case <-time.After(attemptTimeout):
+			err = fmt.Errorf("connect timeout after %s", attemptTimeout)
+		}
 
 		if err == nil {
 			lt.url = ln.URL()

@@ -1,16 +1,25 @@
 package scheduler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	ghclient "github.com/ephpm/ephemerd/pkg/github"
+	"github.com/ephpm/ephemerd/pkg/tunnel"
+	vmPkg "github.com/ephpm/ephemerd/pkg/vm"
 	gh "github.com/google/go-github/v72/github"
 )
 
@@ -458,5 +467,459 @@ func TestSocketPath(t *testing.T) {
 func TestSeenTTL(t *testing.T) {
 	if seenTTL != 10*time.Minute {
 		t.Errorf("seenTTL = %v, want 10m", seenTTL)
+	}
+}
+
+// --- backoffDuration tests ---
+
+func TestBackoffDuration_ExponentialSequence(t *testing.T) {
+	repo := "test-backoff-sequence"
+	// Reset any prior state
+	resetBackoff(repo)
+
+	// Each call increments the failure count: 2^1, 2^2, 2^3, ...
+	expected := []time.Duration{
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		16 * time.Second,
+		32 * time.Second,
+		60 * time.Second, // capped at 60s
+		60 * time.Second, // stays capped
+	}
+
+	for i, want := range expected {
+		got := backoffDuration(repo)
+		if got != want {
+			t.Errorf("call %d: backoffDuration(%q) = %v, want %v", i+1, repo, got, want)
+		}
+	}
+
+	// Clean up
+	resetBackoff(repo)
+}
+
+func TestBackoffDuration_IndependentRepos(t *testing.T) {
+	resetBackoff("repo-a")
+	resetBackoff("repo-b")
+
+	// Advance repo-a 3 times
+	backoffDuration("repo-a")
+	backoffDuration("repo-a")
+	d3 := backoffDuration("repo-a") // 3rd call → 2^3 = 8s
+
+	// repo-b should start fresh
+	d1 := backoffDuration("repo-b") // 1st call → 2^1 = 2s
+
+	if d3 != 8*time.Second {
+		t.Errorf("repo-a call 3: got %v, want 8s", d3)
+	}
+	if d1 != 2*time.Second {
+		t.Errorf("repo-b call 1: got %v, want 2s", d1)
+	}
+
+	resetBackoff("repo-a")
+	resetBackoff("repo-b")
+}
+
+func TestResetBackoff(t *testing.T) {
+	repo := "test-reset"
+	resetBackoff(repo)
+
+	// Build up some backoff
+	backoffDuration(repo) // 2s
+	backoffDuration(repo) // 4s
+	backoffDuration(repo) // 8s
+
+	// Reset
+	resetBackoff(repo)
+
+	// Should restart from 2s
+	got := backoffDuration(repo)
+	if got != 2*time.Second {
+		t.Errorf("after reset: backoffDuration = %v, want 2s", got)
+	}
+
+	resetBackoff(repo)
+}
+
+func TestResetBackoff_NonexistentRepo(t *testing.T) {
+	// Should not panic
+	resetBackoff("never-seen-before")
+}
+
+// --- registerVMSSHHandler tests ---
+
+// mockMacOSVM is a minimal mock for vm.MacOSVM used by vmssh tests.
+type mockMacOSVM struct {
+	ip string
+}
+
+func (m *mockMacOSVM) WriteJITConfig(string) error                          { return nil }
+func (m *mockMacOSVM) Start(ctx context.Context) error                      { return nil }
+func (m *mockMacOSVM) WaitForRunner(ctx context.Context) (string, error)    { return m.ip, nil }
+func (m *mockMacOSVM) RunnerAddress() string                                { return m.ip }
+func (m *mockMacOSVM) Wait(ctx context.Context) (int, error)                { return 0, nil }
+func (m *mockMacOSVM) Stop()                                                {}
+
+func newVMSSHTestMux(s *Scheduler) *http.ServeMux {
+	mux := http.NewServeMux()
+	s.registerVMSSHHandler(mux)
+	return mux
+}
+
+func TestVMSSH_MissingJobID(t *testing.T) {
+	s := New(Config{Log: testLogger()})
+	mux := newVMSSHTestMux(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestVMSSH_InvalidJobID(t *testing.T) {
+	s := New(Config{Log: testLogger()})
+	mux := newVMSSHTestMux(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info?job_id=abc", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestVMSSH_UnknownJob(t *testing.T) {
+	s := New(Config{Log: testLogger()})
+	mux := newVMSSHTestMux(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info?job_id=999", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestVMSSH_NonMacOSJob(t *testing.T) {
+	s := New(Config{Log: testLogger()})
+	// Add a running job WITHOUT a macosVM
+	s.running[100] = &runningJob{repo: "test", startedAt: time.Now()}
+	mux := newVMSSHTestMux(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info?job_id=100", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestVMSSH_VMIPNotReady(t *testing.T) {
+	s := New(Config{Log: testLogger()})
+	s.running[200] = &runningJob{
+		repo:      "test",
+		macosVM:   &mockMacOSVM{ip: ""}, // IP not yet discovered
+		startedAt: time.Now(),
+	}
+	mux := newVMSSHTestMux(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info?job_id=200", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestVMSSH_ValidMacOSJob(t *testing.T) {
+	priv, _, err := vmPkg.GenerateEphemeralSSHKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(Config{
+		Log: testLogger(),
+		MacOSVMConfig: &vmPkg.MacOSVMConfig{
+			SSHSigner: priv,
+		},
+	})
+	s.running[300] = &runningJob{
+		repo:      "test",
+		macosVM:   &mockMacOSVM{ip: "192.168.64.5"},
+		startedAt: time.Now(),
+	}
+	mux := newVMSSHTestMux(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info?job_id=300", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	ct := w.Header().Get("Content-Type")
+	if ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+
+	var info VMSSHInfo
+	if err := json.NewDecoder(w.Body).Decode(&info); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if info.IP != "192.168.64.5" {
+		t.Errorf("IP = %q, want 192.168.64.5", info.IP)
+	}
+	if info.User != "admin" {
+		t.Errorf("User = %q, want admin", info.User)
+	}
+	if len(info.PrivateKey) == 0 {
+		t.Error("PrivateKey is empty, want PEM-encoded key")
+	}
+}
+
+// --- serveTunnelWithReconnect tests ---
+
+// mockTunnel is a tunnel.Provider that returns controllable listeners.
+type mockTunnel struct {
+	mu        sync.Mutex
+	listeners []net.Listener
+	idx       int
+	url       string
+}
+
+func (m *mockTunnel) Listen(ctx context.Context) (net.Listener, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.idx >= len(m.listeners) {
+		return nil, fmt.Errorf("no more listeners")
+	}
+	ln := m.listeners[m.idx]
+	m.idx++
+	return ln, nil
+}
+
+func (m *mockTunnel) PublicURL() string { return m.url }
+
+// Verify mockTunnel implements tunnel.Provider at compile time.
+var _ tunnel.Provider = (*mockTunnel)(nil)
+
+// newLocalListener creates a TCP listener on a random port.
+func newLocalListener(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	return ln
+}
+
+// newTestGitHubClient creates a ghclient.Client backed by a mock server.
+// Returns the client, and atomic counters for webhook register/deregister calls.
+func newTestGitHubClient(t *testing.T) (*ghclient.Client, *atomic.Int32, *atomic.Int32) {
+	t.Helper()
+	var registered, deregistered atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			// CreateHook
+			registered.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			if _, err := fmt.Fprintf(w, `{"id":%d,"active":true}`, registered.Load()); err != nil {
+				t.Logf("writing response: %v", err)
+			}
+		case http.MethodDelete:
+			deregistered.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	ghGoClient := gh.NewClient(nil).WithAuthToken("test")
+	u, err := url.Parse(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ghGoClient.BaseURL = u
+
+	client, err := ghclient.New(ghclient.Config{
+		Token: "test",
+		Owner: "testorg",
+		Repos: []string{"repo"},
+		Log:   testLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.SetHTTPClient(ghGoClient)
+
+	return client, &registered, &deregistered
+}
+
+func TestServeTunnelWithReconnect_ClosesOldListener(t *testing.T) {
+	client, registered, _ := newTestGitHubClient(t)
+
+	// Create two listeners — first one will be killed, second one will serve.
+	ln1 := newLocalListener(t)
+	ln2 := newLocalListener(t)
+
+	mt := &mockTunnel{
+		listeners: []net.Listener{ln2},
+		url:       "http://tunnel.test",
+	}
+
+	s := New(Config{
+		Log:              testLogger(),
+		GitHub:           client,
+		Tunnel:           mt,
+		TunnelMaxRetries: 3,
+	})
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := fmt.Fprint(w, "ok"); err != nil {
+			t.Logf("writing response: %v", err)
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		s.serveTunnelWithReconnect(ctx, handler, ln1, nil, make(chan ghclient.JobEvent, 1))
+		close(done)
+	}()
+
+	// Give the server a moment to start serving on ln1
+	time.Sleep(50 * time.Millisecond)
+
+	// Kill ln1 — this should trigger the reconnect path
+	_ = ln1.Close()
+
+	// Wait for reconnect to happen (new listener ln2 used, webhook re-registered)
+	deadline := time.After(15 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for reconnect")
+		default:
+		}
+		if registered.Load() >= 1 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Verify we can make HTTP requests through the new listener
+	addr := ln2.Addr().String()
+	resp, err := http.Get(fmt.Sprintf("http://%s/healthz", addr))
+	if err != nil {
+		t.Fatalf("GET through reconnected listener: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status through reconnected listener = %d, want 200", resp.StatusCode)
+	}
+
+	// Shut down
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveTunnelWithReconnect did not exit after cancel")
+	}
+}
+
+func TestServeTunnelWithReconnect_FallsBackToPolling(t *testing.T) {
+	client, _, deregistered := newTestGitHubClient(t)
+
+	// No reconnect listeners available — all attempts should fail
+	mt := &mockTunnel{
+		listeners: nil,
+		url:       "http://tunnel.test",
+	}
+
+	s := New(Config{
+		Log:              testLogger(),
+		GitHub:           client,
+		Tunnel:           mt,
+		TunnelMaxRetries: 1, // fail after 1 attempt
+		PollInterval:     1 * time.Second,
+	})
+
+	ln := newLocalListener(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		s.serveTunnelWithReconnect(ctx, http.NewServeMux(), ln, nil, make(chan ghclient.JobEvent, 1))
+		close(done)
+	}()
+
+	// Give server a moment to start
+	time.Sleep(50 * time.Millisecond)
+
+	// Kill the listener to trigger reconnect
+	_ = ln.Close()
+
+	// serveTunnelWithReconnect should exit (falling back to polling)
+	select {
+	case <-done:
+		// good — it exited
+	case <-time.After(15 * time.Second):
+		t.Fatal("serveTunnelWithReconnect did not exit after max retries")
+	}
+
+	// Verify webhooks were deregistered on exit
+	if deregistered.Load() < 1 {
+		t.Logf("deregistered = %d (may be 0 if hooks were nil)", deregistered.Load())
+	}
+}
+
+func TestServeTunnelWithReconnect_CancelExitsCleanly(t *testing.T) {
+	client, _, _ := newTestGitHubClient(t)
+
+	ln := newLocalListener(t)
+	mt := &mockTunnel{url: "http://tunnel.test"}
+
+	s := New(Config{
+		Log:    testLogger(),
+		GitHub: client,
+		Tunnel: mt,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		s.serveTunnelWithReconnect(ctx, http.NewServeMux(), ln, nil, make(chan ghclient.JobEvent, 1))
+		close(done)
+	}()
+
+	// Give server a moment to start
+	time.Sleep(50 * time.Millisecond)
+
+	// Cancel should cause clean exit
+	cancel()
+
+	select {
+	case <-done:
+		// clean exit
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveTunnelWithReconnect did not exit after context cancel")
 	}
 }

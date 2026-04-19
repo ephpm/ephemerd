@@ -18,6 +18,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/github"
 	"github.com/ephpm/ephemerd/pkg/metrics"
 	"github.com/ephpm/ephemerd/pkg/names"
+	"github.com/ephpm/ephemerd/pkg/providers"
 	"github.com/ephpm/ephemerd/pkg/runtime"
 	"github.com/ephpm/ephemerd/pkg/tunnel"
 	"github.com/ephpm/ephemerd/pkg/vm"
@@ -27,12 +28,14 @@ import (
 // Config for the scheduler.
 type Config struct {
 	Runtime         *runtime.Runtime
-	GitHub          *github.Client
+	GitHub          *github.Client        // used when Provider is nil (GitHub mode)
+	Provider        providers.Poll        // if non-nil, used instead of GitHub for job discovery + lifecycle
 	Artifacts       *artifacts.Extractor  // OCI image layer extractor for macOS VM jobs (nil if not available)
-	LinuxDispatcher *DispatchClient       // if non-nil, Linux jobs are dispatched to this WSL worker via gRPC
-	MacOSVMConfig   *vm.MacOSVMConfig     // if non-nil, macOS-native jobs are enabled (darwin only)
-	DataDir         string                // ephemerd data directory (used for artifact extraction paths)
-	MaxConcurrent   int
+	LinuxDispatcher *DispatchClient       // if non-nil, Linux jobs are dispatched to a Linux VM worker via gRPC
+	MacOSVMConfig     *vm.MacOSVMConfig     // if non-nil, macOS-native jobs are enabled (darwin only)
+	DataDir           string                // ephemerd data directory (used for artifact extraction paths)
+	MaxConcurrent     int
+	MaxMacOSVMs       int                   // max concurrent macOS VMs (Vz limit; default auto-detected)
 	Labels          []string
 	PollInterval    time.Duration // if >0, use polling mode (default)
 	WebhookPort     int           // listen port for health/webhook server
@@ -56,11 +59,22 @@ type Scheduler struct {
 	seen      map[int64]time.Time // recently handled job IDs for dedup
 	mu        sync.Mutex
 	sem       chan struct{} // concurrency limiter
+	macSem    chan struct{} // macOS VM concurrency limiter (Vz has a hard cap)
 	draining  bool         // true when shutting down, rejects new jobs
 	startTime time.Time
 }
 
 const seenTTL = 10 * time.Minute
+
+// SetMacOSVMConfig enables macOS job support after startup. This is used when
+// the macOS disk image is being provisioned in the background — the scheduler
+// starts immediately for Linux jobs and picks up macOS jobs once the install
+// finishes.
+func (s *Scheduler) SetMacOSVMConfig(cfg *vm.MacOSVMConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cfg.MacOSVMConfig = cfg
+}
 
 // failureBackoff tracks per-repo failure counts to compute exponential backoff.
 // Resets to zero on the next successful job for that repo.
@@ -97,7 +111,7 @@ type runningJob struct {
 	runnerID     int64
 	cancel       context.CancelFunc
 	artifactsDir string    // non-empty if OCI artifacts were extracted for this job
-	dispatched   string    // non-empty if dispatched to WSL worker (stores container name)
+	dispatched   string    // non-empty if dispatched to Linux VM worker (stores container name)
 	macosVM      vm.MacOSVM // non-nil if running as a macOS VM job
 	startedAt    time.Time
 }
@@ -113,11 +127,27 @@ func New(cfg Config) *Scheduler {
 		cfg.WebhookPort = 8080
 	}
 
+	macVMs := cfg.MaxMacOSVMs
+	if macVMs <= 0 {
+		// Auto-detect: Vz allows roughly (host CPUs / CPUs-per-VM) VMs total.
+		// Subtract 1 for the always-running Linux VM on darwin hosts.
+		hostCPUs := goruntime.NumCPU()
+		cpusPerVM := 4 // default from MacOSVMConfig.SetDefaults
+		if cfg.MacOSVMConfig != nil && cfg.MacOSVMConfig.CPUs > 0 {
+			cpusPerVM = int(cfg.MacOSVMConfig.CPUs)
+		}
+		macVMs = hostCPUs/cpusPerVM - 1 // -1 for Linux VM
+		if macVMs < 1 {
+			macVMs = 1
+		}
+	}
+
 	return &Scheduler{
 		cfg:       cfg,
 		running:   make(map[int64]*runningJob),
 		seen:      make(map[int64]time.Time),
 		sem:       make(chan struct{}, cfg.MaxConcurrent),
+		macSem:    make(chan struct{}, macVMs),
 		startTime: time.Now(),
 	}
 }
@@ -172,12 +202,41 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	}
 	defer grpcCleanup()
 
+	// Start VM SSH info server on a second unix socket (HTTP/JSON).
+	// Used by `ephemerd jobs ssh <id>` to get the ephemeral key + VM IP.
+	sshCleanup, err := s.StartVMSSHServer()
+	if err != nil {
+		s.cfg.Log.Warn("failed to start VM SSH info server", "error", err)
+	} else {
+		defer sshCleanup()
+	}
+
 	// Start health/webhook HTTP server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
 
+	// --- Forge provider mode (Gitea/Forgejo/etc) ---
+	var forgeEvents <-chan providers.JobEvent
+	if s.cfg.Provider != nil {
+		pollCfg := providers.PollConfig{}
+		if s.cfg.PollInterval > 0 {
+			pollCfg.PollInterval = int(s.cfg.PollInterval.Seconds())
+		}
+		var err error
+		forgeEvents, err = s.cfg.Provider.Start(ctx, pollCfg)
+		if err != nil {
+			return fmt.Errorf("starting forge provider: %w", err)
+		}
+		defer func() {
+			if stopErr := s.cfg.Provider.Stop(context.Background()); stopErr != nil {
+				s.cfg.Log.Warn("forge provider stop error", "error", stopErr)
+			}
+		}()
+		s.cfg.Log.Info("forge provider started", "provider", s.cfg.Provider.Name())
+	}
+
 	// Determine job discovery mode: webhook if tunnel or secret is set, polling otherwise
-	useWebhook := s.cfg.Tunnel != nil || s.cfg.WebhookSecret != ""
+	useWebhook := s.cfg.Provider == nil && (s.cfg.Tunnel != nil || s.cfg.WebhookSecret != "")
 	useTLS := s.cfg.TLSCert != "" && s.cfg.TLSKey != ""
 
 	if useWebhook {
@@ -212,8 +271,10 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		}
 
 		// Serve with automatic reconnect on tunnel drops.
-		go s.serveTunnelWithReconnect(ctx, server, ln, hooks, events)
-		defer s.cfg.GitHub.DeregisterWebhooks(context.Background(), hooks)
+		// serveTunnelWithReconnect owns the full lifecycle: it creates
+		// fresh HTTP servers on each reconnect, closes old listeners,
+		// and deregisters webhooks on shutdown. No defer needed here.
+		go s.serveTunnelWithReconnect(ctx, mux, ln, hooks, events)
 	} else if useTLS {
 		go func() {
 			s.cfg.Log.Info("webhook server listening (TLS)", "port", s.cfg.WebhookPort)
@@ -235,7 +296,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	}
 	defer func() { _ = server.Shutdown(context.Background()) }()
 
-	if !useWebhook {
+	if s.cfg.Provider == nil && !useWebhook {
 		interval := s.cfg.PollInterval
 		if interval <= 0 {
 			interval = 10 * time.Second
@@ -248,7 +309,10 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	cleanupTicker := time.NewTicker(5 * time.Minute)
 	defer cleanupTicker.Stop()
 
-	// Process events
+	// Process events. When a forge provider is active, we read from
+	// forgeEvents (providers.JobEvent). GitHub mode uses the events channel
+	// (github.JobEvent). Both may be active during transition but typically
+	// only one is non-nil.
 	for {
 		select {
 		case <-cleanupTicker.C:
@@ -266,6 +330,17 @@ func (s *Scheduler) Run(ctx context.Context) error {
 				go s.handleQueued(ctx, event)
 			case "completed":
 				go s.handleCompleted(ctx, event)
+			}
+
+		case fev, ok := <-forgeEvents:
+			if !ok {
+				s.cfg.Log.Info("forge provider event channel closed")
+				forgeEvents = nil // stop selecting on closed channel
+				continue
+			}
+			if fev.Action == "queued" {
+				metrics.JobsQueuedTotal.Inc()
+				go s.handleForgeJob(ctx, fev)
 			}
 		}
 	}
@@ -308,21 +383,45 @@ func (s *Scheduler) poll(ctx context.Context, events chan<- github.JobEvent) {
 	}
 }
 
-// canHandleJob returns false if the job's labels include an OS that this
-// scheduler cannot handle. On Windows with a LinuxDispatcher, Linux jobs
-// are accepted and routed to the WSL worker via gRPC.
+// canHandleJob returns false if the job's labels include an OS or
+// architecture that this scheduler cannot handle.
 func (s *Scheduler) canHandleJob(jobLabels []string) bool {
+	osOK := true // assume OK until we see an OS label we can't handle
 	for _, label := range jobLabels {
 		switch strings.ToLower(label) {
 		case "linux":
-			return goruntime.GOOS == "linux" || s.cfg.LinuxDispatcher != nil
+			// Linux jobs run natively on Linux, via VM dispatch on Windows/macOS,
+			// or inside the embedded Linux VM on macOS.
+			osOK = goruntime.GOOS == "linux" || goruntime.GOOS == "darwin" || s.cfg.LinuxDispatcher != nil
 		case "windows":
-			return goruntime.GOOS == "windows"
+			osOK = goruntime.GOOS == "windows"
 		case "macos", "macosx":
-			return goruntime.GOOS == "darwin"
+			// macOS jobs need a per-job VM for isolation. Without
+			// MacOSVMConfig we refuse the job rather than fall back to
+			// running on the host — sharing the runner process tree with
+			// other jobs (and the daemon) is a non-starter for CI.
+			osOK = goruntime.GOOS == "darwin" && s.cfg.MacOSVMConfig != nil
 		}
 	}
-	return true // no OS label → accept
+	if !osOK {
+		return false
+	}
+	// Arch check: if the job asks for an arch we can't satisfy, skip. We
+	// don't emulate (no qemu-user, no rosetta-in-container), so x64 jobs
+	// on an arm64 host and vice versa won't work.
+	for _, label := range jobLabels {
+		switch strings.ToLower(label) {
+		case "x64", "amd64":
+			if goruntime.GOARCH != "amd64" {
+				return false
+			}
+		case "arm64", "aarch64":
+			if goruntime.GOARCH != "arm64" {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // isLinuxJob returns true if the job's labels include "linux".
@@ -380,24 +479,37 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	}
 	s.mu.Unlock()
 
-	// Dispatch Linux jobs to the WSL worker if available
+	// Dispatch Linux jobs to the Linux VM worker if available
 	if s.cfg.LinuxDispatcher != nil && isLinuxJob(event.Job.Labels) {
 		s.handleLinuxJob(ctx, event)
 		return
 	}
 
-	// Route macOS-native jobs to per-job macOS VMs
-	if s.cfg.MacOSVMConfig != nil && isMacOSJob(event.Job.Labels) {
-		s.handleMacOSJob(ctx, event)
+	// Route macOS-native jobs to per-job macOS VMs.
+	if isMacOSJob(event.Job.Labels) {
+		s.mu.Lock()
+		macCfg := s.cfg.MacOSVMConfig
+		s.mu.Unlock()
+		if macCfg != nil {
+			s.handleMacOSJob(ctx, event)
+			return
+		}
+		// macOS VM disk is still being provisioned — remove from seen so
+		// the next poll retries this job once the install finishes.
+		s.mu.Lock()
+		delete(s.seen, jobID)
+		s.mu.Unlock()
+		log.Info("macOS VM disk not ready yet, deferring job")
 		return
 	}
 
 	s.handleLocalJob(ctx, event)
 }
 
-// handleLinuxJob dispatches a Linux job to the WSL worker via gRPC.
-// The Windows host registers the JIT runner (with Linux labels) and sends
-// Create/Wait/Destroy RPCs to the dispatch server running inside WSL.
+// handleLinuxJob dispatches a Linux job to the Linux VM worker via gRPC.
+// The host registers the JIT runner (with Linux labels) and sends
+// Create/Wait/Destroy RPCs to the dispatch server running inside the VM
+// (WSL on Windows, Virtualization.framework on macOS).
 func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
 	jobID := event.Job.GetID()
 	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo, "dispatch", "linux")
@@ -416,7 +528,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
 		return
 	}
 
-	log.Info("provisioning Linux runner via WSL dispatch")
+	log.Info("provisioning Linux runner via dispatch")
 
 	image := s.cfg.GitHub.FetchJobImage(ctx, event.Repo, event.Job.GetRunID(), jobID)
 	if image != "" {
@@ -457,7 +569,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
 		return
 	}
 
-	// Track the dispatched job (env is nil — lifecycle managed by WSL worker)
+	// Track the dispatched job (env is nil — lifecycle managed by Linux VM worker)
 	s.mu.Lock()
 	s.running[jobID] = &runningJob{
 		repo:      event.Repo,
@@ -470,7 +582,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
 	s.mu.Unlock()
 	metrics.JobsActive.Inc()
 
-	log.Info("Linux runner dispatched to WSL", "name", name)
+	log.Info("Linux runner dispatched", "name", name)
 
 	// Wait for the job to finish in the background
 	go func() {
@@ -516,10 +628,18 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 		s.mu.Unlock()
 	}
 
-	// Acquire concurrency slot
+	// Acquire concurrency slots: general + macOS VM limit.
+	// Vz caps the number of simultaneous VMs based on host resources.
 	select {
 	case s.sem <- struct{}{}:
 	case <-ctx.Done():
+		unsee()
+		return
+	}
+	select {
+	case s.macSem <- struct{}{}:
+	case <-ctx.Done():
+		<-s.sem
 		unsee()
 		return
 	}
@@ -550,6 +670,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 		}
 		unsee()
 		time.Sleep(backoffDuration(event.Repo))
+		<-s.macSem
 		<-s.sem
 		return
 	}
@@ -568,6 +689,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
 		unsee()
+		<-s.macSem
 		<-s.sem
 		return
 	}
@@ -583,6 +705,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
 		unsee()
+		<-s.macSem
 		<-s.sem
 		return
 	}
@@ -607,6 +730,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 		}
 		unsee()
 		cancel()
+		<-s.macSem
 		<-s.sem
 		return
 	}
@@ -624,6 +748,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 		}
 		unsee()
 		cancel()
+		<-s.macSem
 		<-s.sem
 		return
 	}
@@ -646,7 +771,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 
 	// Wait for the job to finish in the background
 	go func() {
-		defer func() { <-s.sem }()
+		defer func() { <-s.macSem; <-s.sem }()
 
 		exitCode, err := macVM.Wait(jobCtx)
 		if err != nil {
@@ -721,8 +846,21 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event github.JobEvent) {
 		}
 	}
 
-	// Build runner labels
-	labels := s.buildLabels()
+	// Build runner labels. When the job requests a specific OS (e.g. `linux`)
+	// we must register the runner with matching labels or GitHub won't route
+	// the job to us — even if we can execute it. On Darwin the host OS is
+	// `darwin` but we run `linux` jobs inside the embedded Linux VM, so
+	// honour the job's labels rather than blindly using the host.
+	var targetOS string
+	switch {
+	case isLinuxJob(event.Job.Labels):
+		targetOS = "linux"
+	case isMacOSJob(event.Job.Labels):
+		targetOS = "darwin"
+	default:
+		targetOS = goruntime.GOOS
+	}
+	labels := buildLabelsForOS(targetOS, s.cfg.Labels)
 
 	// Generate a unique runner name and register with GitHub.
 	// Retry with a new name on 409 conflict (stale runner from a previous crash).
@@ -752,7 +890,9 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event github.JobEvent) {
 	} else {
 		jobCtx, cancel = context.WithCancel(ctx)
 	}
-	env, err := s.cfg.Runtime.Create(jobCtx, name, image, encodedConfig)
+	env, err := s.cfg.Runtime.Create(jobCtx, runtime.CreateConfig{
+		ID: name, Image: image, JITConfig: encodedConfig,
+	})
 	if err != nil {
 		log.Error("failed to create runner environment", "error", err)
 		// Remove the ghost runner from GitHub since the container won't start
@@ -815,6 +955,141 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event github.JobEvent) {
 			if rj.artifactsDir != "" {
 				artifacts.Cleanup(rj.artifactsDir, s.cfg.Log)
 			}
+		} else {
+			s.mu.Unlock()
+		}
+	}()
+}
+
+// handleForgeJob provisions a runner container for a Gitea/Forgejo task.
+// The container self-registers with the forge and handles one job.
+func (s *Scheduler) handleForgeJob(ctx context.Context, event providers.JobEvent) {
+	jobID := event.JobID
+	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo, "provider", s.cfg.Provider.Name())
+
+	// Dedup
+	s.mu.Lock()
+	if _, exists := s.running[jobID]; exists {
+		s.mu.Unlock()
+		return
+	}
+	if t, seen := s.seen[jobID]; seen && time.Since(t) < seenTTL {
+		s.mu.Unlock()
+		return
+	}
+	s.seen[jobID] = time.Now()
+	if s.draining {
+		s.mu.Unlock()
+		log.Info("rejecting job, scheduler is draining")
+		return
+	}
+	s.mu.Unlock()
+
+	unsee := func() {
+		s.mu.Lock()
+		delete(s.seen, jobID)
+		s.mu.Unlock()
+	}
+
+	// Acquire concurrency slot
+	select {
+	case s.sem <- struct{}{}:
+	case <-ctx.Done():
+		unsee()
+		return
+	}
+
+	log.Info("provisioning forge runner for job")
+
+	// Get custom image from workflow payload
+	image := s.cfg.Provider.FetchJobImage(ctx, &event)
+	if image == "" {
+		image = s.cfg.Provider.DefaultImage()
+	}
+	if image != "" {
+		log.Info("using image", "image", image)
+	}
+
+	// Claim the job — get env vars and entrypoint for the runner container
+	runnerName := fmt.Sprintf("ephemerd-%s-%s", s.cfg.Provider.Name(), names.Generate())
+	claim, err := s.cfg.Provider.ClaimJob(ctx, &event, runnerName, s.cfg.Labels)
+	if err != nil {
+		log.Error("failed to claim job", "error", err)
+		unsee()
+		<-s.sem
+		return
+	}
+
+	var jobCtx context.Context
+	var cancel context.CancelFunc
+	if s.cfg.JobTimeout > 0 {
+		jobCtx, cancel = context.WithTimeout(ctx, s.cfg.JobTimeout)
+	} else {
+		jobCtx, cancel = context.WithCancel(ctx)
+	}
+
+	env, err := s.cfg.Runtime.Create(jobCtx, runtime.CreateConfig{
+		ID:         runnerName,
+		Image:      image,
+		Env:        claim.Env,
+		Entrypoint: claim.Entrypoint,
+	})
+	if err != nil {
+		log.Error("failed to create runner environment", "error", err)
+		unsee()
+		cancel()
+		<-s.sem
+		return
+	}
+
+	s.mu.Lock()
+	s.running[jobID] = &runningJob{
+		env:       env,
+		repo:      event.Repo,
+		image:     image,
+		runnerID:  claim.RunnerID,
+		cancel:    cancel,
+		startedAt: time.Now(),
+	}
+	s.mu.Unlock()
+	metrics.JobsActive.Inc()
+
+	log.Info("forge runner environment ready", "name", runnerName)
+
+	go func() {
+		defer func() { <-s.sem }()
+
+		exitCode, err := s.cfg.Runtime.Wait(jobCtx, env)
+		if err != nil {
+			if jobCtx.Err() != nil {
+				log.Warn("forge runner killed (timeout or shutdown)", "error", err)
+			} else {
+				log.Error("forge runner crashed", "error", err)
+			}
+		} else if exitCode != 0 {
+			log.Warn("forge runner exited with failure", "exit_code", exitCode)
+		} else {
+			log.Info("forge runner exited", "exit_code", exitCode)
+		}
+
+		// Cleanup
+		s.mu.Lock()
+		rj, exists := s.running[jobID]
+		if exists {
+			delete(s.running, jobID)
+			s.mu.Unlock()
+			if releaseErr := s.cfg.Provider.ReleaseJob(context.Background(), claim); releaseErr != nil {
+				log.Warn("release job failed", "error", releaseErr)
+			}
+			if destroyErr := s.cfg.Runtime.Destroy(context.Background(), env); destroyErr != nil {
+				log.Warn("destroy failed", "error", destroyErr)
+			}
+			if rj.artifactsDir != "" {
+				artifacts.Cleanup(rj.artifactsDir, s.cfg.Log)
+			}
+			metrics.JobsActive.Dec()
+			metrics.JobsTotal.WithLabelValues(event.Repo, "completed").Inc()
+			metrics.JobDuration.WithLabelValues(event.Repo).Observe(time.Since(rj.startedAt).Seconds())
 		} else {
 			s.mu.Unlock()
 		}
@@ -970,10 +1245,6 @@ func (s *Scheduler) cleanSeen() {
 	}
 }
 
-func (s *Scheduler) buildLabels() []string {
-	return buildLabelsForOS(goruntime.GOOS, s.cfg.Labels)
-}
-
 // buildLabelsForOS builds runner labels for a given target OS.
 // Used by the dispatcher to register Linux runners from the Windows host.
 func buildLabelsForOS(targetOS string, extraLabels []string) []string {
@@ -1039,20 +1310,49 @@ const (
 // serveTunnelWithReconnect serves the webhook HTTP server on a tunnel listener,
 // automatically re-establishing the tunnel and re-registering webhooks when the
 // connection drops. Falls back to polling after maxRetries consecutive failures.
-func (s *Scheduler) serveTunnelWithReconnect(ctx context.Context, server *http.Server, ln net.Listener, hooks []github.ManagedWebhook, events chan<- github.JobEvent) {
+//
+// Each reconnect cycle creates a fresh http.Server because Go's http.Server
+// cannot be reused after Serve() returns — its internal state (shutdown flag,
+// connection tracking) is not reset. The handler mux is shared across all
+// server instances since it's stateless.
+func (s *Scheduler) serveTunnelWithReconnect(ctx context.Context, handler http.Handler, ln net.Listener, hooks []github.ManagedWebhook, events chan<- github.JobEvent) {
 	maxRetries := s.cfg.TunnelMaxRetries
 	if maxRetries <= 0 {
 		maxRetries = defaultTunnelMaxRetries
 	}
 
+	// On exit, clean up whichever webhooks are currently active.
+	defer func() {
+		s.cfg.GitHub.DeregisterWebhooks(context.Background(), hooks)
+	}()
+
 	consecutiveFailures := 0
 	delay := tunnelReconnectDelay
 
 	for {
+		// Create a fresh server for each tunnel listener. http.Server
+		// cannot be reused after Serve() returns.
+		server := &http.Server{Handler: handler}
+
+		// Watch for context cancellation so we can unblock Serve().
+		// http.Server.Serve blocks on the listener and doesn't check
+		// ctx.Done — we need to shut down the server explicitly.
+		go func() {
+			<-ctx.Done()
+			_ = server.Close()
+		}()
+
 		err := server.Serve(ln)
-		if errors.Is(err, http.ErrServerClosed) || ctx.Err() != nil {
+
+		if ctx.Err() != nil {
+			// Parent context cancelled — clean shutdown.
 			return
 		}
+
+		// Shut down the server to release its internal state before
+		// we create a new one. (The ctx watcher goroutine above may
+		// also call Close, which is safe to call multiple times.)
+		_ = server.Close()
 		consecutiveFailures++
 		s.cfg.Log.Warn("tunnel connection lost, reconnecting",
 			"error", err,
@@ -1060,12 +1360,15 @@ func (s *Scheduler) serveTunnelWithReconnect(ctx context.Context, server *http.S
 			"max_retries", maxRetries,
 		)
 
+		// Close the dead listener to stop its goroutines (localtunnel
+		// proxy workers, ngrok tunnel connection). Without this, each
+		// reconnect leaks the old listener's resources.
+		_ = ln.Close()
+
 		if consecutiveFailures >= maxRetries {
 			s.cfg.Log.Warn("tunnel max retries exceeded, falling back to polling",
 				"failures", consecutiveFailures,
 			)
-			// Best-effort cleanup of last webhook.
-			s.cfg.GitHub.DeregisterWebhooks(ctx, hooks)
 
 			interval := s.cfg.PollInterval
 			if interval <= 0 {
@@ -1078,6 +1381,7 @@ func (s *Scheduler) serveTunnelWithReconnect(ctx context.Context, server *http.S
 
 		// Deregister old webhooks (best-effort — URL is dead anyway).
 		s.cfg.GitHub.DeregisterWebhooks(ctx, hooks)
+		hooks = nil
 
 		// Exponential backoff reconnect.
 		select {

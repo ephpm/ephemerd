@@ -24,8 +24,9 @@ type Config struct {
 	Containerd ContainerdConfig `toml:"containerd"`
 	Network    NetworkConfig    `toml:"network"`
 	VM         VMConfig         `toml:"vm"`
-	Dind       DindConfig       `toml:"dind"`
-	Runner     RunnerConfig     `toml:"runner"`
+	Dind        DindConfig        `toml:"dind"`
+	ModuleProxy ModuleProxyConfig `toml:"module_proxy"`
+	Runner      RunnerConfig      `toml:"runner"`
 	Metrics    MetricsConfig    `toml:"metrics"`
 	Log        LogConfig        `toml:"log"`
 }
@@ -87,10 +88,33 @@ type DindConfig struct {
 	Enabled bool `toml:"enabled"` // mount /var/run/docker.sock with a fake Docker API
 }
 
+// ModuleProxyConfig configures the Go module caching proxy.
+// When enabled, ephemerd runs a local GOPROXY on the bridge gateway that
+// caches module downloads. Containers receive GOPROXY env var automatically.
+type ModuleProxyConfig struct {
+	Enabled  bool   `toml:"enabled"`  // enable Go module caching proxy
+	Port     int    `toml:"port"`     // listen port on bridge gateway (default 8082)
+	Upstream string `toml:"upstream"` // upstream proxy URL (default "https://proxy.golang.org")
+	Cleanup  bool   `toml:"cleanup"`  // wipe cache on shutdown (default true)
+}
+
 // VMConfig configures virtual machines for cross-OS job execution.
 type VMConfig struct {
-	Linux LinuxVMToml `toml:"linux"`
-	MacOS MacOSVMToml `toml:"macos"`
+	// CrossPlatform enables macOS and Windows VM support. Default true.
+	// Set to false for platforms like Gitea/Forgejo that only support
+	// Linux runners — this skips macOS image pulls and Windows VM setup.
+	CrossPlatform *bool        `toml:"cross_platform"`
+	Linux         LinuxVMToml  `toml:"linux"`
+	MacOS         MacOSVMToml  `toml:"macos"`
+}
+
+// CrossPlatformEnabled returns whether macOS/Windows VM support is enabled.
+// Defaults to true when not set.
+func (v *VMConfig) CrossPlatformEnabled() bool {
+	if v.CrossPlatform == nil {
+		return true
+	}
+	return *v.CrossPlatform
 }
 
 // LinuxVMToml configures the long-running Linux VM for Linux jobs
@@ -102,12 +126,21 @@ type LinuxVMToml struct {
 	DiskSizeGB uint64 `toml:"disk_size_gb"` // sparse disk size in GB (default: 50)
 }
 
-// MacOSVMToml configures per-job macOS VMs on macOS hosts.
+// MacOSVMToml configures per-job macOS VMs. macOS jobs always run in a
+// per-job VM on darwin hosts — there's no other way on Apple Silicon —
+// so there's no enable/disable toggle. On non-darwin hosts this block
+// is ignored.
 type MacOSVMToml struct {
-	Enabled   bool   `toml:"enabled"`    // enable macOS-native jobs
-	BaseImage string `toml:"base_image"` // path to provisioned macOS disk image
-	CPUs      uint   `toml:"cpus"`       // CPUs per VM (default: 4)
-	MemoryMB  uint64 `toml:"memory_mb"`  // memory per VM in MB (default: 8192)
+	// DiskImage is an optional path to a pre-installed macOS VM disk
+	// (produced by `ephemerd vm setup-macos` or an operator-supplied
+	// restore of an Apple IPSW). If empty, ephemerd downloads the latest
+	// Apple-signed IPSW on first boot and installs stock macOS into
+	// <data_dir>/vm/macos/base.img. Distinct from the OCI base image
+	// overlaid per job — that's fetched from the job's image label.
+	DiskImage    string `toml:"disk_image"`
+	CPUs         uint   `toml:"cpus"`          // CPUs per VM (default: 4)
+	MemoryMB     uint64 `toml:"memory_mb"`     // memory per VM in MB (default: 8192)
+	MaxConcurrent int   `toml:"max_concurrent"` // max simultaneous macOS VMs (default: auto-detected from host CPUs)
 }
 
 type GitHubConfig struct {
@@ -121,7 +154,7 @@ type GitHubConfig struct {
 	Owner string   `toml:"owner"`
 	Repos []string `toml:"repos"`
 
-	// Job discovery: polling interval (default "10s")
+	// Job discovery: polling interval (default "30s")
 	PollInterval string `toml:"poll_interval"`
 }
 
@@ -133,6 +166,7 @@ type ForgejoConfig struct {
 	Token       string   `toml:"token"`        // runner registration token from Forgejo admin
 	Owner       string   `toml:"owner"`        // org or user (empty = instance-level runner)
 	Repos       []string `toml:"repos"`        // limit to specific repos (empty = all)
+	Labels      []string `toml:"labels"`       // runner labels (default: ["ubuntu-latest:docker://<job_image>"])
 	JobImage    string   `toml:"job_image"`    // default job execution image (default: "gitea/runner-images:ubuntu-24.04")
 }
 
@@ -144,6 +178,7 @@ type GiteaConfig struct {
 	Token       string   `toml:"token"`        // runner registration token from Gitea admin
 	Owner       string   `toml:"owner"`        // org or user (empty = instance-level runner)
 	Repos       []string `toml:"repos"`        // limit to specific repos (empty = all)
+	Labels      []string `toml:"labels"`       // runner labels (default: ["ubuntu-latest:docker://<job_image>"])
 	JobImage    string   `toml:"job_image"`    // default job execution image (default: "gitea/runner-images:ubuntu-24.04")
 }
 
@@ -186,11 +221,11 @@ func (r *RunnerConfig) ImageForRepo(repo string) string {
 // ParsedPollInterval returns the poll interval as a time.Duration.
 func (g *GitHubConfig) ParsedPollInterval() time.Duration {
 	if g.PollInterval == "" {
-		return 10 * time.Second
+		return 30 * time.Second
 	}
 	d, err := time.ParseDuration(g.PollInterval)
 	if err != nil {
-		return 10 * time.Second
+		return 30 * time.Second
 	}
 	return d
 }

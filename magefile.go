@@ -81,6 +81,20 @@ func E2ewoodpecker() error {
 	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "8m", "-run", "TestWoodpecker_E2E", "./test/e2e/woodpecker/")
 }
 
+// E2EModProxy runs the Go module proxy e2e test.
+// Starts a local proxy, fetches real modules, and builds a small Go app through it.
+// Requires: internet access, go toolchain.
+func E2emodproxy() error {
+	return sh.RunV("go", "test", "-tags", "e2e", "-v", "-timeout", "2m", "-run", "TestModProxy_E2E", "./test/e2e/modproxy/")
+}
+
+// E2ERun runs the `ephemerd run` CLI e2e tests.
+// Executes `ephemerd run` as a subprocess against test workflows.
+// Requires: root + `mage build` (uses embedded containerd).
+func E2erun() error {
+	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "10m", "-run", "TestE2E_RunCLI", "./test/e2e/")
+}
+
 // CI runs download, lint, test, and build.
 func CI() {
 	mg.SerialDeps(Lint, Test, build.Build)
@@ -106,6 +120,9 @@ func Clean() error {
 		"pkg/containerd/embed/runc",
 		"pkg/vm/embed/ephemerd-linux",
 		"pkg/vm/embed/alpine-minirootfs-*",
+		"pkg/vm/embed/ephemerd-rootfs-*",
+		"pkg/vm/embed/vmlinuz",
+		"pkg/vm/embed/initrd",
 	}
 	for _, p := range patterns {
 		matches, _ := filepath.Glob(p)

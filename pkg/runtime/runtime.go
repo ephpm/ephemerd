@@ -51,9 +51,17 @@ type Config struct {
 	DefaultImage string // override default container image (auto-detected if empty)
 	LogDir       string // directory for per-job container logs
 	DataDir      string // ephemerd data directory (used for dind socket paths)
-	DindEnabled  bool   // mount a fake Docker socket into each container
-	Network      *networking.Manager
-	Log          *slog.Logger
+	// ContainerDataDir is the path containerd/runc see for the DataDir.
+	// On Linux this matches DataDir. On Darwin the host DataDir is shared
+	// into the Linux VM via virtio-fs at a different path (e.g.
+	// /mnt/ephemerd), and any bind-mount sources that reference the
+	// DataDir must be rewritten to that VM-side path. When empty, falls
+	// back to DataDir.
+	ContainerDataDir string
+	DindEnabled      bool     // mount a fake Docker socket into each container
+	CacheProxyEnv    []string // extra env vars from cache proxies (e.g., GOPROXY=...)
+	Network          *networking.Manager
+	Log              *slog.Logger
 }
 
 // Runtime manages container lifecycle for runner environments.
@@ -176,8 +184,16 @@ func (r *Runtime) PullImage(ctx context.Context, ref string) error {
 
 	r.cfg.Log.Info("pulling image", "ref", ref)
 
+	// Force overlayfs snapshotter. containerd 2.2.2 may default to the
+	// experimental erofs snapshotter on some Linux kernels, which then
+	// fails image unpack with "snapshotter not loaded: erofs: invalid argument".
+	snapshotter := "overlayfs"
+	if goruntime.GOOS == "windows" {
+		snapshotter = "windows"
+	}
 	_, err := r.client.Pull(ctx, ref,
 		client.WithPullUnpack,
+		client.WithPullSnapshotter(snapshotter),
 	)
 	if err != nil {
 		return fmt.Errorf("pulling image %s: %w", ref, err)
@@ -187,8 +203,32 @@ func (r *Runtime) PullImage(ctx context.Context, ref string) error {
 	return nil
 }
 
+// CreateConfig holds parameters for creating a runner environment.
+type CreateConfig struct {
+	ID    string // unique job identifier (container name, dind socket path)
+	Image string // OCI image reference (empty = use default)
+
+	// JITConfig is the base64-encoded JIT config for GitHub runners.
+	// Passed as "--jitconfig <value>" to the runner entrypoint.
+	// Mutually exclusive with Entrypoint.
+	JITConfig string
+
+	// Env holds extra environment variables injected into the container.
+	// Used by Gitea/Forgejo to pass instance URL, runner token, etc.
+	Env map[string]string
+
+	// Entrypoint overrides the container's process args.
+	// When set, used instead of the default "--jitconfig" entrypoint.
+	// When nil and JITConfig is set, uses the GitHub "--jitconfig" mode.
+	// When nil and JITConfig is empty, uses the image's default CMD.
+	Entrypoint []string
+}
+
 // Create provisions an ephemeral runner environment.
-func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig string) (*RunnerEnv, error) {
+func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, error) {
+	id := cfg.ID
+	image := cfg.Image
+	jitConfig := cfg.JITConfig
 	ctx = namespaces.WithNamespace(ctx, namespace)
 
 	// Use a default image when no custom image is specified.
@@ -230,12 +270,24 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		entrypoint = "/home/runner/run.sh"
 	}
 
-	// Build container spec
+	// Build container spec. containerd's default spec generator uses the HOST
+	// GOOS to decide whether to populate the Linux or Windows section of the
+	// OCI spec. On macOS hosts that means neither section is filled (the host
+	// is darwin), and runc rejects the resulting spec with "spec does not
+	// contain Linux or Windows section". Force a platform-appropriate base.
+	targetPlatform := "linux/" + goruntime.GOARCH
+	if goruntime.GOOS == "windows" {
+		targetPlatform = "windows/" + goruntime.GOARCH
+	}
+	envVars := []string{"RUNNER_ALLOW_RUNASROOT=1"}
+	envVars = append(envVars, r.cfg.CacheProxyEnv...)
+	for k, v := range cfg.Env {
+		envVars = append(envVars, k+"="+v)
+	}
 	opts := []oci.SpecOpts{
+		oci.WithDefaultSpecForPlatform(targetPlatform),
 		oci.WithImageConfig(img),
-		oci.WithEnv([]string{
-			"RUNNER_ALLOW_RUNASROOT=1",
-		}),
+		oci.WithEnv(envVars),
 		// Allow sudo inside the container. The default OCI spec sets
 		// NoNewPrivileges=true which blocks privilege escalation, but
 		// jobs need sudo for apt-get install and similar operations.
@@ -246,14 +298,19 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		oci.WithCapabilities(containerCapabilities),
 	}
 	opts = append(opts, seccompOpts()...)
-	if goruntime.GOOS == "windows" {
-		// Wrap entrypoint in cmd.exe redirect so we can capture runner output
-		// to a file readable from the host (the runner dir is mounted in).
+	switch {
+	case len(cfg.Entrypoint) > 0:
+		// Forge mode: custom entrypoint (e.g. act_runner register + daemon).
+		opts = append(opts, oci.WithProcessArgs(cfg.Entrypoint...))
+	case jitConfig != "" && goruntime.GOOS == "windows":
+		// GitHub on Windows: wrap in cmd.exe redirect for log capture.
 		cmdLine := fmt.Sprintf(`%s --jitconfig %s > C:\actions-runner\runner.log 2>&1`, entrypoint, jitConfig)
 		opts = append(opts, oci.WithProcessArgs("cmd.exe", "/c", cmdLine))
-	} else {
+	case jitConfig != "":
+		// GitHub on Linux/macOS: pass JIT config directly.
 		opts = append(opts, oci.WithProcessArgs(entrypoint, "--jitconfig", jitConfig))
 	}
+	// else: no entrypoint override — use image default CMD/ENTRYPOINT.
 
 	// Mount the embedded runner binary into the container.
 	// On Linux with the official GHA image, the runner is pre-installed so no mount needed.
@@ -268,9 +325,17 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		opts = append(opts, withRunnerMount(jobRunnerDir, r.cfg.RunnerMount))
 	}
 
-	// Mount host DNS config so containers can resolve names
+	// Mount host DNS config so containers can resolve names.
+	// filepath.Dir(LogDir) is the DataDir for Linux hosts; the caller
+	// (scheduler) also set ContainerDataDir for Darwin so the container
+	// sees the virtio-fs-shared path instead of the host path.
 	if goruntime.GOOS != "windows" {
-		opts = append(opts, withDNSMount(filepath.Dir(r.cfg.LogDir), id))
+		hostDataDir := filepath.Dir(r.cfg.LogDir)
+		containerDataDir := hostDataDir
+		if r.cfg.ContainerDataDir != "" {
+			containerDataDir = r.cfg.ContainerDataDir
+		}
+		opts = append(opts, withDNSMount(hostDataDir, containerDataDir, id))
 	}
 
 	// Start per-job fake Docker daemon and mount socket into container
@@ -336,10 +401,19 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		}
 	}
 
+	// Force runc runtime. containerd 2.2 may default to the experimental
+	// io.containerd.nerdbox.v1 runtime, whose shim binary isn't in our
+	// embed. Use runc explicitly on Linux, host shim on Windows.
+	runtimeName := "io.containerd.runc.v2"
+	if goruntime.GOOS == "windows" {
+		runtimeName = "io.containerd.runhcs.v1"
+	}
 	container, err := r.client.NewContainer(ctx, id,
 		client.WithImage(img),
+		client.WithSnapshotter(snapshotterName),
 		client.WithNewSnapshot(snapshotName, img),
 		client.WithNewSpec(opts...),
+		client.WithRuntime(runtimeName, nil),
 	)
 	if err != nil {
 		stopDind()
@@ -520,19 +594,25 @@ func (r *Runtime) Wait(ctx context.Context, env *RunnerEnv) (uint32, error) {
 // We write a temporary file with the host's nameservers, filtering out
 // any private/unreachable IPs (e.g. WSL2's 10.255.255.254) and falling
 // back to public DNS if no usable nameservers are found.
-func withDNSMount(dataDir string, containerID string) oci.SpecOpts {
+//
+// hostDir is where the file is written (where ephemerd can reach it);
+// containerSrc is the path the container runtime will see. On Linux/Windows
+// these are the same; on Darwin the DataDir is shared into the VM via
+// virtio-fs so the container sees a different path.
+func withDNSMount(hostDir, containerDir, containerID string) oci.SpecOpts {
 	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
 		content := buildResolvConf()
 
-		dir := filepath.Join(dataDir, "dns")
+		dir := filepath.Join(hostDir, "dns")
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("creating dns dir: %w", err)
 		}
-		src := filepath.Join(dir, containerID+".conf")
-		if err := os.WriteFile(src, []byte(content), 0o644); err != nil {
+		hostFile := filepath.Join(dir, containerID+".conf")
+		if err := os.WriteFile(hostFile, []byte(content), 0o644); err != nil {
 			return fmt.Errorf("writing resolv.conf: %w", err)
 		}
 
+		src := filepath.Join(containerDir, "dns", containerID+".conf")
 		if s.Mounts == nil {
 			s.Mounts = []ocispec.Mount{}
 		}

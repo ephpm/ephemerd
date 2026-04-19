@@ -124,6 +124,9 @@ func doctorCmd() *cli.Command {
 
 			if !checkOnly {
 				fmt.Println("Cleanup:")
+				if os.Geteuid() != 0 {
+					fmt.Println("  (run with sudo for full cleanup — ephemerd data is owned by root)")
+				}
 				fmt.Println()
 
 				log := slog.Default()

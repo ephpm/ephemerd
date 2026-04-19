@@ -13,11 +13,12 @@ const DefaultSubnet = "10.88.0.0/16"
 
 // Config for container networking.
 type Config struct {
-	DataDir   string
-	Subnet    string // container subnet (auto-selected if empty)
-	MTU       int    // bridge MTU (auto-detected from host if 0)
-	CNIBinDir string // path to CNI plugin binaries (Linux only, ignored elsewhere)
-	Log       *slog.Logger
+	DataDir       string
+	Subnet        string // container subnet (auto-selected if empty)
+	MTU           int    // bridge MTU (auto-detected from host if 0)
+	CNIBinDir     string // path to CNI plugin binaries (Linux only, ignored elsewhere)
+	GatewayPorts  []int  // extra TCP ports to allow from containers to the gateway (e.g., module proxy)
+	Log           *slog.Logger
 }
 
 // pickSubnet tries the default subnet first. If it conflicts with an existing
@@ -119,6 +120,27 @@ func (m *Manager) Setup(ctx context.Context, id string, netns string) (*SetupRes
 // Teardown detaches a container from the network.
 func (m *Manager) Teardown(ctx context.Context, id string, netns string) error {
 	return m.platform.teardown(ctx, id, netns)
+}
+
+// GatewayIP returns the bridge gateway IP address (e.g., "10.88.0.1").
+// This is the first usable IP in the container subnet, reachable from
+// inside containers. Used by services that need to be accessible to jobs
+// (e.g., Go module proxy, DNS).
+func (m *Manager) GatewayIP() string {
+	subnet := m.cfg.Subnet
+	if subnet == "" {
+		subnet = DefaultSubnet
+	}
+	ip, _, err := net.ParseCIDR(subnet)
+	if err != nil {
+		return "10.88.0.1"
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return "10.88.0.1"
+	}
+	ip4[3] = 1
+	return ip4.String()
 }
 
 // InstallFirewallRules blocks container traffic to private network ranges.
