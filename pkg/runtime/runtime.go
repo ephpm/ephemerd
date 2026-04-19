@@ -222,6 +222,11 @@ type CreateConfig struct {
 	// When nil and JITConfig is set, uses the GitHub "--jitconfig" mode.
 	// When nil and JITConfig is empty, uses the image's default CMD.
 	Entrypoint []string
+
+	// Mounts maps host paths to container paths for additional bind mounts.
+	// Used to inject the forge-runner binary into base containers.
+	// On Windows, these become mapped directories; on Linux, bind mounts.
+	Mounts map[string]string
 }
 
 // Create provisions an ephemeral runner environment.
@@ -323,6 +328,11 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			return nil, fmt.Errorf("copying runner dir for %s: %w", id, err)
 		}
 		opts = append(opts, withRunnerMount(jobRunnerDir, r.cfg.RunnerMount))
+	}
+
+	// Apply additional mounts from CreateConfig (e.g. forge-runner binary).
+	for hostPath, containerPath := range cfg.Mounts {
+		opts = append(opts, withRunnerMount(hostPath, containerPath))
 	}
 
 	// Mount host DNS config so containers can resolve names.
