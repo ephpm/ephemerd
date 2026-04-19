@@ -19,6 +19,9 @@ import (
 	goproxy "github.com/ephpm/ephemerd/pkg/proxies/go"
 	"github.com/ephpm/ephemerd/pkg/proxies"
 	"github.com/ephpm/ephemerd/pkg/networking"
+	"github.com/ephpm/ephemerd/pkg/providers"
+	forgejoprovider "github.com/ephpm/ephemerd/pkg/providers/forgejo"
+	giteaprovider "github.com/ephpm/ephemerd/pkg/providers/gitea"
 	"github.com/ephpm/ephemerd/pkg/runner"
 	"github.com/ephpm/ephemerd/pkg/runtime"
 	"github.com/ephpm/ephemerd/pkg/scheduler"
@@ -304,10 +307,75 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		cacheProxyEnvVars = append(cacheProxyEnvVars, cp.EnvVars()...)
 	}
 
-	// Create runtime (container lifecycle manager)
-	// On Darwin the Linux VM sees the host's DataDir at /mnt/ephemerd
-	// (virtio-fs share tag "ephemerd"). Bind-mount sources pointed at the
-	// DataDir need to be translated to that VM-side path.
+	// Create provider based on config. Must happen before runtime creation
+	// because forge providers auto-enable dind.
+	var gh *github.Client
+	var forgeProvider providers.Poll
+
+	switch cfg.Provider() {
+	case "gitea":
+		cfg.Dind.Enabled = true
+		p, err := giteaprovider.New(giteaprovider.Config{
+			InstanceURL: cfg.Gitea.InstanceURL,
+			Token:       cfg.Gitea.Token,
+			Owner:       cfg.Gitea.Owner,
+			Repos:       cfg.Gitea.Repos,
+			Labels:      cfg.Gitea.Labels,
+			JobImage:    cfg.Gitea.JobImage,
+			Log:         log,
+		})
+		if err != nil {
+			return fmt.Errorf("creating gitea provider: %w", err)
+		}
+		forgeProvider = p
+		log.Info("using Gitea provider", "instance", cfg.Gitea.InstanceURL)
+
+	case "forgejo":
+		cfg.Dind.Enabled = true
+		p, err := forgejoprovider.New(forgejoprovider.Config{
+			InstanceURL: cfg.Forgejo.InstanceURL,
+			Token:       cfg.Forgejo.Token,
+			Owner:       cfg.Forgejo.Owner,
+			Repos:       cfg.Forgejo.Repos,
+			Labels:      cfg.Forgejo.Labels,
+			JobImage:    cfg.Forgejo.JobImage,
+			Log:         log,
+		})
+		if err != nil {
+			return fmt.Errorf("creating forgejo provider: %w", err)
+		}
+		forgeProvider = p
+		log.Info("using Forgejo provider", "instance", cfg.Forgejo.InstanceURL)
+
+	default: // "github"
+		ghCfg := github.Config{
+			Token: cfg.GitHub.Token,
+			Owner: cfg.GitHub.Owner,
+			Repos: cfg.GitHub.Repos,
+			Log:   log,
+		}
+		if cfg.GitHub.AppID != 0 {
+			appAuth, err := github.NewAppAuth(
+				cfg.GitHub.AppID,
+				cfg.GitHub.InstallationID,
+				cfg.GitHub.PrivateKeyPath,
+				log,
+			)
+			if err != nil {
+				return fmt.Errorf("initializing github app auth: %w", err)
+			}
+			defer appAuth.Stop()
+			ghCfg.AppAuth = appAuth
+		}
+		var err error
+		gh, err = github.New(ghCfg)
+		if err != nil {
+			return fmt.Errorf("creating github client: %w", err)
+		}
+	}
+
+	// Create runtime (container lifecycle manager).
+	// On Darwin the Linux VM sees the host's DataDir at /mnt/ephemerd.
 	containerDataDir := configDir
 	if runtime_.GOOS == "darwin" {
 		containerDataDir = "/mnt/ephemerd"
@@ -328,84 +396,54 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	if err != nil {
 		return fmt.Errorf("creating runtime: %w", err)
 	}
-
-	// Clean up orphan containers from any previous crash
 	if err := rt.CleanOrphans(ctx); err != nil {
 		log.Warn("failed to clean orphan containers", "error", err)
 	}
 
-	// Create GitHub client
-	ghCfg := github.Config{
-		Token: cfg.GitHub.Token,
-		Owner: cfg.GitHub.Owner,
-		Repos: cfg.GitHub.Repos,
-		Log:   log,
-	}
-	if cfg.GitHub.AppID != 0 {
-		appAuth, err := github.NewAppAuth(
-			cfg.GitHub.AppID,
-			cfg.GitHub.InstallationID,
-			cfg.GitHub.PrivateKeyPath,
-			log,
-		)
-		if err != nil {
-			return fmt.Errorf("initializing github app auth: %w", err)
-		}
-		defer appAuth.Stop()
-		ghCfg.AppAuth = appAuth
-	}
-	gh, err := github.New(ghCfg)
-	if err != nil {
-		return fmt.Errorf("creating github client: %w", err)
-	}
-
-	// Create artifact extractor for macOS VM jobs. On macOS hosts, this
-	// allows EPHEMERD_IMAGE to pull OCI images and extract their layers
-	// into the shared data directory (available inside macOS VMs via virtio-fs).
+	// Create artifact extractor for macOS VM jobs.
 	artifactExtractor := artifacts.NewExtractor(ctrdClient, log)
 
 	// Wait for Linux dispatch client if WSL VM is booting in the background.
-	// All setup above (runner, CNI, networking, GitHub) runs in parallel with
-	// the WSL boot, so this typically doesn't add much delay.
 	linuxDispatcher := waitDispatch()
 	if linuxDispatcher != nil {
 		log.Info("Linux job dispatch enabled via WSL")
 	}
 
-	// Set up webhook tunnel (default: localtunnel, set tunnel = "none" for polling)
+	// Set up webhook tunnel (GitHub mode only)
 	var tunnelProvider tunnel.Provider
-	if cfg.Webhook.Tunnel != "none" {
+	if forgeProvider == nil && cfg.Webhook.Tunnel != "none" {
 		var err error
 		tunnelProvider, err = tunnel.New(cfg.Webhook.Tunnel, cfg.Webhook.NgrokAuthtoken, cfg.Webhook.TunnelURL)
 		if err != nil {
 			return fmt.Errorf("creating tunnel provider: %w", err)
 		}
 		log.Info("webhook tunnel configured", "provider", cfg.Webhook.Tunnel)
-	} else {
+	} else if forgeProvider == nil {
 		log.Info("polling mode enabled (tunnel disabled)")
 	}
 
-	// Start scheduler (ties GitHub jobs to container lifecycle)
+	// Start scheduler
 	sched := scheduler.New(scheduler.Config{
-		Runtime:         rt,
-		GitHub:          gh,
-		Artifacts:       artifactExtractor,
-		LinuxDispatcher: linuxDispatcher,
-		DataDir:         configDir,
-		MaxConcurrent:   cfg.Runner.MaxConcurrent,
-		MaxMacOSVMs:     cfg.VM.MacOS.MaxConcurrent,
-		Labels:          cfg.Runner.ExtraLabels,
-		PollInterval:    cfg.GitHub.ParsedPollInterval(),
-		WebhookPort:     cfg.Webhook.Port,
-		WebhookSecret:   cfg.Webhook.Secret,
-		TLSCert:         cfg.Webhook.TLSCert,
-		TLSKey:          cfg.Webhook.TLSKey,
-		Tunnel:            tunnelProvider,
-		TunnelMaxRetries:  cfg.Webhook.TunnelMaxRetries,
-		JobTimeout:        cfg.Runner.ParsedJobTimeout(),
-		ShutdownTimeout: cfg.Runner.ParsedShutdownTimeout(),
-		LogRetention:    cfg.Log.LogRetentionDuration(),
-		Log:             log,
+		Runtime:          rt,
+		GitHub:           gh,
+		Provider:         forgeProvider,
+		Artifacts:        artifactExtractor,
+		LinuxDispatcher:  linuxDispatcher,
+		DataDir:          configDir,
+		MaxConcurrent:    cfg.Runner.MaxConcurrent,
+		MaxMacOSVMs:      cfg.VM.MacOS.MaxConcurrent,
+		Labels:           cfg.Runner.ExtraLabels,
+		PollInterval:     cfg.GitHub.ParsedPollInterval(),
+		WebhookPort:      cfg.Webhook.Port,
+		WebhookSecret:    cfg.Webhook.Secret,
+		TLSCert:          cfg.Webhook.TLSCert,
+		TLSKey:           cfg.Webhook.TLSKey,
+		Tunnel:           tunnelProvider,
+		TunnelMaxRetries: cfg.Webhook.TunnelMaxRetries,
+		JobTimeout:       cfg.Runner.ParsedJobTimeout(),
+		ShutdownTimeout:  cfg.Runner.ParsedShutdownTimeout(),
+		LogRetention:     cfg.Log.LogRetentionDuration(),
+		Log:              log,
 	})
 
 	// Start metrics server if enabled
@@ -451,7 +489,7 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		}()
 	}
 
-	log.Info("ephemerd ready", "repos", cfg.GitHub.Repos, "max_concurrent", cfg.Runner.MaxConcurrent)
+	log.Info("ephemerd ready", "provider", cfg.Provider(), "max_concurrent", cfg.Runner.MaxConcurrent)
 
 	return sched.Run(ctx)
 }

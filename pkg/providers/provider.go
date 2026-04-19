@@ -136,4 +136,12 @@ type Claim struct {
 	// Env holds extra environment variables injected into the runner container.
 	// Used by Forgejo/GitLab to pass instance URL, runner token, etc.
 	Env map[string]string
+
+	// Entrypoint overrides the container's process args.
+	// When set, the runtime uses these args instead of the default
+	// "--jitconfig" entrypoint used by GitHub Actions runners.
+	//   Gitea:   ["sh", "-c", "act_runner register ... && act_runner daemon --ephemeral"]
+	//   Forgejo: ["sh", "-c", "forgejo-runner register ... && forgejo-runner daemon"]
+	//   GitHub:  nil (uses --jitconfig from RunnerConfig)
+	Entrypoint []string
 }
