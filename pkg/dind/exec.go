@@ -99,7 +99,7 @@ func (s *Server) handleExecCreate(w http.ResponseWriter, r *http.Request, contai
 
 	execID := generateContainerID()[:16]
 
-	ctx := namespaces.WithNamespace(r.Context(), containerNamespace)
+	ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
 
 	// Build OCI process spec.
 	pspec := &ocispec.Process{
@@ -173,7 +173,7 @@ func (s *Server) handleExecStart(w http.ResponseWriter, r *http.Request, execID 
 		return
 	}
 
-	ctx := namespaces.WithNamespace(r.Context(), containerNamespace)
+	ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
 
 	// Register wait channel BEFORE starting (containerd requirement).
 	statusCh, err := exec.Process.Wait(ctx)
@@ -235,7 +235,7 @@ func (s *Server) handleExecInspect(w http.ResponseWriter, r *http.Request, execI
 	running := exec.Running
 	exitCode := exec.ExitCode
 	if exec.Process != nil && running {
-		ctx := namespaces.WithNamespace(r.Context(), containerNamespace)
+		ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
 		if st, err := exec.Process.Status(ctx); err == nil {
 			switch st.Status {
 			case client.Running:
@@ -289,7 +289,7 @@ func (s *Server) handleContainerCopyTo(w http.ResponseWriter, r *http.Request, i
 	}
 
 	// Container not running — write directly to the snapshot's upperdir.
-	ctx := namespaces.WithNamespace(r.Context(), containerNamespace)
+	ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
 	snapshotID := entry.ID + "-snapshot"
 	snapshotter := s.client.SnapshotService("overlayfs")
 	if snapshotter == nil {
@@ -372,7 +372,7 @@ func (s *Server) copyToViaExec(w http.ResponseWriter, r *http.Request, entry *co
 	// For the exec approach to work, we need the tar file visible inside
 	// the container. Since the container uses overlayfs, we can write the
 	// tar to the upperdir and then exec tar inside the container.
-	ctx := namespaces.WithNamespace(r.Context(), containerNamespace)
+	ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
 	snapshotID := entry.ID + "-snapshot"
 	snapshotter := s.client.SnapshotService("overlayfs")
 	if snapshotter == nil {
@@ -507,7 +507,7 @@ func (s *Server) handleContainerCopyFrom(w http.ResponseWriter, r *http.Request,
 
 	// For running containers, exec tar inside to stream files out.
 	// For stopped containers, read from the overlay upperdir.
-	ctx := namespaces.WithNamespace(r.Context(), containerNamespace)
+	ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
 	snapshotID := entry.ID + "-snapshot"
 	snapshotter := s.client.SnapshotService("overlayfs")
 	if snapshotter == nil {
@@ -612,7 +612,7 @@ func (s *Server) cleanupExec(execID string) {
 	}
 
 	if exec.Process != nil {
-		ctx := namespaces.WithNamespace(context.Background(), containerNamespace)
+		ctx := namespaces.WithNamespace(context.Background(), s.jobNamespace)
 		if _, err := exec.Process.Delete(ctx, client.WithProcessKill); err != nil {
 			s.log.Debug("exec process delete", "exec_id", execID, "error", err)
 		}

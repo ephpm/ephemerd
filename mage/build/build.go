@@ -24,7 +24,7 @@ func Build() error {
 	if env := os.Getenv("OUTPUT"); env != "" {
 		output = env
 	}
-	return sh.RunV("go", "build", "-ldflags", ldflags(), "-o", output, "./cmd/ephemerd/")
+	return sh.RunV("go", "build", "-tags", "containers_image_openpgp", "-ldflags", ldflags(), "-o", output, "./cmd/ephemerd/")
 }
 
 // Windows performs the two-stage Windows build:
@@ -46,7 +46,7 @@ func Windows() error {
 	}
 	return sh.RunWith(
 		map[string]string{"GOOS": "windows", "GOARCH": "amd64"},
-		"go", "build", "-ldflags", ldflags(), "-o", output, "./cmd/ephemerd/",
+		"go", "build", "-tags", "containers_image_openpgp", "-ldflags", ldflags(), "-o", output, "./cmd/ephemerd/",
 	)
 }
 
@@ -59,7 +59,7 @@ func Linuxembed() error {
 	}
 	return sh.RunWith(
 		map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64"},
-		"go", "build", "-ldflags", ldflags(), "-o", "pkg/vm/embed/ephemerd-linux", "./cmd/ephemerd/",
+		"go", "build", "-tags", "containers_image_openpgp", "-ldflags", ldflags(), "-o", "pkg/vm/embed/ephemerd-linux", "./cmd/ephemerd/",
 	)
 }
 
@@ -99,7 +99,7 @@ func Macos() error {
 	}
 	defer func() { _ = restoreStashed(stash) }()
 
-	if err := sh.RunV("go", "build", "-ldflags", ldflags(), "-o", output, "./cmd/ephemerd/"); err != nil {
+	if err := sh.RunV("go", "build", "-tags", "containers_image_openpgp", "-ldflags", ldflags(), "-o", output, "./cmd/ephemerd/"); err != nil {
 		return err
 	}
 
@@ -136,7 +136,7 @@ func Linuxembedarm64() error {
 
 	return sh.RunWith(
 		map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "arm64"},
-		"go", "build", "-ldflags", ldflags(), "-o", "pkg/vm/embed/ephemerd-linux", "./cmd/ephemerd/",
+		"go", "build", "-tags", "containers_image_openpgp", "-ldflags", ldflags(), "-o", "pkg/vm/embed/ephemerd-linux", "./cmd/ephemerd/",
 	)
 }
 

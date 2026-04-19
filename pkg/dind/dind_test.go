@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -489,6 +490,34 @@ func TestCopyFromContainerNotFound(t *testing.T) {
 
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestBuildRoute(t *testing.T) {
+	s := newTestServer(t)
+	client := dialSocket(s.SocketPath())
+
+	// Build endpoint should be routed (not 501 "not implemented").
+	// On Linux with no client: 500 (no containerd client).
+	// On non-Linux: 501 (build not supported).
+	resp, err := client.Post("http://docker/v1.45/build?t=myapp", "application/x-tar", nil)
+	if err != nil {
+		t.Fatalf("POST /v1.45/build: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
+
+	if runtime.GOOS == "linux" {
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Errorf("status = %d, want 500 (no containerd client)", resp.StatusCode)
+		}
+	} else {
+		if resp.StatusCode != http.StatusNotImplemented {
+			t.Errorf("status = %d, want 501 (not supported on %s)", resp.StatusCode, runtime.GOOS)
+		}
 	}
 }
 

@@ -21,8 +21,6 @@ import (
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-const containerNamespace = "ephemerd"
-
 // containerEntry tracks a container created through the fake Docker socket.
 type containerEntry struct {
 	ID        string
@@ -140,7 +138,7 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	id := generateContainerID()
 	name := strings.TrimPrefix(r.URL.Query().Get("name"), "/")
 
-	ctx := namespaces.WithNamespace(r.Context(), containerNamespace)
+	ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
 
 	// Resolve image from containerd, pulling if needed.
 	img, err := s.client.GetImage(ctx, req.Image)
@@ -244,7 +242,7 @@ func (s *Server) handleContainerStart(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 
-	ctx := namespaces.WithNamespace(r.Context(), containerNamespace)
+	ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
 
 	// Create log directory for capturing stdout/stderr.
 	logDir := filepath.Join(filepath.Dir(s.sockPath), "containers", id)
@@ -320,7 +318,7 @@ func (s *Server) handleContainerInspect(w http.ResponseWriter, r *http.Request, 
 	status := entry.Status
 	exitCode := entry.ExitCode
 	if entry.Task != nil {
-		ctx := namespaces.WithNamespace(r.Context(), containerNamespace)
+		ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
 		if taskStatus, err := entry.Task.Status(ctx); err == nil {
 			switch taskStatus.Status {
 			case client.Running:
@@ -381,7 +379,7 @@ func (s *Server) handleContainerStop(w http.ResponseWriter, r *http.Request, id 
 		return
 	}
 
-	ctx := namespaces.WithNamespace(r.Context(), containerNamespace)
+	ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
 
 	if err := entry.Task.Kill(ctx, 15); err != nil {
 		s.log.Debug("SIGTERM failed, sending SIGKILL", "id", id, "error", err)
@@ -430,7 +428,7 @@ func (s *Server) handleContainerWait(w http.ResponseWriter, r *http.Request, id 
 		return
 	}
 
-	ctx := namespaces.WithNamespace(r.Context(), containerNamespace)
+	ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
 	exitCh, err := entry.Task.Wait(ctx)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
@@ -497,7 +495,7 @@ func (s *Server) handleContainerRemove(w http.ResponseWriter, r *http.Request, i
 		return
 	}
 
-	ctx := namespaces.WithNamespace(r.Context(), containerNamespace)
+	ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
 	s.cleanupContainer(ctx, id, entry)
 
 	s.mu.Lock()
@@ -575,7 +573,7 @@ func (s *Server) cleanupContainer(ctx context.Context, id string, entry *contain
 
 // destroyAllContainers cleans up every container in the map.
 func (s *Server) destroyAllContainers() {
-	ctx := namespaces.WithNamespace(context.Background(), containerNamespace)
+	ctx := namespaces.WithNamespace(context.Background(), s.jobNamespace)
 
 	s.mu.Lock()
 	snapshot := make(map[string]*containerEntry, len(s.containers))

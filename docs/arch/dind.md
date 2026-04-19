@@ -115,7 +115,7 @@ For workflows with `services:` (databases, caches):
 | `POST /networks/create` | **TODO** | act | Needed for `services:` |
 | `POST /networks/{id}/connect` | **TODO** | act | Needed for `services:` |
 | `DELETE /networks/{id}` | **TODO** | act | Cleanup |
-| `POST /build` | **TODO** | CLI | Needs buildah integration |
+| `POST /build` | **Done** | CLI | Buildah library (`imagebuildah.BuildDockerfiles`) in-process |
 | `POST /images/{name}/push` | **TODO** | CLI | Needs buildah + registry auth |
 | `POST /images/{name}/tag` | **TODO** | CLI | Alias in in-memory map |
 | `DELETE /images/{name}` | **TODO** | CLI | Remove from map |
@@ -158,9 +158,9 @@ Each job gets its own fake daemon instance. The daemon maintains an in-memory im
 
 | Docker API | ephemerd action |
 |---|---|
-| `POST /images/create` (pull) | Pull via containerd's content store. Register in the in-memory map. Stream progress JSON. |
+| `POST /images/create` (pull) | Check shared `ephemerd` namespace first (cached base images). Pull into per-job namespace on miss. Register in the in-memory map. Stream progress JSON. |
 | `GET /images/json` | Return entries from the in-memory map. |
-| `POST /build` | *(planned)* Stream build context to temp dir. Run `buildah bud`. Register result. |
+| `POST /build` | Extract tar build context, call `imagebuildah.BuildDockerfiles()` in-process via buildah library. Uses per-job `containers/storage` root for isolation. Register result in in-memory map. |
 | `POST /images/{name}/push` | *(planned)* Push via `buildah push` with registry credentials. |
 
 ### Container lifecycle
@@ -213,19 +213,43 @@ Name resolution for `--name` containers (e.g. `docker run -d --name postgres pos
 
 This is also how `services:` in workflow YAML works — act calls `docker create` + `docker start` for each service, and those calls hit the fake daemon which creates sibling containers on the shared network.
 
+## Namespace Isolation
+
+DinD operations use a **two-tier containerd namespace** model to prevent image leaks between jobs while preserving caching for common base images:
+
+```
+Shared namespace: "ephemerd"
+  └── Runner containers (actions-runner, forgejo-runner images)
+  └── Base images cached by ephemerd (node:20, ubuntu:24.04, etc.)
+
+Per-job namespace: "ephemerd/dind/{jobID}"
+  └── Images pulled via fake socket (docker pull)
+  └── Images built via fake socket (docker build)
+  └── Containers created via fake socket (docker run)
+```
+
+**Image pull read-through**: when a job does `docker pull node:20`, the fake socket checks the shared `ephemerd` namespace first. If the image exists there (pulled by ephemerd for runner containers), it's referenced directly — no redundant pull. Private registry images that aren't in the shared namespace are pulled into the per-job namespace, invisible to other jobs.
+
+**Build isolation**: `docker build` output goes into a per-job `containers/storage` root at `<DataDir>/jobs/<JobID>/docker/buildah-store/`. This is completely isolated from other jobs and from containerd's store.
+
+**Cleanup**: when the job exits, the entire per-job namespace is destroyed — all containers, snapshots, images, and build artifacts. The shared namespace is untouched.
+
+**Why per-job, not per-repo**: while per-repo namespaces would improve cache hit rates, they create a window where one PR's build artifacts are visible to concurrent jobs in the same repo. Per-job namespaces are the strictest isolation boundary. Cross-job caching can be added later via a read-only shared layer.
+
 ## Storage
 
-- **Pulled images**: stored in containerd's content store (shared across jobs for caching).
+- **Pulled images (shared)**: common base images in containerd's `ephemerd` namespace, cached across all jobs.
+- **Pulled images (private)**: per-job images in containerd's `ephemerd/dind/{jobID}` namespace. Destroyed on job exit.
 - **Container snapshots**: one overlayfs snapshot per container, named `{containerID}-snapshot`. Cleaned up on container removal.
 - **Container logs**: per-container log files at `<DataDir>/jobs/<JobID>/docker/containers/<containerID>/output.log`. Cleaned up on removal.
-- **Build layers** *(planned)*: OCI directories under `<DataDir>/jobs/<JobID>/layers/`. Buildah's `--root` and `--runroot` flags point here.
-- **Garbage collection**: on job cleanup, `destroyAllContainers()` handles everything. Pulled images remain in containerd's store for future jobs.
+- **Build layers**: per-job `containers/storage` at `<DataDir>/jobs/<JobID>/docker/buildah-store/`. Destroyed on job exit.
+- **Garbage collection**: on job cleanup, `destroyAllContainers()` handles containers, `os.RemoveAll` handles the buildah store directory. Shared images remain cached.
 
 ## Dependencies
 
 - **containerd**: embedded, provides image pull and container lifecycle.
 - **CNI plugins**: bridge + host-local + portmap, extracted at build time. Provide networking for sibling containers.
-- **buildah** *(planned)*: embedded or downloaded at build time. Statically linked binary, ~30MB. Required for `docker build`.
+- **buildah**: imported as Go library (`github.com/containers/buildah`). Used for `docker build`. Built with `containers_image_openpgp` tag to avoid CGo dependency on gpgme.
 - **No Docker daemon**: the entire point.
 - **No additional capabilities**: sibling containers get the same restricted capability set as job containers.
 
@@ -237,8 +261,9 @@ This is also how `services:` in workflow YAML works — act calls `docker create
 4. ~~CNI networking for sibling containers~~ — done
 5. ~~Exec (create/start/inspect)~~ — done
 6. ~~Copy to/from container~~ — done
-7. **Image inspect** (`GET /images/{name}/json`) — act checks before pulling
-8. **Network create/connect** — required for `services:` support
-9. **Image build** (`POST /build`) — embed buildah, wire up build context streaming
-10. **Image push** — registry auth + `buildah push`
-11. **`/etc/hosts` injection** — service discovery for named sidecars
+7. ~~Image build (`POST /build`) — buildah as Go library~~ — done
+8. ~~Per-job containerd namespace isolation~~ — done
+9. **Image inspect** (`GET /images/{name}/json`) — act checks before pulling
+10. **Network create/connect** — required for `services:` support
+11. **Image push** — registry auth + `buildah push`
+12. **`/etc/hosts` injection** — service discovery for named sidecars
