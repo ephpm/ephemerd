@@ -1,6 +1,8 @@
 ---
 title: CLI Reference
 weight: 3
+cascade:
+  type: docs
 ---
 
 Complete reference for all ephemerd commands.
