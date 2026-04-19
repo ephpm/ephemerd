@@ -203,8 +203,32 @@ func (r *Runtime) PullImage(ctx context.Context, ref string) error {
 	return nil
 }
 
+// CreateConfig holds parameters for creating a runner environment.
+type CreateConfig struct {
+	ID    string // unique job identifier (container name, dind socket path)
+	Image string // OCI image reference (empty = use default)
+
+	// JITConfig is the base64-encoded JIT config for GitHub runners.
+	// Passed as "--jitconfig <value>" to the runner entrypoint.
+	// Mutually exclusive with Entrypoint.
+	JITConfig string
+
+	// Env holds extra environment variables injected into the container.
+	// Used by Gitea/Forgejo to pass instance URL, runner token, etc.
+	Env map[string]string
+
+	// Entrypoint overrides the container's process args.
+	// When set, used instead of the default "--jitconfig" entrypoint.
+	// When nil and JITConfig is set, uses the GitHub "--jitconfig" mode.
+	// When nil and JITConfig is empty, uses the image's default CMD.
+	Entrypoint []string
+}
+
 // Create provisions an ephemeral runner environment.
-func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig string) (*RunnerEnv, error) {
+func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, error) {
+	id := cfg.ID
+	image := cfg.Image
+	jitConfig := cfg.JITConfig
 	ctx = namespaces.WithNamespace(ctx, namespace)
 
 	// Use a default image when no custom image is specified.
@@ -255,9 +279,11 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 	if goruntime.GOOS == "windows" {
 		targetPlatform = "windows/" + goruntime.GOARCH
 	}
-
 	envVars := []string{"RUNNER_ALLOW_RUNASROOT=1"}
 	envVars = append(envVars, r.cfg.CacheProxyEnv...)
+	for k, v := range cfg.Env {
+		envVars = append(envVars, k+"="+v)
+	}
 	opts := []oci.SpecOpts{
 		oci.WithDefaultSpecForPlatform(targetPlatform),
 		oci.WithImageConfig(img),
@@ -272,14 +298,19 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		oci.WithCapabilities(containerCapabilities),
 	}
 	opts = append(opts, seccompOpts()...)
-	if goruntime.GOOS == "windows" {
-		// Wrap entrypoint in cmd.exe redirect so we can capture runner output
-		// to a file readable from the host (the runner dir is mounted in).
+	switch {
+	case len(cfg.Entrypoint) > 0:
+		// Forge mode: custom entrypoint (e.g. act_runner register + daemon).
+		opts = append(opts, oci.WithProcessArgs(cfg.Entrypoint...))
+	case jitConfig != "" && goruntime.GOOS == "windows":
+		// GitHub on Windows: wrap in cmd.exe redirect for log capture.
 		cmdLine := fmt.Sprintf(`%s --jitconfig %s > C:\actions-runner\runner.log 2>&1`, entrypoint, jitConfig)
 		opts = append(opts, oci.WithProcessArgs("cmd.exe", "/c", cmdLine))
-	} else {
+	case jitConfig != "":
+		// GitHub on Linux/macOS: pass JIT config directly.
 		opts = append(opts, oci.WithProcessArgs(entrypoint, "--jitconfig", jitConfig))
 	}
+	// else: no entrypoint override — use image default CMD/ENTRYPOINT.
 
 	// Mount the embedded runner binary into the container.
 	// On Linux with the official GHA image, the runner is pre-installed so no mount needed.

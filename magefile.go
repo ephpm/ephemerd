@@ -103,6 +103,13 @@ func E2emodproxy() error {
 	return sh.RunV("go", "test", "-tags", "e2e", "-v", "-timeout", "2m", "-run", "TestModProxy_E2E", "./test/e2e/modproxy/")
 }
 
+// E2ERun runs the `ephemerd run` CLI e2e tests.
+// Executes `ephemerd run` as a subprocess against test workflows.
+// Requires: root + `mage build` (uses embedded containerd).
+func E2erun() error {
+	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "10m", "-run", "TestE2E_RunCLI", "./test/e2e/")
+}
+
 // CI runs download, lint, test, and build.
 func CI() {
 	mg.SerialDeps(Lint, Test, build.Build)
