@@ -344,6 +344,13 @@ base_image = "/path/to/macos.img"    # provisioned base image
 cpus = 4
 memory_mb = 8192
 
+# Go module caching proxy — speeds up `go mod download` across jobs
+[module_proxy]
+enabled = true                        # run a GOPROXY on the bridge gateway
+# port = 8082                         # default listen port
+# upstream = "https://proxy.golang.org"  # upstream to fetch from on cache miss
+# cleanup = true                      # wipe cache on shutdown
+
 [log]
 level = "info"                        # debug, info, warn, error
 format = "text"                       # text or json

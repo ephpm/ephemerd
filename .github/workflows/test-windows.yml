@@ -10,7 +10,7 @@ jobs:
     name: Windows Smoke Test
     runs-on: [self-hosted, windows, x64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: System info
         run: |

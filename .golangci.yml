@@ -1,5 +1,9 @@
 version: "2"
 
+run:
+  build-tags:
+    - containers_image_openpgp
+
 linters:
   enable:
     - errcheck

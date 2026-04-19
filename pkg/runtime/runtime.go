@@ -58,7 +58,8 @@ type Config struct {
 	// DataDir must be rewritten to that VM-side path. When empty, falls
 	// back to DataDir.
 	ContainerDataDir string
-	DindEnabled      bool   // mount a fake Docker socket into each container
+	DindEnabled      bool     // mount a fake Docker socket into each container
+	CacheProxyEnv    []string // extra env vars from cache proxies (e.g., GOPROXY=...)
 	Network          *networking.Manager
 	Log              *slog.Logger
 }
@@ -254,12 +255,13 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 	if goruntime.GOOS == "windows" {
 		targetPlatform = "windows/" + goruntime.GOARCH
 	}
+
+	envVars := []string{"RUNNER_ALLOW_RUNASROOT=1"}
+	envVars = append(envVars, r.cfg.CacheProxyEnv...)
 	opts := []oci.SpecOpts{
 		oci.WithDefaultSpecForPlatform(targetPlatform),
 		oci.WithImageConfig(img),
-		oci.WithEnv([]string{
-			"RUNNER_ALLOW_RUNASROOT=1",
-		}),
+		oci.WithEnv(envVars),
 		// Allow sudo inside the container. The default OCI spec sets
 		// NoNewPrivileges=true which blocks privilege escalation, but
 		// jobs need sudo for apt-get install and similar operations.

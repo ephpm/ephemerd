@@ -42,7 +42,8 @@
       "Bash(go vet:*)",
       "Bash(go list:*)",
       "Bash(go get:*)",
-      "Bash(go mod:*)"
+      "Bash(go mod:*)",
+      "Bash(gh run:*)"
     ]
   }
 }
