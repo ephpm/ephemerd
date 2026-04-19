@@ -41,7 +41,11 @@ menu:
 params:
   navbar:
     displayTitle: true
-    displayLogo: false
+    displayLogo: true
+    logo:
+      path: favicon.svg
+      width: 24
+      height: 24
     width: normal
 
   theme:

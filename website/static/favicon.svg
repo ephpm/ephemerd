@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <clipPath id="ghost">
+      <path d="M24 54 C24 26 44 8 64 8 C84 8 104 26 104 54 L104 108 L93 98 L82 108 L71 98 L60 108 L49 98 L38 108 L24 108 Z"/>
+    </clipPath>
+  </defs>
+
+  <!-- Ghost 4 (most faded) -->
+  <g opacity="0.08" transform="translate(-18, 0)">
+    <path d="M24 54 C24 26 44 8 64 8 C84 8 104 26 104 54 L104 108 L93 98 L82 108 L71 98 L60 108 L49 98 L38 108 L24 108 Z" fill="#5B4FD6"/>
+  </g>
+
+  <!-- Ghost 3 -->
+  <g opacity="0.15" transform="translate(-12, 0)">
+    <path d="M24 54 C24 26 44 8 64 8 C84 8 104 26 104 54 L104 108 L93 98 L82 108 L71 98 L60 108 L49 98 L38 108 L24 108 Z" fill="#5B4FD6"/>
+  </g>
+
+  <!-- Ghost 2 -->
+  <g opacity="0.25" transform="translate(-6, 0)">
+    <path d="M24 54 C24 26 44 8 64 8 C84 8 104 26 104 54 L104 108 L93 98 L82 108 L71 98 L60 108 L49 98 L38 108 L24 108 Z" fill="#5B4FD6"/>
+  </g>
+
+  <!-- Ghost 1 (primary) -->
+  <g>
+    <path d="M24 54 C24 26 44 8 64 8 C84 8 104 26 104 54 L104 108 L93 98 L82 108 L71 98 L60 108 L49 98 L38 108 L24 108 Z" fill="#5B4FD6"/>
+    <!-- Left eye -->
+    <ellipse cx="50" cy="50" rx="9" ry="11" fill="white"/>
+    <ellipse cx="53" cy="52" rx="5" ry="6" fill="#2D2B55"/>
+    <!-- Right eye -->
+    <ellipse cx="78" cy="50" rx="9" ry="11" fill="white"/>
+    <ellipse cx="81" cy="52" rx="5" ry="6" fill="#2D2B55"/>
+  </g>
+</svg>
