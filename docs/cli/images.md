@@ -1,6 +1,6 @@
 ---
 title: images
-weight: 7
+weight: 10
 ---
 
 List cached OCI container images from the embedded containerd instance.

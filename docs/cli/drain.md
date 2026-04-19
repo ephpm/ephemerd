@@ -1,6 +1,6 @@
 ---
 title: drain
-weight: 5
+weight: 8
 ---
 
 Gracefully drain the running ephemerd daemon. The daemon stops accepting new jobs and waits for all running jobs to finish before exiting.

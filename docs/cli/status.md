@@ -1,6 +1,6 @@
 ---
 title: status
-weight: 4
+weight: 7
 ---
 
 Show the running daemon's health and job status by querying its gRPC control socket.

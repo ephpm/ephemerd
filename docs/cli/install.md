@@ -1,6 +1,6 @@
 ---
 title: install
-weight: 10
+weight: 13
 ---
 
 Install ephemerd as a system service. Copies the binary to the system install location, creates the data directory with a default config, and registers a system service.

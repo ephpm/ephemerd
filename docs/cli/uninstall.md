@@ -1,6 +1,6 @@
 ---
 title: uninstall
-weight: 11
+weight: 14
 ---
 
 Remove the ephemerd binary, system service, and optionally all data.

@@ -1,6 +1,6 @@
 ---
 title: doctor
-weight: 9
+weight: 12
 ---
 
 Check system readiness and clean up stale runtime state. By default, runs both checks and cleanup. Use `--check` or `--clean` to run only one phase.

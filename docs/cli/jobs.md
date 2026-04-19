@@ -1,6 +1,6 @@
 ---
 title: jobs
-weight: 6
+weight: 9
 ---
 
 List and manage running jobs. When called without a subcommand, lists all active jobs. When called with a job ID as an argument, shows detailed information about that job.
