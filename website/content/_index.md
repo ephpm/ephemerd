@@ -20,7 +20,7 @@ layout: hextra-home
 </div>
 
 <div style="margin-top: 4rem; margin-bottom: 1.5rem;">
-{{< hextra/hero-button text="Get Started" link="getting-started/" >}}
+{{< hextra/hero-button text="Get Started" link="getting-started/installation/" >}}
 {{< hextra/hero-button text="GitHub" link="https://github.com/ephpm/ephemerd" style="alt" >}}
 </div>
 
