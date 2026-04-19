@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	vmPkg "github.com/ephpm/ephemerd/pkg/vm"
 	gh "github.com/google/go-github/v72/github"
 )
 
@@ -458,5 +460,222 @@ func TestSocketPath(t *testing.T) {
 func TestSeenTTL(t *testing.T) {
 	if seenTTL != 10*time.Minute {
 		t.Errorf("seenTTL = %v, want 10m", seenTTL)
+	}
+}
+
+// --- backoffDuration tests ---
+
+func TestBackoffDuration_ExponentialSequence(t *testing.T) {
+	repo := "test-backoff-sequence"
+	// Reset any prior state
+	resetBackoff(repo)
+
+	// Each call increments the failure count: 2^1, 2^2, 2^3, ...
+	expected := []time.Duration{
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		16 * time.Second,
+		32 * time.Second,
+		60 * time.Second, // capped at 60s
+		60 * time.Second, // stays capped
+	}
+
+	for i, want := range expected {
+		got := backoffDuration(repo)
+		if got != want {
+			t.Errorf("call %d: backoffDuration(%q) = %v, want %v", i+1, repo, got, want)
+		}
+	}
+
+	// Clean up
+	resetBackoff(repo)
+}
+
+func TestBackoffDuration_IndependentRepos(t *testing.T) {
+	resetBackoff("repo-a")
+	resetBackoff("repo-b")
+
+	// Advance repo-a 3 times
+	backoffDuration("repo-a")
+	backoffDuration("repo-a")
+	d3 := backoffDuration("repo-a") // 3rd call → 2^3 = 8s
+
+	// repo-b should start fresh
+	d1 := backoffDuration("repo-b") // 1st call → 2^1 = 2s
+
+	if d3 != 8*time.Second {
+		t.Errorf("repo-a call 3: got %v, want 8s", d3)
+	}
+	if d1 != 2*time.Second {
+		t.Errorf("repo-b call 1: got %v, want 2s", d1)
+	}
+
+	resetBackoff("repo-a")
+	resetBackoff("repo-b")
+}
+
+func TestResetBackoff(t *testing.T) {
+	repo := "test-reset"
+	resetBackoff(repo)
+
+	// Build up some backoff
+	backoffDuration(repo) // 2s
+	backoffDuration(repo) // 4s
+	backoffDuration(repo) // 8s
+
+	// Reset
+	resetBackoff(repo)
+
+	// Should restart from 2s
+	got := backoffDuration(repo)
+	if got != 2*time.Second {
+		t.Errorf("after reset: backoffDuration = %v, want 2s", got)
+	}
+
+	resetBackoff(repo)
+}
+
+func TestResetBackoff_NonexistentRepo(t *testing.T) {
+	// Should not panic
+	resetBackoff("never-seen-before")
+}
+
+// --- registerVMSSHHandler tests ---
+
+// mockMacOSVM is a minimal mock for vm.MacOSVM used by vmssh tests.
+type mockMacOSVM struct {
+	ip string
+}
+
+func (m *mockMacOSVM) WriteJITConfig(string) error                          { return nil }
+func (m *mockMacOSVM) Start(ctx context.Context) error                      { return nil }
+func (m *mockMacOSVM) WaitForRunner(ctx context.Context) (string, error)    { return m.ip, nil }
+func (m *mockMacOSVM) RunnerAddress() string                                { return m.ip }
+func (m *mockMacOSVM) Wait(ctx context.Context) (int, error)                { return 0, nil }
+func (m *mockMacOSVM) Stop()                                                {}
+
+func newVMSSHTestMux(s *Scheduler) *http.ServeMux {
+	mux := http.NewServeMux()
+	s.registerVMSSHHandler(mux)
+	return mux
+}
+
+func TestVMSSH_MissingJobID(t *testing.T) {
+	s := New(Config{Log: testLogger()})
+	mux := newVMSSHTestMux(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestVMSSH_InvalidJobID(t *testing.T) {
+	s := New(Config{Log: testLogger()})
+	mux := newVMSSHTestMux(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info?job_id=abc", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestVMSSH_UnknownJob(t *testing.T) {
+	s := New(Config{Log: testLogger()})
+	mux := newVMSSHTestMux(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info?job_id=999", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestVMSSH_NonMacOSJob(t *testing.T) {
+	s := New(Config{Log: testLogger()})
+	// Add a running job WITHOUT a macosVM
+	s.running[100] = &runningJob{repo: "test", startedAt: time.Now()}
+	mux := newVMSSHTestMux(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info?job_id=100", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestVMSSH_VMIPNotReady(t *testing.T) {
+	s := New(Config{Log: testLogger()})
+	s.running[200] = &runningJob{
+		repo:      "test",
+		macosVM:   &mockMacOSVM{ip: ""}, // IP not yet discovered
+		startedAt: time.Now(),
+	}
+	mux := newVMSSHTestMux(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info?job_id=200", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestVMSSH_ValidMacOSJob(t *testing.T) {
+	priv, _, err := vmPkg.GenerateEphemeralSSHKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(Config{
+		Log: testLogger(),
+		MacOSVMConfig: &vmPkg.MacOSVMConfig{
+			SSHSigner: priv,
+		},
+	})
+	s.running[300] = &runningJob{
+		repo:      "test",
+		macosVM:   &mockMacOSVM{ip: "192.168.64.5"},
+		startedAt: time.Now(),
+	}
+	mux := newVMSSHTestMux(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/vm/ssh-info?job_id=300", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	ct := w.Header().Get("Content-Type")
+	if ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+
+	var info VMSSHInfo
+	if err := json.NewDecoder(w.Body).Decode(&info); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if info.IP != "192.168.64.5" {
+		t.Errorf("IP = %q, want 192.168.64.5", info.IP)
+	}
+	if info.User != "admin" {
+		t.Errorf("User = %q, want admin", info.User)
+	}
+	if len(info.PrivateKey) == 0 {
+		t.Error("PrivateKey is empty, want PEM-encoded key")
 	}
 }
