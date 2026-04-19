@@ -35,20 +35,23 @@ See the [Configuration]({{< relref "configuration" >}}) page for the full refere
 
 ## 2. Start the service
 
-**Linux (systemd):**
+ephemerd includes cross-platform service management commands so you don't need to remember `systemctl` vs `launchctl` vs `sc.exe`:
 
 ```bash
-sudo systemctl start ephemerd
-sudo systemctl enable ephemerd   # start on boot
+ephemerd install     # copy binary, create config, register system service
+ephemerd start       # start the service
+ephemerd stop        # stop the service
+ephemerd restart     # restart the service
+ephemerd uninstall   # remove binary, service, and data
 ```
 
-**macOS (launchd):**
+These work the same on Linux, macOS, and Windows. To start ephemerd and have it run on boot:
 
 ```bash
-sudo launchctl load /Library/LaunchDaemons/dev.ephpm.ephemerd.plist
+sudo ephemerd start
 ```
 
-**Manual (any platform):**
+To run manually in the foreground (useful for debugging):
 
 ```bash
 export GITHUB_TOKEN=ghp_...

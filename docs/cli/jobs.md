@@ -64,7 +64,7 @@ ephemerd jobs logs <job-id>
 
 Streams the job's log data from the daemon via the `GetJobLogs` gRPC call. The output is written to stdout and the command exits when the log stream ends.
 
-### ssh
+### ssh (macOS only)
 
 Open an interactive SSH session to a running macOS VM job. Only works for macOS VM jobs — Linux container jobs don't have SSH access.
 

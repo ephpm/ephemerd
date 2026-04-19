@@ -29,7 +29,7 @@ layout: hextra-home
 {{< hextra/feature-grid >}}
   {{< hextra/feature-card
     title="Single Binary"
-    subtitle="Embeds containerd as a Go library (like k3s). No runtime dependencies beyond the OS kernel."
+    subtitle="Embeds containerd as a Go library. No runtime dependencies beyond the OS kernel."
     style="background: radial-gradient(ellipse at 50% 80%,rgba(45,112,210,0.15),hsla(0,0%,100%,0));"
   >}}
   {{< hextra/feature-card
@@ -43,8 +43,8 @@ layout: hextra-home
     style="background: radial-gradient(ellipse at 50% 80%,rgba(221,74,57,0.15),hsla(0,0%,100%,0));"
   >}}
   {{< hextra/feature-card
-    title="Multi-Forge"
-    subtitle="GitHub Actions, Forgejo, Gitea, GitLab, and Woodpecker CI. One daemon, any forge."
+    title="Multiple Providers"
+    subtitle="GitHub Actions, Forgejo, Gitea, GitLab, and Woodpecker. One daemon, choose your provider."
   >}}
   {{< hextra/feature-card
     title="Zero Config"

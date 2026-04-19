@@ -13,12 +13,9 @@ import (
 	"syscall"
 
 	apiv1 "github.com/ephpm/ephemerd/api/v1"
-	containerdpkg "github.com/ephpm/ephemerd/pkg/containerd"
 	"github.com/ephpm/ephemerd/pkg/config"
 	"github.com/ephpm/ephemerd/pkg/scheduler"
 
-	"github.com/containerd/containerd/v2/client"
-	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/urfave/cli/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -154,11 +151,7 @@ func jobsCmd() *cli.Command {
 
 			return jobList(ctx, cc)
 		},
-		Commands: []*cli.Command{
-			jobKillCmd(),
-			jobLogsCmd(),
-			jobSSHCmd(),
-		},
+		Commands: jobSubcommands(),
 	}
 }
 
@@ -290,44 +283,6 @@ func jobLogsCmd() *cli.Command {
 	}
 }
 
-func imagesCmd() *cli.Command {
-	return &cli.Command{
-		Name:  "images",
-		Usage: "List cached container images",
-		Action: func(ctx context.Context, cmd *cli.Command) (retErr error) {
-			socket := containerdpkg.SocketPath(configDir)
-			c, err := client.New(socket)
-			if err != nil {
-				return fmt.Errorf("connecting to containerd at %s: %w", socket, err)
-			}
-			defer func() {
-				if err := c.Close(); err != nil && retErr == nil {
-					retErr = fmt.Errorf("closing containerd client: %w", err)
-				}
-			}()
-
-			nsCtx := namespaces.WithNamespace(ctx, "ephemerd")
-			images, err := c.ListImages(nsCtx)
-			if err != nil {
-				return fmt.Errorf("listing images: %w", err)
-			}
-
-			if len(images) == 0 {
-				fmt.Println("No cached images.")
-				return nil
-			}
-
-			fmt.Printf("%-60s %s\n", "IMAGE", "SIZE")
-			for _, img := range images {
-				size, _ := img.Size(nsCtx)
-				fmt.Printf("%-60s %s\n", img.Name(), formatBytes(size))
-			}
-
-			return nil
-		},
-	}
-}
-
 func configCheckCmd() *cli.Command {
 	return &cli.Command{
 		Name:  "config",
@@ -377,17 +332,4 @@ func configCheckCmd() *cli.Command {
 			return nil
 		},
 	}
-}
-
-func formatBytes(b int64) string {
-	const unit = 1024
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }

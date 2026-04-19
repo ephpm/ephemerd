@@ -532,16 +532,15 @@ ephemerd restart        Restart the ephemerd system service
 ephemerd logs           Tail the ephemerd system service logs
 ephemerd status         Show running jobs, health, uptime
 ephemerd drain          Stop accepting new jobs, wait for running jobs
-ephemerd jobs           List and manage running jobs (kill, logs, ssh)
-ephemerd images         List cached container images
+ephemerd jobs           List and manage running jobs (kill, logs, ssh — macOS only)
 ephemerd config         Validate configuration
 ephemerd doctor         Check system readiness and clean up stale state
 ephemerd install        Install binary and register as a system service
 ephemerd uninstall      Remove binary, service, and data
-ephemerd ctrctl         Debug the embedded containerd (passthrough to ctr)
+ephemerd crictl         Debug the embedded containerd (in-process crictl)
 ```
 
-`ctrctl` gives you direct access to the embedded containerd — list containers, inspect images, check snapshots. Same as `rke2 ctr` from the rke2 world.
+`crictl` gives you direct access to the embedded containerd — list containers, inspect images, check pods. Built into the ephemerd binary, nothing extra to install.
 
 ## Building Runner Images
 
