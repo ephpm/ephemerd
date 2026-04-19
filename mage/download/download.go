@@ -57,6 +57,8 @@ func EnsurePlaceholders() error {
 		filepath.Join(vmEmbedDir, "vmlinuz"),
 		filepath.Join(vmEmbedDir, "initrd"),
 		filepath.Join(vmEmbedDir, "ephemerd-rootfs-placeholder.tar.gz"),
+		filepath.Join(shimEmbedDir, "containerd-shim-runc-v2"),
+		filepath.Join(shimEmbedDir, "runc"),
 	}
 	for _, p := range placeholders {
 		if fileExists(p) {

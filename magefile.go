@@ -89,6 +89,13 @@ func E2edind() error {
 	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "6m", "./test/e2e/dind/")
 }
 
+// E2EBuild runs the buildah docker-build e2e tests.
+// Tests POST /build through the fake Docker socket against real containerd.
+// Requires: root + containerd (privileged).
+func E2ebuild() error {
+	return sh.RunV("go", "test", "-tags", "linux,e2e,privileged,containers_image_openpgp", "-v", "-timeout", "10m", "-run", "TestE2E_Build", "./test/e2e/")
+}
+
 // E2EModProxy runs the Go module proxy e2e test.
 // Starts a local proxy, fetches real modules, and builds a small Go app through it.
 // Requires: internet access, go toolchain.
