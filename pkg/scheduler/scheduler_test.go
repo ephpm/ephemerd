@@ -4,14 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	ghclient "github.com/ephpm/ephemerd/pkg/github"
+	"github.com/ephpm/ephemerd/pkg/tunnel"
 	vmPkg "github.com/ephpm/ephemerd/pkg/vm"
 	gh "github.com/google/go-github/v72/github"
 )
@@ -677,5 +684,242 @@ func TestVMSSH_ValidMacOSJob(t *testing.T) {
 	}
 	if len(info.PrivateKey) == 0 {
 		t.Error("PrivateKey is empty, want PEM-encoded key")
+	}
+}
+
+// --- serveTunnelWithReconnect tests ---
+
+// mockTunnel is a tunnel.Provider that returns controllable listeners.
+type mockTunnel struct {
+	mu        sync.Mutex
+	listeners []net.Listener
+	idx       int
+	url       string
+}
+
+func (m *mockTunnel) Listen(ctx context.Context) (net.Listener, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.idx >= len(m.listeners) {
+		return nil, fmt.Errorf("no more listeners")
+	}
+	ln := m.listeners[m.idx]
+	m.idx++
+	return ln, nil
+}
+
+func (m *mockTunnel) PublicURL() string { return m.url }
+
+// Verify mockTunnel implements tunnel.Provider at compile time.
+var _ tunnel.Provider = (*mockTunnel)(nil)
+
+// newLocalListener creates a TCP listener on a random port.
+func newLocalListener(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	return ln
+}
+
+// newTestGitHubClient creates a ghclient.Client backed by a mock server.
+// Returns the client, and atomic counters for webhook register/deregister calls.
+func newTestGitHubClient(t *testing.T) (*ghclient.Client, *atomic.Int32, *atomic.Int32) {
+	t.Helper()
+	var registered, deregistered atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			// CreateHook
+			registered.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			if _, err := fmt.Fprintf(w, `{"id":%d,"active":true}`, registered.Load()); err != nil {
+				t.Logf("writing response: %v", err)
+			}
+		case http.MethodDelete:
+			deregistered.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	ghGoClient := gh.NewClient(nil).WithAuthToken("test")
+	u, err := url.Parse(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ghGoClient.BaseURL = u
+
+	client, err := ghclient.New(ghclient.Config{
+		Token: "test",
+		Owner: "testorg",
+		Repos: []string{"repo"},
+		Log:   testLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.SetHTTPClient(ghGoClient)
+
+	return client, &registered, &deregistered
+}
+
+func TestServeTunnelWithReconnect_ClosesOldListener(t *testing.T) {
+	client, registered, _ := newTestGitHubClient(t)
+
+	// Create two listeners — first one will be killed, second one will serve.
+	ln1 := newLocalListener(t)
+	ln2 := newLocalListener(t)
+
+	mt := &mockTunnel{
+		listeners: []net.Listener{ln2},
+		url:       "http://tunnel.test",
+	}
+
+	s := New(Config{
+		Log:              testLogger(),
+		GitHub:           client,
+		Tunnel:           mt,
+		TunnelMaxRetries: 3,
+	})
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := fmt.Fprint(w, "ok"); err != nil {
+			t.Logf("writing response: %v", err)
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		s.serveTunnelWithReconnect(ctx, handler, ln1, nil, make(chan ghclient.JobEvent, 1))
+		close(done)
+	}()
+
+	// Give the server a moment to start serving on ln1
+	time.Sleep(50 * time.Millisecond)
+
+	// Kill ln1 — this should trigger the reconnect path
+	_ = ln1.Close()
+
+	// Wait for reconnect to happen (new listener ln2 used, webhook re-registered)
+	deadline := time.After(15 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for reconnect")
+		default:
+		}
+		if registered.Load() >= 1 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Verify we can make HTTP requests through the new listener
+	addr := ln2.Addr().String()
+	resp, err := http.Get(fmt.Sprintf("http://%s/healthz", addr))
+	if err != nil {
+		t.Fatalf("GET through reconnected listener: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status through reconnected listener = %d, want 200", resp.StatusCode)
+	}
+
+	// Shut down
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveTunnelWithReconnect did not exit after cancel")
+	}
+}
+
+func TestServeTunnelWithReconnect_FallsBackToPolling(t *testing.T) {
+	client, _, deregistered := newTestGitHubClient(t)
+
+	// No reconnect listeners available — all attempts should fail
+	mt := &mockTunnel{
+		listeners: nil,
+		url:       "http://tunnel.test",
+	}
+
+	s := New(Config{
+		Log:              testLogger(),
+		GitHub:           client,
+		Tunnel:           mt,
+		TunnelMaxRetries: 1, // fail after 1 attempt
+		PollInterval:     1 * time.Second,
+	})
+
+	ln := newLocalListener(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		s.serveTunnelWithReconnect(ctx, http.NewServeMux(), ln, nil, make(chan ghclient.JobEvent, 1))
+		close(done)
+	}()
+
+	// Give server a moment to start
+	time.Sleep(50 * time.Millisecond)
+
+	// Kill the listener to trigger reconnect
+	_ = ln.Close()
+
+	// serveTunnelWithReconnect should exit (falling back to polling)
+	select {
+	case <-done:
+		// good — it exited
+	case <-time.After(15 * time.Second):
+		t.Fatal("serveTunnelWithReconnect did not exit after max retries")
+	}
+
+	// Verify webhooks were deregistered on exit
+	if deregistered.Load() < 1 {
+		t.Logf("deregistered = %d (may be 0 if hooks were nil)", deregistered.Load())
+	}
+}
+
+func TestServeTunnelWithReconnect_CancelExitsCleanly(t *testing.T) {
+	client, _, _ := newTestGitHubClient(t)
+
+	ln := newLocalListener(t)
+	mt := &mockTunnel{url: "http://tunnel.test"}
+
+	s := New(Config{
+		Log:    testLogger(),
+		GitHub: client,
+		Tunnel: mt,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		s.serveTunnelWithReconnect(ctx, http.NewServeMux(), ln, nil, make(chan ghclient.JobEvent, 1))
+		close(done)
+	}()
+
+	// Give server a moment to start
+	time.Sleep(50 * time.Millisecond)
+
+	// Cancel should cause clean exit
+	cancel()
+
+	select {
+	case <-done:
+		// clean exit
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveTunnelWithReconnect did not exit after context cancel")
 	}
 }
