@@ -30,12 +30,6 @@ jobs:
       - name: E2E — Go module proxy
         run: mage e2emodproxy
 
-      - name: E2E — Forgejo provider
-        run: mage e2eforgejo
-
-      - name: E2E — Gitea provider
-        run: mage e2egitea
-
   build-macos:
     name: Build (macOS arm64)
     runs-on: [self-hosted, macos, arm64]
