@@ -1,6 +1,6 @@
 ---
 title: Providers
-weight: 4
+weight: 2
 ---
 
 ephemerd supports five CI providers. The provider determines how jobs are discovered, how runners are registered, and which runner binary executes inside the container. Everything else -- container runtime, networking, VM support, concurrency control -- is shared across all providers.

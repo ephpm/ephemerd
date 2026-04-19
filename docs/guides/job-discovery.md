@@ -1,6 +1,6 @@
 ---
 title: Job Discovery
-weight: 2
+weight: 3
 ---
 
 ephemerd discovers queued CI jobs through three modes: polling, webhook via tunnel, and webhook via direct TLS. Each mode has different tradeoffs around latency, infrastructure requirements, and API quota usage.
