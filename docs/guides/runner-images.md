@@ -107,10 +107,15 @@ COPY --from=builder /deps /deps
 
 Forgejo and Gitea use a **two-container model**. The runner daemon (`forgejo-runner` or `act_runner`) runs in one container and creates job execution containers via the Docker API. ephemerd's fake Docker socket (`pkg/dind`) intercepts these Docker API calls and translates them to containerd operations. The job container is a sibling container managed by ephemerd, not a nested container.
 
-```
-[ runner container: forgejo-runner ] --docker API--> [ job container: ubuntu-24.04 ]
-         │                                                    │
-         └── fake Docker socket (pkg/dind) ──────────────────>└── containerd sibling
+```mermaid
+flowchart LR
+    RC["Runner Container\nforgejo-runner"] -->|Docker API| DS["Fake Docker Socket\npkg/dind"]
+    DS -->|containerd create| JC["Job Container\nubuntu-24.04"]
+    DS -->|containerd create| SC["Service Containers\npostgres, redis, etc."]
+    style DS fill:#f3e5f5,stroke:#7b1fa2
+    style RC fill:#e1f5ff,stroke:#0288d1
+    style JC fill:#fff3e0,stroke:#f57c00
+    style SC fill:#fff3e0,stroke:#f57c00
 ```
 
 ### Two images to configure
