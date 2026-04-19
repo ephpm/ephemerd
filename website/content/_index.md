@@ -19,7 +19,7 @@ layout: hextra-home
 {{< /hextra/hero-subtitle >}}
 </div>
 
-<div class="hx-mt-8 hx-mb-6">
+<div class="hx-mt-16 hx-mb-6">
 {{< hextra/hero-button text="Get Started" link="getting-started/" >}}
 {{< hextra/hero-button text="GitHub" link="https://github.com/ephpm/ephemerd" style="alt" >}}
 </div>
