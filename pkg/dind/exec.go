@@ -358,16 +358,16 @@ func (s *Server) copyToViaExec(w http.ResponseWriter, r *http.Request, entry *co
 		return
 	}
 	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
+	defer func() { _ = os.Remove(tmpPath) }()
 
 	if _, err := io.Copy(tmpFile, r.Body); err != nil {
-		tmpFile.Close()
+		_ = tmpFile.Close()
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"message": fmt.Sprintf("writing temp tar: %v", err),
 		})
 		return
 	}
-	tmpFile.Close()
+	_ = tmpFile.Close()
 
 	// For the exec approach to work, we need the tar file visible inside
 	// the container. Since the container uses overlayfs, we can write the
@@ -423,7 +423,7 @@ func (s *Server) copyToViaExec(w http.ResponseWriter, r *http.Request, entry *co
 		})
 		return
 	}
-	defer os.Remove(hostStagingPath)
+	defer func() { _ = os.Remove(hostStagingPath) }()
 
 	// Exec tar inside the container to extract.
 	execID := generateContainerID()[:16]
@@ -434,7 +434,7 @@ func (s *Server) copyToViaExec(w http.ResponseWriter, r *http.Request, entry *co
 	}
 
 	logDir := filepath.Join(filepath.Dir(s.sockPath), "exec", execID)
-	os.MkdirAll(logDir, 0o755)
+	_ = os.MkdirAll(logDir, 0o755)
 	logPath := filepath.Join(logDir, "output.log")
 
 	proc, err := entry.Task.Exec(ctx, execID, pspec, cio.LogFile(logPath))
@@ -445,8 +445,8 @@ func (s *Server) copyToViaExec(w http.ResponseWriter, r *http.Request, entry *co
 		return
 	}
 	defer func() {
-		proc.Delete(ctx, client.WithProcessKill)
-		os.RemoveAll(logDir)
+		_, _ = proc.Delete(ctx, client.WithProcessKill)
+		_ = os.RemoveAll(logDir)
 	}()
 
 	statusCh, err := proc.Wait(ctx)
@@ -537,10 +537,7 @@ func (s *Server) handleContainerCopyFrom(w http.ResponseWriter, r *http.Request,
 					searchDirs = append(searchDirs, strings.TrimPrefix(part, "upperdir="))
 				}
 				if strings.HasPrefix(part, "lowerdir=") {
-					// lowerdir can be colon-separated
-					for _, d := range strings.Split(strings.TrimPrefix(part, "lowerdir="), ":") {
-						searchDirs = append(searchDirs, d)
-					}
+					searchDirs = append(searchDirs, strings.Split(strings.TrimPrefix(part, "lowerdir="), ":")...)
 				}
 			}
 		}
@@ -565,10 +562,10 @@ func (s *Server) handleContainerCopyFrom(w http.ResponseWriter, r *http.Request,
 	w.WriteHeader(http.StatusOK)
 
 	tw := tar.NewWriter(w)
-	defer tw.Close()
+	defer func() { _ = tw.Close() }()
 
 	base := filepath.Dir(fullPath)
-	filepath.Walk(fullPath, func(path string, info os.FileInfo, err error) error {
+	if err := filepath.Walk(fullPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -589,11 +586,16 @@ func (s *Server) handleContainerCopyFrom(w http.ResponseWriter, r *http.Request,
 			if err != nil {
 				return err
 			}
-			defer f.Close()
-			io.Copy(tw, f)
+			if _, cpErr := io.Copy(tw, f); cpErr != nil {
+				_ = f.Close()
+				return cpErr
+			}
+			_ = f.Close()
 		}
 		return nil
-	})
+	}); err != nil {
+		s.log.Debug("creating archive", "error", err)
+	}
 }
 
 // cleanupExec deletes an exec process and its log.
@@ -616,7 +618,7 @@ func (s *Server) cleanupExec(execID string) {
 		}
 	}
 	if exec.LogPath != "" {
-		os.RemoveAll(filepath.Dir(exec.LogPath))
+		_ = os.RemoveAll(filepath.Dir(exec.LogPath))
 	}
 }
 
@@ -668,12 +670,14 @@ func extractTar(r io.Reader, dst string) error {
 				return err
 			}
 			if _, err := io.Copy(f, tr); err != nil {
-				f.Close()
+				_ = f.Close()
 				return err
 			}
-			f.Close()
+			if err := f.Close(); err != nil {
+				return err
+			}
 		case tar.TypeSymlink:
-			os.Remove(target) // remove existing before creating symlink
+			_ = os.Remove(target) // remove existing before creating symlink
 			if err := os.Symlink(hdr.Linkname, target); err != nil {
 				return err
 			}
