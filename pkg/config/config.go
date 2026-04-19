@@ -184,6 +184,7 @@ type ForgejoConfig struct {
 	Token        string   `toml:"token"`         // runner registration token from Forgejo admin
 	Owner        string   `toml:"owner"`         // org or user (empty = instance-level runner)
 	Repos        []string `toml:"repos"`         // limit to specific repos (empty = all)
+	Labels       []string `toml:"labels"`        // runner labels (default: ["ubuntu-latest:docker://<job_image>"])
 	DefaultImage string   `toml:"default_image"` // runner daemon image (default: "data.forgejo.org/forgejo/runner:12")
 	JobImage     string   `toml:"job_image"`     // job execution image (default: "gitea/runner-images:ubuntu-24.04")
 }
@@ -196,6 +197,7 @@ type GiteaConfig struct {
 	Token        string   `toml:"token"`         // runner registration token from Gitea admin
 	Owner        string   `toml:"owner"`         // org or user (empty = instance-level runner)
 	Repos        []string `toml:"repos"`         // limit to specific repos (empty = all)
+	Labels       []string `toml:"labels"`        // runner labels (default: ["ubuntu-latest:docker://<job_image>"])
 	DefaultImage string   `toml:"default_image"` // runner daemon image (default: "docker.io/gitea/act_runner:latest")
 	JobImage     string   `toml:"job_image"`     // job execution image (default: "gitea/runner-images:ubuntu-24.04")
 }

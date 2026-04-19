@@ -10,14 +10,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	ghclient "github.com/ephpm/ephemerd/pkg/github"
+	"github.com/ephpm/ephemerd/pkg/providers"
 	"github.com/ephpm/ephemerd/pkg/tunnel"
 	vmPkg "github.com/ephpm/ephemerd/pkg/vm"
 	gh "github.com/google/go-github/v72/github"
@@ -723,53 +722,37 @@ func newLocalListener(t *testing.T) net.Listener {
 	return ln
 }
 
-// newTestGitHubClient creates a ghclient.Client backed by a mock server.
-// Returns the client, and atomic counters for webhook register/deregister calls.
-func newTestGitHubClient(t *testing.T) (*ghclient.Client, *atomic.Int32, *atomic.Int32) {
-	t.Helper()
-	var registered, deregistered atomic.Int32
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodPost:
-			// CreateHook
-			registered.Add(1)
-			w.WriteHeader(http.StatusCreated)
-			if _, err := fmt.Fprintf(w, `{"id":%d,"active":true}`, registered.Load()); err != nil {
-				t.Logf("writing response: %v", err)
-			}
-		case http.MethodDelete:
-			deregistered.Add(1)
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	t.Cleanup(srv.Close)
-
-	ghGoClient := gh.NewClient(nil).WithAuthToken("test")
-	u, err := url.Parse(srv.URL + "/")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ghGoClient.BaseURL = u
-
-	client, err := ghclient.New(ghclient.Config{
-		Token: "test",
-		Owner: "testorg",
-		Repos: []string{"repo"},
-		Log:   testLogger(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.SetHTTPClient(ghGoClient)
-
-	return client, &registered, &deregistered
+// mockWebhookProvider implements providers.Webhook for tunnel reconnect tests.
+type mockWebhookProvider struct {
+	mockProvider
+	registered   atomic.Int32
+	deregistered atomic.Int32
 }
 
+func newMockWebhookProvider() *mockWebhookProvider {
+	return &mockWebhookProvider{
+		mockProvider: *newMockProvider("test-webhook"),
+	}
+}
+
+func (m *mockWebhookProvider) WebhookHandler(_ string) (http.Handler, <-chan providers.JobEvent) {
+	return http.NewServeMux(), make(chan providers.JobEvent)
+}
+
+func (m *mockWebhookProvider) RegisterWebhooks(_ context.Context, _, _ string) error {
+	m.registered.Add(1)
+	return nil
+}
+
+func (m *mockWebhookProvider) DeregisterWebhooks(_ context.Context) error {
+	m.deregistered.Add(1)
+	return nil
+}
+
+var _ providers.Webhook = (*mockWebhookProvider)(nil)
+
 func TestServeTunnelWithReconnect_ClosesOldListener(t *testing.T) {
-	client, registered, _ := newTestGitHubClient(t)
+	whp := newMockWebhookProvider()
 
 	// Create two listeners — first one will be killed, second one will serve.
 	ln1 := newLocalListener(t)
@@ -782,7 +765,7 @@ func TestServeTunnelWithReconnect_ClosesOldListener(t *testing.T) {
 
 	s := New(Config{
 		Log:              testLogger(),
-		GitHub:           client,
+		Providers:        []providers.Provider{whp},
 		Tunnel:           mt,
 		TunnelMaxRetries: 3,
 	})
@@ -798,7 +781,7 @@ func TestServeTunnelWithReconnect_ClosesOldListener(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		s.serveTunnelWithReconnect(ctx, handler, ln1, nil, make(chan ghclient.JobEvent, 1))
+		s.serveTunnelWithReconnect(ctx, handler, ln1, []providers.Webhook{whp}, make(chan providers.JobEvent, 1))
 		close(done)
 	}()
 
@@ -816,7 +799,7 @@ func TestServeTunnelWithReconnect_ClosesOldListener(t *testing.T) {
 			t.Fatal("timed out waiting for reconnect")
 		default:
 		}
-		if registered.Load() >= 1 {
+		if whp.registered.Load() >= 1 {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -843,7 +826,7 @@ func TestServeTunnelWithReconnect_ClosesOldListener(t *testing.T) {
 }
 
 func TestServeTunnelWithReconnect_FallsBackToPolling(t *testing.T) {
-	client, _, deregistered := newTestGitHubClient(t)
+	whp := newMockWebhookProvider()
 
 	// No reconnect listeners available — all attempts should fail
 	mt := &mockTunnel{
@@ -853,7 +836,7 @@ func TestServeTunnelWithReconnect_FallsBackToPolling(t *testing.T) {
 
 	s := New(Config{
 		Log:              testLogger(),
-		GitHub:           client,
+		Providers:        []providers.Provider{whp},
 		Tunnel:           mt,
 		TunnelMaxRetries: 1, // fail after 1 attempt
 		PollInterval:     1 * time.Second,
@@ -866,7 +849,7 @@ func TestServeTunnelWithReconnect_FallsBackToPolling(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		s.serveTunnelWithReconnect(ctx, http.NewServeMux(), ln, nil, make(chan ghclient.JobEvent, 1))
+		s.serveTunnelWithReconnect(ctx, http.NewServeMux(), ln, []providers.Webhook{whp}, make(chan providers.JobEvent, 1))
 		close(done)
 	}()
 
@@ -885,28 +868,28 @@ func TestServeTunnelWithReconnect_FallsBackToPolling(t *testing.T) {
 	}
 
 	// Verify webhooks were deregistered on exit
-	if deregistered.Load() < 1 {
-		t.Logf("deregistered = %d (may be 0 if hooks were nil)", deregistered.Load())
+	if whp.deregistered.Load() < 1 {
+		t.Logf("deregistered = %d (may be 0 if providers list was empty)", whp.deregistered.Load())
 	}
 }
 
 func TestServeTunnelWithReconnect_CancelExitsCleanly(t *testing.T) {
-	client, _, _ := newTestGitHubClient(t)
+	whp := newMockWebhookProvider()
 
 	ln := newLocalListener(t)
 	mt := &mockTunnel{url: "http://tunnel.test"}
 
 	s := New(Config{
-		Log:    testLogger(),
-		GitHub: client,
-		Tunnel: mt,
+		Log:       testLogger(),
+		Providers: []providers.Provider{whp},
+		Tunnel:    mt,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan struct{})
 	go func() {
-		s.serveTunnelWithReconnect(ctx, http.NewServeMux(), ln, nil, make(chan ghclient.JobEvent, 1))
+		s.serveTunnelWithReconnect(ctx, http.NewServeMux(), ln, []providers.Webhook{whp}, make(chan providers.JobEvent, 1))
 		close(done)
 	}()
 

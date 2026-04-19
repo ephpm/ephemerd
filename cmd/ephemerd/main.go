@@ -21,6 +21,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/networking"
 	"github.com/ephpm/ephemerd/pkg/providers"
 	"github.com/ephpm/ephemerd/pkg/providers/forgejo"
+	"github.com/ephpm/ephemerd/pkg/providers/gitea"
 	githubProv "github.com/ephpm/ephemerd/pkg/providers/github"
 	goproxy "github.com/ephpm/ephemerd/pkg/proxies/go"
 	"github.com/ephpm/ephemerd/pkg/proxies"
@@ -483,11 +484,13 @@ func initProviders(cfg *config.Config, log *slog.Logger) ([]providers.Provider, 
 
 	// Forgejo: configured when instance_url is set
 	if cfg.Forgejo.InstanceURL != "" {
+		cfg.Dind.Enabled = true // Forgejo runner needs Docker API for job containers
 		p, err := forgejo.New(forgejo.Config{
 			InstanceURL:  cfg.Forgejo.InstanceURL,
 			Token:        cfg.Forgejo.Token,
 			Owner:        cfg.Forgejo.Owner,
 			Repos:        cfg.Forgejo.Repos,
+			Labels:       cfg.Forgejo.Labels,
 			DefaultImage: cfg.Forgejo.DefaultImage,
 			JobImage:     cfg.Forgejo.JobImage,
 			Log:          log,
@@ -498,6 +501,27 @@ func initProviders(cfg *config.Config, log *slog.Logger) ([]providers.Provider, 
 		}
 		active = append(active, p)
 		log.Info("provider enabled", "provider", "forgejo", "instance", cfg.Forgejo.InstanceURL)
+	}
+
+	// Gitea: configured when instance_url is set
+	if cfg.Gitea.InstanceURL != "" {
+		cfg.Dind.Enabled = true // Gitea runner needs Docker API for job containers
+		p, err := gitea.New(gitea.Config{
+			InstanceURL:  cfg.Gitea.InstanceURL,
+			Token:        cfg.Gitea.Token,
+			Owner:        cfg.Gitea.Owner,
+			Repos:        cfg.Gitea.Repos,
+			Labels:       cfg.Gitea.Labels,
+			DefaultImage: cfg.Gitea.DefaultImage,
+			JobImage:     cfg.Gitea.JobImage,
+			Log:          log,
+		})
+		if err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("creating gitea provider: %w", err)
+		}
+		active = append(active, p)
+		log.Info("provider enabled", "provider", "gitea", "instance", cfg.Gitea.InstanceURL)
 	}
 
 	if len(active) == 0 {

@@ -73,17 +73,6 @@ func (m *mockProvider) Stop(_ context.Context) error {
 	return nil
 }
 
-// emit sends a job event on the provider's channel with Provider set to itself.
-func (m *mockProvider) emit(action string, jobID int64, repo string) {
-	m.events <- providers.JobEvent{
-		Provider: m,
-		Action:   action,
-		Repo:     repo,
-		JobID:    jobID,
-		Labels:   []string{"self-hosted"},
-	}
-}
-
 func mpLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
