@@ -221,6 +221,8 @@ Default images when `default_image` is not set:
 - **Linux:** `ghcr.io/actions/actions-runner:latest`
 - **Windows:** `mcr.microsoft.com/windows/servercore:ltsc20XX` (auto-detected from host build)
 
+**VM resource planning (Windows and macOS):** On Windows and macOS, `max_concurrent` applies to the entire ephemerd instance — Linux container jobs and native OS jobs share the same concurrency pool. All Linux jobs run inside a single VM (WSL2 on Windows, Virtualization.framework on macOS), so if `max_concurrent = 4`, that VM could be running 4 jobs simultaneously. Size the VM's CPU and memory (`[vm.linux]`) accordingly, or jobs will compete for resources and slow each other down.
+
 ### `[vm.linux]`
 
 Linux VM for running Linux jobs on Windows or macOS hosts.

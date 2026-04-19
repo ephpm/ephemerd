@@ -98,6 +98,23 @@ Every supported host can run both its native jobs and Linux jobs:
 
 This means a single ephemerd host can serve workflows that need both Linux and native platform steps.
 
+### Resource planning for VMs
+
+On Windows and macOS, the `max_concurrent` setting applies globally — Linux container jobs and native OS jobs share the same concurrency pool. All Linux container jobs run inside a single VM (WSL2 on Windows, Virtualization.framework on macOS), so if `max_concurrent = 4`, that one VM could be running up to 4 concurrent jobs.
+
+Size the Linux VM resources accordingly:
+
+```toml
+[runner]
+max_concurrent = 4
+
+[vm.linux]
+cpus = 4          # at least 1 per concurrent job
+memory_mb = 8192  # at least 2GB per concurrent job
+```
+
+If the VM is undersized, jobs will compete for CPU and memory and slow each other down. On Linux hosts this isn't an issue — containers run directly on the host with access to all host resources.
+
 ## One Image, Every Host
 
 The same Dockerfile produces an image that runs on all three platforms. ephemerd always uses containerd to run Linux OCI containers -- whether that containerd is running natively (Linux), inside WSL2 (Windows), or inside a Virtualization.framework VM (macOS). The container runtime is identical in all cases.
