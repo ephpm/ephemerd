@@ -110,7 +110,7 @@ If the tunnel connection drops, ephemerd automatically reconnects and re-registe
 
 ### localtunnel
 
-localtunnel is free, requires no account, and can be self-hosted. The public localtunnel.me server works for testing. For production use, deploy a localtunnel server on a cheap VPS -- a $5/month Linode is more than enough.
+localtunnel is free, requires no account, and can be self-hosted. The public localtunnel.me server works for testing. For production use, deploy a localtunnel server on a cheap VPS — a $5/month Linode is more than enough. See [examples/localtunnel](https://github.com/ephpm/ephemerd/tree/main/examples/localtunnel) for a Terraform config that sets one up.
 
 ```toml
 [webhook]
