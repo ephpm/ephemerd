@@ -9,6 +9,15 @@ import (
 func serviceAction(action string) error {
 	out, err := exec.Command("sc.exe", action, "ephemerd").CombinedOutput()
 	if err != nil {
+		// If SCM stop fails, force kill the process
+		if action == "stop" {
+			fmt.Printf("note: sc stop failed, force killing: %s", string(out))
+			if killErr := exec.Command("taskkill", "/f", "/im", "ephemerd.exe").Run(); killErr != nil {
+				return fmt.Errorf("sc stop and taskkill both failed: %s", string(out))
+			}
+			fmt.Println("ephemerd killed")
+			return nil
+		}
 		return fmt.Errorf("sc %s: %s", action, out)
 	}
 	switch action {
