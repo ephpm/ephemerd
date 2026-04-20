@@ -308,9 +308,11 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	// One-time poll on startup to catch jobs that queued while ephemerd
 	// was down. Webhook events only fire at the moment a job transitions
 	// to "queued" — they aren't replayed for jobs already in that state.
+	// Run in a goroutine so it doesn't block if there are more queued jobs
+	// than the channel buffer can hold.
 	if s.cfg.GitHub != nil {
 		s.cfg.Log.Info("startup poll: checking for queued jobs")
-		s.poll(ctx, events)
+		go s.poll(ctx, events)
 	}
 
 	// Periodically clean up the seen-jobs dedup map
