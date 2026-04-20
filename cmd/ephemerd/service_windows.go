@@ -16,11 +16,20 @@ func serviceAction(action string) error {
 }
 
 func serviceLogs(lines int, follow bool) error {
-	args := []string{"qe", "Application",
-		"/q:*[System[Provider[@Name='ephemerd']]]",
-		fmt.Sprintf("/c:%d", lines),
-		"/f:text", "/rd:true"}
-	cmd := exec.Command("wevtutil.exe", args...)
+	logPath := joinPath(configDir, "ephemerd.log")
+
+	if follow {
+		// Use PowerShell Get-Content -Wait for tail -f equivalent
+		cmd := exec.Command("powershell", "-NoProfile", "-Command",
+			fmt.Sprintf("Get-Content -Path '%s' -Tail %d -Wait", logPath, lines))
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	}
+
+	// Read last N lines
+	cmd := exec.Command("powershell", "-NoProfile", "-Command",
+		fmt.Sprintf("Get-Content -Path '%s' -Tail %d", logPath, lines))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()

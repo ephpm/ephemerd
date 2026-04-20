@@ -23,13 +23,6 @@ func installService(binPath, dataDir string) error {
 	}
 	fmt.Println("  service: ephemerd (Windows service)")
 
-	// Register as a Windows Event Log source so logs appear in Event Viewer
-	if err := installEventLog(); err != nil {
-		fmt.Printf("  warning: could not register event log source: %v\n", err)
-	} else {
-		fmt.Println("  eventlog: ephemerd source registered")
-	}
-
 	// Set description
 	out, err = exec.Command("sc.exe", "description", "ephemerd",
 		"Ephemeral GitHub Actions runner daemon. Provisions isolated containers for each CI job.").CombinedOutput()

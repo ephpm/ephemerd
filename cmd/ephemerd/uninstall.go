@@ -184,6 +184,4 @@ func uninstallWindowsService() {
 		fmt.Println("  removed Windows service")
 	}
 
-	// Remove event log source
-	removeEventLog()
 }

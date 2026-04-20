@@ -8,17 +8,15 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"strings"
 
 	"golang.org/x/sys/windows/svc"
-	"golang.org/x/sys/windows/svc/eventlog"
 )
 
 const eventSource = "ephemerd"
 
 // serviceLogWriter is set by the Windows Service handler before calling
 // serve(). When non-nil, serve() injects it into the config so cfg.Logger()
-// routes output to the Windows Event Log instead of stderr.
+// routes output to the log file instead of stderr.
 var serviceLogWriter io.Writer
 
 // ephemerdService implements svc.Handler for the Windows Service Control Manager.
@@ -36,32 +34,20 @@ func (s *ephemerdService) Execute(_ []string, r <-chan svc.ChangeRequest, status
 	const accepted = svc.AcceptStop | svc.AcceptShutdown
 	status <- svc.Status{State: svc.StartPending}
 
-	// Open the Windows Event Log so all slog output goes there.
-	elog, err := eventlog.Open(eventSource)
+	// Open a log file in the data directory for service output.
+	logPath := joinPath(configDir, "ephemerd.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		// Can't log — report failure to SCM
 		return false, 1
 	}
-	defer func() {
-		if err := elog.Close(); err != nil {
-			// Nothing we can do here
-			_ = err
-		}
-	}()
+	defer func() { _ = logFile.Close() }()
 
-	// Set the Event Log writer as the global service log output.
-	// serve() picks this up via serviceLogWriter and injects it into
-	// the config so cfg.Logger() routes all slog output to the Event Log.
-	serviceLogWriter = &eventLogWriter{elog: elog}
-
-	// Also set the default slog logger for any early logging before
-	// serve() creates its own logger.
-	slog.SetDefault(slog.New(slog.NewTextHandler(serviceLogWriter, nil)))
+	serviceLogWriter = logFile
+	slog.SetDefault(slog.New(slog.NewTextHandler(logFile, nil)))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Run serve in a goroutine so we can report Running to SCM immediately.
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- serve(ctx, s.configFile, s.ctrdTCPPort, s.ctrdTCPAddr, s.containerdOnly, s.dind)
@@ -73,9 +59,7 @@ func (s *ephemerdService) Execute(_ []string, r <-chan svc.ChangeRequest, status
 		select {
 		case err := <-errCh:
 			if err != nil {
-				if logErr := elog.Error(1, fmt.Sprintf("ephemerd serve error: %v", err)); logErr != nil {
-					fmt.Fprintf(os.Stderr, "ephemerd serve error: %v\n", err)
-				}
+				fmt.Fprintf(logFile, "ephemerd serve error: %v\n", err)
 				return false, 1
 			}
 			return false, 0
@@ -86,14 +70,10 @@ func (s *ephemerdService) Execute(_ []string, r <-chan svc.ChangeRequest, status
 				status <- cr.CurrentStatus
 			case svc.Stop, svc.Shutdown:
 				status <- svc.Status{State: svc.StopPending}
-				if logErr := elog.Info(1, "ephemerd stopping"); logErr != nil {
-					fmt.Fprintf(os.Stderr, "ephemerd stopping\n")
-				}
-				cancel() // triggers graceful drain in serve()
+				fmt.Fprintln(logFile, "ephemerd stopping")
+				cancel()
 				if err := <-errCh; err != nil {
-					if logErr := elog.Error(1, fmt.Sprintf("ephemerd shutdown error: %v", err)); logErr != nil {
-						fmt.Fprintf(os.Stderr, "ephemerd shutdown error: %v\n", err)
-					}
+					fmt.Fprintf(logFile, "ephemerd shutdown error: %v\n", err)
 				}
 				return false, 0
 			}
@@ -101,35 +81,9 @@ func (s *ephemerdService) Execute(_ []string, r <-chan svc.ChangeRequest, status
 	}
 }
 
-// eventLogWriter implements io.Writer by sending each Write to the Windows
-// Event Log. slog writes one log line per Write call, so each call becomes
-// one event. Lines containing "level=ERROR" are logged as errors, "level=WARN"
-// as warnings, everything else as info.
-type eventLogWriter struct {
-	elog *eventlog.Log
-}
-
-func (w *eventLogWriter) Write(p []byte) (int, error) {
-	msg := strings.TrimSpace(string(p))
-	if msg == "" {
-		return len(p), nil
-	}
-
-	switch {
-	case strings.Contains(msg, "level=ERROR"):
-		if err := w.elog.Error(1, msg); err != nil {
-			return 0, err
-		}
-	case strings.Contains(msg, "level=WARN"):
-		if err := w.elog.Warning(1, msg); err != nil {
-			return 0, err
-		}
-	default:
-		if err := w.elog.Info(1, msg); err != nil {
-			return 0, err
-		}
-	}
-	return len(p), nil
+// getServiceLogWriter returns the log file writer if running as a service.
+func getServiceLogWriter() io.Writer {
+	return serviceLogWriter
 }
 
 // runAsWindowsService detects whether the process is running as a Windows
@@ -141,9 +95,6 @@ func runAsWindowsService() bool {
 		return false
 	}
 
-	// When SCM starts the service, the command line is:
-	//   "C:\Program Files\ephemerd\ephemerd.exe" serve --data-dir "C:\ProgramData\ephemerd"
-	// Parse flags manually since we bypass urfave/cli.
 	configFile := ""
 	dataDir := defaultDataDir()
 	for i, arg := range os.Args {
@@ -168,20 +119,4 @@ func runAsWindowsService() bool {
 	}
 
 	return true
-}
-
-// getServiceLogWriter returns the Event Log writer if running as a service.
-func getServiceLogWriter() io.Writer {
-	return serviceLogWriter
-}
-
-// installEventLog registers ephemerd as a Windows Event Log source.
-// Called during `ephemerd install`.
-func installEventLog() error {
-	return eventlog.InstallAsEventCreate(eventSource, eventlog.Info|eventlog.Warning|eventlog.Error)
-}
-
-// removeEventLog removes the event log source. Called during `ephemerd uninstall`.
-func removeEventLog() {
-	_ = eventlog.Remove(eventSource)
 }
