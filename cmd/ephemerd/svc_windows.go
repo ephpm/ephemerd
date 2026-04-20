@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"time"
 
 	"golang.org/x/sys/windows/svc"
 )
@@ -72,8 +73,15 @@ func (s *ephemerdService) Execute(_ []string, r <-chan svc.ChangeRequest, status
 				status <- svc.Status{State: svc.StopPending}
 				fmt.Fprintln(logFile, "ephemerd stopping")
 				cancel()
-				if err := <-errCh; err != nil {
-					fmt.Fprintf(logFile, "ephemerd shutdown error: %v\n", err)
+				// Wait for serve() to exit, but force-exit after 30s
+				// to avoid hanging the SCM indefinitely.
+				select {
+				case err := <-errCh:
+					if err != nil {
+						fmt.Fprintf(logFile, "ephemerd shutdown error: %v\n", err)
+					}
+				case <-time.After(30 * time.Second):
+					fmt.Fprintln(logFile, "ephemerd shutdown timed out after 30s, force exiting")
 				}
 				return false, 0
 			}

@@ -163,6 +163,11 @@ func extractZipFromReader(r io.Reader, dest string) error {
 		return fmt.Errorf("writing temp file: %w", err)
 	}
 
+	// Seek back to start — zip.NewReader needs to read from offset 0.
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seeking temp file: %w", err)
+	}
+
 	zr, err := zip.NewReader(tmp, size)
 	if err != nil {
 		return fmt.Errorf("zip reader: %w", err)

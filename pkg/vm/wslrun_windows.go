@@ -6,10 +6,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
+	"unicode/utf16"
 )
 
 // NewRunDistro creates a fresh WSL distro with a unique name for a single
@@ -42,6 +45,9 @@ func NewRunDistro(ctx context.Context, cfg RunDistroConfig) (*RunDistro, error) 
 	if err != nil {
 		return nil, fmt.Errorf("reading embedded rootfs: %w", err)
 	}
+	if err := validateEmbeddedAsset("rootfs", rootfsData, true); err != nil {
+		return nil, err
+	}
 	rootfsPath := filepath.Join(dir, "rootfs.tar.gz")
 	if err := os.WriteFile(rootfsPath, rootfsData, 0o644); err != nil {
 		return nil, fmt.Errorf("writing rootfs: %w", err)
@@ -50,6 +56,9 @@ func NewRunDistro(ctx context.Context, cfg RunDistroConfig) (*RunDistro, error) 
 	ephemerdData, err := vmFS.ReadFile("embed/ephemerd-linux")
 	if err != nil {
 		return nil, fmt.Errorf("reading embedded ephemerd-linux: %w", err)
+	}
+	if err := validateEmbeddedAsset("ephemerd-linux", ephemerdData, false); err != nil {
+		return nil, err
 	}
 	ephemerdPath := filepath.Join(dir, "ephemerd-linux")
 	if err := os.WriteFile(ephemerdPath, ephemerdData, 0o755); err != nil {
@@ -151,4 +160,91 @@ func (d *RunDistro) Destroy() {
 	if err := os.RemoveAll(dir); err != nil {
 		d.log.Warn("removing distro directory failed", "path", dir, "error", err)
 	}
+}
+
+const wslCmdTimeout = 30 * time.Second
+
+func wslExec(args ...string) error {
+	cmd := exec.Command("wsl", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		detail := strings.TrimSpace(decodeWSLOutput(out))
+		if detail != "" {
+			return fmt.Errorf("wsl %s: %w: %s", strings.Join(args, " "), err, detail)
+		}
+		return fmt.Errorf("wsl %s: %w", strings.Join(args, " "), err)
+	}
+	return nil
+}
+
+func wslExecTimeout(timeout time.Duration, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "wsl", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("wsl %s: timed out after %s", strings.Join(args, " "), timeout)
+		}
+		detail := strings.TrimSpace(decodeWSLOutput(out))
+		if detail != "" {
+			return fmt.Errorf("wsl %s: %w: %s", strings.Join(args, " "), err, detail)
+		}
+		return fmt.Errorf("wsl %s: %w", strings.Join(args, " "), err)
+	}
+	return nil
+}
+
+func wslOutputTimeout(timeout time.Duration, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "wsl", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("wsl %s: timed out after %s", strings.Join(args, " "), timeout)
+		}
+		detail := strings.TrimSpace(decodeWSLOutput(out))
+		if detail != "" {
+			return "", fmt.Errorf("wsl %s: %w: %s", strings.Join(args, " "), err, detail)
+		}
+		return "", fmt.Errorf("wsl %s: %w", strings.Join(args, " "), err)
+	}
+	return strings.TrimSpace(decodeWSLOutput(out)), nil
+}
+
+// decodeWSLOutput converts WSL's UTF-16LE output (from wsl --list) to UTF-8.
+// If the output doesn't look like UTF-16LE, it's returned as-is.
+func decodeWSLOutput(b []byte) string {
+	if len(b) >= 2 && b[0] == 0xFF && b[1] == 0xFE {
+		b = b[2:]
+	}
+	if len(b)%2 != 0 {
+		return string(b)
+	}
+	hasNull := false
+	for i := 1; i < len(b); i += 2 {
+		if b[i] == 0 {
+			hasNull = true
+			break
+		}
+	}
+	if !hasNull {
+		return string(b)
+	}
+	u16 := make([]uint16, len(b)/2)
+	for i := range u16 {
+		u16[i] = uint16(b[2*i]) | uint16(b[2*i+1])<<8
+	}
+	return string(utf16.Decode(u16))
+}
+
+// killWSLService force-kills wslservice.exe to unstick a hung WSL.
+func killWSLService(log *slog.Logger) {
+	log.Warn("killing wslservice.exe to recover from stuck WSL")
+	cmd := exec.Command("taskkill", "/F", "/IM", "wslservice.exe")
+	if err := cmd.Run(); err != nil {
+		log.Warn("taskkill wslservice.exe failed (may not be running)", "error", err)
+	}
+	time.Sleep(2 * time.Second)
 }

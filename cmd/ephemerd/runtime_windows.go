@@ -42,7 +42,7 @@ func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool
 
 	go func() {
 		defer close(linuxVMDone)
-		log.Info("starting Linux VM in background (WSL)")
+		log.Info("starting Linux VM in background (Hyper-V)")
 
 		lvm, err := vm.StartLinuxVM(vm.LinuxVMConfig{
 			DataDir:     dataDir,

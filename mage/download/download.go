@@ -453,6 +453,221 @@ func Initrd() error {
 	return buildInitrd(dest, pkgData, moduleFiles, loadOrder)
 }
 
+// Kernel modules for x86_64 Hyper-V initrd.
+// Hyper-V synthetic drivers (hv_vmbus, hv_storvsc, hv_netvsc) are built into
+// the Alpine linux-virt kernel, not modules — no insmod needed.
+// We need: FAT32 for assets disk, ext4 for root disk, overlayfs for containerd,
+// netfilter/iptables for CNI MASQUERADE, bridge + veth for container networking.
+var initrdKernelModulesX86 = []string{
+	// 9P filesystem for host share (Plan9 over VMBus)
+	"kernel/net/9p/9pnet.ko.gz",
+	"kernel/net/9p/9pnet_virtio.ko.gz",
+	"kernel/fs/9p/9p.ko.gz",
+	// FAT32 (fallback if 9P unavailable)
+	"kernel/fs/fat/fat.ko.gz",
+	"kernel/fs/fat/vfat.ko.gz",
+	"kernel/fs/nls/nls_cp437.ko.gz",
+	"kernel/fs/nls/nls_utf8.ko.gz",
+	// af_packet for udhcpc
+	"kernel/net/packet/af_packet.ko.gz",
+	// ext4 + deps
+	"kernel/lib/crc16.ko.gz",
+	"kernel/crypto/crc32c_generic.ko.gz",
+	"kernel/lib/libcrc32c.ko.gz",
+	"kernel/fs/mbcache.ko.gz",
+	"kernel/fs/jbd2/jbd2.ko.gz",
+	"kernel/fs/ext4/ext4.ko.gz",
+	// containerd overlayfs snapshotter
+	"kernel/fs/overlayfs/overlay.ko.gz",
+	// Netfilter + iptables/nftables for CNI bridge + MASQUERADE
+	"kernel/net/ipv4/netfilter/nf_defrag_ipv4.ko.gz",
+	"kernel/net/netfilter/nf_conntrack.ko.gz",
+	"kernel/net/netfilter/nf_nat.ko.gz",
+	"kernel/net/netfilter/nfnetlink.ko.gz",
+	"kernel/net/netfilter/nf_tables.ko.gz",
+	"kernel/net/netfilter/nft_chain_nat.ko.gz",
+	"kernel/net/netfilter/nft_compat.ko.gz",
+	"kernel/net/netfilter/nft_masq.ko.gz",
+	"kernel/net/ipv4/netfilter/ip_tables.ko.gz",
+	"kernel/net/ipv4/netfilter/iptable_nat.ko.gz",
+	"kernel/net/netfilter/xt_MASQUERADE.ko.gz",
+	"kernel/net/netfilter/xt_conntrack.ko.gz",
+	"kernel/net/netfilter/xt_comment.ko.gz",
+	"kernel/net/netfilter/xt_addrtype.ko.gz",
+	"kernel/net/netfilter/xt_mark.ko.gz",
+	"kernel/net/bridge/bridge.ko.gz",
+	"kernel/drivers/net/veth.ko.gz",
+}
+
+// Kernelx86 downloads the Alpine linux-virt kernel for x86_64 and extracts
+// the uncompressed vmlinux from the bzImage. HCS LinuxKernelDirect requires
+// an uncompressed ELF kernel, not the compressed bzImage.
+func Kernelx86() error {
+	dest := filepath.Join(vmEmbedDir, "vmlinuz")
+	if fileExists(dest) {
+		fmt.Printf("  %s already exists, skipping\n", dest)
+		return nil
+	}
+	if err := os.MkdirAll(vmEmbedDir, 0o755); err != nil {
+		return err
+	}
+
+	url := fmt.Sprintf("https://dl-cdn.alpinelinux.org/alpine/v%s/main/x86_64/linux-virt-%s.apk",
+		alpineMajorMinor(AlpineVersion), LinuxVirtVersion)
+	fmt.Printf("  Downloading linux-virt %s (x86_64)...\n", LinuxVirtVersion)
+	data, err := httpGetBytes(url)
+	if err != nil {
+		return fmt.Errorf("downloading linux-virt: %w", err)
+	}
+
+	// Extract the bzImage from the APK to a temp file
+	tmp := filepath.Join(vmEmbedDir, "vmlinuz.bzimage")
+	if err := extractAPKFile(data, "boot/vmlinuz-virt", tmp); err != nil {
+		return fmt.Errorf("extracting vmlinuz: %w", err)
+	}
+	defer func() {
+		if removeErr := os.Remove(tmp); removeErr != nil {
+			fmt.Printf("  warning: could not remove temp bzImage: %v\n", removeErr)
+		}
+	}()
+
+	// Decompress the bzImage to get the raw ELF vmlinux.
+	// HCS LinuxKernelDirect needs the uncompressed kernel.
+	if err := extractVmlinuxFromBzImage(tmp, dest); err != nil {
+		return err
+	}
+
+	st, err := os.Stat(dest)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("  Extracted uncompressed x86_64 vmlinux (%d bytes)\n", st.Size())
+	return nil
+}
+
+// extractVmlinuxFromBzImage finds the gzip-compressed payload inside an
+// x86_64 bzImage and decompresses it to get the raw ELF vmlinux.
+// The bzImage format embeds a compressed kernel that can be found by
+// scanning for the gzip magic bytes (0x1f 0x8b 0x08).
+func extractVmlinuxFromBzImage(bzImagePath, dest string) error {
+	data, err := os.ReadFile(bzImagePath)
+	if err != nil {
+		return fmt.Errorf("reading bzImage: %w", err)
+	}
+
+	// Scan for gzip magic bytes. The first occurrence is typically the
+	// compressed kernel payload (may also match compressed data tables,
+	// so we try each gzip stream until we find one containing an ELF binary).
+	magic := []byte{0x1f, 0x8b, 0x08}
+	for i := 0; i <= len(data)-3; i++ {
+		if data[i] != magic[0] || data[i+1] != magic[1] || data[i+2] != magic[2] {
+			continue
+		}
+
+		gr, gzErr := gzip.NewReader(bytes.NewReader(data[i:]))
+		if gzErr != nil {
+			continue
+		}
+		gr.Multistream(false)
+
+		raw, readErr := io.ReadAll(gr)
+		if closeErr := gr.Close(); closeErr != nil {
+			fmt.Printf("  warning: gzip close error at offset %d: %v\n", i, closeErr)
+		}
+		if readErr != nil || len(raw) < 64 {
+			continue
+		}
+
+		// Check for ELF magic: 0x7f 'E' 'L' 'F'
+		if raw[0] == 0x7f && raw[1] == 'E' && raw[2] == 'L' && raw[3] == 'F' {
+			fmt.Printf("  Found ELF vmlinux at bzImage offset %d (%d bytes)\n", i, len(raw))
+			return os.WriteFile(dest, raw, 0o644)
+		}
+	}
+
+	return fmt.Errorf("no gzip-compressed ELF payload found in bzImage")
+}
+
+// Initrdx86 builds a minimal initramfs for the Linux VM on Windows (Hyper-V).
+// Contains busybox (static), e2fsprogs (for first-boot mkfs.ext4),
+// kernel modules needed for Hyper-V (FAT32, ext4, netfilter), and a custom
+// /init script that loads modules, mounts the root + assets disks, and
+// exec's ephemerd-linux as PID 1.
+func Initrdx86() error {
+	dest := filepath.Join(vmEmbedDir, "initrd")
+	if fileExists(dest) {
+		fmt.Printf("  %s already exists, skipping\n", dest)
+		return nil
+	}
+	if err := os.MkdirAll(vmEmbedDir, 0o755); err != nil {
+		return err
+	}
+
+	// Download APK packages for the initrd userspace (same as Darwin, x86_64 arch)
+	pkgData := make([][]byte, len(initrdPackages))
+	var err error
+	for i, pkg := range initrdPackages {
+		url := fmt.Sprintf("https://dl-cdn.alpinelinux.org/alpine/v%s/%s/x86_64/%s-%s.apk",
+			alpineMajorMinor(AlpineVersion), pkg.repo, pkg.name, pkg.version)
+		fmt.Printf("  Downloading %s-%s.apk (initrd x86_64)...\n", pkg.name, pkg.version)
+		pkgData[i], err = httpGetBytes(url)
+		if err != nil {
+			return fmt.Errorf("downloading %s: %w", pkg.name, err)
+		}
+	}
+
+	// Download linux-virt APK for x86_64 and extract kernel modules
+	kernelURL := fmt.Sprintf("https://dl-cdn.alpinelinux.org/alpine/v%s/main/x86_64/linux-virt-%s.apk",
+		alpineMajorMinor(AlpineVersion), LinuxVirtVersion)
+	fmt.Printf("  Downloading linux-virt %s (x86_64) for kernel modules...\n", LinuxVirtVersion)
+	kernelAPK, err := httpGetBytes(kernelURL)
+	if err != nil {
+		return fmt.Errorf("downloading linux-virt for modules: %w", err)
+	}
+	modulePrefix := fmt.Sprintf("lib/modules/%s-0-virt/", linuxKernelReleaseFromVersion(LinuxVirtVersion))
+
+	// Extract modules.dep for transitive dependency resolution
+	depsFile := modulePrefix + "modules.dep"
+	depsRaw, err := extractAPKFilesToMap(kernelAPK, map[string]bool{depsFile: true})
+	if err != nil || depsRaw[depsFile] == nil {
+		return fmt.Errorf("extracting modules.dep: %w", err)
+	}
+	deps := parseModulesDep(string(depsRaw[depsFile]))
+
+	// Resolve transitive deps for everything in initrdKernelModulesX86
+	wanted := make(map[string]bool)
+	loadOrder := []string{}
+	var add func(rel string)
+	add = func(rel string) {
+		key := modulePrefix + rel
+		if wanted[key] {
+			return
+		}
+		for _, dep := range deps[rel] {
+			add(dep)
+		}
+		wanted[key] = true
+		loadOrder = append(loadOrder, rel)
+	}
+	for _, m := range initrdKernelModulesX86 {
+		add(m)
+	}
+
+	moduleFiles, err := extractAPKFilesToMap(kernelAPK, wanted)
+	if err != nil {
+		return fmt.Errorf("extracting kernel modules: %w", err)
+	}
+	for name := range wanted {
+		if _, ok := moduleFiles[name]; !ok {
+			return fmt.Errorf("kernel module not found in APK: %s", name)
+		}
+	}
+	fmt.Printf("  Resolved %d initrd kernel modules for x86_64 (with transitive deps)\n", len(loadOrder))
+
+	fmt.Printf("  Building x86_64 initrd with %d kernel modules...\n", len(moduleFiles))
+	return buildInitrdX86(dest, pkgData, moduleFiles, loadOrder)
+}
+
 // linuxKernelReleaseFromVersion converts "6.12.81-r0" → "6.12.81".
 // Alpine's APK version is "<kernel-release>-r<revision>".
 func linuxKernelReleaseFromVersion(v string) string {
@@ -886,6 +1101,334 @@ exec switch_root /newroot "$EPHEMERD_BIN" serve \
 	// Pad to 512-byte boundary
 	if err := gw.Close(); err != nil {
 		_ = f.Close()
+		return fmt.Errorf("closing gzip: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing initrd file: %w", err)
+	}
+
+	fmt.Printf("  Created %s\n", dest)
+	return nil
+}
+
+// buildInitrdX86 builds the x86_64 initrd for Hyper-V. Same CPIO structure as
+// buildInitrd but with a Hyper-V-specific init script that uses SCSI devices
+// (/dev/sda root, /dev/sdb1 FAT32 assets) instead of virtio devices.
+func buildInitrdX86(dest string, pkgData [][]byte, moduleFiles map[string][]byte, loadOrder []string) error {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for i, data := range pkgData {
+		if err := appendAPKFiles(tw, data); err != nil {
+			return fmt.Errorf("extracting %s: %w", initrdPackages[i].name, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return fmt.Errorf("closing tar: %w", err)
+	}
+
+	// Convert the collected tar entries into cpio entries
+	type cpioFile struct {
+		name string
+		mode int64
+		size int64
+		data []byte
+		link string
+	}
+	var files []cpioFile
+	seen := make(map[string]bool)
+
+	// Standard dirs
+	for _, d := range []string{"dev", "proc", "sys", "tmp", "newroot", "mnt", "mnt/assets", "modules",
+		"usr", "usr/bin", "usr/sbin", "usr/lib", "usr/share", "usr/share/udhcpc",
+		"bin", "sbin", "lib", "etc", "var", "var/lib", "var/lib/ephemerd"} {
+		files = append(files, cpioFile{name: d, mode: 0o40755})
+		seen[d] = true
+	}
+
+	// Extract APK files from the tar
+	tr := tar.NewReader(&buf)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("reading tar entry: %w", err)
+		}
+		name := strings.TrimPrefix(hdr.Name, "./")
+		name = strings.TrimPrefix(name, "/")
+		if name == "" || name == "." || strings.HasPrefix(name, ".PKGINFO") || strings.HasPrefix(name, ".SIGN") {
+			continue
+		}
+
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			files = append(files, cpioFile{name: name, mode: int64(hdr.Mode) | 0o40000})
+		case tar.TypeSymlink:
+			files = append(files, cpioFile{name: name, mode: 0o120777, link: hdr.Linkname})
+		case tar.TypeReg, tar.TypeRegA:
+			data, readErr := io.ReadAll(tr)
+			if readErr != nil {
+				return fmt.Errorf("reading %s: %w", name, readErr)
+			}
+			files = append(files, cpioFile{name: name, mode: int64(hdr.Mode) | 0o100000, size: int64(len(data)), data: data})
+		}
+	}
+
+	// Add kernel modules under /modules/ (flat directory, basename only)
+	for fullPath, modData := range moduleFiles {
+		name := "modules/" + fullPath[strings.LastIndex(fullPath, "/")+1:]
+		files = append(files, cpioFile{
+			name: name,
+			mode: 0o100644,
+			size: int64(len(modData)),
+			data: modData,
+		})
+		seen[name] = true
+	}
+
+	// Add busybox symlinks for common applets (same as Darwin initrd)
+	busyboxPath := "bin/busybox.static"
+	if !seen[busyboxPath] {
+		busyboxPath = "bin/busybox"
+	}
+	for _, applet := range []string{
+		"bin/sh", "bin/mount", "bin/umount", "bin/mkdir", "bin/cat",
+		"bin/echo", "bin/sleep", "bin/ls", "bin/cp", "bin/mv", "bin/rm",
+		"bin/ln", "bin/grep", "bin/sed", "bin/tar", "bin/gzip", "bin/gunzip",
+		"bin/head", "bin/tail", "bin/wc", "bin/find", "bin/stat", "bin/chmod",
+		"bin/test", "bin/true", "bin/false", "bin/date", "bin/dmesg",
+		"bin/ip", "bin/ping", "bin/hostname",
+		"sbin/switch_root", "sbin/modprobe", "sbin/mdev", "sbin/insmod",
+		"sbin/udhcpc", "sbin/ifconfig", "sbin/route",
+	} {
+		if !seen[applet] {
+			dir := applet[:strings.LastIndex(applet, "/")]
+			if !seen[dir] {
+				files = append(files, cpioFile{name: dir, mode: 0o40755})
+				seen[dir] = true
+			}
+			target := busyboxPath[strings.LastIndex(busyboxPath, "/")+1:]
+			if dir != "bin" {
+				target = "../" + busyboxPath
+			}
+			files = append(files, cpioFile{name: applet, mode: 0o120777, link: target})
+			seen[applet] = true
+		}
+	}
+
+	// Add udhcpc handler script (same as Darwin initrd)
+	udhcpcScript := "#!/bin/sh\ncase $1 in\n  bound|renew)\n    ip addr flush dev $interface\n    ip addr add $ip/$mask dev $interface\n    [ -n \"$router\" ] && ip route add default via $router dev $interface\n    [ -n \"$dns\" ] && echo \"nameserver $dns\" > /etc/resolv.conf\n    ;;\nesac\n"
+	udhcpcDir := "usr/share/udhcpc"
+	if !seen[udhcpcDir] {
+		files = append(files, cpioFile{name: udhcpcDir, mode: 0o40755})
+		seen[udhcpcDir] = true
+	}
+	files = append(files, cpioFile{
+		name: "usr/share/udhcpc/default.script",
+		mode: 0o100755,
+		size: int64(len(udhcpcScript)),
+		data: []byte(udhcpcScript),
+	})
+
+	// Bundle rootfs tarball and ephemerd-linux binary into the initrd at /assets/.
+	// The init script extracts these to tmpfs at boot — no disk attachment needed.
+	files = append(files, cpioFile{name: "assets", mode: 0o40755})
+
+	// Read rootfs and ephemerd-linux from the embed directory on disk.
+	// These files are placed there by download.Rootfs and build.Linuxembed.
+	rootfsMatches, _ := filepath.Glob(filepath.Join(vmEmbedDir, "ephemerd-rootfs-*.tar.gz"))
+	if len(rootfsMatches) == 0 {
+		return fmt.Errorf("no rootfs tarball found in %s (run 'mage download:rootfs' first)", vmEmbedDir)
+	}
+	rootfsData, err := os.ReadFile(rootfsMatches[0])
+	if err != nil {
+		return fmt.Errorf("reading rootfs for initrd bundle: %w", err)
+	}
+	files = append(files, cpioFile{
+		name: "assets/rootfs.tar.gz",
+		mode: 0o100644,
+		size: int64(len(rootfsData)),
+		data: rootfsData,
+	})
+	fmt.Printf("  Bundling rootfs in initrd (%d bytes)\n", len(rootfsData))
+
+	ephemerdPath := filepath.Join(vmEmbedDir, "ephemerd-linux")
+	ephemerdData, err := os.ReadFile(ephemerdPath)
+	if err != nil {
+		return fmt.Errorf("reading ephemerd-linux for initrd bundle: %w", err)
+	}
+	files = append(files, cpioFile{
+		name: "assets/ephemerd-linux",
+		mode: 0o100755,
+		size: int64(len(ephemerdData)),
+		data: ephemerdData,
+	})
+	fmt.Printf("  Bundling ephemerd-linux in initrd (%d bytes)\n", len(ephemerdData))
+
+	// Hyper-V init script. All assets bundled in initrd at /assets/ —
+	// no disk attachments needed. Runs from tmpfs.
+	initScript := `#!/bin/sh
+# ephemerd initrd init script (Hyper-V)
+# Loads kernel modules, mounts SCSI root disk, mounts FAT32 assets disk,
+# and exec's ephemerd-linux as PID 1.
+
+mount -t proc     none /proc
+mount -t sysfs    none /sys
+mount -t devtmpfs none /dev
+
+# Load kernel modules. Hyper-V synthetic drivers (hv_vmbus, hv_storvsc,
+# hv_netvsc) are built into the linux-virt kernel — no insmod needed.
+# We load filesystem + netfilter modules only.
+echo "ephemerd-init: loading kernel modules"
+for mod in __MODULE_LOAD_ORDER__; do
+    if [ -f /modules/${mod}.ko.gz ]; then
+        gunzip -c /modules/${mod}.ko.gz > /tmp/${mod}.ko
+        insmod /tmp/${mod}.ko || echo "ephemerd-init: insmod ${mod} failed (may already be loaded)"
+        rm -f /tmp/${mod}.ko
+    fi
+done
+
+# Give devtmpfs a moment to populate /dev after modules attach
+sleep 1
+
+# Parse kernel command line
+CONTAINERD_PORT="10000"
+for param in $(cat /proc/cmdline); do
+    case "$param" in
+        ephemerd.containerd_port=*) CONTAINERD_PORT="${param#*=}" ;;
+    esac
+done
+echo "ephemerd-init: containerd_port=$CONTAINERD_PORT"
+
+# Network: eth0 via hv_netvsc (built-in), DHCP from Default Switch
+NET_IF=""
+for iface in eth0 ens3 enp0s3; do
+    if [ -d /sys/class/net/$iface ]; then
+        NET_IF=$iface
+        break
+    fi
+done
+if [ -n "$NET_IF" ]; then
+    ip link set lo up
+    ip link set "$NET_IF" up
+    udhcpc -i "$NET_IF" -n -t 8 -s /usr/share/udhcpc/default.script
+    # Set DNS — Default Switch gateway is the DNS resolver.
+    GW=$(ip route | sed -n 's/default via \([0-9.]*\).*/\1/p')
+    # Print IP in a parseable format for the host to discover.
+    MY_IP=$(ip -4 addr show "$NET_IF" | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+    echo "EPHEMERD_IP=$MY_IP"
+else
+    echo "ephemerd-init: WARNING: no network interface found"
+fi
+
+# Mount tmpfs root and populate from 9P host share.
+# The host shares <DataDir>/vm/linux/ via Plan9 as tag "ephemerd".
+echo "ephemerd-init: mounting tmpfs root"
+mount -t tmpfs -o size=4G tmpfs /newroot
+
+mkdir -p /mnt/host
+if mount -t 9p -o trans=virtio,version=9p2000.L ephemerd /mnt/host 2>/dev/null; then
+    echo "ephemerd-init: 9P share mounted, extracting rootfs"
+    tar xzf /mnt/host/rootfs.tar.gz -C /newroot
+    cp /mnt/host/ephemerd-linux /newroot/usr/local/bin/ephemerd-linux
+    chmod 755 /newroot/usr/local/bin/ephemerd-linux
+    umount /mnt/host
+elif [ -f /assets/rootfs.tar.gz ]; then
+    # Fallback: use bundled assets from fat initrd
+    echo "ephemerd-init: 9P unavailable, using initrd assets"
+    tar xzf /assets/rootfs.tar.gz -C /newroot
+    cp /assets/ephemerd-linux /newroot/usr/local/bin/ephemerd-linux
+    chmod 755 /newroot/usr/local/bin/ephemerd-linux
+else
+    echo "ephemerd-init: FATAL: no rootfs source available"
+    exec /bin/sh
+fi
+
+# Set up newroot
+mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/tmp /newroot/var/lib/ephemerd /newroot/etc
+
+# DNS config — gateway is the DNS resolver on Default Switch
+if [ -n "$GW" ]; then
+    echo "nameserver $GW" > /newroot/etc/resolv.conf
+fi
+
+mount --move /proc /newroot/proc
+mount --move /sys  /newroot/sys
+mount --move /dev  /newroot/dev
+
+mkdir -p /newroot/sys/fs/cgroup
+mount -t cgroup2 none /newroot/sys/fs/cgroup || \
+    echo "ephemerd-init: WARNING: cgroup2 mount failed"
+
+export PATH=/usr/bin:/usr/sbin:/bin:/sbin
+export HOME=/root
+
+echo "ephemerd-init: launching ephemerd-linux"
+exec switch_root /newroot /usr/local/bin/ephemerd-linux serve \
+    --data-dir /var/lib/ephemerd \
+    --containerd-tcp-port "$CONTAINERD_PORT" \
+    --containerd-tcp-addr 0.0.0.0 \
+    --containerd-only
+`
+	// Substitute the resolved module load order
+	modNames := make([]string, 0, len(loadOrder))
+	for _, m := range loadOrder {
+		base := m[strings.LastIndex(m, "/")+1:]
+		base = strings.TrimSuffix(base, ".ko.gz")
+		modNames = append(modNames, base)
+	}
+	initScript = strings.Replace(initScript, "__MODULE_LOAD_ORDER__", strings.Join(modNames, " "), 1)
+
+	files = append(files, cpioFile{
+		name: "init",
+		mode: 0o100755,
+		size: int64(len(initScript)),
+		data: []byte(initScript),
+	})
+
+	// Write cpio archive (newc format) compressed with gzip
+	f, err := os.Create(dest)
+	if err != nil {
+		return fmt.Errorf("creating initrd: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = os.Remove(dest)
+		}
+	}()
+
+	gw := gzip.NewWriter(f)
+	for _, cf := range files {
+		if err := writeCPIOEntry(gw, cf.name, cf.mode, cf.data, cf.link); err != nil {
+			if closeErr := gw.Close(); closeErr != nil {
+				fmt.Printf("  warning: error closing gzip: %v\n", closeErr)
+			}
+			if closeErr := f.Close(); closeErr != nil {
+				fmt.Printf("  warning: error closing file: %v\n", closeErr)
+			}
+			return fmt.Errorf("writing cpio entry %s: %w", cf.name, err)
+		}
+	}
+	// Write TRAILER
+	if err := writeCPIOEntry(gw, "TRAILER!!!", 0, nil, ""); err != nil {
+		if closeErr := gw.Close(); closeErr != nil {
+			fmt.Printf("  warning: error closing gzip: %v\n", closeErr)
+		}
+		if closeErr := f.Close(); closeErr != nil {
+			fmt.Printf("  warning: error closing file: %v\n", closeErr)
+		}
+		return fmt.Errorf("writing cpio trailer: %w", err)
+	}
+	if err := gw.Close(); err != nil {
+		if closeErr := f.Close(); closeErr != nil {
+			fmt.Printf("  warning: error closing file: %v\n", closeErr)
+		}
 		return fmt.Errorf("closing gzip: %w", err)
 	}
 	if err := f.Close(); err != nil {
