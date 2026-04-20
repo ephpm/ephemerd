@@ -58,6 +58,10 @@ export GITHUB_TOKEN=ghp_...
 sudo -E ephemerd serve
 ```
 
+### macOS: first boot takes time
+
+On macOS, the first time ephemerd starts it downloads a Tart base disk image from the OCI registry. This is a multi-gigabyte download and can take a while depending on your connection. Subsequent starts use the cached image and boot in seconds. Plan for this on the first run — don't expect macOS VM jobs to work immediately after install.
+
 ## 3. Target from a workflow
 
 In your GitHub Actions workflow, use the `self-hosted` label along with the platform label:

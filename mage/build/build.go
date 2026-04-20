@@ -215,20 +215,20 @@ func restoreStashed(stashed [][2]string) error {
 
 // ForgeRunner compiles the Forgejo Actions runner for the current OS/arch.
 func ForgeRunner() error {
-	return buildRunner("forge-runner")
+	return buildRunner("ephemerd-runner-forgejo")
 }
 
 // GiteaRunner compiles the Gitea Actions runner for the current OS/arch.
 func GiteaRunner() error {
-	return buildRunner("gitea-runner")
+	return buildRunner("ephemerd-runner-gitea")
 }
 
-// Runners compiles both forge-runner and gitea-runner for the current OS/arch.
+// Runners compiles both ephemerd-runner-forgejo and ephemerd-runner-gitea for the current OS/arch.
 func Runners() {
 	mg.Deps(ForgeRunner, GiteaRunner)
 }
 
-// RunnersAll cross-compiles forge-runner and gitea-runner for all release platforms.
+// RunnersAll cross-compiles ephemerd-runner-forgejo and ephemerd-runner-gitea for all release platforms.
 // Outputs go to dist/<name>-<os>-<arch>[.exe].
 func RunnersAll() error {
 	type target struct{ goos, goarch string }
@@ -239,7 +239,7 @@ func RunnersAll() error {
 		{"darwin", "arm64"},
 	}
 	for _, t := range targets {
-		for _, name := range []string{"forge-runner", "gitea-runner"} {
+		for _, name := range []string{"ephemerd-runner-forgejo", "ephemerd-runner-gitea"} {
 			if err := crossBuildRunner(name, t.goos, t.goarch); err != nil {
 				return err
 			}

@@ -16,7 +16,7 @@ var version = "dev"
 
 func main() {
 	app := &cli.Command{
-		Name:    "gitea-runner",
+		Name:    "ephemerd-runner-gitea",
 		Usage:   "Ephemeral Gitea Actions runner — direct process execution, no Docker",
 		Version: version,
 		Flags: []cli.Flag{

@@ -40,17 +40,29 @@ repos = ["repo1", "repo2"]   # optional: omit for org-level runners
 
 ## Forgejo
 
-Forgejo Actions uses GitHub Actions workflow syntax but a different runner: `forgejo-runner`, a fork of Gitea's `act_runner`. ephemerd polls for tasks via the ConnectRPC `FetchTask` endpoint.
+Forgejo Actions uses GitHub Actions workflow syntax but a different protocol. There are two ways to run Forgejo jobs:
 
-When a job arrives, ephemerd creates a container from the runner image and launches `forgejo-runner one-job --handle <task-uuid>`. The `--handle` flag binds the runner to a specific task, preventing race conditions when multiple runners are active.
+### Option 1: ephemerd-runner-forgejo (recommended)
 
-Forgejo uses a two-container model: the runner daemon runs in one container and creates job execution containers via the Docker API. ephemerd's fake Docker socket intercepts these calls and translates them into containerd operations, so no actual Docker daemon is needed.
+ephemerd includes **ephemerd-runner-forgejo** — a lightweight Go binary that speaks the Forgejo ConnectRPC protocol and executes workflow steps directly via `os/exec`. Single container, no Docker socket needed. Supports Linux, Windows, and macOS.
+
+ephemerd-runner-forgejo handles `run:` steps. `uses:` steps (actions) are not yet supported — if your workflows rely heavily on actions, use Option 2.
+
+**Runner binary:** `ephemerd-runner-forgejo` (built into ephemerd).
+
+### Option 2: upstream forgejo-runner + fake Docker socket
+
+Use the upstream `forgejo-runner` with ephemerd's fake Docker socket (`pkg/dind`). This is the two-container model — the runner daemon runs in one container and creates a separate job container via the Docker API. ephemerd intercepts those Docker API calls and translates them to containerd operations.
+
+This option has full `uses:` action support via the embedded nektos/act engine, but only works on Linux.
+
+**Runner binary:** `forgejo-runner` (pre-installed in the runner image).
+
+### Config
 
 **Authentication:** Runner registration token from Forgejo admin.
 
 **Job discovery:** ConnectRPC `FetchTask` polling.
-
-**Runner binary:** `forgejo-runner` (pre-installed in the runner image).
 
 ```toml
 [forgejo]
@@ -63,17 +75,11 @@ owner = "your-org"
 
 ## Gitea
 
-Gitea Actions shares the same workflow syntax and ConnectRPC protocol as Forgejo (both descend from the same codebase), but uses `act_runner` with a different ephemeral mode. ephemerd polls for tasks via ConnectRPC `FetchTask` and launches `act_runner daemon --ephemeral`, which runs one job and exits.
-
-The key difference from Forgejo is the lack of a `--handle` flag. The `--ephemeral` mode picks up the next available task rather than binding to a specific one. Gitea also uses a different protobuf package (`code.gitea.io/actions-proto-go` vs Forgejo's `code.forgejo.org/forgejo/actions-proto`).
-
-Like Forgejo, Gitea uses the two-container model with ephemerd's fake Docker socket.
+Gitea Actions shares the same workflow syntax and ConnectRPC protocol as Forgejo. The same two options apply — ephemerd-runner-forgejo (as `gitea-runner`) for the single-container model, or upstream `act_runner` with the fake Docker socket for full action support.
 
 **Authentication:** Runner registration token from Gitea admin.
 
 **Job discovery:** ConnectRPC `FetchTask` polling.
-
-**Runner binary:** `act_runner` (pre-installed in the runner image).
 
 ```toml
 [gitea]
@@ -146,5 +152,4 @@ Regardless of which provider is active, the following subsystems are shared:
 - macOS VM support via Virtualization.framework
 - CNI bridge networking (Linux) and HCN NAT networking (Windows)
 - Concurrency limiting, job dedup, and graceful drain
-- Fake Docker socket for Forgejo/Gitea two-container model
 - gRPC control plane (`ephemerd status`, `ephemerd jobs`)

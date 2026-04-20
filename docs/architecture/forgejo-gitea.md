@@ -209,6 +209,8 @@ owner = "your-org"
 max_concurrent = 4  # pool size
 ```
 
-## Future: forge-runner
+## ephemerd-runner-forgejo (implemented)
 
-The two-container model works for Linux jobs but is a dead end for Windows and macOS -- nektos/act only creates Linux Docker containers. The planned replacement is **forge-runner**: a Go binary that speaks the Forgejo/Gitea ConnectRPC protocol directly, executes steps via `os/exec` process spawning (no Docker), and cross-compiles for all platforms. This gives the same single-container model as GitHub Actions on every OS.
+The two-container model works for Linux jobs but is a dead end for Windows and macOS — nektos/act only creates Linux Docker containers. **ephemerd-runner-forgejo** replaces it with a single-container model: a Go binary that speaks the Forgejo/Gitea ConnectRPC protocol directly, executes steps via `os/exec` process spawning (no Docker), and cross-compiles for all platforms.
+
+See [ephemerd-runner-forgejo architecture]({{< relref "ephemerd-runner-forgejo" >}}) for the full design.

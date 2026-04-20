@@ -16,7 +16,9 @@ pkg/                    Library packages
   runtime/              Container lifecycle (create/wait/destroy)
   scheduler/            Job discovery, routing, dispatch
   tunnel/               Webhook tunnel providers (localtunnel, ngrok)
-  providers/            Multi-forge provider interface (GitHub, Forgejo, Gitea, GitLab, Woodpecker)
+  providers/            Provider interface (GitHub, Forgejo, Gitea, GitLab, Woodpecker)
+  forgerunner/          ephemerd-runner-forgejo execution engine (Forgejo/Gitea single-container runner)
+  forgerpc/             ConnectRPC client for Forgejo/Gitea (raw HTTP + JSON)
   metrics/              Prometheus metrics endpoint
   artifacts/            OCI artifact extraction for macOS VM jobs
   workflow/             Local workflow parser and runner (ephemerd run)

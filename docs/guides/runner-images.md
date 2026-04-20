@@ -3,7 +3,7 @@ title: Runner Images
 weight: 4
 ---
 
-ephemerd uses OCI container images to define the execution environment for each job. The image model differs by provider -- GitHub Actions uses a single container, while Forgejo/Gitea use a two-container model, and Woodpecker manages its own agent containers.
+ephemerd uses OCI container images to define the execution environment for each job. The image determines what tools, runtimes, and system packages are available during the workflow run.
 
 ## GitHub Actions
 
@@ -103,82 +103,58 @@ COPY --from=builder /deps /deps
 
 ## Forgejo / Gitea
 
-### How it works
+There are two ways to run Forgejo/Gitea jobs, each with different image requirements.
 
-Forgejo and Gitea use a **two-container model**. The runner daemon (`forgejo-runner` or `act_runner`) runs in one container and creates job execution containers via the Docker API. ephemerd's fake Docker socket (`pkg/dind`) intercepts these Docker API calls and translates them to containerd operations. The job container is a sibling container managed by ephemerd, not a nested container.
+### Option 1: ephemerd-runner-forgejo (single container)
+
+ephemerd-runner-forgejo runs inside a single container alongside the workflow steps. ephemerd mounts the ephemerd-runner-forgejo binary into the container — the image just needs CI tools.
 
 ```mermaid
 flowchart LR
-    RC["Runner Container\nforgejo-runner"] -->|Docker API| DS["Fake Docker Socket\npkg/dind"]
-    DS -->|containerd create| JC["Job Container\nubuntu-24.04"]
-    DS -->|containerd create| SC["Service Containers\npostgres, redis, etc."]
-    style DS fill:#f3e5f5,stroke:#7b1fa2
-    style RC fill:#e1f5ff,stroke:#0288d1
-    style JC fill:#fff3e0,stroke:#f57c00
-    style SC fill:#fff3e0,stroke:#f57c00
+    E["ephemerd"] -->|containerd create| C["Single Container\nephemerd-runner-forgejo + CI tools"]
+    C -->|os/exec| S["workflow steps"]
+    style C fill:#e1f5ff,stroke:#0288d1
+    style S fill:#fff3e0,stroke:#f57c00
 ```
 
-### Two images to configure
+The default image is `gitea/runner-images:ubuntu-24.04`. Customize it by adding your build dependencies:
+
+```dockerfile
+FROM gitea/runner-images:ubuntu-24.04
+
+RUN apt-get update && apt-get install -y \
+    build-essential cmake pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+### Option 2: upstream runner + fake Docker socket (two containers)
+
+The upstream `forgejo-runner` / `act_runner` creates a separate job container via the Docker API. Two images are involved:
 
 | Image | Purpose | Config key |
 |-------|---------|------------|
 | **Runner image** | Contains the runner daemon binary | `[runner] default_image` |
 | **Job image** | Where workflow steps execute | `[forgejo] job_image` or `[gitea] job_image` |
 
-### Default images
-
-**Forgejo:**
-
-| Image | Default |
-|-------|---------|
-| Runner | `data.forgejo.org/forgejo/runner:12` |
-| Job | `gitea/runner-images:ubuntu-24.04` |
-
-**Gitea:**
-
-| Image | Default |
-|-------|---------|
-| Runner | `docker.io/gitea/act_runner:latest` |
-| Job | `gitea/runner-images:ubuntu-24.04` |
-
-### Customizing the job image
-
-The job image is where your workflow steps actually run. This is the image you'll customize most often. It doesn't need a runner binary -- the runner daemon in the other container handles that.
-
-```dockerfile
-FROM gitea/runner-images:ubuntu-24.04
-
-# Add your project's build dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential cmake pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+```mermaid
+flowchart LR
+    RC["Runner Container\nforgejo-runner"] -->|Docker API| DS["Fake Docker Socket\npkg/dind"]
+    DS -->|containerd create| JC["Job Container\nubuntu-24.04"]
+    style DS fill:#f3e5f5,stroke:#7b1fa2
+    style RC fill:#e1f5ff,stroke:#0288d1
+    style JC fill:#fff3e0,stroke:#f57c00
 ```
 
-```bash
-docker build -t ghcr.io/your-org/forge-job:latest .
-docker push ghcr.io/your-org/forge-job:latest
-```
+Customize the job image the same way. The runner image rarely needs customization — the upstream images work out of the box.
 
-Set it in the config:
+### Config (both options)
 
 ```toml
 [forgejo]
 instance_url = "https://codeberg.org"
 token = "runner-registration-token"
 owner = "your-org"
-job_image = "ghcr.io/your-org/forge-job:latest"
-```
-
-### Customizing the runner image
-
-You rarely need to customize the runner image -- the upstream `forgejo-runner` or `act_runner` images work out of the box. If you do need to (e.g., to pin a specific runner version or add CA certificates), extend the upstream:
-
-```dockerfile
-FROM data.forgejo.org/forgejo/runner:12
-
-# Add custom CA certs for self-hosted registries
-COPY my-ca.crt /usr/local/share/ca-certificates/
-RUN update-ca-certificates
+job_image = "ghcr.io/your-org/ci-job:latest"
 ```
 
 ## GitLab

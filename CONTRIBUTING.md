@@ -48,7 +48,7 @@ pkg/                library packages
   runtime/          container lifecycle (create/wait/destroy)
   scheduler/        job discovery, routing, dispatch
   tunnel/           webhook tunnel providers (localtunnel, ngrok)
-  providers/        multi-forge provider interface (GitHub, Forgejo, Gitea, GitLab, Woodpecker)
+  providers/        provider interface (GitHub, Forgejo, Gitea, GitLab, Woodpecker)
   metrics/          Prometheus metrics endpoint
   artifacts/        OCI artifact extraction for macOS VM jobs
   workflow/         local workflow parser and runner (ephemerd run)
@@ -159,6 +159,6 @@ Design decisions and future plans are documented in `docs/arch/`:
 - `gitlab.md` — GitLab integration design (superseded by providers.md)
 - `webhooks.md` — webhook tunnel architecture
 - `rootfs.md` — pre-baked Alpine rootfs for Linux VMs
-- `providers.md` — multi-forge provider interface
+- `providers.md` — provider interface
 - `forgejo-gitea.md` — Forgejo/Gitea Actions integration
-- `forge-runner.md` — forge-runner design spec (future)
+- `forge-runner.md` — ephemerd-runner-forgejo / ephemerd-runner-gitea architecture
