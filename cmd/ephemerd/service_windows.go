@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 )
 
@@ -20,7 +21,7 @@ func serviceLogs(lines int, follow bool) error {
 		fmt.Sprintf("/c:%d", lines),
 		"/f:text", "/rd:true"}
 	cmd := exec.Command("wevtutil.exe", args...)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
