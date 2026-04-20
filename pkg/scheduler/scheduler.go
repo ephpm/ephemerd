@@ -257,6 +257,10 @@ func (s *Scheduler) Run(ctx context.Context) error {
 
 	// Start HTTP server: via tunnel, TLS, or plain HTTP
 	if s.cfg.Tunnel != nil && useWebhook {
+		// Clean up stale webhooks from previous crashed instances before
+		// registering new ones. Prevents hitting GitHub's 20-hook limit.
+		s.cfg.GitHub.CleanStaleWebhooks(ctx)
+
 		// Initial tunnel connection.
 		ln, err := s.cfg.Tunnel.Listen(ctx)
 		if err != nil {
