@@ -2,8 +2,13 @@
 
 package containerd
 
-// extractShims is a no-op on non-Linux platforms.
-// Windows uses Hyper-V and macOS uses Virtualization.framework.
-func extractShims(_ string) (string, func(), error) {
+import "runtime"
+
+// extractShims returns the data directory on Windows so containerd can find
+// containerd-shim-runhcs-v1.exe on PATH. On other platforms it's a no-op.
+func extractShims(dataDir string) (string, func(), error) {
+	if runtime.GOOS == "windows" {
+		return dataDir, func() {}, nil
+	}
 	return "", func() {}, nil
 }
