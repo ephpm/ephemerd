@@ -72,7 +72,7 @@ jobs:
 
   build-windows:
     name: Build (Windows amd64)
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, windows, x64]
     steps:
       - uses: actions/checkout@v6
 
@@ -84,7 +84,7 @@ jobs:
         run: go install github.com/magefile/mage@latest
 
       - name: Build Windows binary
-        run: mage build:windows
+        run: mage build:build
 
       - name: Verify binary
-        run: ls -lh ./ephemerd.exe
+        run: .\ephemerd.exe --version
