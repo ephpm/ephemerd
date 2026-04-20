@@ -36,6 +36,12 @@ var (
 )
 
 func main() {
+	// When running as a Windows Service, the SCM invokes the binary directly.
+	// Detect this and run the service handler instead of the CLI.
+	if runAsWindowsService() {
+		return
+	}
+
 	app := &cli.Command{
 		Name:           "ephemerd",
 		Usage:          "Ephemeral GitHub Actions runner daemon",
