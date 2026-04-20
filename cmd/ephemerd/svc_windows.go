@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -14,6 +15,11 @@ import (
 )
 
 const eventSource = "ephemerd"
+
+// serviceLogWriter is set by the Windows Service handler before calling
+// serve(). When non-nil, serve() injects it into the config so cfg.Logger()
+// routes output to the Windows Event Log instead of stderr.
+var serviceLogWriter io.Writer
 
 // ephemerdService implements svc.Handler for the Windows Service Control Manager.
 type ephemerdService struct {
@@ -43,9 +49,14 @@ func (s *ephemerdService) Execute(_ []string, r <-chan svc.ChangeRequest, status
 		}
 	}()
 
-	// Redirect the default slog logger to the Event Log. This captures
-	// all output from ephemerd and containerd (which uses slog).
-	slog.SetDefault(slog.New(slog.NewTextHandler(&eventLogWriter{elog: elog}, nil)))
+	// Set the Event Log writer as the global service log output.
+	// serve() picks this up via serviceLogWriter and injects it into
+	// the config so cfg.Logger() routes all slog output to the Event Log.
+	serviceLogWriter = &eventLogWriter{elog: elog}
+
+	// Also set the default slog logger for any early logging before
+	// serve() creates its own logger.
+	slog.SetDefault(slog.New(slog.NewTextHandler(serviceLogWriter, nil)))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -157,6 +168,11 @@ func runAsWindowsService() bool {
 	}
 
 	return true
+}
+
+// getServiceLogWriter returns the Event Log writer if running as a service.
+func getServiceLogWriter() io.Writer {
+	return serviceLogWriter
 }
 
 // installEventLog registers ephemerd as a Windows Event Log source.

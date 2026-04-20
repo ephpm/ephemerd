@@ -148,6 +148,11 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		cfg.Dind.Enabled = true
 	}
 
+	// When running as a Windows Service, route log output to the Event Log.
+	if w := getServiceLogWriter(); w != nil {
+		cfg.Log.Writer = w
+	}
+
 	log := cfg.Logger()
 	log.Info("starting ephemerd", "version", version, "data_dir", configDir)
 
