@@ -11,7 +11,14 @@ func serviceAction(action string) error {
 	if err != nil {
 		return fmt.Errorf("sc %s: %s", action, out)
 	}
-	fmt.Printf("ephemerd %sed\n", action)
+	switch action {
+	case "stop":
+		fmt.Println("ephemerd stopped")
+	case "start":
+		fmt.Println("ephemerd started")
+	default:
+		fmt.Printf("ephemerd %s complete\n", action)
+	}
 	return nil
 }
 
