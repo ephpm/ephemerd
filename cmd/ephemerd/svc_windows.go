@@ -41,7 +41,11 @@ func (s *ephemerdService) Execute(_ []string, r <-chan svc.ChangeRequest, status
 	if err != nil {
 		return false, 1
 	}
-	defer func() { _ = logFile.Close() }()
+	defer func() {
+		if err := logFile.Close(); err != nil {
+			slog.Warn("closing service log file", "error", err)
+		}
+	}()
 
 	serviceLogWriter = logFile
 	slog.SetDefault(slog.New(slog.NewTextHandler(logFile, nil)))
@@ -60,7 +64,9 @@ func (s *ephemerdService) Execute(_ []string, r <-chan svc.ChangeRequest, status
 		select {
 		case err := <-errCh:
 			if err != nil {
-				fmt.Fprintf(logFile, "ephemerd serve error: %v\n", err)
+				if _, wErr := fmt.Fprintf(logFile, "ephemerd serve error: %v\n", err); wErr != nil {
+					slog.Warn("writing to service log", "error", wErr)
+				}
 				return false, 1
 			}
 			return false, 0
@@ -71,17 +77,23 @@ func (s *ephemerdService) Execute(_ []string, r <-chan svc.ChangeRequest, status
 				status <- cr.CurrentStatus
 			case svc.Stop, svc.Shutdown:
 				status <- svc.Status{State: svc.StopPending}
-				fmt.Fprintln(logFile, "ephemerd stopping")
+				if _, wErr := fmt.Fprintln(logFile, "ephemerd stopping"); wErr != nil {
+					slog.Warn("writing to service log", "error", wErr)
+				}
 				cancel()
 				// Wait for serve() to exit, but force-exit after 30s
 				// to avoid hanging the SCM indefinitely.
 				select {
 				case err := <-errCh:
 					if err != nil {
-						fmt.Fprintf(logFile, "ephemerd shutdown error: %v\n", err)
+						if _, wErr := fmt.Fprintf(logFile, "ephemerd shutdown error: %v\n", err); wErr != nil {
+							slog.Warn("writing to service log", "error", wErr)
+						}
 					}
 				case <-time.After(30 * time.Second):
-					fmt.Fprintln(logFile, "ephemerd shutdown timed out after 30s, force exiting")
+					if _, wErr := fmt.Fprintln(logFile, "ephemerd shutdown timed out after 30s, force exiting"); wErr != nil {
+						slog.Warn("writing to service log", "error", wErr)
+					}
 				}
 				return false, 0
 			}

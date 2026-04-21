@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -53,9 +52,13 @@ func NewRunDistro(ctx context.Context, cfg RunDistroConfig) (*RunDistro, error) 
 		return nil, fmt.Errorf("writing rootfs: %w", err)
 	}
 
-	ephemerdData, err := vmFS.ReadFile("embed/ephemerd-linux")
+	// Read ephemerd-linux from disk — it's extracted from the initrd by the
+	// daemon's extractAssets on first run. Not embedded separately to avoid
+	// double-embedding (it's already bundled inside the fat initrd).
+	srcBinary := filepath.Join(d.dataDir, "vm", "linux", "ephemerd-linux")
+	ephemerdData, err := os.ReadFile(srcBinary)
 	if err != nil {
-		return nil, fmt.Errorf("reading embedded ephemerd-linux: %w", err)
+		return nil, fmt.Errorf("reading %s (has 'ephemerd serve' run once?): %w", srcBinary, err)
 	}
 	if err := validateEmbeddedAsset("ephemerd-linux", ephemerdData, false); err != nil {
 		return nil, err
@@ -195,24 +198,6 @@ func wslExecTimeout(timeout time.Duration, args ...string) error {
 	return nil
 }
 
-func wslOutputTimeout(timeout time.Duration, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "wsl", args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("wsl %s: timed out after %s", strings.Join(args, " "), timeout)
-		}
-		detail := strings.TrimSpace(decodeWSLOutput(out))
-		if detail != "" {
-			return "", fmt.Errorf("wsl %s: %w: %s", strings.Join(args, " "), err, detail)
-		}
-		return "", fmt.Errorf("wsl %s: %w", strings.Join(args, " "), err)
-	}
-	return strings.TrimSpace(decodeWSLOutput(out)), nil
-}
-
 // decodeWSLOutput converts WSL's UTF-16LE output (from wsl --list) to UTF-8.
 // If the output doesn't look like UTF-16LE, it's returned as-is.
 func decodeWSLOutput(b []byte) string {
@@ -239,12 +224,3 @@ func decodeWSLOutput(b []byte) string {
 	return string(utf16.Decode(u16))
 }
 
-// killWSLService force-kills wslservice.exe to unstick a hung WSL.
-func killWSLService(log *slog.Logger) {
-	log.Warn("killing wslservice.exe to recover from stuck WSL")
-	cmd := exec.Command("taskkill", "/F", "/IM", "wslservice.exe")
-	if err := cmd.Run(); err != nil {
-		log.Warn("taskkill wslservice.exe failed (may not be running)", "error", err)
-	}
-	time.Sleep(2 * time.Second)
-}

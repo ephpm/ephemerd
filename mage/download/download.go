@@ -367,6 +367,9 @@ var initrdKernelModules = []string{
 	"kernel/net/netfilter/xt_mark.ko.gz",      // common iptables -m mark extension
 	"kernel/net/bridge/bridge.ko.gz",          // CNI bridge plugin needs bridge support
 	"kernel/drivers/net/veth.ko.gz",           // CNI bridge uses veth pairs to connect containers
+	"kernel/net/ipv4/netfilter/ipt_REJECT.ko.gz",   // iptables REJECT target
+	"kernel/net/netfilter/nft_reject.ko.gz",         // nf_tables reject support
+	"kernel/net/netfilter/nft_reject_inet.ko.gz",    // nf_tables inet reject
 }
 
 // Initrd builds a minimal initramfs for the Linux VM on Darwin.
@@ -497,6 +500,8 @@ var initrdKernelModulesX86 = []string{
 	"kernel/net/netfilter/xt_mark.ko.gz",
 	"kernel/net/bridge/bridge.ko.gz",
 	"kernel/drivers/net/veth.ko.gz",
+	// Hyper-V utilities for time sync (TimeSync IC)
+	"kernel/drivers/hv/hv_utils.ko.gz",
 }
 
 // Kernelx86 downloads the Alpine linux-virt kernel for x86_64 and extracts
@@ -1171,7 +1176,7 @@ func buildInitrdX86(dest string, pkgData [][]byte, moduleFiles map[string][]byte
 			files = append(files, cpioFile{name: name, mode: int64(hdr.Mode) | 0o40000})
 		case tar.TypeSymlink:
 			files = append(files, cpioFile{name: name, mode: 0o120777, link: hdr.Linkname})
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg:
 			data, readErr := io.ReadAll(tr)
 			if readErr != nil {
 				return fmt.Errorf("reading %s: %w", name, readErr)
@@ -1318,11 +1323,24 @@ if [ -n "$NET_IF" ]; then
     ip link set lo up
     ip link set "$NET_IF" up
     udhcpc -i "$NET_IF" -n -t 8 -s /usr/share/udhcpc/default.script
-    # Set DNS — Default Switch gateway is the DNS resolver.
-    GW=$(ip route | sed -n 's/default via \([0-9.]*\).*/\1/p')
-    # Print IP in a parseable format for the host to discover.
-    MY_IP=$(ip -4 addr show "$NET_IF" | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+    # Get our IP and gateway. The udhcpc default.script already set the route.
+    MY_IP=$(ip -4 addr show "$NET_IF" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p')
+    # Extract gateway from routing table (busybox ip route output: "default via X.X.X.X dev ethN")
+    GW=""
+    for word in $(ip route 2>/dev/null); do
+        case "$prev" in
+            via) GW="$word"; break ;;
+        esac
+        prev="$word"
+    done
     echo "EPHEMERD_IP=$MY_IP"
+    echo "ephemerd-init: gateway=$GW"
+
+    # Clock sync: hv_utils kernel module provides Hyper-V TimeSync IC
+    # which automatically adjusts the VM clock from the host. Without it,
+    # the VM inherits the host's RTC (local time) but interprets it as UTC,
+    # causing GitHub API token validation failures due to clock skew.
+    echo "ephemerd-init: clock=$(date -u)"
 else
     echo "ephemerd-init: WARNING: no network interface found"
 fi
@@ -1349,6 +1367,10 @@ else
     echo "ephemerd-init: FATAL: no rootfs source available"
     exec /bin/sh
 fi
+
+# Enable IP forwarding so containers can route through the VM to the internet.
+# This is a kernel-level setting that persists across switch_root.
+echo 1 > /proc/sys/net/ipv4/ip_forward
 
 # Set up newroot
 mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/tmp /newroot/var/lib/ephemerd /newroot/etc

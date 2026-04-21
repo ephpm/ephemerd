@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -223,7 +224,8 @@ func (l *hypervLinuxVM) extractAssets() error {
 	assets := []asset{
 		{src: "embed/vmlinuz", dest: filepath.Join(l.vmDir, "vmlinuz"), mode: 0o644},
 		{src: "embed/initrd", dest: filepath.Join(l.vmDir, "initrd"), mode: 0o644},
-		{src: "embed/ephemerd-linux", dest: filepath.Join(l.vmDir, "ephemerd-linux"), mode: 0o755},
+		// ephemerd-linux is NOT embedded separately — it's bundled inside the
+		// fat initrd. The VM's init script extracts it at boot time.
 		{findPrefix: "ephemerd-rootfs-", dest: filepath.Join(l.vmDir, "rootfs.tar.gz"), mode: 0o644, gzip: true},
 	}
 
@@ -273,7 +275,11 @@ func fileSHA256Windows(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			slog.Warn("closing file for SHA-256", "path", path, "error", err)
+		}
+	}()
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
@@ -689,16 +695,3 @@ func psExec(script string) error {
 	return nil
 }
 
-// psOutput runs a PowerShell script and returns its stdout.
-func psOutput(script string) (string, error) {
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		detail := strings.TrimSpace(string(out))
-		if detail != "" {
-			return "", fmt.Errorf("powershell: %w: %s", err, detail)
-		}
-		return "", fmt.Errorf("powershell: %w", err)
-	}
-	return strings.TrimSpace(string(out)), nil
-}

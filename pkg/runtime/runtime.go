@@ -89,6 +89,11 @@ func New(cfg Config) (*Runtime, error) {
 	}, nil
 }
 
+// LogDir returns the configured per-job log directory (empty if logs go to stdio).
+func (r *Runtime) LogDir() string {
+	return r.cfg.LogDir
+}
+
 // CleanOrphans removes any leftover containers and snapshots from a previous
 // ephemerd run. This should be called on startup before the scheduler starts
 // accepting jobs.
@@ -658,27 +663,16 @@ func buildResolvConf() string {
 }
 
 // isRoutableDNS checks if a DNS server IP is reachable from containers.
-// Private IPs (10.x, 172.16-31.x, 192.168.x, 169.254.x) are blocked
-// by our firewall rules, so we filter them out.
+// We only filter out loopback and link-local. Other private IPs (like the
+// Hyper-V Default Switch gateway at 172.20.x.1) are reachable because
+// containers route through the VM which NATs to the host network.
 func isRoutableDNS(ip string) bool {
 	parts := strings.Split(ip, ".")
 	if len(parts) != 4 {
-		return true // IPv6 or weird format, let it through
+		return true
 	}
-	first := parts[0]
-	switch first {
-	case "10", "169":
-		return false
-	case "172":
-		// 172.16.0.0/12
-		second := 0
-		if _, err := fmt.Sscanf(parts[1], "%d", &second); err != nil {
-			return true // can't parse, assume routable
-		}
-		return second < 16 || second > 31
-	case "192":
-		return parts[1] != "168"
-	case "127":
+	switch parts[0] {
+	case "127", "169":
 		return false
 	}
 	return true

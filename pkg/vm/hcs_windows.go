@@ -48,9 +48,7 @@ var (
 	procHcsTerminateComputeSystem  = modvmcompute.NewProc("HcsTerminateComputeSystem")
 	procHcsCloseComputeSystem      = modvmcompute.NewProc("HcsCloseComputeSystem")
 	procHcsOpenComputeSystem       = modvmcompute.NewProc("HcsOpenComputeSystem")
-	procHcsModifyComputeSystem     = modvmcompute.NewProc("HcsModifyComputeSystem")
 	procHcsEnumerateComputeSystems = modvmcompute.NewProc("HcsEnumerateComputeSystems")
-	procGrantVmAccess              = modvmcompute.NewProc("GrantVmAccess")
 )
 
 // --- HCS Schema Structs ---
@@ -266,81 +264,6 @@ func hcsTerminate(handle hcsHandle) error {
 	)
 	if int32(r0) < 0 {
 		return fmt.Errorf("HcsTerminateComputeSystem: HRESULT 0x%08x", r0)
-	}
-	return nil
-}
-
-// hcsModify modifies a running compute system (e.g., hot-add SCSI disk).
-// The request is a JSON-encoded ModifySettingRequest.
-func hcsModify(handle hcsHandle, request interface{}) error {
-	reqJSON, err := json.Marshal(request)
-	if err != nil {
-		return fmt.Errorf("marshaling modify request: %w", err)
-	}
-	reqPtr, err := syscall.UTF16PtrFromString(string(reqJSON))
-	if err != nil {
-		return fmt.Errorf("converting request to UTF-16: %w", err)
-	}
-
-	var resultPtr *uint16
-	r0, _, _ := syscall.SyscallN(
-		procHcsModifyComputeSystem.Addr(),
-		uintptr(handle),
-		uintptr(unsafe.Pointer(reqPtr)),
-		uintptr(unsafe.Pointer(&resultPtr)),
-	)
-	if int32(r0) < 0 {
-		detail := hcsResultString(resultPtr)
-		return fmt.Errorf("HcsModifyComputeSystem: HRESULT 0x%08x: %s", r0, detail)
-	}
-	hcsResultString(resultPtr) // free
-	return nil
-}
-
-// hcsModifyRequest matches hcsschema.ModifySettingRequest.
-type hcsModifyRequest struct {
-	RequestType  string      `json:"RequestType"`
-	Settings     interface{} `json:"Settings,omitempty"`
-	ResourcePath string      `json:"ResourcePath"`
-}
-
-// hcsAddSCSIDisk hot-adds a SCSI disk to a running VM.
-// controller is the index (0-3), lun is the disk slot.
-func hcsAddSCSIDisk(handle hcsHandle, controller int, lun int, path string, readOnly bool) error {
-	req := &hcsModifyRequest{
-		RequestType: "Add",
-		Settings: &hcsAttachment{
-			Type_:    "VirtualDisk",
-			Path:     path,
-			ReadOnly: readOnly,
-		},
-		ResourcePath: fmt.Sprintf("VirtualMachine/Devices/Scsi/%s/Attachments/%d",
-			scsiControllerGUIDs[controller], lun),
-	}
-	return hcsModify(handle, req)
-}
-
-// hcsClose releases the handle to a compute system.
-// hcsGrantVmAccess grants a VM access to a file (e.g., a VHDX).
-// This is required before hot-adding writable SCSI disks — the VM's worker
-// process runs under a restricted security context and cannot open arbitrary files.
-// vmID is the VM's RuntimeId (GUID) from HcsGetComputeSystemProperties.
-func hcsGrantVmAccess(vmID string, filePath string) error {
-	vmIDPtr, err := syscall.UTF16PtrFromString(vmID)
-	if err != nil {
-		return fmt.Errorf("converting vmID to UTF-16: %w", err)
-	}
-	filePathPtr, err := syscall.UTF16PtrFromString(filePath)
-	if err != nil {
-		return fmt.Errorf("converting filePath to UTF-16: %w", err)
-	}
-	r0, _, _ := syscall.SyscallN(
-		procGrantVmAccess.Addr(),
-		uintptr(unsafe.Pointer(vmIDPtr)),
-		uintptr(unsafe.Pointer(filePathPtr)),
-	)
-	if int32(r0) < 0 {
-		return fmt.Errorf("GrantVmAccess(%s, %s): HRESULT 0x%08x", vmID, filePath, r0)
 	}
 	return nil
 }
