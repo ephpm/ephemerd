@@ -177,10 +177,10 @@ func (l *hypervLinuxVM) cleanupStaleVMs() {
 		return
 	}
 	for _, sys := range systems {
-		if !strings.HasPrefix(sys.ID, "ephemerd-linux-") {
+		if sys.Owner != "ephemerd" {
 			continue
 		}
-		l.cfg.Log.Info("cleaning up stale Hyper-V VM", "id", sys.ID, "state", sys.State)
+		l.cfg.Log.Info("cleaning up stale Hyper-V VM", "id", sys.ID, "owner", sys.Owner, "state", sys.State)
 		l.terminateStaleVM(sys.ID)
 	}
 }
@@ -190,9 +190,11 @@ func (l *hypervLinuxVM) cleanupStaleVMs() {
 func (l *hypervLinuxVM) terminateStaleVM(id string) {
 	handle, err := hcsOpen(id)
 	if err != nil {
-		// HcsOpen may fail if the VM is in a bad state -- fall back to PowerShell
+		// HcsOpen may fail if the VM is in a bad state -- fall back to PowerShell.
+		// The id is a GUID (the HCS compute system ID), not a Hyper-V VM name,
+		// so use Get-VM piped through Where-Object to match by Id property.
 		l.cfg.Log.Debug("HCS open failed, trying PowerShell", "id", id, "error", err)
-		script := fmt.Sprintf(`Stop-VM -Name '%s' -Force -TurnOff -ErrorAction SilentlyContinue`, id)
+		script := fmt.Sprintf(`Get-VM | Where-Object { $_.Id -eq '%s' } | Stop-VM -Force -TurnOff -ErrorAction SilentlyContinue`, id)
 		if err := psExec(script); err != nil {
 			l.cfg.Log.Warn("PowerShell Stop-VM also failed", "id", id, "error", err)
 		}

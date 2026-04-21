@@ -67,7 +67,7 @@ func platformChecks(pass, warn, fail func(string)) {
 		if state == "Enabled" {
 			pass("Windows Containers feature enabled")
 		} else {
-			warn("Windows Containers feature not enabled — run: Enable-WindowsOptionalFeature -Online -FeatureName Containers")
+			fail("Windows Containers feature not enabled — run: Enable-WindowsOptionalFeature -Online -FeatureName Containers -NoRestart; then reboot")
 		}
 	}
 }

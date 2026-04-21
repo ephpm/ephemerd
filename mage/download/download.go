@@ -1922,8 +1922,13 @@ func downloadFile(url, dest string) error {
 }
 
 func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	// Treat 0-byte files as missing — EnsurePlaceholders creates empty
+	// files so go:embed compiles, but they must be replaced by real assets.
+	return info.Size() > 0
 }
 
 func runnerPlatform(goos, goarch string) (os_, arch string) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,6 +50,7 @@ type Config struct {
 	RunnerDir    string // host path to extracted runner binary
 	RunnerMount  string // container path to mount runner at
 	DefaultImage string // override default container image (auto-detected if empty)
+	ImagesDir    string // directory containing pre-downloaded OCI image tarballs to import on startup
 	LogDir       string // directory for per-job container logs
 	DataDir      string // ephemerd data directory (used for dind socket paths)
 	// ContainerDataDir is the path containerd/runc see for the DataDir.
@@ -173,6 +175,73 @@ func (r *Runtime) CleanOrphans(ctx context.Context) error {
 	})
 }
 
+// ImportImages loads any pre-downloaded OCI image tarballs from the images
+// directory into containerd's content store. Images already present are
+// skipped. After import, each image is unpacked to the appropriate
+// snapshotter so it's ready to use immediately.
+func (r *Runtime) ImportImages(ctx context.Context) error {
+	dir := r.cfg.ImagesDir
+	if dir == "" {
+		return nil
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("reading images dir %s: %w", dir, err)
+	}
+
+	ctx = namespaces.WithNamespace(ctx, namespace)
+
+	snapshotter := "overlayfs"
+	if goruntime.GOOS == "windows" {
+		snapshotter = "windows"
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".tar") {
+			continue
+		}
+
+		path := filepath.Join(dir, entry.Name())
+		r.cfg.Log.Info("importing image from tarball", "path", path)
+
+		f, err := os.Open(path)
+		if err != nil {
+			r.cfg.Log.Warn("failed to open image tarball", "path", path, "error", err)
+			continue
+		}
+
+		imgs, err := r.client.Import(ctx, f)
+		if closeErr := f.Close(); closeErr != nil {
+			r.cfg.Log.Warn("error closing image tarball", "path", path, "error", closeErr)
+		}
+		if err != nil {
+			r.cfg.Log.Warn("failed to import image tarball", "path", path, "error", err)
+			continue
+		}
+
+		for _, img := range imgs {
+			r.cfg.Log.Info("imported image, unpacking", "name", img.Name, "snapshotter", snapshotter)
+
+			cImg, err := r.client.GetImage(ctx, img.Name)
+			if err != nil {
+				r.cfg.Log.Warn("failed to get imported image for unpack", "name", img.Name, "error", err)
+				continue
+			}
+			if err := cImg.Unpack(ctx, snapshotter); err != nil {
+				r.cfg.Log.Warn("failed to unpack imported image", "name", img.Name, "error", err)
+				continue
+			}
+			r.cfg.Log.Info("image imported and unpacked", "name", img.Name)
+		}
+	}
+
+	return nil
+}
+
 // PullImage ensures the runner image is available locally.
 // Serialized with a mutex to avoid concurrent pulls contending on
 // the content store (which produces noisy lock errors).
@@ -193,13 +262,18 @@ func (r *Runtime) PullImage(ctx context.Context, ref string) error {
 	// experimental erofs snapshotter on some Linux kernels, which then
 	// fails image unpack with "snapshotter not loaded: erofs: invalid argument".
 	snapshotter := "overlayfs"
+	pullOpts := []client.RemoteOpt{
+		client.WithPullUnpack,
+	}
 	if goruntime.GOOS == "windows" {
 		snapshotter = "windows"
+		// Windows container images are multi-platform manifests. Without an
+		// explicit platform filter, containerd may attempt to resolve the
+		// wrong OS version or download all variants, causing the pull to hang.
+		pullOpts = append(pullOpts, client.WithPlatform("windows/amd64"))
 	}
-	_, err := r.client.Pull(ctx, ref,
-		client.WithPullUnpack,
-		client.WithPullSnapshotter(snapshotter),
-	)
+	pullOpts = append(pullOpts, client.WithPullSnapshotter(snapshotter))
+	_, err := r.client.Pull(ctx, ref, pullOpts...)
 	if err != nil {
 		return fmt.Errorf("pulling image %s: %w", ref, err)
 	}
@@ -667,12 +741,13 @@ func buildResolvConf() string {
 // Hyper-V Default Switch gateway at 172.20.x.1) are reachable because
 // containers route through the VM which NATs to the host network.
 func isRoutableDNS(ip string) bool {
-	parts := strings.Split(ip, ".")
-	if len(parts) != 4 {
-		return true
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return true // non-IP strings pass through
 	}
-	switch parts[0] {
-	case "127", "169":
+	// Block loopback, link-local, and RFC1918 private ranges.
+	// Containers should only use public DNS servers.
+	if parsed.IsLoopback() || parsed.IsLinkLocalUnicast() || parsed.IsPrivate() {
 		return false
 	}
 	return true

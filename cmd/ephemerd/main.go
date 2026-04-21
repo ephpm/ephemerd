@@ -396,6 +396,7 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		RunnerDir:        rm.Dir(),
 		RunnerMount:      rm.ContainerDir(),
 		DefaultImage:     cfg.Runner.DefaultImage,
+		ImagesDir:        joinPath(configDir, "images"),
 		LogDir:           joinPath(configDir, "logs"),
 		DataDir:          configDir,
 		ContainerDataDir: containerDataDir,
@@ -409,6 +410,12 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	}
 	if err := rt.CleanOrphans(ctx); err != nil {
 		log.Warn("failed to clean orphan containers", "error", err)
+	}
+
+	// Import any pre-downloaded OCI image tarballs from <data-dir>/images/.
+	// This avoids slow pulls for large images like Windows Server Core.
+	if err := rt.ImportImages(ctx); err != nil {
+		log.Warn("failed to import pre-downloaded images", "error", err)
 	}
 
 	// Create artifact extractor for macOS VM jobs.

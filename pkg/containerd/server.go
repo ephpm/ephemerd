@@ -153,6 +153,8 @@ func (s *Server) start() error {
 		State:   stateDir,
 	}
 	cfg.GRPC.Address = socket
+	cfg.GRPC.MaxRecvMsgSize = 16 << 20 // 16 MB — match containerd client defaults
+	cfg.GRPC.MaxSendMsgSize = 16 << 20
 	cfg.TTRPC.Address = socket + ".ttrpc"
 
 	// On Windows, fix containerd's logrus output for PowerShell.
