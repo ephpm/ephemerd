@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -245,7 +246,18 @@ func ImportImagesTo(ctx context.Context, c *client.Client, paths []string, snaps
 }
 
 // importTarball imports a single OCI tarball into a containerd client and unpacks it.
+// Skips tarballs whose images are already present in containerd.
 func importTarball(ctx context.Context, c *client.Client, path, snapshotter string, log *slog.Logger) error {
+	// Check if the image in this tarball already exists in containerd.
+	// Read the tag from the tarball manifest without importing it.
+	ref, err := tarballImageRef(path)
+	if err == nil && ref != "" {
+		if _, getErr := c.GetImage(ctx, ref); getErr == nil {
+			log.Info("image already present, skipping import", "name", ref, "path", path)
+			return nil
+		}
+	}
+
 	log.Info("importing image from tarball", "path", path)
 
 	f, err := os.Open(path)
@@ -294,6 +306,21 @@ func tarballImageOS(path string) (string, error) {
 		return "", fmt.Errorf("no OS in image config for %s", path)
 	}
 	return cfg.OS, nil
+}
+
+// tarballImageRef reads the image reference (repo tag) from a Docker-format
+// tarball's manifest.json. Returns empty string if untagged or unreadable.
+func tarballImageRef(path string) (string, error) {
+	opener := func() (io.ReadCloser, error) { return os.Open(path) }
+
+	manifest, err := craneTarball.LoadManifest(opener)
+	if err != nil {
+		return "", err
+	}
+	if len(manifest) > 0 && len(manifest[0].RepoTags) > 0 {
+		return manifest[0].RepoTags[0], nil
+	}
+	return "", nil
 }
 
 // PullImage ensures the runner image is available locally.
