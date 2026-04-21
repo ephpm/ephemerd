@@ -413,18 +413,25 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	}
 
 	// Import any pre-downloaded OCI image tarballs from <data-dir>/images/.
-	// This avoids slow pulls for large images like Windows Server Core.
-	if err := rt.ImportImages(ctx); err != nil {
-		log.Warn("failed to import pre-downloaded images", "error", err)
+	// Native-platform images are imported immediately. Cross-platform images
+	// (e.g. Linux tarballs on a Windows host) are deferred until the VM is ready.
+	deferredImages, importErr := rt.ImportImages(ctx)
+	if importErr != nil {
+		log.Warn("failed to import pre-downloaded images", "error", importErr)
 	}
 
 	// Create artifact extractor for macOS VM jobs.
 	artifactExtractor := artifacts.NewExtractor(ctrdClient, log)
 
-	// Wait for Linux dispatch client if WSL VM is booting in the background.
-	linuxDispatcher := waitDispatch()
+	// Wait for Linux dispatch client if the VM is booting in the background.
+	linuxDispatcher, vmClient := waitDispatch()
 	if linuxDispatcher != nil {
-		log.Info("Linux job dispatch enabled via WSL")
+		log.Info("Linux job dispatch enabled")
+	}
+
+	// Import deferred Linux images into the VM's containerd now that it's ready.
+	if len(deferredImages) > 0 && vmClient != nil {
+		runtime.ImportImagesTo(ctx, vmClient, deferredImages, "overlayfs", log)
 	}
 
 	// Set up webhook tunnel (GitHub mode only)

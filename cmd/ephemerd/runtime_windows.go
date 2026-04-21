@@ -18,7 +18,7 @@ import (
 // Returns the native containerd client for Windows jobs and a function that
 // blocks until the Linux dispatch client is ready (nil if Linux VM is disabled
 // or failed to start).
-func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool, _ uint32, _ string, dindEnabled bool) (*client.Client, func() *scheduler.DispatchClient, func(), error) {
+func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool, _ uint32, _ string, dindEnabled bool) (*client.Client, func() (*scheduler.DispatchClient, *client.Client), func(), error) {
 	// Start native containerd for Windows container jobs
 	ctrd, err := containerd.New(containerd.Config{
 		DataDir: dataDir,
@@ -31,7 +31,7 @@ func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool
 	cleanup := func() { ctrd.Stop() }
 
 	if !linuxVMEnabled {
-		return ctrd.Client(), func() *scheduler.DispatchClient { return nil }, cleanup, nil
+		return ctrd.Client(), func() (*scheduler.DispatchClient, *client.Client) { return nil, nil }, cleanup, nil
 	}
 
 	// Boot the Linux VM in the background so we don't block Windows jobs.
@@ -69,10 +69,15 @@ func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool
 		log.Info("Linux VM ready — Linux jobs dispatched via gRPC")
 	}()
 
-	// waitDispatch blocks until the VM boot completes and returns the dispatch client.
-	waitDispatch := func() *scheduler.DispatchClient {
+	// waitDispatch blocks until the VM boot completes and returns the dispatch
+	// client and the VM's containerd client (for importing deferred images).
+	waitDispatch := func() (*scheduler.DispatchClient, *client.Client) {
 		<-linuxVMDone
-		return dispatchClient
+		var vmClient *client.Client
+		if linuxVM != nil {
+			vmClient = linuxVM.Client()
+		}
+		return dispatchClient, vmClient
 	}
 
 	cleanup = func() {

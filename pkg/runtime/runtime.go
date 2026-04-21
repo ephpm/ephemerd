@@ -20,6 +20,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/ephpm/ephemerd/pkg/dind"
 	"github.com/ephpm/ephemerd/pkg/networking"
+	craneTarball "github.com/google/go-containerregistry/pkg/v1/tarball"
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -175,30 +176,35 @@ func (r *Runtime) CleanOrphans(ctx context.Context) error {
 	})
 }
 
-// ImportImages loads any pre-downloaded OCI image tarballs from the images
-// directory into containerd's content store. Images already present are
-// skipped. After import, each image is unpacked to the appropriate
-// snapshotter so it's ready to use immediately.
-func (r *Runtime) ImportImages(ctx context.Context) error {
+// ImportImages loads pre-downloaded OCI image tarballs from the images directory.
+// Each tarball is inspected for its target OS. Images matching the host OS are
+// imported into the host containerd and unpacked immediately. Images targeting a
+// different OS (e.g. Linux images on a Windows host) are returned as deferred
+// paths — the caller should import them into the appropriate VM's containerd
+// after the VM is ready using ImportImagesTo.
+//
+// On Linux, all images are imported directly (no deferral).
+func (r *Runtime) ImportImages(ctx context.Context) (deferred []string, err error) {
 	dir := r.cfg.ImagesDir
 	if dir == "" {
-		return nil
+		return nil, nil
 	}
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return nil, nil
 		}
-		return fmt.Errorf("reading images dir %s: %w", dir, err)
+		return nil, fmt.Errorf("reading images dir %s: %w", dir, err)
+	}
+
+	hostOS := goruntime.GOOS
+	snapshotter := "overlayfs"
+	if hostOS == "windows" {
+		snapshotter = "windows"
 	}
 
 	ctx = namespaces.WithNamespace(ctx, namespace)
-
-	snapshotter := "overlayfs"
-	if goruntime.GOOS == "windows" {
-		snapshotter = "windows"
-	}
 
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".tar") {
@@ -206,40 +212,88 @@ func (r *Runtime) ImportImages(ctx context.Context) error {
 		}
 
 		path := filepath.Join(dir, entry.Name())
-		r.cfg.Log.Info("importing image from tarball", "path", path)
 
-		f, err := os.Open(path)
+		// Inspect the tarball to determine the image's target OS.
+		imageOS, err := tarballImageOS(path)
 		if err != nil {
-			r.cfg.Log.Warn("failed to open image tarball", "path", path, "error", err)
+			r.cfg.Log.Warn("could not detect image OS, importing to host", "path", path, "error", err)
+			// Fall through and try to import — worst case it fails to unpack.
+		} else if imageOS != hostOS {
+			r.cfg.Log.Info("deferring image for VM import", "path", path, "imageOS", imageOS, "hostOS", hostOS)
+			deferred = append(deferred, path)
 			continue
 		}
 
-		imgs, err := r.client.Import(ctx, f)
-		if closeErr := f.Close(); closeErr != nil {
-			r.cfg.Log.Warn("error closing image tarball", "path", path, "error", closeErr)
-		}
-		if err != nil {
-			r.cfg.Log.Warn("failed to import image tarball", "path", path, "error", err)
-			continue
-		}
-
-		for _, img := range imgs {
-			r.cfg.Log.Info("imported image, unpacking", "name", img.Name, "snapshotter", snapshotter)
-
-			cImg, err := r.client.GetImage(ctx, img.Name)
-			if err != nil {
-				r.cfg.Log.Warn("failed to get imported image for unpack", "name", img.Name, "error", err)
-				continue
-			}
-			if err := cImg.Unpack(ctx, snapshotter); err != nil {
-				r.cfg.Log.Warn("failed to unpack imported image", "name", img.Name, "error", err)
-				continue
-			}
-			r.cfg.Log.Info("image imported and unpacked", "name", img.Name)
+		if importErr := importTarball(ctx, r.client, path, snapshotter, r.cfg.Log); importErr != nil {
+			r.cfg.Log.Warn("failed to import image", "path", path, "error", importErr)
 		}
 	}
 
+	return deferred, nil
+}
+
+// ImportImagesTo imports a list of OCI image tarballs into the given containerd
+// client. Used to import deferred Linux images into a VM's containerd after the
+// VM is ready.
+func ImportImagesTo(ctx context.Context, c *client.Client, paths []string, snapshotter string, log *slog.Logger) {
+	ctx = namespaces.WithNamespace(ctx, namespace)
+	for _, path := range paths {
+		if err := importTarball(ctx, c, path, snapshotter, log); err != nil {
+			log.Warn("failed to import image to VM", "path", path, "error", err)
+		}
+	}
+}
+
+// importTarball imports a single OCI tarball into a containerd client and unpacks it.
+func importTarball(ctx context.Context, c *client.Client, path, snapshotter string, log *slog.Logger) error {
+	log.Info("importing image from tarball", "path", path)
+
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("opening %s: %w", path, err)
+	}
+
+	imgs, err := c.Import(ctx, f)
+	if closeErr := f.Close(); closeErr != nil {
+		log.Warn("error closing image tarball", "path", path, "error", closeErr)
+	}
+	if err != nil {
+		return fmt.Errorf("importing %s: %w", path, err)
+	}
+
+	for _, img := range imgs {
+		log.Info("imported image, unpacking", "name", img.Name, "snapshotter", snapshotter)
+
+		cImg, err := c.GetImage(ctx, img.Name)
+		if err != nil {
+			log.Warn("failed to get imported image for unpack", "name", img.Name, "error", err)
+			continue
+		}
+		if err := cImg.Unpack(ctx, snapshotter); err != nil {
+			log.Warn("failed to unpack imported image", "name", img.Name, "error", err)
+			continue
+		}
+		log.Info("image imported and unpacked", "name", img.Name)
+	}
 	return nil
+}
+
+// tarballImageOS reads an OCI/Docker image tarball and returns the OS of the
+// first image found (e.g. "linux", "windows"). Uses go-containerregistry to
+// parse the tarball metadata without extracting it.
+func tarballImageOS(path string) (string, error) {
+	img, err := craneTarball.ImageFromPath(path, nil)
+	if err != nil {
+		return "", fmt.Errorf("reading tarball %s: %w", path, err)
+	}
+	cfg, err := img.ConfigFile()
+	if err != nil {
+		return "", fmt.Errorf("reading config from %s: %w", path, err)
+	}
+	if cfg.OS == "" {
+		return "", fmt.Errorf("no OS in image config for %s", path)
+	}
+	return cfg.OS, nil
 }
 
 // PullImage ensures the runner image is available locally.
