@@ -87,6 +87,9 @@ func StartLinuxVM(cfg LinuxVMConfig) (LinuxVM, error) {
 		return nil, fmt.Errorf("extracting VM assets: %w", err)
 	}
 
+	if err := l.ensureRootVHDX(); err != nil {
+		return nil, fmt.Errorf("creating root VHDX: %w", err)
+	}
 
 	if err := l.createAndBootVM(); err != nil {
 		l.Stop()
@@ -162,8 +165,8 @@ func (l *hypervLinuxVM) Stop() {
 		}
 	}
 
-	// Do NOT delete root VHDX -- it persists across restarts for cached images.
-	// Do NOT delete assets VHDX -- it is recreated only when assets change.
+	// Do NOT delete root VHDX at <data-dir>/containerd/linux-root/root.vhdx —
+	// it persists across restarts so containerd images survive reboots.
 
 	l.cfg.Log.Info("Linux VM stopped (Hyper-V)", "name", l.vmName)
 }
@@ -265,6 +268,47 @@ func (l *hypervLinuxVM) extractAssets() error {
 	return nil
 }
 
+// rootVHDXPath returns the path to the persistent VHDX that stores containerd's
+// content store across VM restarts. Without this, every restart re-imports all
+// images since the VM boots from tmpfs.
+func (l *hypervLinuxVM) rootVHDXPath() string {
+	return filepath.Join(l.cfg.DataDir, "containerd", "linux-root", "root.vhdx")
+}
+
+// ensureRootVHDX creates a sparse VHDX for the Linux VM's containerd root if
+// it doesn't already exist. The VHDX persists across VM restarts so pulled and
+// imported images survive reboots.
+func (l *hypervLinuxVM) ensureRootVHDX() error {
+	vhdxPath := l.rootVHDXPath()
+
+	if _, err := os.Stat(vhdxPath); err == nil {
+		l.cfg.Log.Info("root VHDX already exists", "path", vhdxPath)
+		return nil
+	}
+
+	dir := filepath.Dir(vhdxPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("creating directory %s: %w", dir, err)
+	}
+
+	sizeGB := l.cfg.DiskSizeGB
+	if sizeGB == 0 {
+		sizeGB = 50
+	}
+
+	l.cfg.Log.Info("creating root VHDX for Linux VM containerd", "path", vhdxPath, "size_gb", sizeGB)
+
+	// Use PowerShell's New-VHD to create a sparse (dynamic) VHDX.
+	sizeBytes := uint64(sizeGB) * 1024 * 1024 * 1024
+	cmd := exec.Command("powershell", "-NoProfile", "-Command",
+		fmt.Sprintf("New-VHD -Path '%s' -SizeBytes %d -Dynamic | Out-Null", vhdxPath, sizeBytes))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("New-VHD failed: %w\noutput: %s", err, string(out))
+	}
+
+	return nil
+}
+
 // sha256Bytes returns the hex-encoded SHA-256 hash of data.
 func sha256Bytes(data []byte) string {
 	h := sha256.Sum256(data)
@@ -321,7 +365,7 @@ func (l *hypervLinuxVM) createAndBootVM() error {
 	// - 8250_core: enable serial UART for console output via named pipe
 	// - ephemerd.*: custom params parsed by our init script
 	cmdline := fmt.Sprintf(
-		"rdinit=/init ephemerd.containerd_port=%d "+
+		"rdinit=/init ephemerd.containerd_port=%d ephemerd.root_disk=/dev/sda "+
 			"pci=off brd.rd_nr=0 pmtmr=0 nr_cpus=%d "+
 			"8250_core.nr_uarts=1 8250_core.skip_txen_test=1 console=ttyS0,115200",
 		l.cfg.ContainerdPort, l.cfg.CPUs,
@@ -355,7 +399,15 @@ func (l *hypervLinuxVM) createAndBootVM() error {
 			Devices: &hcsDevices{
 				Scsi: map[string]hcsScsi{
 					scsiControllerGUIDs[0]: {
-						Attachments: map[string]hcsAttachment{},
+						Attachments: map[string]hcsAttachment{
+							// LUN 0: persistent VHDX for containerd root
+							// (images, snapshots). Mounted at /var/lib/ephemerd/containerd/root
+							// by the init script. Survives VM restarts.
+							"0": {
+								Type_: "VirtualDisk",
+								Path:  l.rootVHDXPath(),
+							},
+						},
 					},
 				},
 				NetworkAdapters: map[string]hcsNetworkAdapter{

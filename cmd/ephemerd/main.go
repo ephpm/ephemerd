@@ -412,26 +412,34 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		log.Warn("failed to clean orphan containers", "error", err)
 	}
 
-	// Import any pre-downloaded OCI image tarballs from <data-dir>/images/.
-	// Native-platform images are imported immediately. Cross-platform images
-	// (e.g. Linux tarballs on a Windows host) are deferred until the VM is ready.
-	deferredImages, importErr := rt.ImportImages(ctx)
-	if importErr != nil {
-		log.Warn("failed to import pre-downloaded images", "error", importErr)
-	}
+	// Import pre-downloaded OCI image tarballs in the background so the
+	// scheduler starts immediately. Large images like servercore take
+	// minutes to unpack — jobs that don't need the imported image can
+	// proceed in the meantime.
+	go func() {
+		deferredImages, importErr := rt.ImportImages(ctx)
+		if importErr != nil {
+			log.Warn("failed to import pre-downloaded images", "error", importErr)
+		}
+
+		// Import deferred Linux images into the VM's containerd.
+		// waitDispatch blocks until the VM is ready, which may already
+		// be done by the time we get here.
+		if len(deferredImages) > 0 {
+			_, vmClient := waitDispatch()
+			if vmClient != nil {
+				runtime.ImportImagesTo(ctx, vmClient, deferredImages, "overlayfs", log)
+			}
+		}
+	}()
 
 	// Create artifact extractor for macOS VM jobs.
 	artifactExtractor := artifacts.NewExtractor(ctrdClient, log)
 
 	// Wait for Linux dispatch client if the VM is booting in the background.
-	linuxDispatcher, vmClient := waitDispatch()
+	linuxDispatcher, _ := waitDispatch()
 	if linuxDispatcher != nil {
 		log.Info("Linux job dispatch enabled")
-	}
-
-	// Import deferred Linux images into the VM's containerd now that it's ready.
-	if len(deferredImages) > 0 && vmClient != nil {
-		runtime.ImportImagesTo(ctx, vmClient, deferredImages, "overlayfs", log)
 	}
 
 	// Set up webhook tunnel (GitHub mode only)

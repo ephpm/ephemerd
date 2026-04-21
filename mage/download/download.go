@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -57,6 +58,7 @@ func EnsurePlaceholders() error {
 		filepath.Join(vmEmbedDir, "vmlinuz"),
 		filepath.Join(vmEmbedDir, "initrd"),
 		filepath.Join(vmEmbedDir, "ephemerd-rootfs-placeholder.tar.gz"),
+		filepath.Join(shimEmbedDir, "containerd-shim-runhcs-v1.exe"),
 	}
 	for _, p := range placeholders {
 		if fileExists(p) {
@@ -166,6 +168,31 @@ func Shimlinuxarm64() error {
 		return err
 	}
 	return downloadRuncForArch("arm64")
+}
+
+// Shimwindows builds containerd-shim-runhcs-v1.exe from the hcsshim module.
+// This is the Windows container runtime shim that containerd needs to run
+// Windows containers (process-isolated or Hyper-V isolated).
+func Shimwindows() error {
+	dest := filepath.Join(shimEmbedDir, "containerd-shim-runhcs-v1.exe")
+	if fileExists(dest) {
+		fmt.Printf("  %s already exists, skipping\n", dest)
+		return nil
+	}
+
+	if err := os.MkdirAll(shimEmbedDir, 0o755); err != nil {
+		return fmt.Errorf("creating shim embed dir: %w", err)
+	}
+
+	fmt.Println("  Building containerd-shim-runhcs-v1.exe from hcsshim module...")
+	cmd := exec.Command("go", "build", "-o", dest, "github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1")
+	cmd.Env = append(os.Environ(), "GOOS=windows", "GOARCH=amd64")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("building containerd-shim-runhcs-v1: %w", err)
+	}
+	return nil
 }
 
 // apkPkg describes a package to pre-install in the rootfs.
@@ -1304,12 +1331,14 @@ sleep 1
 
 # Parse kernel command line
 CONTAINERD_PORT="10000"
+ROOT_DISK=""
 for param in $(cat /proc/cmdline); do
     case "$param" in
         ephemerd.containerd_port=*) CONTAINERD_PORT="${param#*=}" ;;
+        ephemerd.root_disk=*) ROOT_DISK="${param#*=}" ;;
     esac
 done
-echo "ephemerd-init: containerd_port=$CONTAINERD_PORT"
+echo "ephemerd-init: containerd_port=$CONTAINERD_PORT root_disk=$ROOT_DISK"
 
 # Network: eth0 via hv_netvsc (built-in), DHCP from Default Switch
 NET_IF=""
@@ -1387,6 +1416,22 @@ mount --move /dev  /newroot/dev
 mkdir -p /newroot/sys/fs/cgroup
 mount -t cgroup2 none /newroot/sys/fs/cgroup || \
     echo "ephemerd-init: WARNING: cgroup2 mount failed"
+
+# Mount persistent VHDX for containerd root (image store, snapshots).
+# The VHDX persists across VM restarts so pulled images survive reboots.
+if [ -n "$ROOT_DISK" ] && [ -b "$ROOT_DISK" ]; then
+    CTRD_ROOT="/newroot/var/lib/ephemerd/containerd/root"
+    mkdir -p "$CTRD_ROOT"
+
+    # Format on first boot — blkid returns non-zero if no filesystem found.
+    if ! /sbin/blkid "$ROOT_DISK" >/dev/null 2>&1; then
+        echo "ephemerd-init: formatting $ROOT_DISK (first boot)"
+        /sbin/mkfs.ext4 -q -L ephemerd-root "$ROOT_DISK"
+    fi
+
+    echo "ephemerd-init: mounting $ROOT_DISK at $CTRD_ROOT"
+    mount -t ext4 "$ROOT_DISK" "$CTRD_ROOT"
+fi
 
 export PATH=/usr/bin:/usr/sbin:/bin:/sbin
 export HOME=/root
