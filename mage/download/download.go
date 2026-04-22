@@ -529,6 +529,12 @@ var initrdKernelModulesX86 = []string{
 	"kernel/drivers/net/veth.ko.gz",
 	// Hyper-V utilities for time sync (TimeSync IC)
 	"kernel/drivers/hv/hv_utils.ko.gz",
+	// Hyper-V synthetic SCSI storage driver + SCSI disk. Required so the
+	// attached VHDX shows up as /dev/sda. Not builtin in Alpine's linux-virt;
+	// transitive deps (scsi_mod, scsi_common, etc.) are pulled in by
+	// modules.dep resolution.
+	"kernel/drivers/scsi/hv_storvsc.ko.gz",
+	"kernel/drivers/scsi/sd_mod.ko.gz",
 }
 
 // Kernelx86 downloads the Alpine linux-virt kernel for x86_64 and extracts
@@ -860,9 +866,10 @@ func buildInitrd(dest string, pkgData [][]byte, moduleFiles map[string][]byte, l
 		"bin/ln", "bin/grep", "bin/sed", "bin/tar", "bin/gzip", "bin/gunzip",
 		"bin/head", "bin/tail", "bin/wc", "bin/find", "bin/stat", "bin/chmod",
 		"bin/test", "bin/true", "bin/false", "bin/date", "bin/dmesg",
-		"bin/ip", "bin/ping", "bin/hostname",
+		"bin/ip", "bin/ping", "bin/hostname", "bin/dd",
 		"sbin/switch_root", "sbin/modprobe", "sbin/mdev", "sbin/insmod",
 		"sbin/udhcpc", "sbin/ifconfig", "sbin/route",
+		"sbin/mkswap", "sbin/swapon", "sbin/swapoff",
 	} {
 		if !seen[applet] {
 			dir := applet[:strings.LastIndex(applet, "/")]
@@ -1235,9 +1242,10 @@ func buildInitrdX86(dest string, pkgData [][]byte, moduleFiles map[string][]byte
 		"bin/ln", "bin/grep", "bin/sed", "bin/tar", "bin/gzip", "bin/gunzip",
 		"bin/head", "bin/tail", "bin/wc", "bin/find", "bin/stat", "bin/chmod",
 		"bin/test", "bin/true", "bin/false", "bin/date", "bin/dmesg",
-		"bin/ip", "bin/ping", "bin/hostname",
+		"bin/ip", "bin/ping", "bin/hostname", "bin/dd",
 		"sbin/switch_root", "sbin/modprobe", "sbin/mdev", "sbin/insmod",
 		"sbin/udhcpc", "sbin/ifconfig", "sbin/route",
+		"sbin/mkswap", "sbin/swapon", "sbin/swapoff",
 	} {
 		if !seen[applet] {
 			dir := applet[:strings.LastIndex(applet, "/")]
@@ -1303,20 +1311,21 @@ func buildInitrdX86(dest string, pkgData [][]byte, moduleFiles map[string][]byte
 	})
 	fmt.Printf("  Bundling ephemerd-linux in initrd (%d bytes)\n", len(ephemerdData))
 
-	// Hyper-V init script. All assets bundled in initrd at /assets/ —
-	// no disk attachments needed. Runs from tmpfs.
+	// Hyper-V init script. On first boot, mkfs.ext4 on the single SCSI disk,
+	// extract the bundled Alpine rootfs + ephemerd-linux onto it, and create a
+	// 4 GiB swapfile. On subsequent boots, just mount + swapon. The entire OS
+	// runs from disk (ext4 on VHDX), not tmpfs, so a 4 GiB VM can unpack
+	// multi-GB OCI images without OOMing.
 	initScript := `#!/bin/sh
-# ephemerd initrd init script (Hyper-V)
-# Loads kernel modules, mounts SCSI root disk, mounts FAT32 assets disk,
-# and exec's ephemerd-linux as PID 1.
+# ephemerd initrd init script (Hyper-V, disk-backed root + swap)
 
 mount -t proc     none /proc
 mount -t sysfs    none /sys
 mount -t devtmpfs none /dev
 
-# Load kernel modules. Hyper-V synthetic drivers (hv_vmbus, hv_storvsc,
-# hv_netvsc) are built into the linux-virt kernel — no insmod needed.
-# We load filesystem + netfilter modules only.
+# Load kernel modules. hv_vmbus and hv_netvsc are built into the linux-virt
+# kernel, but hv_storvsc (and sd_mod) are shipped as modules and must be
+# insmod'd here for /dev/sda to appear. Also load filesystem + netfilter.
 echo "ephemerd-init: loading kernel modules"
 for mod in __MODULE_LOAD_ORDER__; do
     if [ -f /modules/${mod}.ko.gz ]; then
@@ -1374,35 +1383,93 @@ else
     echo "ephemerd-init: WARNING: no network interface found"
 fi
 
-# Mount tmpfs root and populate from 9P host share.
-# The host shares <DataDir>/vm/linux/ via Plan9 as tag "ephemerd".
-echo "ephemerd-init: mounting tmpfs root"
-mount -t tmpfs -o size=4G tmpfs /newroot
+# Root filesystem lives on the attached SCSI disk. tmpfs root was rejected
+# because a CI runner unpacking multi-GB OCI images OOMs a memory-capped VM.
+# Everything under / (Alpine userspace, ephemerd-linux, containerd state, job
+# scratch) is on the VHDX; a 4 GiB swapfile absorbs transient memory pressure.
+if [ -z "$ROOT_DISK" ]; then
+    echo "ephemerd-init: FATAL: ephemerd.root_disk not set on kernel cmdline"
+    exec /bin/sh
+fi
 
-mkdir -p /mnt/host
-if mount -t 9p -o trans=virtio,version=9p2000.L ephemerd /mnt/host 2>/dev/null; then
-    echo "ephemerd-init: 9P share mounted, extracting rootfs"
-    tar xzf /mnt/host/rootfs.tar.gz -C /newroot
-    cp /mnt/host/ephemerd-linux /newroot/usr/local/bin/ephemerd-linux
-    chmod 755 /newroot/usr/local/bin/ephemerd-linux
-    umount /mnt/host
-elif [ -f /assets/rootfs.tar.gz ]; then
-    # Fallback: use bundled assets from fat initrd
-    echo "ephemerd-init: 9P unavailable, using initrd assets"
+# hv_storvsc is built into linux-virt but SCSI enumeration can trail the end of
+# module loading by seconds. Wait up to 15s for the device to appear before
+# giving up. Busybox sleep only takes integer seconds.
+i=0
+while [ ! -b "$ROOT_DISK" ] && [ $i -lt 15 ]; do
+    sleep 1
+    i=$((i + 1))
+done
+if [ ! -b "$ROOT_DISK" ]; then
+    echo "ephemerd-init: FATAL: root disk $ROOT_DISK did not appear after 15s"
+    ls -la /dev/sd* 2>/dev/null || echo "  no /dev/sd* devices present"
+    exec /bin/sh
+fi
+echo "ephemerd-init: root disk $ROOT_DISK ready after ${i}s"
+
+NEED_POPULATE=0
+if ! /sbin/blkid "$ROOT_DISK" >/dev/null 2>&1; then
+    # Unformatted disk — first boot.
+    echo "ephemerd-init: formatting $ROOT_DISK (first boot)"
+    /sbin/mkfs.ext4 -q -L ephemerd-root -F "$ROOT_DISK" || {
+        echo "ephemerd-init: FATAL: mkfs.ext4 failed"
+        exec /bin/sh
+    }
+    NEED_POPULATE=1
+fi
+
+echo "ephemerd-init: mounting $ROOT_DISK at /newroot"
+if ! mount -t ext4 -o noatime "$ROOT_DISK" /newroot; then
+    echo "ephemerd-init: FATAL: mount $ROOT_DISK failed"
+    exec /bin/sh
+fi
+
+# If the disk had a filesystem but the ephemerd rootfs was never populated
+# (e.g. leftover from an older schema that only stored containerd data),
+# treat it as first-boot and repopulate. The ephemerd-linux binary's presence
+# is the marker for a valid rootfs.
+if [ ! -x /newroot/usr/local/bin/ephemerd-linux ]; then
+    NEED_POPULATE=1
+fi
+
+if [ "$NEED_POPULATE" = "1" ]; then
+    if [ ! -f /assets/rootfs.tar.gz ] || [ ! -f /assets/ephemerd-linux ]; then
+        echo "ephemerd-init: FATAL: bundled assets missing (/assets/rootfs.tar.gz, /assets/ephemerd-linux)"
+        exec /bin/sh
+    fi
+    echo "ephemerd-init: populating rootfs on $ROOT_DISK"
     tar xzf /assets/rootfs.tar.gz -C /newroot
+    mkdir -p /newroot/usr/local/bin
     cp /assets/ephemerd-linux /newroot/usr/local/bin/ephemerd-linux
     chmod 755 /newroot/usr/local/bin/ephemerd-linux
+
+    # Create a 4 GiB swapfile so a 4 GiB VM can survive image-unpack peaks.
+    # dd is a busybox applet and handles sparse allocation fine on ext4.
+    echo "ephemerd-init: creating 4 GiB swapfile"
+    dd if=/dev/zero of=/newroot/swapfile bs=1M count=4096 status=none || \
+        echo "ephemerd-init: WARNING: swapfile dd failed"
+    chmod 600 /newroot/swapfile
+    /sbin/mkswap /newroot/swapfile >/dev/null 2>&1 || \
+        busybox mkswap /newroot/swapfile >/dev/null 2>&1 || \
+        echo "ephemerd-init: WARNING: mkswap failed"
 else
-    echo "ephemerd-init: FATAL: no rootfs source available"
-    exec /bin/sh
+    echo "ephemerd-init: existing ephemerd rootfs on $ROOT_DISK"
+fi
+
+# Activate swap every boot (no-op if unavailable).
+if [ -f /newroot/swapfile ]; then
+    /sbin/swapon /newroot/swapfile 2>/dev/null || \
+        busybox swapon /newroot/swapfile 2>/dev/null || \
+        echo "ephemerd-init: WARNING: swapon failed"
 fi
 
 # Enable IP forwarding so containers can route through the VM to the internet.
 # This is a kernel-level setting that persists across switch_root.
 echo 1 > /proc/sys/net/ipv4/ip_forward
 
-# Set up newroot
-mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/tmp /newroot/var/lib/ephemerd /newroot/etc
+# Ensure the mount points the switch_root target expects.
+mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/tmp \
+         /newroot/var/lib/ephemerd/containerd/root /newroot/etc
 
 # DNS config — gateway is the DNS resolver on Default Switch
 if [ -n "$GW" ]; then
@@ -1416,22 +1483,6 @@ mount --move /dev  /newroot/dev
 mkdir -p /newroot/sys/fs/cgroup
 mount -t cgroup2 none /newroot/sys/fs/cgroup || \
     echo "ephemerd-init: WARNING: cgroup2 mount failed"
-
-# Mount persistent VHDX for containerd root (image store, snapshots).
-# The VHDX persists across VM restarts so pulled images survive reboots.
-if [ -n "$ROOT_DISK" ] && [ -b "$ROOT_DISK" ]; then
-    CTRD_ROOT="/newroot/var/lib/ephemerd/containerd/root"
-    mkdir -p "$CTRD_ROOT"
-
-    # Format on first boot — blkid returns non-zero if no filesystem found.
-    if ! /sbin/blkid "$ROOT_DISK" >/dev/null 2>&1; then
-        echo "ephemerd-init: formatting $ROOT_DISK (first boot)"
-        /sbin/mkfs.ext4 -q -L ephemerd-root "$ROOT_DISK"
-    fi
-
-    echo "ephemerd-init: mounting $ROOT_DISK at $CTRD_ROOT"
-    mount -t ext4 "$ROOT_DISK" "$CTRD_ROOT"
-fi
 
 export PATH=/usr/bin:/usr/sbin:/bin:/sbin
 export HOME=/root

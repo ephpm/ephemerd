@@ -31,7 +31,13 @@ func Build() error {
 // 1. Cross-compile static Linux binary with Linux assets embedded
 // 2. Build Windows binary embedding the Linux binary + Alpine rootfs + kernel + initrd
 func Windows() error {
-	mg.Deps(Linuxembed, download.Rootfs, download.Runnerwindows, download.Kernelx86, download.Initrdx86, download.Shimwindows)
+	// Phase 1: produce the inputs the initrd will bundle (ephemerd-linux binary
+	// and Alpine rootfs tarball), plus downloads that Initrdx86 doesn't touch.
+	mg.Deps(Linuxembed, download.Rootfs, download.Runnerwindows, download.Kernelx86, download.Shimwindows)
+	// Phase 2: build the initrd. Must run after Linuxembed + Rootfs — Initrdx86
+	// bundles pkg/vm/embed/ephemerd-linux and pkg/vm/embed/ephemerd-rootfs-*.tar.gz
+	// directly, and will fail on a fresh workspace if those aren't on disk yet.
+	mg.Deps(download.Initrdx86)
 
 	// Remove any Linux runner from embed dir to avoid bloating the Windows binary.
 	matches, _ := filepath.Glob("pkg/runner/embed/actions-runner-linux-*.tar.gz")

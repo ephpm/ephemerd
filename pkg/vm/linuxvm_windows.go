@@ -253,41 +253,83 @@ func (l *hypervLinuxVM) extractAssets() error {
 			return err
 		}
 
-		// Compare SHA-256 to avoid re-writing unchanged assets
+		// Compare SHA-256 to avoid re-writing unchanged assets. Even when the
+		// bytes match, we still re-apply the VM-worker ACL grant below —
+		// without it, HcsStartComputeSystem fails with
+		// HCS_E_SYSTEM_ALREADY_STOPPED on the second start because the VM
+		// worker's virtual account can't read files created by the host user.
+		skip := false
 		if existingHash, err := fileSHA256Windows(a.dest); err == nil {
 			if existingHash == sha256Bytes(data) {
-				continue
+				skip = true
 			}
 		}
 
-		l.cfg.Log.Info("extracting embedded asset", "src", src, "dest", a.dest, "size", len(data))
-		if err := os.WriteFile(a.dest, data, a.mode); err != nil {
-			return fmt.Errorf("writing %s: %w", a.dest, err)
+		if !skip {
+			l.cfg.Log.Info("extracting embedded asset", "src", src, "dest", a.dest, "size", len(data))
+			if err := os.WriteFile(a.dest, data, a.mode); err != nil {
+				return fmt.Errorf("writing %s: %w", a.dest, err)
+			}
+		}
+
+		// Grant the Hyper-V VM worker virtual account read access to the
+		// kernel/initrd/rootfs files. Required every boot — a file written by
+		// the current user only inherits ACEs for that user, so the VM worker
+		// cannot open it without an explicit grant.
+		if err := grantVmFileAccess(a.dest); err != nil {
+			return fmt.Errorf("granting VM access to %s: %w", a.dest, err)
 		}
 	}
 
 	return nil
 }
 
-// rootVHDXPath returns the path to the persistent VHDX that stores containerd's
-// content store across VM restarts. Without this, every restart re-imports all
-// images since the VM boots from tmpfs.
+// rootVHDXPath returns the path to the persistent VHDX that stores the entire
+// Linux VM root filesystem (Alpine userspace + ephemerd-linux + containerd
+// state + a 4 GiB swapfile). Survives VM restarts so pulled images don't need
+// to be re-imported and Alpine doesn't need to be re-extracted each boot.
 func (l *hypervLinuxVM) rootVHDXPath() string {
 	return filepath.Join(l.cfg.DataDir, "containerd", "linux-root", "root.vhdx")
 }
 
-// ensureRootVHDX creates a sparse VHDX for the Linux VM's containerd root if
-// it doesn't already exist. The VHDX persists across VM restarts so pulled and
-// imported images survive reboots. After creating (or if the file already
-// exists) we always re-run the VM-group ACL grant: the Hyper-V VM worker
-// opens the VHDX under a virtual account that needs explicit access, and
-// without it HcsStartComputeSystem returns HCS_E_SYSTEM_ALREADY_STOPPED.
+// vhdxSchemaPath returns the path to a small sidecar file that records the
+// disk layout version used to populate the VHDX. When the daemon's expected
+// schema version moves past what's on disk, we wipe the VHDX so the init
+// script can mkfs+populate from scratch.
+func (l *hypervLinuxVM) vhdxSchemaPath() string {
+	return filepath.Join(l.cfg.DataDir, "containerd", "linux-root", "root.vhdx.schema")
+}
+
+// rootVHDXSchemaVersion is the disk layout version the init script expects.
+// Bump when the on-disk format changes incompatibly (e.g. different swapfile
+// size, partitioned vs whole-disk, different mount points). Existing VHDXes
+// below this version are wiped on daemon startup.
+//
+//	v1 — original tmpfs-root design; VHDX held only containerd state
+//	v2 — disk-backed root + 4 GiB swapfile, ext4 on the whole disk
+const rootVHDXSchemaVersion = 2
+
+// ensureRootVHDX creates a sparse VHDX for the Linux VM's root filesystem if
+// it doesn't exist, or wipes it if the on-disk schema is older than what this
+// daemon expects. After either branch we always re-run the VM-group ACL grant:
+// the Hyper-V VM worker opens the VHDX under a virtual account that needs
+// explicit access, and without it HcsStartComputeSystem returns
+// HCS_E_SYSTEM_ALREADY_STOPPED.
 func (l *hypervLinuxVM) ensureRootVHDX() error {
 	vhdxPath := l.rootVHDXPath()
 
 	if _, err := os.Stat(vhdxPath); err == nil {
-		l.cfg.Log.Info("root VHDX already exists", "path", vhdxPath)
-		return grantVmFileAccess(vhdxPath)
+		if l.schemaMatches() {
+			l.cfg.Log.Info("root VHDX already exists", "path", vhdxPath)
+			return grantVmFileAccess(vhdxPath)
+		}
+		l.cfg.Log.Info("root VHDX has stale schema, recreating", "path", vhdxPath, "expected_version", rootVHDXSchemaVersion)
+		if err := os.Remove(vhdxPath); err != nil {
+			return fmt.Errorf("removing stale VHDX %s: %w", vhdxPath, err)
+		}
+		if err := os.Remove(l.vhdxSchemaPath()); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing stale VHDX schema file: %w", err)
+		}
 	}
 
 	dir := filepath.Dir(vhdxPath)
@@ -300,7 +342,7 @@ func (l *hypervLinuxVM) ensureRootVHDX() error {
 		sizeGB = 50
 	}
 
-	l.cfg.Log.Info("creating root VHDX for Linux VM containerd", "path", vhdxPath, "size_gb", sizeGB)
+	l.cfg.Log.Info("creating root VHDX for Linux VM", "path", vhdxPath, "size_gb", sizeGB, "schema", rootVHDXSchemaVersion)
 
 	// Use PowerShell's New-VHD to create a sparse (dynamic) VHDX.
 	sizeBytes := uint64(sizeGB) * 1024 * 1024 * 1024
@@ -310,7 +352,33 @@ func (l *hypervLinuxVM) ensureRootVHDX() error {
 		return fmt.Errorf("New-VHD failed: %w\noutput: %s", err, string(out))
 	}
 
+	if err := os.WriteFile(l.vhdxSchemaPath(), []byte(fmt.Sprintf("%d\n", rootVHDXSchemaVersion)), 0o644); err != nil {
+		return fmt.Errorf("writing VHDX schema marker: %w", err)
+	}
+
 	return grantVmFileAccess(vhdxPath)
+}
+
+// schemaMatches reports whether the sidecar schema marker equals the current
+// expected version. A missing marker counts as a stale schema so VHDXes
+// created by older daemons (before the marker existed) get reinitialized.
+func (l *hypervLinuxVM) schemaMatches() bool {
+	return readSchemaVersion(l.vhdxSchemaPath()) == rootVHDXSchemaVersion
+}
+
+// readSchemaVersion returns the integer version recorded in the VHDX schema
+// marker file, or 0 if the file is missing or unparseable. Extracted for
+// testability — schemaMatches composes over it.
+func readSchemaVersion(path string) int {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	var got int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &got); err != nil {
+		return 0
+	}
+	return got
 }
 
 // grantVmFileAccess grants the Hyper-V VM worker's virtual account read+write
@@ -422,9 +490,11 @@ func (l *hypervLinuxVM) createAndBootVM() error {
 				Scsi: map[string]hcsScsi{
 					scsiControllerGUIDs[0]: {
 						Attachments: map[string]hcsAttachment{
-							// LUN 0: persistent VHDX for containerd root
-							// (images, snapshots). Mounted at /var/lib/ephemerd/containerd/root
-							// by the init script. Survives VM restarts.
+							// LUN 0: persistent VHDX holding the entire Linux
+							// VM root filesystem — Alpine userspace,
+							// ephemerd-linux binary, containerd state, and a
+							// 4 GiB swapfile. Init script mounts it at
+							// /newroot and switch_roots into it.
 							"0": {
 								Type_: "VirtualDisk",
 								Path:  l.rootVHDXPath(),
@@ -476,7 +546,8 @@ func (l *hypervLinuxVM) createAndBootVM() error {
 
 	l.cfg.Log.Info("Hyper-V Linux VM started", "name", l.vmName)
 
-	// No disk hot-add needed — everything runs from the fat initrd (tmpfs).
+	// The SCSI disk is attached at VM creation; init script mkfs's on first
+	// boot, populates from the bundled initrd assets, and switch_roots into it.
 
 	// Read console output from the VM via named pipe and write to log file.
 	// This captures kernel boot messages and init script output.
