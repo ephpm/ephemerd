@@ -64,8 +64,9 @@ type Provider interface {
 
 	// FetchJobImage returns a custom container image for the job, if specified
 	// in the workflow/pipeline definition.
-	//   - GitHub/Forgejo/Gitea: fetches workflow YAML and reads EPHEMERD_IMAGE env var
-	//   - GitLab: reads the image: field from the job payload directly
+	//   - GitHub/Forgejo/Gitea: fetches workflow YAML and reads the job's
+	//     `container.image` field (mapping or string shorthand).
+	//   - GitLab: reads the image: field from the job payload directly.
 	// Returns empty string if none.
 	FetchJobImage(ctx context.Context, event *JobEvent) string
 

@@ -56,7 +56,7 @@ func baseURL() string { return "http://localhost:" + forgejoPort }
 //  4. Push a workflow to trigger a task
 //  5. Receive JobEvent on the events channel
 //  6. Verify ClaimJob returns correct env vars (including FORGEJO_TASK_UUID)
-//  7. Verify FetchJobImage extracts EPHEMERD_IMAGE from the task payload
+//  7. Verify FetchJobImage extracts container.image from the task payload
 func TestForgejo_E2E(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping forgejo e2e in short mode")
@@ -131,14 +131,14 @@ func TestForgejo_E2E(t *testing.T) {
 		fmt.Sprintf("/api/v1/repos/%s/%s/actions/runners", testOrg, testRepo))
 	t.Logf("[debug] runners: status=%d keys=%v body=%s", rStatus, keys(runnersResp), truncate(rBody, 500))
 
-	// Push a workflow with EPHEMERD_IMAGE set. Forgejo uses .forgejo/workflows/ path.
+	// Push a workflow with container.image set. Forgejo uses .forgejo/workflows/ path.
 	workflow := `name: e2e-test
 on: [push]
 jobs:
   hello:
     runs-on: ubuntu-latest
-    env:
-      EPHEMERD_IMAGE: custom/runner:e2e
+    container:
+      image: custom/runner:e2e
     steps:
       - run: echo hello from ephemerd forgejo e2e
 `

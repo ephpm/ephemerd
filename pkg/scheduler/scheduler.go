@@ -824,7 +824,7 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event github.JobEvent) {
 
 	log.Info("provisioning runner for job")
 
-	// Fetch the job's EPHEMERD_IMAGE env var (extra API call to read workflow YAML)
+	// Fetch the job's container image from the workflow YAML (extra API call)
 	image := s.cfg.GitHub.FetchJobImage(ctx, event.Repo, event.Job.GetRunID(), jobID)
 	if image != "" {
 		log.Info("using job-specified image", "image", image)

@@ -96,7 +96,7 @@ func TestReleaseJob_Noop(t *testing.T) {
 }
 
 func TestFetchJobImage_FromTask(t *testing.T) {
-	workflow := "name: CI\njobs:\n  build:\n    runs-on: ubuntu-latest\n    env:\n      EPHEMERD_IMAGE: custom/runner:v3\n"
+	workflow := "name: CI\njobs:\n  build:\n    runs-on: ubuntu-latest\n    container:\n      image: custom/runner:v3\n"
 	task := &forgerpc.Task{ID: 1, WorkflowPayload: base64.StdEncoding.EncodeToString([]byte(workflow))}
 	p := &Provider{}
 	if img := p.FetchJobImage(context.Background(), &providers.JobEvent{Raw: task}); img != "custom/runner:v3" {

@@ -400,7 +400,10 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		log.Warn("failed to clean orphan containers", "error", err)
 	}
 
-	// Create artifact extractor for macOS VM jobs.
+	// Create artifact extractor for macOS VM jobs. On macOS hosts, this
+	// lets a job's `container: { image: ... }` pull OCI images and extract
+	// their layers into the shared data directory (available inside macOS
+	// VMs via virtio-fs).
 	artifactExtractor := artifacts.NewExtractor(ctrdClient, log)
 
 	// Wait for Linux dispatch client if WSL VM is booting in the background.

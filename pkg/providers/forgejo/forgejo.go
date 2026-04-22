@@ -251,7 +251,7 @@ func (p *Provider) FetchJobImage(ctx context.Context, event *providers.JobEvent)
 	if !ok || task == nil {
 		return ""
 	}
-	return task.EphemerdImage()
+	return task.ContainerImage()
 }
 
 func (p *Provider) Stop(ctx context.Context) error {
