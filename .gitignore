@@ -15,5 +15,8 @@ pkg/vm/embed/ephemerd-rootfs-*
 pkg/vm/embed/vmlinuz
 pkg/vm/embed/initrd
 
+# --images-dir testing
+/images
+
 # JetBrains
 .idea/
