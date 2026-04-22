@@ -148,9 +148,42 @@ func (r *Runtime) CleanOrphans(ctx context.Context) error {
 		}
 	}
 
+	// Clean orphan per-job runner dir copies from `<data-dir>/runners/job-*`.
+	// These are ~200MB each and accumulate rapidly when container creation
+	// fails after copyDirForJob. No live job needs them at startup — any
+	// survivors belong to a previous ephemerd process.
+	if r.cfg.RunnerDir != "" {
+		runnersParent := filepath.Dir(r.cfg.RunnerDir)
+		entries, err := os.ReadDir(runnersParent)
+		if err == nil {
+			for _, e := range entries {
+				if !e.IsDir() || !strings.HasPrefix(e.Name(), "job-") {
+					continue
+				}
+				p := filepath.Join(runnersParent, e.Name())
+				r.cfg.Log.Info("removing orphan runner dir", "path", p)
+				if err := os.RemoveAll(p); err != nil {
+					r.cfg.Log.Warn("failed to remove orphan runner dir", "path", p, "error", err)
+				}
+			}
+		}
+		// On Windows only: grant the runners parent traverse-only access
+		// (no inheritance) so Hyper-V utility VMs can step into per-job
+		// subdirectories. Each per-job directory gets its own Modify ACE
+		// at Create() time so concurrent jobs stay isolated from each
+		// other's runner dirs.
+		if err := grantHyperVTraverse(runnersParent); err != nil {
+			r.cfg.Log.Warn("failed to grant Hyper-V traverse on runners parent", "path", runnersParent, "error", err)
+		}
+	}
+
 	// Clean orphan snapshots that no longer have a container pointing to them.
 	// This catches snapshots left behind when a container create partially failed.
-	snapshotter := r.client.SnapshotService("overlayfs")
+	ss := "overlayfs"
+	if goruntime.GOOS == "windows" {
+		ss = "windows"
+	}
+	snapshotter := r.client.SnapshotService(ss)
 	if snapshotter == nil {
 		return nil
 	}
@@ -332,25 +365,32 @@ func (r *Runtime) PullImage(ctx context.Context, ref string) error {
 
 	ctx = namespaces.WithNamespace(ctx, namespace)
 
-	// Check if another goroutine already pulled it while we waited
-	if _, err := r.client.GetImage(ctx, ref); err == nil {
-		return nil
+	// Check if another goroutine already pulled/imported it while we waited.
+	// Also verify the image is unpacked — the background import may have loaded
+	// the content but not yet finished unpacking to the snapshotter.
+	snapshotter := "overlayfs"
+	if goruntime.GOOS == "windows" {
+		snapshotter = "windows"
+	}
+	if img, err := r.client.GetImage(ctx, ref); err == nil {
+		if unpacked, _ := img.IsUnpacked(ctx, snapshotter); unpacked {
+			return nil
+		}
+		// Image exists but isn't unpacked yet — unpack it now.
+		r.cfg.Log.Info("image imported but not yet unpacked, unpacking", "ref", ref)
+		if err := img.Unpack(ctx, snapshotter); err != nil {
+			r.cfg.Log.Warn("unpack failed, will try full pull", "ref", ref, "error", err)
+		} else {
+			return nil
+		}
 	}
 
 	r.cfg.Log.Info("pulling image", "ref", ref)
 
-	// Force overlayfs snapshotter. containerd 2.2.2 may default to the
-	// experimental erofs snapshotter on some Linux kernels, which then
-	// fails image unpack with "snapshotter not loaded: erofs: invalid argument".
-	snapshotter := "overlayfs"
 	pullOpts := []client.RemoteOpt{
 		client.WithPullUnpack,
 	}
 	if goruntime.GOOS == "windows" {
-		snapshotter = "windows"
-		// Windows container images are multi-platform manifests. Without an
-		// explicit platform filter, containerd may attempt to resolve the
-		// wrong OS version or download all variants, causing the pull to hang.
 		pullOpts = append(pullOpts, client.WithPlatform("windows/amd64"))
 	}
 	pullOpts = append(pullOpts, client.WithPullSnapshotter(snapshotter))
@@ -406,7 +446,13 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 
 	r.cfg.Log.Info("creating runner environment", "id", id, "image", image, "custom", customImage)
 
-	// Get the image, pulling it if not present locally
+	// Get the image, pulling if needed. Also ensure it's unpacked — the
+	// background import goroutine may have loaded the content but not yet
+	// finished unpacking to the snapshotter.
+	ss := "overlayfs"
+	if goruntime.GOOS == "windows" {
+		ss = "windows"
+	}
 	img, err := r.client.GetImage(ctx, image)
 	if err != nil {
 		r.cfg.Log.Info("image not found locally, pulling", "image", image)
@@ -416,6 +462,15 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		img, err = r.client.GetImage(ctx, image)
 		if err != nil {
 			return nil, fmt.Errorf("getting image %s after pull: %w", image, err)
+		}
+	}
+
+	// Ensure the image is unpacked. The background import goroutine may have
+	// loaded content into the store but not finished unpacking to the snapshotter.
+	if unpacked, _ := img.IsUnpacked(ctx, ss); !unpacked {
+		r.cfg.Log.Info("image not yet unpacked, unpacking now", "image", image, "snapshotter", ss)
+		if err := img.Unpack(ctx, ss); err != nil {
+			return nil, fmt.Errorf("unpacking image %s: %w", image, err)
 		}
 	}
 
@@ -477,10 +532,30 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	// On Windows, always mount because there's no Windows GHA runner image.
 	needsRunnerMount := (customImage || goruntime.GOOS == "windows") && r.cfg.RunnerDir != "" && r.cfg.RunnerMount != ""
 	var jobRunnerDir string
+	// Per-job runner dir cleanup on error. On success, Destroy() removes it
+	// via env.RunnerDir; on failure, the function returns before building
+	// the RunnerEnv so we must clean up here or the ~200MB copy orphans on
+	// disk (observed: 70 GB accumulated across a few hundred failed jobs).
+	createSucceeded := false
+	defer func() {
+		if !createSucceeded && jobRunnerDir != "" {
+			if err := os.RemoveAll(jobRunnerDir); err != nil {
+				r.cfg.Log.Warn("failed to remove job runner dir on error", "path", jobRunnerDir, "error", err)
+			}
+		}
+	}()
 	if needsRunnerMount {
 		jobRunnerDir = filepath.Join(filepath.Dir(r.cfg.RunnerDir), "job-"+id)
 		if err := copyDirForJob(r.cfg.RunnerDir, jobRunnerDir); err != nil {
 			return nil, fmt.Errorf("copying runner dir for %s: %w", id, err)
+		}
+		// Hyper-V isolated containers on Windows mount this host directory
+		// into the utility VM via a VSMB share. The parent runners dir has
+		// already been granted traverse at startup; we grant Modify scoped
+		// to this specific job directory so each job's utility VM sees
+		// only its own files.
+		if err := grantHyperVModify(jobRunnerDir); err != nil {
+			return nil, fmt.Errorf("granting Hyper-V access to %s: %w", jobRunnerDir, err)
 		}
 		opts = append(opts, withRunnerMount(jobRunnerDir, r.cfg.RunnerMount))
 	}
@@ -669,6 +744,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		envNetns = windowsNetNS
 	}
 
+	createSucceeded = true
 	return &RunnerEnv{
 		ID:        id,
 		Netns:     envNetns,

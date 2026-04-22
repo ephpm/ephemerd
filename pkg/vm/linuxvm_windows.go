@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Microsoft/go-winio"
@@ -277,13 +278,16 @@ func (l *hypervLinuxVM) rootVHDXPath() string {
 
 // ensureRootVHDX creates a sparse VHDX for the Linux VM's containerd root if
 // it doesn't already exist. The VHDX persists across VM restarts so pulled and
-// imported images survive reboots.
+// imported images survive reboots. After creating (or if the file already
+// exists) we always re-run the VM-group ACL grant: the Hyper-V VM worker
+// opens the VHDX under a virtual account that needs explicit access, and
+// without it HcsStartComputeSystem returns HCS_E_SYSTEM_ALREADY_STOPPED.
 func (l *hypervLinuxVM) ensureRootVHDX() error {
 	vhdxPath := l.rootVHDXPath()
 
 	if _, err := os.Stat(vhdxPath); err == nil {
 		l.cfg.Log.Info("root VHDX already exists", "path", vhdxPath)
-		return nil
+		return grantVmFileAccess(vhdxPath)
 	}
 
 	dir := filepath.Dir(vhdxPath)
@@ -306,6 +310,24 @@ func (l *hypervLinuxVM) ensureRootVHDX() error {
 		return fmt.Errorf("New-VHD failed: %w\noutput: %s", err, string(out))
 	}
 
+	return grantVmFileAccess(vhdxPath)
+}
+
+// grantVmFileAccess grants the Hyper-V VM worker's virtual account read+write
+// access to the given file via icacls. Mirrors hcsshim's internal
+// security.GrantVmGroupAccess which uses SetEntriesInAcl on the same SID but
+// lives in an internal package we can't import. "Everyone" is used here for
+// the same reason grant_windows.go in pkg/runtime uses it: virtual accounts
+// on Windows 11 client do not reliably inherit membership in
+// "NT VIRTUAL MACHINE\Virtual Machines" (S-1-5-83-0).
+func grantVmFileAccess(path string) error {
+	// Everyone:(M) = Modify rights. No inheritance flags — this is a file,
+	// not a directory.
+	cmd := exec.Command("icacls", path, "/grant", "*S-1-1-0:M", "/C", "/Q")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("icacls grant VM access on %s: %w: %s", path, err, string(out))
+	}
 	return nil
 }
 

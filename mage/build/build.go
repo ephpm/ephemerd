@@ -31,7 +31,7 @@ func Build() error {
 // 1. Cross-compile static Linux binary with Linux assets embedded
 // 2. Build Windows binary embedding the Linux binary + Alpine rootfs + kernel + initrd
 func Windows() error {
-	mg.Deps(Linuxembed, download.Rootfs, download.Runnerwindows, download.Kernelx86, download.Initrdx86)
+	mg.Deps(Linuxembed, download.Rootfs, download.Runnerwindows, download.Kernelx86, download.Initrdx86, download.Shimwindows)
 
 	// Remove any Linux runner from embed dir to avoid bloating the Windows binary.
 	matches, _ := filepath.Glob("pkg/runner/embed/actions-runner-linux-*.tar.gz")

@@ -1,14 +1,9 @@
-//go:build !linux
+//go:build !linux && !windows
 
 package containerd
 
-import "runtime"
-
-// extractShims returns the data directory on Windows so containerd can find
-// containerd-shim-runhcs-v1.exe on PATH. On other platforms it's a no-op.
-func extractShims(dataDir string) (string, func(), error) {
-	if runtime.GOOS == "windows" {
-		return dataDir, func() {}, nil
-	}
+// extractShims is a no-op on platforms that don't need embedded shims
+// (e.g. macOS where the VM runs Linux containerd internally).
+func extractShims(_ string) (string, func(), error) {
 	return "", func() {}, nil
 }
