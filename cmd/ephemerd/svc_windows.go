@@ -55,7 +55,7 @@ func (s *ephemerdService) Execute(_ []string, r <-chan svc.ChangeRequest, status
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- serve(ctx, s.configFile, s.ctrdTCPPort, s.ctrdTCPAddr, s.containerdOnly, s.dind)
+		errCh <- serve(ctx, s.configFile, "", s.ctrdTCPPort, s.ctrdTCPAddr, s.containerdOnly, s.dind)
 	}()
 
 	status <- svc.Status{State: svc.Running, Accepts: accepted}

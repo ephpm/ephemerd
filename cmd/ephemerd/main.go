@@ -91,6 +91,10 @@ func serveCmd() *cli.Command {
 				Aliases: []string{"c"},
 				Usage:   "path to config file (default: <data-dir>/config.toml)",
 			},
+			&cli.StringFlag{
+				Name:  "images-dir",
+				Usage: "directory of OCI image tarballs (*.tar) to copy into <data-dir>/images/ on startup",
+			},
 			&cli.UintFlag{
 				Name:  "containerd-tcp-port",
 				Usage: "also expose containerd on a TCP port (used by WSL host integration)",
@@ -110,12 +114,12 @@ func serveCmd() *cli.Command {
 			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			return serve(ctx, cmd.String("config"), uint32(cmd.Uint("containerd-tcp-port")), cmd.String("containerd-tcp-addr"), cmd.Bool("containerd-only"), cmd.Bool("dind"))
+			return serve(ctx, cmd.String("config"), cmd.String("images-dir"), uint32(cmd.Uint("containerd-tcp-port")), cmd.String("containerd-tcp-addr"), cmd.Bool("containerd-only"), cmd.Bool("dind"))
 		},
 	}
 }
 
-func serve(ctx context.Context, configFile string, containerdTCPPort uint32, containerdTCPAddr string, containerdOnly bool, dindFlag bool) error {
+func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPPort uint32, containerdTCPAddr string, containerdOnly bool, dindFlag bool) error {
 	// Check if another instance is already running.
 	if cc, err := dialControl(ctx); err == nil {
 		if resp, err := cc.Status(ctx, &apiv1.StatusRequest{}); err == nil {
@@ -159,6 +163,13 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 	// Ensure data directory exists
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		return fmt.Errorf("creating data directory %s: %w", configDir, err)
+	}
+
+	// Stage any caller-supplied OCI image tarballs into <data-dir>/images/.
+	// Runtime.ImportImages then picks them up at boot. Same-size files are
+	// skipped so re-running serve doesn't re-copy multi-GB tarballs.
+	if err := copyTarballs(imagesDirFlag, joinPath(configDir, "images"), log); err != nil {
+		return fmt.Errorf("staging images from --images-dir: %w", err)
 	}
 
 	// Write PID file for drain command
