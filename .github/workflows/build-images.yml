@@ -26,6 +26,7 @@ jobs:
     name: Build Linux CI Runner (${{ matrix.arch }})
     runs-on: [self-hosted, linux, "${{ matrix.runner }}"]
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: amd64
