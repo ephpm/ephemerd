@@ -146,6 +146,32 @@ func (p *Provider) DeregisterWebhooks(ctx context.Context) error {
 	return nil
 }
 
+// CleanStaleWebhooks removes any workflow_job webhooks left behind by previous
+// ephemerd instances that crashed or were killed without cleanup. Called on
+// startup before registering new webhooks to avoid hitting GitHub's 20-hook limit.
+func (p *Provider) CleanStaleWebhooks(ctx context.Context) {
+	p.client.CleanStaleWebhooks(ctx)
+}
+
+// CatchUpPoll fires a single poll to discover jobs queued while ephemerd was
+// offline. Used in webhook mode (where continuous polling is disabled) to catch
+// jobs that transitioned to "queued" before webhooks could be registered —
+// webhook events aren't replayed for jobs already in that state.
+func (p *Provider) CatchUpPoll(ctx context.Context) error {
+	events, err := p.client.PollJobs(ctx)
+	if err != nil {
+		return fmt.Errorf("startup poll: %w", err)
+	}
+	for _, ev := range events {
+		select {
+		case p.events <- p.convertEvent(ev):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
 func (p *Provider) Stop(ctx context.Context) error {
 	if p.cancel != nil {
 		p.cancel()

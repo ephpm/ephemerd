@@ -269,8 +269,14 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	// Start HTTP server: via tunnel, TLS, or plain HTTP
 	if s.cfg.Tunnel != nil && useWebhook {
 		// Clean up stale webhooks from previous crashed instances before
-		// registering new ones. Prevents hitting GitHub's 20-hook limit.
-		s.cfg.GitHub.CleanStaleWebhooks(ctx)
+		// registering new ones. Prevents hitting platform per-repo/org hook
+		// limits (e.g. GitHub's 20-hook cap). Providers that don't implement
+		// this are skipped.
+		for _, whp := range whProviders {
+			if cleaner, ok := whp.(interface{ CleanStaleWebhooks(context.Context) }); ok {
+				cleaner.CleanStaleWebhooks(ctx)
+			}
+		}
 
 		// Initial tunnel connection.
 		ln, err := s.cfg.Tunnel.Listen(ctx)
@@ -350,11 +356,21 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	// One-time poll on startup to catch jobs that queued while ephemerd
 	// was down. Webhook events only fire at the moment a job transitions
 	// to "queued" — they aren't replayed for jobs already in that state.
-	// Run in a goroutine so it doesn't block if there are more queued jobs
-	// than the channel buffer can hold.
-	if s.cfg.GitHub != nil {
-		s.cfg.Log.Info("startup poll: checking for queued jobs")
-		go s.poll(ctx, events)
+	// Continuous-poll mode catches these on the next tick naturally, but
+	// in webhook mode we need an explicit one-shot. Run in a goroutine so
+	// it doesn't block if there are more queued jobs than the channel buffer.
+	for _, p := range s.cfg.Providers {
+		catcher, ok := p.(interface{ CatchUpPoll(context.Context) error })
+		if !ok {
+			continue
+		}
+		name := p.Name()
+		s.cfg.Log.Info("startup poll: checking for queued jobs", "provider", name)
+		go func() {
+			if err := catcher.CatchUpPoll(ctx); err != nil {
+				s.cfg.Log.Warn("startup poll failed", "provider", name, "error", err)
+			}
+		}()
 	}
 
 	// Periodically clean up the seen-jobs dedup map
