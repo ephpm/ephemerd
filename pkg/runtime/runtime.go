@@ -298,7 +298,14 @@ func importTarball(ctx context.Context, c *client.Client, path, snapshotter stri
 		return fmt.Errorf("opening %s: %w", path, err)
 	}
 
-	imgs, err := c.Import(ctx, f)
+	// WithAllPlatforms(true) is required because importTarball is also called
+	// cross-platform (e.g. importing a linux/amd64 tarball into a Linux VM's
+	// containerd from a Windows host client, where the client's host platform
+	// is windows/amd64 and would otherwise filter every manifest out, yielding
+	// containerd's "image might be filtered out" error). The tarballs are
+	// already platform-filtered at `crane pull --platform=...` time, so trusting
+	// the tarball's contents whole is correct.
+	imgs, err := c.Import(ctx, f, client.WithAllPlatforms(true))
 	if closeErr := f.Close(); closeErr != nil {
 		log.Warn("error closing image tarball", "path", path, "error", closeErr)
 	}
