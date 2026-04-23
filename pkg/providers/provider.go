@@ -64,8 +64,9 @@ type Provider interface {
 
 	// FetchJobImage returns a custom container image for the job, if specified
 	// in the workflow/pipeline definition.
-	//   - GitHub/Forgejo/Gitea: fetches workflow YAML and reads EPHEMERD_IMAGE env var
-	//   - GitLab: reads the image: field from the job payload directly
+	//   - GitHub/Forgejo/Gitea: fetches workflow YAML and reads the job's
+	//     `container.image` field (mapping or string shorthand).
+	//   - GitLab: reads the image: field from the job payload directly.
 	// Returns empty string if none.
 	FetchJobImage(ctx context.Context, event *JobEvent) string
 
@@ -136,4 +137,12 @@ type Claim struct {
 	// Env holds extra environment variables injected into the runner container.
 	// Used by Forgejo/GitLab to pass instance URL, runner token, etc.
 	Env map[string]string
+
+	// Entrypoint overrides the container's process args.
+	// When set, the runtime uses these args instead of the default
+	// "--jitconfig" entrypoint used by GitHub Actions runners.
+	//   Gitea:   ["sh", "-c", "act_runner register ... && act_runner daemon --ephemeral"]
+	//   Forgejo: ["sh", "-c", "forgejo-runner register ... && forgejo-runner daemon"]
+	//   GitHub:  nil (uses --jitconfig from RunnerConfig)
+	Entrypoint []string
 }

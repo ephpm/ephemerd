@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
@@ -11,28 +9,34 @@ env:
 
 jobs:
   ci:
-    name: Lint, Test & Build (Linux)
+    name: Lint, Unit, E2E & Build (Linux)
     runs-on: [self-hosted, linux, x64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
 
       - name: Install mage
         run: go install github.com/magefile/mage@latest
 
-      - name: CI (download, lint, test, build)
+      - name: Lint, test & build
         run: mage ci
+
+      - name: E2E — GitHub provider (fake server)
+        run: mage e2egithub
+
+      - name: E2E — Go module proxy
+        run: mage e2emodproxy
 
   build-macos:
     name: Build (macOS arm64)
     runs-on: [self-hosted, macos, arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -51,9 +55,9 @@ jobs:
     name: Build (Linux arm64)
     runs-on: [self-hosted, linux, arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -68,11 +72,11 @@ jobs:
 
   build-windows:
     name: Build (Windows amd64)
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, windows, x64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -80,7 +84,7 @@ jobs:
         run: go install github.com/magefile/mage@latest
 
       - name: Build Windows binary
-        run: mage build:windows
+        run: mage build:build
 
       - name: Verify binary
-        run: ls -lh ./ephemerd.exe
+        run: .\ephemerd.exe --version

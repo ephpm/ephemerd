@@ -35,7 +35,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"strings"
+	"time"
 
+	"github.com/ephpm/ephemerd/pkg/forgerpc"
+	"github.com/ephpm/ephemerd/pkg/names"
 	"github.com/ephpm/ephemerd/pkg/providers"
 )
 
@@ -64,11 +69,20 @@ type Config struct {
 	// If empty, the runner accepts jobs from all repos the owner has access to.
 	Repos []string
 
+	// Labels are the runner labels to register with the forge.
+	// Each label is a string like "ubuntu-latest:docker://image:tag".
+	// If empty, defaults to ["ubuntu-latest:docker://<job_image>"].
+	Labels []string
+
 	// JobImage is the default OCI image for job execution containers.
 	// The runner daemon creates job containers via the fake Docker socket;
 	// this image is what those containers run.
 	// Default: "docker.io/gitea/runner-images:ubuntu-24.04"
 	JobImage string
+
+	// HTTPClient is an optional *http.Client for the ConnectRPC client.
+	// If nil, a default client with 30s timeout is used.
+	HTTPClient *http.Client
 
 	Log *slog.Logger
 }
@@ -76,13 +90,14 @@ type Config struct {
 // Provider implements providers.Provider for Gitea Actions.
 type Provider struct {
 	cfg    Config
+	rpc    *forgerpc.Client
 	events chan providers.JobEvent
 	cancel context.CancelFunc
 
-	// runnerToken is the persistent token received after registration.
-	// Passed into containers for act_runner to use.
+	// Runner credentials from registration.
 	runnerToken string
 	runnerID    int64
+	runnerUUID  string
 }
 
 // New creates a Gitea provider.
@@ -93,14 +108,18 @@ func New(cfg Config) (*Provider, error) {
 	if cfg.Token == "" {
 		return nil, fmt.Errorf("gitea: token is required")
 	}
+	if cfg.Log == nil {
+		cfg.Log = slog.Default()
+	}
 	return &Provider{
 		cfg:    cfg,
+		rpc:    forgerpc.NewClient(cfg.InstanceURL, cfg.HTTPClient),
 		events: make(chan providers.JobEvent, 64),
 	}, nil
 }
 
-func (p *Provider) Name() string            { return "gitea" }
-func (p *Provider) DefaultImage() string    { return defaultImage }
+func (p *Provider) Name() string         { return "gitea" }
+func (p *Provider) DefaultImage() string { return defaultImage }
 func (p *Provider) DefaultJobImage() string {
 	if p.cfg.JobImage != "" {
 		return p.cfg.JobImage
@@ -111,9 +130,6 @@ func (p *Provider) DefaultJobImage() string {
 func (p *Provider) Start(ctx context.Context, cfg providers.PollConfig) (<-chan providers.JobEvent, error) {
 	ctx, p.cancel = context.WithCancel(ctx)
 
-	// Register this runner with the Gitea instance.
-	// Uses the ConnectRPC Register endpoint to exchange the registration
-	// token for a persistent runner ID + auth token.
 	if err := p.register(ctx); err != nil {
 		return nil, fmt.Errorf("gitea runner registration: %w", err)
 	}
@@ -123,77 +139,134 @@ func (p *Provider) Start(ctx context.Context, cfg providers.PollConfig) (<-chan 
 		"runner_id", p.runnerID,
 	)
 
-	// Poll for tasks via ConnectRPC FetchTask.
-	// When a task arrives, emit a JobEvent so the scheduler can spin
-	// up a container and launch act_runner --ephemeral inside it.
 	go p.pollLoop(ctx, cfg.PollInterval)
 
 	return p.events, nil
 }
 
 func (p *Provider) register(ctx context.Context) error {
-	// TODO: ConnectRPC call to RunnerService/Register
-	//
-	// Request:  { name, token, labels, version }
-	// Response: { id, token }  (persistent runner credentials)
-	//
-	// Proto package: code.gitea.io/actions-proto-go
-	//
-	// Store p.runnerID and p.runnerToken from response.
-	// Then call RunnerService/Declare to announce labels.
-	return fmt.Errorf("gitea: runner registration not yet implemented")
+	runnerName := fmt.Sprintf("ephemerd-%s", names.Generate())
+	labels := p.buildLabels()
+
+	runner, err := p.rpc.Register(ctx, runnerName, p.cfg.Token, "ephemerd/v1", labels)
+	if err != nil {
+		return fmt.Errorf("register: %w", err)
+	}
+
+	p.runnerID = runner.ID
+	p.runnerUUID = runner.UUID
+	p.runnerToken = runner.Token
+
+	if err := p.rpc.Declare(ctx, forgerpc.DeclareLabels(labels)); err != nil {
+		p.cfg.Log.Warn("declare labels failed (non-fatal)", "error", err)
+	}
+
+	return nil
 }
 
 func (p *Provider) pollLoop(ctx context.Context, intervalSec int) {
-	// TODO: ConnectRPC call to RunnerService/FetchTask
-	//
-	// FetchTask returns a Task proto containing:
-	//   - task ID
-	//   - workflow_payload (YAML bytes)
-	//   - context (repo, ref, secrets, etc.)
-	//
-	// On receiving a task, convert to providers.JobEvent and send on
-	// p.events. The scheduler will launch a container with act_runner
-	// in --ephemeral mode which picks up the task.
-	//
-	// FetchTask supports long-poll (~5s server timeout) with backoff.
-	// tasks_version field enables change detection.
-	//
-	// Note: unlike Forgejo, Gitea's FetchTask returns a single task
-	// per request (no multi-task batch support).
+	defer close(p.events)
+
+	var tasksVersion int64
+	var failCount int
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		result, err := p.rpc.FetchTask(ctx, tasksVersion)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			failCount++
+			backoff := min(time.Duration(1<<uint(min(failCount, 6)))*time.Second, 60*time.Second)
+			p.cfg.Log.Warn("fetch task failed", "error", err, "fail_count", failCount, "backoff", backoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			continue
+		}
+
+		failCount = 0
+		tasksVersion = result.TasksVersion
+
+		if result.Task == nil {
+			delay := time.Duration(intervalSec) * time.Second
+			if delay <= 0 {
+				delay = 1 * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+			}
+			continue
+		}
+
+		repo := result.Task.Repo()
+		p.cfg.Log.Info("task received", "task_id", result.Task.ID, "repo", repo)
+
+		select {
+		case p.events <- providers.JobEvent{
+			Action: "queued",
+			Repo:   repo,
+			JobID:  result.Task.ID,
+			Raw:    result.Task,
+		}:
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (p *Provider) ClaimJob(ctx context.Context, event *providers.JobEvent, runnerName string, labels []string) (*providers.Claim, error) {
-	// No per-job registration needed — act_runner uses the persistent
-	// runner credentials. In --ephemeral mode it runs one job and exits.
+	regLabels := strings.Join(p.buildLabels(), ",")
+	regCmd := fmt.Sprintf(
+		"act_runner register --no-interactive --instance $GITEA_INSTANCE_URL --token $GITEA_RUNNER_TOKEN --name %s --labels %s && act_runner daemon --ephemeral",
+		runnerName, regLabels,
+	)
 	return &providers.Claim{
 		RunnerID:   p.runnerID,
 		RunnerName: runnerName,
 		Repo:       event.Repo,
 		Env: map[string]string{
 			"GITEA_INSTANCE_URL": p.cfg.InstanceURL,
-			"GITEA_RUNNER_TOKEN": p.runnerToken,
+			"GITEA_RUNNER_TOKEN": p.cfg.Token, // registration token — container self-registers
 		},
+		Entrypoint: []string{"sh", "-c", regCmd},
 	}, nil
 }
 
 func (p *Provider) ReleaseJob(ctx context.Context, claim *providers.Claim) error {
-	// act_runner handles UpdateTask/UpdateLog — nothing to clean up.
 	return nil
 }
 
 func (p *Provider) FetchJobImage(ctx context.Context, event *providers.JobEvent) string {
-	// TODO: the Task proto from FetchTask includes workflow_payload bytes.
-	// Parse the YAML and look for EPHEMERD_IMAGE in env, same as GitHub.
-	// If not available from the task, fall back to the Gitea API:
-	//   GET /api/v1/repos/{owner}/{repo}/contents/{path}
-	return ""
+	task, ok := event.Raw.(*forgerpc.Task)
+	if !ok || task == nil {
+		return ""
+	}
+	return task.ContainerImage()
 }
 
 func (p *Provider) Stop(ctx context.Context) error {
 	if p.cancel != nil {
 		p.cancel()
 	}
-	// TODO: unregister runner via ConnectRPC or REST API
 	return nil
+}
+
+// buildLabels returns label strings for registration.
+// Register uses repeated string; Declare converts to AgentLabel.
+func (p *Provider) buildLabels() []string {
+	if len(p.cfg.Labels) > 0 {
+		return p.cfg.Labels
+	}
+	return []string{
+		fmt.Sprintf("ubuntu-latest:docker://%s", p.DefaultJobImage()),
+	}
 }

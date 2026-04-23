@@ -32,7 +32,7 @@ jobs:
           echo "DNS:"
           nslookup github.com 2>&1 | head -5 || host github.com 2>&1 | head -3
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Verify checkout
         run: |
@@ -53,7 +53,7 @@ jobs:
           echo ""
           system_profiler SPHardwareDataType 2>/dev/null | head -15
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Verify checkout
         run: |

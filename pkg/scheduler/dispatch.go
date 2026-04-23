@@ -29,7 +29,9 @@ type dispatchServer struct {
 func (s *dispatchServer) CreateJob(ctx context.Context, req *apiv1.CreateJobRequest) (*apiv1.CreateJobResponse, error) {
 	s.log.Info("dispatch: creating job", "id", req.Id, "image", req.Image)
 
-	env, err := s.rt.Create(ctx, req.Id, req.Image, req.JitConfig)
+	env, err := s.rt.Create(ctx, runtime.CreateConfig{
+		ID: req.Id, Image: req.Image, JITConfig: req.JitConfig,
+	})
 	if err != nil {
 		s.log.Error("dispatch: create failed", "id", req.Id, "error", err)
 		return nil, status.Errorf(codes.Internal, "creating container: %v", err)

@@ -155,7 +155,7 @@ func TestGitHub_E2E_WaitForRemoval(t *testing.T) {
 }
 
 // TestGitHub_E2E_FetchJobImage verifies the image lookup returns empty
-// when no EPHEMERD_IMAGE is set in the workflow.
+// when no container.image is set in the workflow.
 func TestGitHub_E2E_FetchJobImage(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -167,6 +167,6 @@ func TestGitHub_E2E_FetchJobImage(t *testing.T) {
 	client := srv.Client()
 	image := client.FetchJobImage(ctx, "myrepo", 1, jobID)
 	if image != "" {
-		t.Errorf("FetchJobImage() = %q, want empty (no EPHEMERD_IMAGE)", image)
+		t.Errorf("FetchJobImage() = %q, want empty (no container.image)", image)
 	}
 }

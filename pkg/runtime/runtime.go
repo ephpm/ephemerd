@@ -3,7 +3,9 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +21,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/ephpm/ephemerd/pkg/dind"
 	"github.com/ephpm/ephemerd/pkg/networking"
+	craneTarball "github.com/google/go-containerregistry/pkg/v1/tarball"
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -49,6 +52,7 @@ type Config struct {
 	RunnerDir    string // host path to extracted runner binary
 	RunnerMount  string // container path to mount runner at
 	DefaultImage string // override default container image (auto-detected if empty)
+	ImagesDir    string // directory containing pre-downloaded OCI image tarballs to import on startup
 	LogDir       string // directory for per-job container logs
 	DataDir      string // ephemerd data directory (used for dind socket paths)
 	// ContainerDataDir is the path containerd/runc see for the DataDir.
@@ -58,7 +62,8 @@ type Config struct {
 	// DataDir must be rewritten to that VM-side path. When empty, falls
 	// back to DataDir.
 	ContainerDataDir string
-	DindEnabled      bool   // mount a fake Docker socket into each container
+	DindEnabled      bool     // mount a fake Docker socket into each container
+	CacheProxyEnv    []string // extra env vars from cache proxies (e.g., GOPROXY=...)
 	Network          *networking.Manager
 	Log              *slog.Logger
 }
@@ -86,6 +91,11 @@ func New(cfg Config) (*Runtime, error) {
 		cfg:    cfg,
 		client: cfg.Client,
 	}, nil
+}
+
+// LogDir returns the configured per-job log directory (empty if logs go to stdio).
+func (r *Runtime) LogDir() string {
+	return r.cfg.LogDir
 }
 
 // CleanOrphans removes any leftover containers and snapshots from a previous
@@ -138,9 +148,42 @@ func (r *Runtime) CleanOrphans(ctx context.Context) error {
 		}
 	}
 
+	// Clean orphan per-job runner dir copies from `<data-dir>/runners/job-*`.
+	// These are ~200MB each and accumulate rapidly when container creation
+	// fails after copyDirForJob. No live job needs them at startup — any
+	// survivors belong to a previous ephemerd process.
+	if r.cfg.RunnerDir != "" {
+		runnersParent := filepath.Dir(r.cfg.RunnerDir)
+		entries, err := os.ReadDir(runnersParent)
+		if err == nil {
+			for _, e := range entries {
+				if !e.IsDir() || !strings.HasPrefix(e.Name(), "job-") {
+					continue
+				}
+				p := filepath.Join(runnersParent, e.Name())
+				r.cfg.Log.Info("removing orphan runner dir", "path", p)
+				if err := os.RemoveAll(p); err != nil {
+					r.cfg.Log.Warn("failed to remove orphan runner dir", "path", p, "error", err)
+				}
+			}
+		}
+		// On Windows only: grant the runners parent traverse-only access
+		// (no inheritance) so Hyper-V utility VMs can step into per-job
+		// subdirectories. Each per-job directory gets its own Modify ACE
+		// at Create() time so concurrent jobs stay isolated from each
+		// other's runner dirs.
+		if err := grantHyperVTraverse(runnersParent); err != nil {
+			r.cfg.Log.Warn("failed to grant Hyper-V traverse on runners parent", "path", runnersParent, "error", err)
+		}
+	}
+
 	// Clean orphan snapshots that no longer have a container pointing to them.
 	// This catches snapshots left behind when a container create partially failed.
-	snapshotter := r.client.SnapshotService("overlayfs")
+	ss := "overlayfs"
+	if goruntime.GOOS == "windows" {
+		ss = "windows"
+	}
+	snapshotter := r.client.SnapshotService(ss)
 	if snapshotter == nil {
 		return nil
 	}
@@ -167,6 +210,159 @@ func (r *Runtime) CleanOrphans(ctx context.Context) error {
 	})
 }
 
+// ImportImages loads pre-downloaded OCI image tarballs from the images directory.
+// Each tarball is inspected for its target OS. Images matching the host OS are
+// imported into the host containerd and unpacked immediately. Images targeting a
+// different OS (e.g. Linux images on a Windows host) are returned as deferred
+// paths — the caller should import them into the appropriate VM's containerd
+// after the VM is ready using ImportImagesTo.
+//
+// On Linux, all images are imported directly (no deferral).
+func (r *Runtime) ImportImages(ctx context.Context) (deferred []string, err error) {
+	dir := r.cfg.ImagesDir
+	if dir == "" {
+		return nil, nil
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading images dir %s: %w", dir, err)
+	}
+
+	hostOS := goruntime.GOOS
+	snapshotter := "overlayfs"
+	if hostOS == "windows" {
+		snapshotter = "windows"
+	}
+
+	ctx = namespaces.WithNamespace(ctx, namespace)
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".tar") {
+			continue
+		}
+
+		path := filepath.Join(dir, entry.Name())
+
+		// Inspect the tarball to determine the image's target OS.
+		imageOS, err := tarballImageOS(path)
+		if err != nil {
+			r.cfg.Log.Warn("could not detect image OS, importing to host", "path", path, "error", err)
+			// Fall through and try to import — worst case it fails to unpack.
+		} else if imageOS != hostOS {
+			r.cfg.Log.Info("deferring image for VM import", "path", path, "imageOS", imageOS, "hostOS", hostOS)
+			deferred = append(deferred, path)
+			continue
+		}
+
+		if importErr := importTarball(ctx, r.client, path, snapshotter, r.cfg.Log); importErr != nil {
+			r.cfg.Log.Warn("failed to import image", "path", path, "error", importErr)
+		}
+	}
+
+	return deferred, nil
+}
+
+// ImportImagesTo imports a list of OCI image tarballs into the given containerd
+// client. Used to import deferred Linux images into a VM's containerd after the
+// VM is ready.
+func ImportImagesTo(ctx context.Context, c *client.Client, paths []string, snapshotter string, log *slog.Logger) {
+	ctx = namespaces.WithNamespace(ctx, namespace)
+	for _, path := range paths {
+		if err := importTarball(ctx, c, path, snapshotter, log); err != nil {
+			log.Warn("failed to import image to VM", "path", path, "error", err)
+		}
+	}
+}
+
+// importTarball imports a single OCI tarball into a containerd client and unpacks it.
+// Skips tarballs whose images are already present in containerd.
+func importTarball(ctx context.Context, c *client.Client, path, snapshotter string, log *slog.Logger) error {
+	// Check if the image in this tarball already exists in containerd.
+	// Read the tag from the tarball manifest without importing it.
+	ref, err := tarballImageRef(path)
+	if err == nil && ref != "" {
+		if _, getErr := c.GetImage(ctx, ref); getErr == nil {
+			log.Info("image already present, skipping import", "name", ref, "path", path)
+			return nil
+		}
+	}
+
+	log.Info("importing image from tarball", "path", path)
+
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("opening %s: %w", path, err)
+	}
+
+	// WithAllPlatforms(true) is required because importTarball is also called
+	// cross-platform (e.g. importing a linux/amd64 tarball into a Linux VM's
+	// containerd from a Windows host client, where the client's host platform
+	// is windows/amd64 and would otherwise filter every manifest out, yielding
+	// containerd's "image might be filtered out" error). The tarballs are
+	// already platform-filtered at `crane pull --platform=...` time, so trusting
+	// the tarball's contents whole is correct.
+	imgs, err := c.Import(ctx, f, client.WithAllPlatforms(true))
+	if closeErr := f.Close(); closeErr != nil {
+		log.Warn("error closing image tarball", "path", path, "error", closeErr)
+	}
+	if err != nil {
+		return fmt.Errorf("importing %s: %w", path, err)
+	}
+
+	for _, img := range imgs {
+		log.Info("imported image, unpacking", "name", img.Name, "snapshotter", snapshotter)
+
+		cImg, err := c.GetImage(ctx, img.Name)
+		if err != nil {
+			log.Warn("failed to get imported image for unpack", "name", img.Name, "error", err)
+			continue
+		}
+		if err := cImg.Unpack(ctx, snapshotter); err != nil {
+			log.Warn("failed to unpack imported image", "name", img.Name, "error", err)
+			continue
+		}
+		log.Info("image imported and unpacked", "name", img.Name)
+	}
+	return nil
+}
+
+// tarballImageOS reads an OCI/Docker image tarball and returns the OS of the
+// first image found (e.g. "linux", "windows"). Uses go-containerregistry to
+// parse the tarball metadata without extracting it.
+func tarballImageOS(path string) (string, error) {
+	img, err := craneTarball.ImageFromPath(path, nil)
+	if err != nil {
+		return "", fmt.Errorf("reading tarball %s: %w", path, err)
+	}
+	cfg, err := img.ConfigFile()
+	if err != nil {
+		return "", fmt.Errorf("reading config from %s: %w", path, err)
+	}
+	if cfg.OS == "" {
+		return "", fmt.Errorf("no OS in image config for %s", path)
+	}
+	return cfg.OS, nil
+}
+
+// tarballImageRef reads the image reference (repo tag) from a Docker-format
+// tarball's manifest.json. Returns empty string if untagged or unreadable.
+func tarballImageRef(path string) (string, error) {
+	opener := func() (io.ReadCloser, error) { return os.Open(path) }
+
+	manifest, err := craneTarball.LoadManifest(opener)
+	if err != nil {
+		return "", err
+	}
+	if len(manifest) > 0 && len(manifest[0].RepoTags) > 0 {
+		return manifest[0].RepoTags[0], nil
+	}
+	return "", nil
+}
+
 // PullImage ensures the runner image is available locally.
 // Serialized with a mutex to avoid concurrent pulls contending on
 // the content store (which produces noisy lock errors).
@@ -176,24 +372,36 @@ func (r *Runtime) PullImage(ctx context.Context, ref string) error {
 
 	ctx = namespaces.WithNamespace(ctx, namespace)
 
-	// Check if another goroutine already pulled it while we waited
-	if _, err := r.client.GetImage(ctx, ref); err == nil {
-		return nil
-	}
-
-	r.cfg.Log.Info("pulling image", "ref", ref)
-
-	// Force overlayfs snapshotter. containerd 2.2.2 may default to the
-	// experimental erofs snapshotter on some Linux kernels, which then
-	// fails image unpack with "snapshotter not loaded: erofs: invalid argument".
+	// Check if another goroutine already pulled/imported it while we waited.
+	// Also verify the image is unpacked — the background import may have loaded
+	// the content but not yet finished unpacking to the snapshotter.
 	snapshotter := "overlayfs"
 	if goruntime.GOOS == "windows" {
 		snapshotter = "windows"
 	}
-	_, err := r.client.Pull(ctx, ref,
+	if img, err := r.client.GetImage(ctx, ref); err == nil {
+		if unpacked, _ := img.IsUnpacked(ctx, snapshotter); unpacked {
+			return nil
+		}
+		// Image exists but isn't unpacked yet — unpack it now.
+		r.cfg.Log.Info("image imported but not yet unpacked, unpacking", "ref", ref)
+		if err := img.Unpack(ctx, snapshotter); err != nil {
+			r.cfg.Log.Warn("unpack failed, will try full pull", "ref", ref, "error", err)
+		} else {
+			return nil
+		}
+	}
+
+	r.cfg.Log.Info("pulling image", "ref", ref)
+
+	pullOpts := []client.RemoteOpt{
 		client.WithPullUnpack,
-		client.WithPullSnapshotter(snapshotter),
-	)
+	}
+	if goruntime.GOOS == "windows" {
+		pullOpts = append(pullOpts, client.WithPlatform("windows/amd64"))
+	}
+	pullOpts = append(pullOpts, client.WithPullSnapshotter(snapshotter))
+	_, err := r.client.Pull(ctx, ref, pullOpts...)
 	if err != nil {
 		return fmt.Errorf("pulling image %s: %w", ref, err)
 	}
@@ -202,8 +410,32 @@ func (r *Runtime) PullImage(ctx context.Context, ref string) error {
 	return nil
 }
 
+// CreateConfig holds parameters for creating a runner environment.
+type CreateConfig struct {
+	ID    string // unique job identifier (container name, dind socket path)
+	Image string // OCI image reference (empty = use default)
+
+	// JITConfig is the base64-encoded JIT config for GitHub runners.
+	// Passed as "--jitconfig <value>" to the runner entrypoint.
+	// Mutually exclusive with Entrypoint.
+	JITConfig string
+
+	// Env holds extra environment variables injected into the container.
+	// Used by Gitea/Forgejo to pass instance URL, runner token, etc.
+	Env map[string]string
+
+	// Entrypoint overrides the container's process args.
+	// When set, used instead of the default "--jitconfig" entrypoint.
+	// When nil and JITConfig is set, uses the GitHub "--jitconfig" mode.
+	// When nil and JITConfig is empty, uses the image's default CMD.
+	Entrypoint []string
+}
+
 // Create provisions an ephemeral runner environment.
-func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig string) (*RunnerEnv, error) {
+func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, error) {
+	id := cfg.ID
+	image := cfg.Image
+	jitConfig := cfg.JITConfig
 	ctx = namespaces.WithNamespace(ctx, namespace)
 
 	// Use a default image when no custom image is specified.
@@ -221,7 +453,13 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 
 	r.cfg.Log.Info("creating runner environment", "id", id, "image", image, "custom", customImage)
 
-	// Get the image, pulling it if not present locally
+	// Get the image, pulling if needed. Also ensure it's unpacked — the
+	// background import goroutine may have loaded the content but not yet
+	// finished unpacking to the snapshotter.
+	ss := "overlayfs"
+	if goruntime.GOOS == "windows" {
+		ss = "windows"
+	}
 	img, err := r.client.GetImage(ctx, image)
 	if err != nil {
 		r.cfg.Log.Info("image not found locally, pulling", "image", image)
@@ -231,6 +469,15 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		img, err = r.client.GetImage(ctx, image)
 		if err != nil {
 			return nil, fmt.Errorf("getting image %s after pull: %w", image, err)
+		}
+	}
+
+	// Ensure the image is unpacked. The background import goroutine may have
+	// loaded content into the store but not finished unpacking to the snapshotter.
+	if unpacked, _ := img.IsUnpacked(ctx, ss); !unpacked {
+		r.cfg.Log.Info("image not yet unpacked, unpacking now", "image", image, "snapshotter", ss)
+		if err := img.Unpack(ctx, ss); err != nil {
+			return nil, fmt.Errorf("unpacking image %s: %w", image, err)
 		}
 	}
 
@@ -254,12 +501,15 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 	if goruntime.GOOS == "windows" {
 		targetPlatform = "windows/" + goruntime.GOARCH
 	}
+	envVars := []string{"RUNNER_ALLOW_RUNASROOT=1"}
+	envVars = append(envVars, r.cfg.CacheProxyEnv...)
+	for k, v := range cfg.Env {
+		envVars = append(envVars, k+"="+v)
+	}
 	opts := []oci.SpecOpts{
 		oci.WithDefaultSpecForPlatform(targetPlatform),
 		oci.WithImageConfig(img),
-		oci.WithEnv([]string{
-			"RUNNER_ALLOW_RUNASROOT=1",
-		}),
+		oci.WithEnv(envVars),
 		// Allow sudo inside the container. The default OCI spec sets
 		// NoNewPrivileges=true which blocks privilege escalation, but
 		// jobs need sudo for apt-get install and similar operations.
@@ -270,24 +520,49 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		oci.WithCapabilities(containerCapabilities),
 	}
 	opts = append(opts, seccompOpts()...)
-	if goruntime.GOOS == "windows" {
-		// Wrap entrypoint in cmd.exe redirect so we can capture runner output
-		// to a file readable from the host (the runner dir is mounted in).
+	switch {
+	case len(cfg.Entrypoint) > 0:
+		// Forge mode: custom entrypoint (e.g. act_runner register + daemon).
+		opts = append(opts, oci.WithProcessArgs(cfg.Entrypoint...))
+	case jitConfig != "" && goruntime.GOOS == "windows":
+		// GitHub on Windows: wrap in cmd.exe redirect for log capture.
 		cmdLine := fmt.Sprintf(`%s --jitconfig %s > C:\actions-runner\runner.log 2>&1`, entrypoint, jitConfig)
 		opts = append(opts, oci.WithProcessArgs("cmd.exe", "/c", cmdLine))
-	} else {
+	case jitConfig != "":
+		// GitHub on Linux/macOS: pass JIT config directly.
 		opts = append(opts, oci.WithProcessArgs(entrypoint, "--jitconfig", jitConfig))
 	}
+	// else: no entrypoint override — use image default CMD/ENTRYPOINT.
 
 	// Mount the embedded runner binary into the container.
 	// On Linux with the official GHA image, the runner is pre-installed so no mount needed.
 	// On Windows, always mount because there's no Windows GHA runner image.
 	needsRunnerMount := (customImage || goruntime.GOOS == "windows") && r.cfg.RunnerDir != "" && r.cfg.RunnerMount != ""
 	var jobRunnerDir string
+	// Per-job runner dir cleanup on error. On success, Destroy() removes it
+	// via env.RunnerDir; on failure, the function returns before building
+	// the RunnerEnv so we must clean up here or the ~200MB copy orphans on
+	// disk (observed: 70 GB accumulated across a few hundred failed jobs).
+	createSucceeded := false
+	defer func() {
+		if !createSucceeded && jobRunnerDir != "" {
+			if err := os.RemoveAll(jobRunnerDir); err != nil {
+				r.cfg.Log.Warn("failed to remove job runner dir on error", "path", jobRunnerDir, "error", err)
+			}
+		}
+	}()
 	if needsRunnerMount {
 		jobRunnerDir = filepath.Join(filepath.Dir(r.cfg.RunnerDir), "job-"+id)
 		if err := copyDirForJob(r.cfg.RunnerDir, jobRunnerDir); err != nil {
 			return nil, fmt.Errorf("copying runner dir for %s: %w", id, err)
+		}
+		// Hyper-V isolated containers on Windows mount this host directory
+		// into the utility VM via a VSMB share. The parent runners dir has
+		// already been granted traverse at startup; we grant Modify scoped
+		// to this specific job directory so each job's utility VM sees
+		// only its own files.
+		if err := grantHyperVModify(jobRunnerDir); err != nil {
+			return nil, fmt.Errorf("granting Hyper-V access to %s: %w", jobRunnerDir, err)
 		}
 		opts = append(opts, withRunnerMount(jobRunnerDir, r.cfg.RunnerMount))
 	}
@@ -313,6 +588,7 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 			JobID:   id,
 			DataDir: r.cfg.DataDir,
 			Client:  r.client,
+			Network: r.cfg.Network,
 			Log:     r.cfg.Log,
 		})
 		if err != nil {
@@ -476,6 +752,7 @@ func (r *Runtime) Create(ctx context.Context, id string, image string, jitConfig
 		envNetns = windowsNetNS
 	}
 
+	createSucceeded = true
 	return &RunnerEnv{
 		ID:        id,
 		Netns:     envNetns,
@@ -625,27 +902,17 @@ func buildResolvConf() string {
 }
 
 // isRoutableDNS checks if a DNS server IP is reachable from containers.
-// Private IPs (10.x, 172.16-31.x, 192.168.x, 169.254.x) are blocked
-// by our firewall rules, so we filter them out.
+// We only filter out loopback and link-local. Other private IPs (like the
+// Hyper-V Default Switch gateway at 172.20.x.1) are reachable because
+// containers route through the VM which NATs to the host network.
 func isRoutableDNS(ip string) bool {
-	parts := strings.Split(ip, ".")
-	if len(parts) != 4 {
-		return true // IPv6 or weird format, let it through
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return true // non-IP strings pass through
 	}
-	first := parts[0]
-	switch first {
-	case "10", "169":
-		return false
-	case "172":
-		// 172.16.0.0/12
-		second := 0
-		if _, err := fmt.Sscanf(parts[1], "%d", &second); err != nil {
-			return true // can't parse, assume routable
-		}
-		return second < 16 || second > 31
-	case "192":
-		return parts[1] != "168"
-	case "127":
+	// Block loopback, link-local, and RFC1918 private ranges.
+	// Containers should only use public DNS servers.
+	if parsed.IsLoopback() || parsed.IsLinkLocalUnicast() || parsed.IsPrivate() {
 		return false
 	}
 	return true

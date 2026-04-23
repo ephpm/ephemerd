@@ -24,14 +24,20 @@ func Build() error {
 	if env := os.Getenv("OUTPUT"); env != "" {
 		output = env
 	}
-	return sh.RunV("go", "build", "-ldflags", ldflags(), "-o", output, "./cmd/ephemerd/")
+	return sh.RunV("go", "build", "-tags", "containers_image_openpgp", "-ldflags", ldflags(), "-o", output, "./cmd/ephemerd/")
 }
 
 // Windows performs the two-stage Windows build:
 // 1. Cross-compile static Linux binary with Linux assets embedded
-// 2. Build Windows binary embedding the Linux binary + Alpine rootfs
+// 2. Build Windows binary embedding the Linux binary + Alpine rootfs + kernel + initrd
 func Windows() error {
-	mg.Deps(Linuxembed, download.Rootfs, download.Runnerwindows)
+	// Phase 1: produce the inputs the initrd will bundle (ephemerd-linux binary
+	// and Alpine rootfs tarball), plus downloads that Initrdx86 doesn't touch.
+	mg.Deps(Linuxembed, download.Rootfs, download.Runnerwindows, download.Kernelx86, download.Shimwindows)
+	// Phase 2: build the initrd. Must run after Linuxembed + Rootfs — Initrdx86
+	// bundles pkg/vm/embed/ephemerd-linux and pkg/vm/embed/ephemerd-rootfs-*.tar.gz
+	// directly, and will fail on a fresh workspace if those aren't on disk yet.
+	mg.Deps(download.Initrdx86)
 
 	// Remove any Linux runner from embed dir to avoid bloating the Windows binary.
 	matches, _ := filepath.Glob("pkg/runner/embed/actions-runner-linux-*.tar.gz")
@@ -46,7 +52,7 @@ func Windows() error {
 	}
 	return sh.RunWith(
 		map[string]string{"GOOS": "windows", "GOARCH": "amd64"},
-		"go", "build", "-ldflags", ldflags(), "-o", output, "./cmd/ephemerd/",
+		"go", "build", "-tags", "containers_image_openpgp", "-ldflags", ldflags(), "-o", output, "./cmd/ephemerd/",
 	)
 }
 
@@ -59,7 +65,7 @@ func Linuxembed() error {
 	}
 	return sh.RunWith(
 		map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64"},
-		"go", "build", "-ldflags", ldflags(), "-o", "pkg/vm/embed/ephemerd-linux", "./cmd/ephemerd/",
+		"go", "build", "-tags", "containers_image_openpgp", "-ldflags", ldflags(), "-o", "pkg/vm/embed/ephemerd-linux", "./cmd/ephemerd/",
 	)
 }
 
@@ -99,7 +105,7 @@ func Macos() error {
 	}
 	defer func() { _ = restoreStashed(stash) }()
 
-	if err := sh.RunV("go", "build", "-ldflags", ldflags(), "-o", output, "./cmd/ephemerd/"); err != nil {
+	if err := sh.RunV("go", "build", "-tags", "containers_image_openpgp", "-ldflags", ldflags(), "-o", output, "./cmd/ephemerd/"); err != nil {
 		return err
 	}
 
@@ -136,7 +142,7 @@ func Linuxembedarm64() error {
 
 	return sh.RunWith(
 		map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "arm64"},
-		"go", "build", "-ldflags", ldflags(), "-o", "pkg/vm/embed/ephemerd-linux", "./cmd/ephemerd/",
+		"go", "build", "-tags", "containers_image_openpgp", "-ldflags", ldflags(), "-o", "pkg/vm/embed/ephemerd-linux", "./cmd/ephemerd/",
 	)
 }
 
@@ -175,6 +181,70 @@ func restoreStashed(stashed [][2]string) error {
 		}
 	}
 	return nil
+}
+
+// ForgeRunner compiles the Forgejo Actions runner for the current OS/arch.
+func ForgeRunner() error {
+	return buildRunner("forge-runner")
+}
+
+// GiteaRunner compiles the Gitea Actions runner for the current OS/arch.
+func GiteaRunner() error {
+	return buildRunner("gitea-runner")
+}
+
+// Runners compiles both forge-runner and gitea-runner for the current OS/arch.
+func Runners() {
+	mg.Deps(ForgeRunner, GiteaRunner)
+}
+
+// RunnersAll cross-compiles forge-runner and gitea-runner for all release platforms.
+// Outputs go to dist/<name>-<os>-<arch>[.exe].
+func RunnersAll() error {
+	type target struct{ goos, goarch string }
+	targets := []target{
+		{"linux", "amd64"},
+		{"linux", "arm64"},
+		{"windows", "amd64"},
+		{"darwin", "arm64"},
+	}
+	for _, t := range targets {
+		for _, name := range []string{"forge-runner", "gitea-runner"} {
+			if err := crossBuildRunner(name, t.goos, t.goarch); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func buildRunner(name string) error {
+	output := name
+	if runtime.GOOS == "windows" {
+		output += ".exe"
+	}
+	return sh.RunV("go", "build", "-ldflags", runnerLdflags(), "-o", output, fmt.Sprintf("./cmd/%s/", name))
+}
+
+func crossBuildRunner(name, goos, goarch string) error {
+	ext := ""
+	if goos == "windows" {
+		ext = ".exe"
+	}
+	output := filepath.Join("dist", fmt.Sprintf("%s-%s-%s%s", name, goos, goarch, ext))
+	fmt.Printf("  Building %s\n", output)
+
+	if err := os.MkdirAll("dist", 0o755); err != nil {
+		return err
+	}
+	return sh.RunWith(
+		map[string]string{"CGO_ENABLED": "0", "GOOS": goos, "GOARCH": goarch},
+		"go", "build", "-ldflags", runnerLdflags(), "-o", output, fmt.Sprintf("./cmd/%s/", name),
+	)
+}
+
+func runnerLdflags() string {
+	return fmt.Sprintf("-s -w -X main.version=%s", gitVersion())
 }
 
 func ldflags() string {

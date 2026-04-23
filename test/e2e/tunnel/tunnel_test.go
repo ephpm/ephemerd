@@ -235,6 +235,164 @@ func listenWithRetry(t *testing.T, deadline time.Duration) (net.Listener, *tunne
 	return nil, nil
 }
 
+// hitTunnel sends HTTP requests to publicURL/healthz until one succeeds or
+// maxAttempts is exhausted. Returns the response body on success, nil on failure.
+func hitTunnel(t *testing.T, publicURL string, maxAttempts int) []byte {
+	t.Helper()
+	client := &http.Client{Timeout: 15 * time.Second}
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		resp, err := client.Get(publicURL + "/healthz")
+		if err != nil {
+			t.Logf("  attempt %d: GET error: %v", attempt, err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			t.Logf("  attempt %d: success", attempt)
+			return body
+		}
+		t.Logf("  attempt %d: status %d", attempt, resp.StatusCode)
+		time.Sleep(2 * time.Second)
+	}
+	return nil
+}
+
+// healthzHandler returns an HTTP handler that serves {"status":"ok"}.
+func healthzHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"status":"ok"}`)
+	})
+	return mux
+}
+
+// TestLocaltunnelReconnect verifies that after a localtunnel listener is
+// closed (simulating a tunnel drop), a new Listen() call succeeds and HTTP
+// requests work through the new tunnel. This is what serveTunnelWithReconnect
+// relies on.
+func TestLocaltunnelReconnect(t *testing.T) {
+	// Phase 1: establish first tunnel, verify HTTP works
+	t.Log("phase 1: establishing first tunnel")
+	ln1, lt1 := listenWithRetry(t, 60*time.Second)
+	url1 := lt1.PublicURL()
+	t.Logf("tunnel 1: %s", url1)
+
+	server1 := &http.Server{Handler: healthzHandler()}
+	go func() { _ = server1.Serve(ln1) }()
+
+	body := hitTunnel(t, url1, 10)
+	if body == nil {
+		_ = server1.Close()
+		t.Fatal("phase 1: failed to get response through first tunnel")
+	}
+	t.Logf("phase 1: OK — %s", string(body))
+
+	// Phase 2: kill the first tunnel (simulates a drop)
+	t.Log("phase 2: killing first tunnel")
+	_ = server1.Close()
+	_ = ln1.Close()
+	time.Sleep(1 * time.Second)
+
+	// Phase 3: establish a new tunnel, verify HTTP works again
+	t.Log("phase 3: establishing second tunnel")
+	ln2, lt2 := listenWithRetry(t, 60*time.Second)
+	defer func() { _ = ln2.Close() }()
+	url2 := lt2.PublicURL()
+	t.Logf("tunnel 2: %s", url2)
+
+	server2 := &http.Server{Handler: healthzHandler()}
+	go func() { _ = server2.Serve(ln2) }()
+	defer func() { _ = server2.Close() }()
+
+	body = hitTunnel(t, url2, 10)
+	if body == nil {
+		t.Fatal("phase 3: failed to get response through second tunnel")
+	}
+	t.Logf("phase 3: OK — %s", string(body))
+
+	// Verify the old URL no longer works (best-effort, may get 502 or timeout)
+	t.Log("verifying old tunnel URL is dead")
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url1 + "/healthz")
+	if err != nil {
+		t.Logf("old URL correctly fails: %v", err)
+	} else {
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			t.Log("warning: old URL still returns 200 (tunnel server may be caching)")
+		} else {
+			t.Logf("old URL returns %d (expected)", resp.StatusCode)
+		}
+	}
+}
+
+// TestNgrokReconnect verifies the same reconnect flow using ngrok.
+func TestNgrokReconnect(t *testing.T) {
+	authtoken := os.Getenv("NGROK_AUTHTOKEN")
+	if authtoken == "" {
+		t.Skip("NGROK_AUTHTOKEN not set")
+	}
+
+	ctx := context.Background()
+
+	// Phase 1: establish first tunnel
+	t.Log("phase 1: establishing first ngrok tunnel")
+	ngrok1, err := tunnel.NewNgrok(authtoken)
+	if err != nil {
+		t.Fatalf("NewNgrok: %v", err)
+	}
+	ln1, err := ngrok1.Listen(ctx)
+	if err != nil {
+		t.Fatalf("ngrok listen 1: %v", err)
+	}
+	url1 := ngrok1.PublicURL()
+	t.Logf("tunnel 1: %s", url1)
+
+	server1 := &http.Server{Handler: healthzHandler()}
+	go func() { _ = server1.Serve(ln1) }()
+
+	body := hitTunnel(t, url1, 10)
+	if body == nil {
+		_ = server1.Close()
+		_ = ln1.Close()
+		t.Fatal("phase 1: failed to get response through first ngrok tunnel")
+	}
+	t.Logf("phase 1: OK — %s", string(body))
+
+	// Phase 2: kill the first tunnel
+	t.Log("phase 2: killing first ngrok tunnel")
+	_ = server1.Close()
+	_ = ln1.Close()
+	time.Sleep(2 * time.Second)
+
+	// Phase 3: establish a new tunnel
+	t.Log("phase 3: establishing second ngrok tunnel")
+	ngrok2, err := tunnel.NewNgrok(authtoken)
+	if err != nil {
+		t.Fatalf("NewNgrok 2: %v", err)
+	}
+	ln2, err := ngrok2.Listen(ctx)
+	if err != nil {
+		t.Fatalf("ngrok listen 2: %v", err)
+	}
+	defer func() { _ = ln2.Close() }()
+	url2 := ngrok2.PublicURL()
+	t.Logf("tunnel 2: %s", url2)
+
+	server2 := &http.Server{Handler: healthzHandler()}
+	go func() { _ = server2.Serve(ln2) }()
+	defer func() { _ = server2.Close() }()
+
+	body = hitTunnel(t, url2, 10)
+	if body == nil {
+		t.Fatal("phase 3: failed to get response through second ngrok tunnel")
+	}
+	t.Logf("phase 3: OK — %s", string(body))
+}
+
 // TestLocaltunnelHTTP verifies the tunnel works for basic HTTP without GitHub.
 // This is a fast sanity check that doesn't need a GitHub token.
 func TestLocaltunnelHTTP(t *testing.T) {

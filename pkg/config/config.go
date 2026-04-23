@@ -24,8 +24,9 @@ type Config struct {
 	Containerd ContainerdConfig `toml:"containerd"`
 	Network    NetworkConfig    `toml:"network"`
 	VM         VMConfig         `toml:"vm"`
-	Dind       DindConfig       `toml:"dind"`
-	Runner     RunnerConfig     `toml:"runner"`
+	Dind        DindConfig        `toml:"dind"`
+	ModuleProxy ModuleProxyConfig `toml:"module_proxy"`
+	Runner      RunnerConfig      `toml:"runner"`
 	Metrics    MetricsConfig    `toml:"metrics"`
 	Log        LogConfig        `toml:"log"`
 }
@@ -85,6 +86,16 @@ type ContainerdConfig struct {
 // DindConfig configures the fake Docker daemon mounted into job containers.
 type DindConfig struct {
 	Enabled bool `toml:"enabled"` // mount /var/run/docker.sock with a fake Docker API
+}
+
+// ModuleProxyConfig configures the Go module caching proxy.
+// When enabled, ephemerd runs a local GOPROXY on the bridge gateway that
+// caches module downloads. Containers receive GOPROXY env var automatically.
+type ModuleProxyConfig struct {
+	Enabled  bool   `toml:"enabled"`  // enable Go module caching proxy
+	Port     int    `toml:"port"`     // listen port on bridge gateway (default 8082)
+	Upstream string `toml:"upstream"` // upstream proxy URL (default "https://proxy.golang.org")
+	Cleanup  bool   `toml:"cleanup"`  // wipe cache on shutdown (default true)
 }
 
 // VMConfig configures virtual machines for cross-OS job execution.
@@ -155,6 +166,7 @@ type ForgejoConfig struct {
 	Token       string   `toml:"token"`        // runner registration token from Forgejo admin
 	Owner       string   `toml:"owner"`        // org or user (empty = instance-level runner)
 	Repos       []string `toml:"repos"`        // limit to specific repos (empty = all)
+	Labels      []string `toml:"labels"`       // runner labels (default: ["ubuntu-latest:docker://<job_image>"])
 	JobImage    string   `toml:"job_image"`    // default job execution image (default: "gitea/runner-images:ubuntu-24.04")
 }
 
@@ -166,6 +178,7 @@ type GiteaConfig struct {
 	Token       string   `toml:"token"`        // runner registration token from Gitea admin
 	Owner       string   `toml:"owner"`        // org or user (empty = instance-level runner)
 	Repos       []string `toml:"repos"`        // limit to specific repos (empty = all)
+	Labels      []string `toml:"labels"`       // runner labels (default: ["ubuntu-latest:docker://<job_image>"])
 	JobImage    string   `toml:"job_image"`    // default job execution image (default: "gitea/runner-images:ubuntu-24.04")
 }
 
@@ -228,6 +241,11 @@ type LogConfig struct {
 	Level        string `toml:"level"`
 	Format       string `toml:"format"`        // "text" or "json"
 	LogRetention string `toml:"log_retention"` // max age for job log files (e.g. "7d", "24h"); default "7d"
+
+	// Writer overrides the log output destination. When nil, logs go to
+	// stderr. Set by the Windows Service handler to route logs to the
+	// Windows Event Log.
+	Writer io.Writer `toml:"-"`
 }
 
 // LogRetentionDuration returns the parsed log retention duration.
@@ -366,11 +384,17 @@ func (c *Config) Logger() *slog.Logger {
 
 	opts := &slog.HandlerOptions{Level: level}
 
-	// On Windows, slog's \n doesn't include \r, causing stair-step output
-	// in PowerShell/cmd.exe terminals. Wrap stderr to fix line endings.
-	var w io.Writer = os.Stderr
-	if goruntime.GOOS == "windows" {
+	// Use the configured writer, or fall back to stderr.
+	// On Windows terminals, wrap stderr to fix \n → \r\n line endings.
+	// When Writer is set (e.g. Event Log), use it directly — it handles
+	// its own formatting.
+	var w io.Writer
+	if c.Log.Writer != nil {
+		w = c.Log.Writer
+	} else if goruntime.GOOS == "windows" {
 		w = &crlfWriter{w: os.Stderr}
+	} else {
+		w = os.Stderr
 	}
 
 	var handler slog.Handler

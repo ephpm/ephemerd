@@ -134,7 +134,7 @@ jobs:
 
       # --- Functional tests ---
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Verify checkout
         run: |

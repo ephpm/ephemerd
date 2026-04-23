@@ -121,14 +121,14 @@ The final image is tiny — just the SDK files on a scratch base, no OS, no runt
 
 **Example: using it in a macOS job**
 
-Your ePHPm release pipeline needs that `libphp.a` to build the final binary on macOS. Set `EPHEMERD_IMAGE` and ephemerd pulls the OCI image, unpacks it into the VM, and your job finds the files ready to go:
+Your ePHPm release pipeline needs that `libphp.a` to build the final binary on macOS. Set `container:` on the job and ephemerd pulls the OCI image, unpacks its layers into the VM via virtio-fs, and your job finds the files ready to go:
 
 ```yaml
 jobs:
   build-macos:
     runs-on: [self-hosted, macos, arm64]
-    env:
-      EPHEMERD_IMAGE: ghcr.io/ephpm/php-sdk:8.5.2-macos
+    container:
+      image: ghcr.io/ephpm/php-sdk:8.5.2-macos
     steps:
       - uses: actions/checkout@v4
       - name: Build ephpm
@@ -243,22 +243,22 @@ jobs:
 
 ### macOS jobs (VMs)
 
-macOS jobs run in ephemeral VMs, not containers. The `container:` key doesn't work on macOS runners. Instead, set `EPHEMERD_IMAGE` in the job's env to select which VM snapshot to boot:
+macOS jobs run in ephemeral VMs, not containers. GitHub-hosted macOS runners ignore the `container:` key, but on ephemerd it has a specific meaning: the OCI image whose layers are extracted onto the running VM via virtio-fs. Use it to deliver pre-built SDKs, toolchains, or release artifacts alongside the job:
 
 ```yaml
 jobs:
   build-ios:
     runs-on: [self-hosted, macos, arm64]
-    env:
-      EPHEMERD_IMAGE: xcode15
+    container:
+      image: ghcr.io/your-org/xcode-sdk:16
     steps:
       - uses: actions/checkout@v4
       - run: xcodebuild -scheme MyApp
 ```
 
-ephemerd reads the workflow YAML from the GitHub API when a job is queued and picks up `EPHEMERD_IMAGE` before creating the VM. The value maps to a snapshot configured in ephemerd's `[vm.macos]` section.
+ephemerd reads the workflow YAML from the GitHub API when a job is queued and picks up `container.image` before creating the VM. The image layers are extracted into a host directory that is shared into the VM over virtio-fs — no container runs, just filesystem payload.
 
-If `EPHEMERD_IMAGE` is not set, the base macOS VM boots as-is — all the tools provisioned into the snapshot are already there.
+If `container:` is not set, the base macOS VM boots as-is — all the tools provisioned into the disk image are already there.
 
 ## Providers
 
@@ -343,6 +343,13 @@ enabled = false                       # enable macOS VM per-job
 base_image = "/path/to/macos.img"    # provisioned base image
 cpus = 4
 memory_mb = 8192
+
+# Go module caching proxy — speeds up `go mod download` across jobs
+[module_proxy]
+enabled = true                        # run a GOPROXY on the bridge gateway
+# port = 8082                         # default listen port
+# upstream = "https://proxy.golang.org"  # upstream to fetch from on cache miss
+# cleanup = true                      # wipe cache on shutdown
 
 [log]
 level = "info"                        # debug, info, warn, error

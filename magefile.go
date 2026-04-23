@@ -21,9 +21,14 @@ import (
 var Default = build.Build
 
 // Test runs all Go tests (downloads embedded deps first if needed).
+//
+// The containers_image_openpgp tag swaps buildah's CGo gpgme dep for the
+// pure-Go OpenPGP implementation so packages like pkg/dind compile on CI
+// runners without libgpgme headers. Must match what mage build and
+// .golangci.yml use — if it diverges, lint/build pass but test fails.
 func Test() error {
 	mg.Deps(download.All)
-	return sh.RunV("go", "test", "-count=1", "./...")
+	return sh.RunV("go", "test", "-tags", "containers_image_openpgp", "-count=1", "./...")
 }
 
 // Lint runs golangci-lint (downloads linter and embedded deps first if needed).
@@ -79,6 +84,35 @@ func E2egithub() error {
 // Requires: docker with compose support.
 func E2ewoodpecker() error {
 	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "8m", "-run", "TestWoodpecker_E2E", "./test/e2e/woodpecker/")
+}
+
+// E2EDind runs the DinD (fake Docker socket) container lifecycle e2e test.
+// Boots Forgejo via docker-compose, runs workflows that exercise container
+// create/start/inspect via the runner's Docker socket.
+// Requires: docker with compose support.
+func E2edind() error {
+	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "6m", "./test/e2e/dind/")
+}
+
+// E2EBuild runs the buildah docker-build e2e tests.
+// Tests POST /build through the fake Docker socket against real containerd.
+// Requires: root + containerd (privileged).
+func E2ebuild() error {
+	return sh.RunV("go", "test", "-tags", "linux,e2e,privileged,containers_image_openpgp", "-v", "-timeout", "10m", "-run", "TestE2E_Build", "./test/e2e/")
+}
+
+// E2EModProxy runs the Go module proxy e2e test.
+// Starts a local proxy, fetches real modules, and builds a small Go app through it.
+// Requires: internet access, go toolchain.
+func E2emodproxy() error {
+	return sh.RunV("go", "test", "-tags", "e2e", "-v", "-timeout", "2m", "-run", "TestModProxy_E2E", "./test/e2e/modproxy/")
+}
+
+// E2ERun runs the `ephemerd run` CLI e2e tests.
+// Executes `ephemerd run` as a subprocess against test workflows.
+// Requires: root + `mage build` (uses embedded containerd).
+func E2erun() error {
+	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "10m", "-run", "TestE2E_RunCLI", "./test/e2e/")
 }
 
 // CI runs download, lint, test, and build.
