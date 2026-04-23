@@ -588,6 +588,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			JobID:   id,
 			DataDir: r.cfg.DataDir,
 			Client:  r.client,
+			Network: r.cfg.Network,
 			Log:     r.cfg.Log,
 		})
 		if err != nil {
