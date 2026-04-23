@@ -15,6 +15,8 @@ import (
 	ctdserver "github.com/containerd/containerd/v2/cmd/containerd/server"
 	srvconfig "github.com/containerd/containerd/v2/cmd/containerd/server/config"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	// Blank import registers all containerd plugins (services, snapshotters,
 	// runtimes, etc.) with the global registry. Without this, ctdserver.New()
@@ -153,6 +155,8 @@ func (s *Server) start() error {
 		State:   stateDir,
 	}
 	cfg.GRPC.Address = socket
+	cfg.GRPC.MaxRecvMsgSize = 16 << 20 // 16 MB — match containerd client defaults
+	cfg.GRPC.MaxSendMsgSize = 16 << 20
 	cfg.TTRPC.Address = socket + ".ttrpc"
 
 	// On Windows, fix containerd's logrus output for PowerShell.
@@ -237,9 +241,54 @@ func (s *Server) start() error {
 
 	s.cfg.Log.Info("containerd server started in-process", "socket", socket)
 
+	// On Windows, connect the in-process client via a local TCP port instead
+	// of the named pipe. Windows named pipes have gRPC stream limitations that
+	// cause "failed to send write: EOF" errors during large image pulls
+	// (e.g. servercore at ~5GB). TCP avoids this entirely.
+	//
+	// We use client.NewWithConn to bypass containerd's DialAddress helper
+	// which always prepends npipe:// on Windows.
+	useTCP := false
+	var tcpAddr string
+	if goruntime.GOOS == "windows" {
+		const internalTCPPort = 17362 // internal only, not configurable
+		tcpAddr = fmt.Sprintf("127.0.0.1:%d", internalTCPPort)
+		tcpL, err := net.Listen("tcp", tcpAddr)
+		if err != nil {
+			s.cfg.Log.Warn("failed to start internal TCP listener, falling back to named pipe", "error", err)
+		} else {
+			go func() {
+				if err := srv.ServeGRPC(tcpL); err != nil {
+					select {
+					case <-ctx.Done():
+					default:
+						s.cfg.Log.Error("containerd internal TCP error", "error", err)
+					}
+				}
+			}()
+			useTCP = true
+			s.cfg.Log.Info("containerd internal TCP ready (avoids named pipe gRPC limits)", "addr", tcpAddr)
+		}
+	}
+
 	// Connect client to the in-process server
 	for i := range 30 {
-		s.client, err = client.New(socket)
+		if useTCP {
+			conn, dialErr := grpc.NewClient(tcpAddr,
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithDefaultCallOptions(
+					grpc.MaxCallRecvMsgSize(16<<20),
+					grpc.MaxCallSendMsgSize(16<<20),
+				),
+			)
+			if dialErr != nil {
+				err = dialErr
+			} else {
+				s.client, err = client.NewWithConn(conn)
+			}
+		} else {
+			s.client, err = client.New(socket)
+		}
 		if err == nil {
 			_, err = s.client.Version(ctx)
 			if err == nil {
@@ -248,14 +297,22 @@ func (s *Server) start() error {
 			}
 		}
 		if i == 0 {
-			s.cfg.Log.Debug("waiting for containerd to be ready", "socket", socket)
+			addr := socket
+			if useTCP {
+				addr = tcpAddr
+			}
+			s.cfg.Log.Debug("waiting for containerd to be ready", "address", addr)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 
 	srv.Stop()
 	cancel()
-	return fmt.Errorf("timed out connecting to containerd at %s: %w", socket, err)
+	addr := socket
+	if useTCP {
+		addr = tcpAddr
+	}
+	return fmt.Errorf("timed out connecting to containerd at %s: %w", addr, err)
 }
 
 // crlfFormatter wraps a logrus formatter to use \r\n line endings on Windows.

@@ -241,6 +241,11 @@ type LogConfig struct {
 	Level        string `toml:"level"`
 	Format       string `toml:"format"`        // "text" or "json"
 	LogRetention string `toml:"log_retention"` // max age for job log files (e.g. "7d", "24h"); default "7d"
+
+	// Writer overrides the log output destination. When nil, logs go to
+	// stderr. Set by the Windows Service handler to route logs to the
+	// Windows Event Log.
+	Writer io.Writer `toml:"-"`
 }
 
 // LogRetentionDuration returns the parsed log retention duration.
@@ -379,11 +384,17 @@ func (c *Config) Logger() *slog.Logger {
 
 	opts := &slog.HandlerOptions{Level: level}
 
-	// On Windows, slog's \n doesn't include \r, causing stair-step output
-	// in PowerShell/cmd.exe terminals. Wrap stderr to fix line endings.
-	var w io.Writer = os.Stderr
-	if goruntime.GOOS == "windows" {
+	// Use the configured writer, or fall back to stderr.
+	// On Windows terminals, wrap stderr to fix \n → \r\n line endings.
+	// When Writer is set (e.g. Event Log), use it directly — it handles
+	// its own formatting.
+	var w io.Writer
+	if c.Log.Writer != nil {
+		w = c.Log.Writer
+	} else if goruntime.GOOS == "windows" {
 		w = &crlfWriter{w: os.Stderr}
+	} else {
+		w = os.Stderr
 	}
 
 	var handler slog.Handler

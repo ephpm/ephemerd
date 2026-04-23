@@ -15,7 +15,7 @@ import (
 // a dispatch client to ephemerd-linux running inside the VM. Linux jobs run as
 // containers inside the VM, dispatched through the gRPC dispatch server so
 // they get full CNI networking (the raw containerd API skips CRI/CNI).
-func startContainerRuntime(dataDir string, log *slog.Logger, _ bool, _ uint32, _ string, _ bool) (*client.Client, func() *scheduler.DispatchClient, func(), error) {
+func startContainerRuntime(dataDir string, log *slog.Logger, _ bool, _ uint32, _ string, _ bool) (*client.Client, func() (*scheduler.DispatchClient, *client.Client), func(), error) {
 	log.Info("macOS detected — booting Linux VM for container runtime")
 
 	linuxVM, err := vm.StartLinuxVM(vm.LinuxVMConfig{
@@ -44,5 +44,5 @@ func startContainerRuntime(dataDir string, log *slog.Logger, _ bool, _ uint32, _
 		}
 		linuxVM.Stop()
 	}
-	return linuxVM.Client(), func() *scheduler.DispatchClient { return dispatchClient }, cleanup, nil
+	return linuxVM.Client(), func() (*scheduler.DispatchClient, *client.Client) { return dispatchClient, linuxVM.Client() }, cleanup, nil
 }

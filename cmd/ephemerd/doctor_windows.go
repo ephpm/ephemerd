@@ -13,32 +13,7 @@ import (
 )
 
 func platformChecks(pass, warn, fail func(string)) {
-	// WSL2
-	wslPath, err := exec.LookPath("wsl.exe")
-	if err != nil {
-		warn("WSL not found — Linux jobs will not be available on this host")
-	} else {
-		pass(fmt.Sprintf("WSL available (%s)", wslPath))
-
-		// Check WSL version — output is UTF-16 on Windows, so also check --status
-		out, err := exec.Command("wsl.exe", "--status").CombinedOutput()
-		if err != nil {
-			// Fallback: try --version
-			out, err = exec.Command("wsl.exe", "--version").CombinedOutput()
-		}
-		if err != nil {
-			warn("could not determine WSL version")
-		} else {
-			output := cleanUTF16(string(out))
-			if strings.Contains(output, "2") || strings.Contains(strings.ToLower(output), "wsl2") || strings.Contains(strings.ToLower(output), "wsl version") {
-				pass("WSL2 detected")
-			} else {
-				warn("WSL version unclear — ensure WSL2 is the default (wsl --set-default-version 2)")
-			}
-		}
-	}
-
-	// Hyper-V — check via PowerShell
+	// Hyper-V — required for both Windows containers and the Linux VM
 	out, err := exec.Command("powershell", "-NoProfile", "-Command",
 		"(Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-Hypervisor).State").CombinedOutput()
 	if err != nil {
@@ -48,8 +23,34 @@ func platformChecks(pass, warn, fail func(string)) {
 		if state == "Enabled" {
 			pass("Hyper-V hypervisor enabled")
 		} else {
-			warn(fmt.Sprintf("Hyper-V hypervisor state: %s — Windows container isolation requires Hyper-V", state))
+			fail(fmt.Sprintf("Hyper-V hypervisor state: %s — required for Windows containers and Linux VM", state))
 		}
+	}
+
+	// Hyper-V management tools (PowerShell module)
+	out, err = exec.Command("powershell", "-NoProfile", "-Command",
+		"Get-Command Get-VM -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "Get-VM" {
+		warn("Hyper-V PowerShell module not available — Linux VM IP discovery may fail")
+	} else {
+		pass("Hyper-V PowerShell management tools available")
+	}
+
+	// Default Switch (used for Linux VM networking)
+	out, err = exec.Command("powershell", "-NoProfile", "-Command",
+		"Get-VMSwitch -Name 'Default Switch' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		warn("Hyper-V Default Switch not found — Linux VM networking may fail")
+	} else {
+		pass("Hyper-V Default Switch available")
+	}
+
+	// WSL2 (optional — only needed for interactive 'ephemerd run' on Windows)
+	wslPath, err := exec.LookPath("wsl.exe")
+	if err != nil {
+		pass("WSL not found (optional — only needed for 'ephemerd run')")
+	} else {
+		pass(fmt.Sprintf("WSL available for interactive use (%s)", wslPath))
 	}
 
 	// Windows build version
@@ -66,7 +67,7 @@ func platformChecks(pass, warn, fail func(string)) {
 		if state == "Enabled" {
 			pass("Windows Containers feature enabled")
 		} else {
-			warn("Windows Containers feature not enabled — run: Enable-WindowsOptionalFeature -Online -FeatureName Containers")
+			fail("Windows Containers feature not enabled — run: Enable-WindowsOptionalFeature -Online -FeatureName Containers -NoRestart; then reboot")
 		}
 	}
 }
@@ -116,24 +117,41 @@ func cleanUTF16(s string) string {
 }
 
 func platformCleanup(dataDir string, pass, warn, fail func(string)) {
-	// Check for stale WSL distros
-	out, err := exec.Command("wsl.exe", "--list", "--quiet").CombinedOutput()
-	if err != nil {
-		return
+	// Check for stale Hyper-V VMs (created by ephemerd)
+	out, err := exec.Command("powershell", "-NoProfile", "-Command",
+		"Get-VM -Name 'ephemerd-*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name").CombinedOutput()
+	if err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			name := strings.TrimSpace(line)
+			if name == "" {
+				continue
+			}
+			stopOut, stopErr := exec.Command("powershell", "-NoProfile", "-Command",
+				fmt.Sprintf("Stop-VM -Name '%s' -Force -TurnOff -ErrorAction SilentlyContinue; Remove-VM -Name '%s' -Force", name, name)).CombinedOutput()
+			if stopErr != nil {
+				warn(fmt.Sprintf("could not remove stale VM %s: %s", name, strings.TrimSpace(string(stopOut))))
+			} else {
+				pass(fmt.Sprintf("removed stale Hyper-V VM: %s", name))
+			}
+		}
 	}
 
-	lines := strings.Split(cleanUTF16(string(out)), "\n")
-	for _, line := range lines {
-		name := strings.TrimSpace(line)
-		if name == "" {
-			continue
-		}
-		if strings.HasPrefix(name, "ephemerd-") {
-			out, err := exec.Command("wsl.exe", "--unregister", name).CombinedOutput()
-			if err != nil {
-				warn(fmt.Sprintf("could not remove stale WSL distro %s: %s", name, cleanUTF16(string(out))))
-			} else {
-				pass(fmt.Sprintf("removed stale WSL distro: %s", name))
+	// Check for stale WSL distros (from older ephemerd or 'ephemerd run')
+	out, err = exec.Command("wsl.exe", "--list", "--quiet").CombinedOutput()
+	if err == nil {
+		lines := strings.Split(cleanUTF16(string(out)), "\n")
+		for _, line := range lines {
+			name := strings.TrimSpace(line)
+			if name == "" {
+				continue
+			}
+			if strings.HasPrefix(name, "ephemerd-") {
+				unregOut, unregErr := exec.Command("wsl.exe", "--unregister", name).CombinedOutput()
+				if unregErr != nil {
+					warn(fmt.Sprintf("could not remove stale WSL distro %s: %s", name, cleanUTF16(string(unregOut))))
+				} else {
+					pass(fmt.Sprintf("removed stale WSL distro: %s", name))
+				}
 			}
 		}
 	}

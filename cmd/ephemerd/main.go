@@ -36,6 +36,12 @@ var (
 )
 
 func main() {
+	// When running as a Windows Service, the SCM invokes the binary directly.
+	// Detect this and run the service handler instead of the CLI.
+	if runAsWindowsService() {
+		return
+	}
+
 	app := &cli.Command{
 		Name:           "ephemerd",
 		Usage:          "Ephemeral GitHub Actions runner daemon",
@@ -85,6 +91,10 @@ func serveCmd() *cli.Command {
 				Aliases: []string{"c"},
 				Usage:   "path to config file (default: <data-dir>/config.toml)",
 			},
+			&cli.StringFlag{
+				Name:  "images-dir",
+				Usage: "directory of OCI image tarballs (*.tar) to copy into <data-dir>/images/ on startup",
+			},
 			&cli.UintFlag{
 				Name:  "containerd-tcp-port",
 				Usage: "also expose containerd on a TCP port (used by WSL host integration)",
@@ -104,12 +114,12 @@ func serveCmd() *cli.Command {
 			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			return serve(ctx, cmd.String("config"), uint32(cmd.Uint("containerd-tcp-port")), cmd.String("containerd-tcp-addr"), cmd.Bool("containerd-only"), cmd.Bool("dind"))
+			return serve(ctx, cmd.String("config"), cmd.String("images-dir"), uint32(cmd.Uint("containerd-tcp-port")), cmd.String("containerd-tcp-addr"), cmd.Bool("containerd-only"), cmd.Bool("dind"))
 		},
 	}
 }
 
-func serve(ctx context.Context, configFile string, containerdTCPPort uint32, containerdTCPAddr string, containerdOnly bool, dindFlag bool) error {
+func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPPort uint32, containerdTCPAddr string, containerdOnly bool, dindFlag bool) error {
 	// Check if another instance is already running.
 	if cc, err := dialControl(ctx); err == nil {
 		if resp, err := cc.Status(ctx, &apiv1.StatusRequest{}); err == nil {
@@ -142,12 +152,24 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		cfg.Dind.Enabled = true
 	}
 
+	// When running as a Windows Service, route log output to the Event Log.
+	if w := getServiceLogWriter(); w != nil {
+		cfg.Log.Writer = w
+	}
+
 	log := cfg.Logger()
 	log.Info("starting ephemerd", "version", version, "data_dir", configDir)
 
 	// Ensure data directory exists
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		return fmt.Errorf("creating data directory %s: %w", configDir, err)
+	}
+
+	// Stage any caller-supplied OCI image tarballs into <data-dir>/images/.
+	// Runtime.ImportImages then picks them up at boot. Same-size files are
+	// skipped so re-running serve doesn't re-copy multi-GB tarballs.
+	if err := copyTarballs(imagesDirFlag, joinPath(configDir, "images"), log); err != nil {
+		return fmt.Errorf("staging images from --images-dir: %w", err)
 	}
 
 	// Write PID file for drain command
@@ -385,6 +407,7 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		RunnerDir:        rm.Dir(),
 		RunnerMount:      rm.ContainerDir(),
 		DefaultImage:     cfg.Runner.DefaultImage,
+		ImagesDir:        joinPath(configDir, "images"),
 		LogDir:           joinPath(configDir, "logs"),
 		DataDir:          configDir,
 		ContainerDataDir: containerDataDir,
@@ -400,16 +423,37 @@ func serve(ctx context.Context, configFile string, containerdTCPPort uint32, con
 		log.Warn("failed to clean orphan containers", "error", err)
 	}
 
+	// Import pre-downloaded OCI image tarballs in the background so the
+	// scheduler starts immediately. Large images like servercore take
+	// minutes to unpack — jobs that don't need the imported image can
+	// proceed in the meantime.
+	go func() {
+		deferredImages, importErr := rt.ImportImages(ctx)
+		if importErr != nil {
+			log.Warn("failed to import pre-downloaded images", "error", importErr)
+		}
+
+		// Import deferred Linux images into the VM's containerd.
+		// waitDispatch blocks until the VM is ready, which may already
+		// be done by the time we get here.
+		if len(deferredImages) > 0 {
+			_, vmClient := waitDispatch()
+			if vmClient != nil {
+				runtime.ImportImagesTo(ctx, vmClient, deferredImages, "overlayfs", log)
+			}
+		}
+	}()
+
 	// Create artifact extractor for macOS VM jobs. On macOS hosts, this
 	// lets a job's `container: { image: ... }` pull OCI images and extract
 	// their layers into the shared data directory (available inside macOS
 	// VMs via virtio-fs).
 	artifactExtractor := artifacts.NewExtractor(ctrdClient, log)
 
-	// Wait for Linux dispatch client if WSL VM is booting in the background.
-	linuxDispatcher := waitDispatch()
+	// Wait for Linux dispatch client if the VM is booting in the background.
+	linuxDispatcher, _ := waitDispatch()
 	if linuxDispatcher != nil {
-		log.Info("Linux job dispatch enabled via WSL")
+		log.Info("Linux job dispatch enabled")
 	}
 
 	// Set up webhook tunnel (GitHub mode only)

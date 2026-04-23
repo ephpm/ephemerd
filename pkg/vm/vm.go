@@ -4,7 +4,7 @@
 //
 //  1. Linux VM (long-running): On Windows and macOS hosts, a lightweight Linux VM
 //     runs containerd for Linux jobs. Same OCI images as native Linux.
-//     - Windows: WSL2 distro with embedded ephemerd binary (Hyper-V fallback for Server)
+//     - Windows: Hyper-V Gen 2 VM with direct kernel boot via HCS API
 //     - macOS: Virtualization.framework Linux VM
 //
 //  2. macOS VM (per-job): On macOS hosts, ephemeral macOS VMs run macOS-native
@@ -55,7 +55,7 @@ func (c *LinuxVMConfig) SetDefaults() {
 		c.CPUs = 1
 	}
 	if c.MemoryMB == 0 {
-		c.MemoryMB = 1024
+		c.MemoryMB = 4096
 	}
 	if c.DiskSizeGB == 0 {
 		c.DiskSizeGB = 50

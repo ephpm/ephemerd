@@ -17,3 +17,6 @@ pkg/vm/embed/initrd
 
 # JetBrains
 .idea/
+
+# Claude Code personal overrides (per-engineer, per-project)
+.claude/settings.local.json
