@@ -98,7 +98,7 @@ func (p *Provider) Start(ctx context.Context, cfg providers.PollConfig) (<-chan 
 	//
 	// Start() sets up the custom executor listener (a local HTTP or unix
 	// socket server) that gitlab-runner's custom executor scripts call.
-	if err := p.register(ctx); err != nil {
+	if err := p.register(ctx); err != nil { //nolint:staticcheck // SA4023: register is a stub
 		return nil, fmt.Errorf("gitlab runner registration: %w", err)
 	}
 
@@ -119,7 +119,8 @@ func (p *Provider) Start(ctx context.Context, cfg providers.PollConfig) (<-chan 
 	return p.events, nil
 }
 
-func (p *Provider) register(ctx context.Context) error {
+//nolint:staticcheck // SA4023: stub always errors — will return nil once registration is implemented
+func (p *Provider) register(_ context.Context) error {
 	// TODO: implement runner registration
 	//
 	// GitLab 16+ (runner authentication tokens):

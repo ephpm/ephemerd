@@ -49,9 +49,9 @@ func TestIsRoutableDNS(t *testing.T) {
 		{"127.0.0.1", false},
 		{"127.0.0.53", false},
 
-		// IPv6 — passes through (can't parse as IPv4)
-		{"::1", true},
-		{"2001:db8::1", true},
+		// IPv6
+		{"::1", false},        // loopback, blocked
+		{"2001:db8::1", true}, // public, passes through
 
 		// Edge cases
 		{"", true},     // empty, let it through

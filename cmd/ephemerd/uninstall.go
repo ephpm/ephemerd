@@ -183,4 +183,5 @@ func uninstallWindowsService() {
 	} else {
 		fmt.Println("  removed Windows service")
 	}
+
 }
