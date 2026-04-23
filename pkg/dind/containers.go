@@ -51,6 +51,7 @@ type createRequest struct {
 type hostConfig struct {
 	Binds       []string `json:"Binds"`
 	NetworkMode string   `json:"NetworkMode"`
+	Privileged  bool     `json:"Privileged"`
 }
 
 // argsStrategy selects how to assemble Process.Args for a new container.
@@ -223,6 +224,35 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	if req.WorkingDir != "" {
 		opts = append(opts, oci.WithProcessCwd(req.WorkingDir))
 	}
+
+	// Privileged: grant all current caps, drop seccomp/apparmor/selinux,
+	// make /proc/sys, /sys, /cgroup writable, and allow every device.
+	// buildx's docker-container driver needs this so buildkitd can bind-mount
+	// snapshot layers ("operation not permitted" on bind mount → missing
+	// CAP_SYS_ADMIN). This matches `docker run --privileged` semantics.
+	//
+	// Also force the host cgroup namespace and bind-mount the cgroup2 root:
+	// our VM is cgroup v2 but containerd's default OCI spec mounts the
+	// legacy `cgroup` (v1) filesystem type, which silently doesn't work and
+	// leaves buildkit's inner runc failing with "no cgroup mount found in
+	// mountinfo". Host cgroupns + rbind of /sys/fs/cgroup makes the nested
+	// runc see the real v2 hierarchy. This matches `docker run --privileged
+	// --cgroupns=host` semantics used by every docker-in-docker setup.
+	if req.HostConfig != nil && req.HostConfig.Privileged {
+		opts = append(opts,
+			oci.WithPrivileged,
+			oci.WithAllDevicesAllowed,
+			oci.WithHostNamespace(ocispec.CgroupNamespace),
+			withBindMount("/sys/fs/cgroup", "/sys/fs/cgroup", []string{"rbind", "rw"}),
+		)
+	}
+
+	// Inherit the VM's /etc/resolv.conf so sibling containers can resolve
+	// external hostnames (e.g., buildkit pulling FROM ghcr.io/...). Without
+	// this the container uses whatever resolv.conf is baked into its image,
+	// which typically points at localhost and fails with "connection refused"
+	// on DNS lookups.
+	opts = append(opts, withBindMount("/etc/resolv.conf", "/etc/resolv.conf", []string{"rbind", "ro"}))
 
 	// Bind mounts from HostConfig.
 	if req.HostConfig != nil {

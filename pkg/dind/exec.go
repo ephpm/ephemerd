@@ -287,8 +287,14 @@ func (s *Server) runHijackedExec(w http.ResponseWriter, r *http.Request, exec *e
 		}
 		s.markExecExited(exec, 137)
 	}
-	// Let the stdin goroutine drain (conn.Close will cause it to return).
-	<-stdinDone
+	// Don't wait for stdinDone here — once the process has exited, any further
+	// stdin bytes from the client are meaningless, and the goroutine is
+	// blocked on conn.Read (the client typically holds the conn open until it
+	// sees EOF). The deferred conn.Close() below unblocks that read, letting
+	// the goroutine exit on its own; Go will clean it up. Waiting on stdinDone
+	// before the defer ran caused a server↔client deadlock where the client
+	// waited for EOF and we waited for stdin to finish.
+	_ = stdinDone
 }
 
 // runBufferedExec is the legacy non-streaming path: start the exec with

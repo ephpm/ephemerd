@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -215,6 +216,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.handleVersion(w, r)
 	case path == "/info":
 		s.handleInfo(w, r)
+	case path == "/auth" && r.Method == http.MethodPost:
+		s.handleAuth(w, r)
 	case path == "/images/json" && r.Method == http.MethodGet:
 		s.handleImageList(w, r)
 	case path == "/images/create" && r.Method == http.MethodPost:
@@ -406,6 +409,22 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 
 	writeProgress(fmt.Sprintf("Digest: %s", img.Target().Digest.String()))
 	writeProgress(fmt.Sprintf("Status: Downloaded newer image for %s", ref))
+}
+
+// handleAuth accepts docker login requests and returns success without
+// validating against any registry. Docker CLI writes the credentials to
+// ~/.docker/config.json on success; buildx later reads that file and passes
+// the credentials to buildkitd via its session API when pushing. The real
+// credential check happens at push time on the upstream registry — we don't
+// have (or need) a way to verify Docker Hub creds at login.
+func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
+	// Drain the body so the client doesn't see a broken pipe.
+	_, _ = io.Copy(io.Discard, r.Body)
+	s.log.Info("docker auth accepted (not validated)")
+	writeJSON(w, http.StatusOK, map[string]string{
+		"Status":        "Login Succeeded",
+		"IdentityToken": "",
+	})
 }
 
 func (s *Server) handleNotImplemented(w http.ResponseWriter, r *http.Request) {
