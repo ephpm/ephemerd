@@ -129,46 +129,36 @@ func (c *Client) RemoveRunner(ctx context.Context, repo string, runnerID int64) 
 	return nil
 }
 
-// FetchJobImage fetches the workflow run's job definition and looks for an
-// EPHEMERD_IMAGE environment variable. This requires an extra API call per job
-// but allows users to specify the container image directly in their workflow:
+// FetchJobImage fetches the workflow run's job definition and reads the
+// container image declared in the job's `container:` field. This requires an
+// extra API call per job but lets users specify the image directly in their
+// workflow:
 //
 //	jobs:
 //	  build:
 //	    runs-on: [self-hosted, linux, x64]
-//	    env:
-//	      EPHEMERD_IMAGE: ghcr.io/myorg/custom-build:latest
+//	    container:
+//	      image: ghcr.io/myorg/custom-build:latest
+//	  quick:
+//	    runs-on: [self-hosted, linux, x64]
+//	    container: ghcr.io/myorg/quick:latest  # shorthand
 //
-// Returns empty string if no EPHEMERD_IMAGE is set.
+// Returns empty string if no container image is set.
 func (c *Client) FetchJobImage(ctx context.Context, repo string, runID int64, jobID int64) string {
-	// Fetch the workflow file content to read job-level env vars.
-	// The Jobs API doesn't expose env, so we fetch via the workflow run.
+	// The Jobs API only gives us IDs and names — we resolve the target job's
+	// name here, then match it against the workflow YAML below.
 	jobs, _, err := c.client.Actions.ListWorkflowJobs(ctx, c.cfg.Owner, repo, runID, nil)
 	if err != nil {
 		c.cfg.Log.Debug("failed to fetch workflow jobs for image lookup", "error", err)
 		return ""
 	}
 
-	for _, job := range jobs.Jobs {
-		if job.GetID() != jobID {
-			continue
-		}
-
-		// The Jobs API doesn't directly expose env vars from the workflow YAML.
-		// However, we can read them from the workflow file via the run's workflow path.
-		// For now, check if the job name encodes an image hint as a convention,
-		// or fetch the workflow YAML from the repo.
-		break
-	}
-
-	// Fetch the workflow YAML to read the job's env block
 	run, _, err := c.client.Actions.GetWorkflowRunByID(ctx, c.cfg.Owner, repo, runID)
 	if err != nil {
 		c.cfg.Log.Debug("failed to fetch workflow run for image lookup", "error", err)
 		return ""
 	}
 
-	// Get the workflow file from the repo at the run's head SHA
 	workflowPath := run.GetPath()
 	if workflowPath == "" {
 		return ""
@@ -187,9 +177,7 @@ func (c *Client) FetchJobImage(ctx context.Context, repo string, runID int64, jo
 		return ""
 	}
 
-	// Parse the YAML to find the job's EPHEMERD_IMAGE env var.
-	// We do a lightweight parse — look for the job by name and extract env.
-	image := parseEphemerdImage(content, jobs.Jobs, jobID)
+	image := parseContainerImage(content, jobs.Jobs, jobID)
 	if image != "" {
 		c.cfg.Log.Info("job specifies custom image", "job_id", jobID, "image", image)
 	}
@@ -203,12 +191,37 @@ type workflowSchema struct {
 }
 
 type workflowJob struct {
-	Name string            `yaml:"name"`
-	Env  map[string]string `yaml:"env"`
+	Name      string         `yaml:"name"`
+	Container containerField `yaml:"container"`
 }
 
-// parseEphemerdImage extracts EPHEMERD_IMAGE from a workflow YAML for a specific job.
-func parseEphemerdImage(workflowContent string, jobs []*gh.WorkflowJob, targetJobID int64) string {
+// containerField accepts either a string shorthand or a full mapping for the
+// job's `container:` key, matching GitHub Actions' own parser.
+type containerField struct {
+	Image string `yaml:"image"`
+}
+
+func (c *containerField) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		c.Image = node.Value
+		return nil
+	case yaml.MappingNode:
+		type raw containerField
+		var r raw
+		if err := node.Decode(&r); err != nil {
+			return err
+		}
+		*c = containerField(r)
+		return nil
+	default:
+		return fmt.Errorf("container: expected string or mapping, got %v", node.Kind)
+	}
+}
+
+// parseContainerImage extracts container.image from a workflow YAML for a
+// specific job.
+func parseContainerImage(workflowContent string, jobs []*gh.WorkflowJob, targetJobID int64) string {
 	var jobName string
 	for _, j := range jobs {
 		if j.GetID() == targetJobID {
@@ -231,7 +244,7 @@ func parseEphemerdImage(workflowContent string, jobs []*gh.WorkflowJob, targetJo
 			name = key
 		}
 		if name == jobName {
-			return job.Env["EPHEMERD_IMAGE"]
+			return job.Container.Image
 		}
 	}
 

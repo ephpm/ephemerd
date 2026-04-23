@@ -16,10 +16,44 @@ type Workflow struct {
 
 // Job represents a single job within a workflow.
 type Job struct {
-	Name   string            `yaml:"name"`
-	RunsOn interface{}       `yaml:"runs-on"` // string or []string
-	Env    map[string]string `yaml:"env"`
-	Steps  []Step            `yaml:"steps"`
+	Name      string            `yaml:"name"`
+	RunsOn    interface{}       `yaml:"runs-on"` // string or []string
+	Env       map[string]string `yaml:"env"`
+	Container Container         `yaml:"container"`
+	Steps     []Step            `yaml:"steps"`
+}
+
+// Container specifies the OCI image to use for the job.
+//
+// On Linux and Windows hosts, this is the runner container image. On macOS
+// hosts, it is an OCI artifact image whose layers are extracted onto the
+// per-job VM via virtio-fs.
+//
+// GitHub Actions accepts both a bare string (shorthand for {image: "..."})
+// and a full object. The custom UnmarshalYAML below handles both forms.
+type Container struct {
+	Image string `yaml:"image"`
+}
+
+// UnmarshalYAML accepts either a bare string ("image:tag") or a full mapping
+// ({image: "...", ...}) for the container field, matching GitHub Actions.
+func (c *Container) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		c.Image = node.Value
+		return nil
+	case yaml.MappingNode:
+		// Use an alias type to avoid recursing into our own UnmarshalYAML.
+		type raw Container
+		var r raw
+		if err := node.Decode(&r); err != nil {
+			return err
+		}
+		*c = Container(r)
+		return nil
+	default:
+		return fmt.Errorf("container: expected string or mapping, got %v", node.Kind)
+	}
 }
 
 // Step represents a single step within a job.

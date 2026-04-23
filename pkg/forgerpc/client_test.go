@@ -280,14 +280,19 @@ func TestTask_WorkflowYAML(t *testing.T) {
 	})
 }
 
-func TestTask_EphemerdImage(t *testing.T) {
+func TestTask_ContainerImage(t *testing.T) {
 	tests := []struct {
 		name, workflow, want string
 	}{
 		{
-			name: "found in job env",
-			workflow: "name: CI\njobs:\n  build:\n    runs-on: ubuntu-latest\n    env:\n      EPHEMERD_IMAGE: custom/image:v2\n    steps:\n      - run: echo hello\n",
-			want: "custom/image:v2",
+			name:     "container mapping form",
+			workflow: "name: CI\njobs:\n  build:\n    runs-on: ubuntu-latest\n    container:\n      image: custom/image:v2\n    steps:\n      - run: echo hello\n",
+			want:     "custom/image:v2",
+		},
+		{
+			name:     "container string shorthand",
+			workflow: "name: CI\njobs:\n  build:\n    runs-on: ubuntu-latest\n    container: custom/short:v1\n    steps:\n      - run: echo hello\n",
+			want:     "custom/short:v1",
 		},
 		{
 			name:     "not set",
@@ -303,8 +308,8 @@ func TestTask_EphemerdImage(t *testing.T) {
 				payload = base64.StdEncoding.EncodeToString([]byte(tt.workflow))
 			}
 			task := &Task{WorkflowPayload: payload}
-			if got := task.EphemerdImage(); got != tt.want {
-				t.Errorf("EphemerdImage() = %q, want %q", got, tt.want)
+			if got := task.ContainerImage(); got != tt.want {
+				t.Errorf("ContainerImage() = %q, want %q", got, tt.want)
 			}
 		})
 	}

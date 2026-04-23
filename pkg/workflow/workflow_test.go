@@ -22,8 +22,8 @@ jobs:
       - run: echo hello
   test:
     runs-on: [self-hosted, linux, x64]
-    env:
-      EPHEMERD_IMAGE: ghcr.io/myorg/runner:latest
+    container:
+      image: ghcr.io/myorg/runner:latest
     steps:
       - run: make test
 `), 0o644); err != nil {
@@ -57,8 +57,33 @@ jobs:
 	if !ok {
 		t.Fatal("missing 'test' job")
 	}
-	if test.Env["EPHEMERD_IMAGE"] != "ghcr.io/myorg/runner:latest" {
-		t.Errorf("test.Env[EPHEMERD_IMAGE] = %q, want %q", test.Env["EPHEMERD_IMAGE"], "ghcr.io/myorg/runner:latest")
+	if test.Container.Image != "ghcr.io/myorg/runner:latest" {
+		t.Errorf("test.Container.Image = %q, want %q", test.Container.Image, "ghcr.io/myorg/runner:latest")
+	}
+}
+
+func TestParse_ContainerAsString(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "shorthand.yml")
+	if err := os.WriteFile(path, []byte(`
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ghcr.io/myorg/runner:v2
+    steps:
+      - run: echo hi
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	wf, err := Parse(path)
+	if err != nil {
+		t.Fatalf("Parse() error: %v", err)
+	}
+
+	if wf.Jobs["build"].Container.Image != "ghcr.io/myorg/runner:v2" {
+		t.Errorf("Container.Image = %q, want %q",
+			wf.Jobs["build"].Container.Image, "ghcr.io/myorg/runner:v2")
 	}
 }
 
