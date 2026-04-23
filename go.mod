@@ -11,6 +11,7 @@ require (
 	github.com/containerd/go-cni v1.1.13
 	github.com/containerd/platforms v1.0.0-rc.2
 	github.com/containers/buildah v1.43.1
+	github.com/distribution/reference v0.6.0
 	github.com/golang/protobuf v1.5.4
 	github.com/google/go-containerregistry v0.21.5
 	github.com/google/go-github/v72 v72.0.0
@@ -81,7 +82,6 @@ require (
 	github.com/cyphar/filepath-securejoin v0.5.2 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/disiqueira/gotree/v3 v3.0.2 // indirect
-	github.com/distribution/reference v0.6.0 // indirect
 	github.com/docker/distribution v2.8.3+incompatible // indirect
 	github.com/docker/docker v28.5.1+incompatible // indirect
 	github.com/docker/docker-credential-helpers v0.9.4 // indirect

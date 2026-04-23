@@ -53,6 +53,33 @@ type hostConfig struct {
 	NetworkMode string   `json:"NetworkMode"`
 }
 
+// argsStrategy selects how to assemble Process.Args for a new container.
+type argsStrategy int
+
+const (
+	// argsUseImageConfig: neither Entrypoint nor Cmd overridden — use image defaults.
+	argsUseImageConfig argsStrategy = iota
+	// argsImageEntrypointWithCmd: keep image's Entrypoint, override image's Cmd.
+	// This is what happens when Docker clients send `Entrypoint: null, Cmd: [...]`
+	// (the common "pass flags to an image's entrypoint" case, e.g. buildx booting
+	// moby/buildkit with --allow-insecure-entitlement flags).
+	argsImageEntrypointWithCmd
+	// argsFullOverride: request specified its own Entrypoint — it replaces the
+	// image's entirely, and Cmd (if any) is appended to it.
+	argsFullOverride
+)
+
+func argsStrategyFor(reqEntrypoint, reqCmd []string) argsStrategy {
+	switch {
+	case len(reqEntrypoint) > 0:
+		return argsFullOverride
+	case len(reqCmd) > 0:
+		return argsImageEntrypointWithCmd
+	default:
+		return argsUseImageConfig
+	}
+}
+
 // routeContainer dispatches /containers/{id}/{action} requests.
 func (s *Server) routeContainer(w http.ResponseWriter, r *http.Request, path string) {
 	rest := strings.TrimPrefix(path, "/containers/")
@@ -82,6 +109,8 @@ func (s *Server) routeContainer(w http.ResponseWriter, r *http.Request, path str
 		s.handleContainerLogs(w, r, id)
 	case action == "exec" && r.Method == http.MethodPost:
 		s.handleExecCreate(w, r, id)
+	case action == "attach" && r.Method == http.MethodPost:
+		s.handleContainerAttach(w, r, id)
 	case action == "archive" && r.Method == http.MethodPut:
 		s.handleContainerCopyTo(w, r, id)
 	case action == "archive" && r.Method == http.MethodGet:
@@ -140,14 +169,25 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 
 	ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
 
-	// Resolve image from containerd, pulling if needed.
-	img, err := s.client.GetImage(ctx, req.Image)
+	// Normalize the ref so "moby/buildkit:tag" becomes
+	// "docker.io/moby/buildkit:tag" before we hit containerd — containerd's
+	// resolver would otherwise treat "moby" as a hostname and fail DNS.
+	imageRef, err := normalizeImageRef(req.Image)
 	if err != nil {
-		s.log.Info("image not found, pulling for container create", "image", req.Image)
-		img, err = s.client.Pull(ctx, req.Image, client.WithPullUnpack)
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"message": err.Error(),
+		})
+		return
+	}
+
+	// Resolve image from containerd, pulling if needed.
+	img, err := s.client.GetImage(ctx, imageRef)
+	if err != nil {
+		s.log.Info("image not found, pulling for container create", "image", imageRef)
+		img, err = s.client.Pull(ctx, imageRef, client.WithPullUnpack)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{
-				"message": fmt.Sprintf("image %s not found: %v", req.Image, err),
+				"message": fmt.Sprintf("image %s not found: %v", imageRef, err),
 			})
 			return
 		}
@@ -157,13 +197,23 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	targetPlatform := "linux/" + goruntime.GOARCH
 	opts := []oci.SpecOpts{
 		oci.WithDefaultSpecForPlatform(targetPlatform),
-		oci.WithImageConfig(img),
 	}
 
-	if len(req.Cmd) > 0 {
-		opts = append(opts, oci.WithProcessArgs(req.Cmd...))
-	} else if len(req.Entrypoint) > 0 {
-		opts = append(opts, oci.WithProcessArgs(req.Entrypoint...))
+	// Docker semantics for Process.Args:
+	//   effective Entrypoint = req.Entrypoint if non-empty, else image.Entrypoint
+	//   effective Cmd        = req.Cmd        if non-empty, else image.Cmd
+	//   Process.Args         = effective Entrypoint + effective Cmd
+	// Critical for buildx, which sends Entrypoint=null and Cmd=["--allow-insecure-
+	// entitlement", ...]: we must preserve the image's "buildkitd" entrypoint.
+	switch argsStrategyFor(req.Entrypoint, req.Cmd) {
+	case argsFullOverride:
+		args := append([]string{}, req.Entrypoint...)
+		args = append(args, req.Cmd...)
+		opts = append(opts, oci.WithImageConfig(img), oci.WithProcessArgs(args...))
+	case argsImageEntrypointWithCmd:
+		opts = append(opts, oci.WithImageConfigArgs(img, req.Cmd))
+	default:
+		opts = append(opts, oci.WithImageConfig(img))
 	}
 
 	if len(req.Env) > 0 {

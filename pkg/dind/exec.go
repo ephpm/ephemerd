@@ -18,17 +18,28 @@ import (
 )
 
 // execEntry tracks an exec process created inside a running container.
+// Task.Exec is called lazily at /exec/start so stdio can be wired to the
+// hijacked TCP connection (not available at /exec/create time).
 type execEntry struct {
 	ID          string
 	ContainerID string
 	Cmd         []string
 	Env         []string
 	WorkingDir  string
-	Process     client.Process
-	LogPath     string
-	Running     bool
-	ExitCode    int
-	exited      bool
+	Tty         bool
+
+	// pspec is the prepared OCI process spec used when Task.Exec is called.
+	pspec *ocispec.Process
+	// task is the parent container task we'll exec against. Kept on the
+	// entry so a later /exec/start doesn't have to re-resolve the container.
+	task client.Task
+
+	// Process is nil until the first /exec/start successfully invokes Task.Exec.
+	Process  client.Process
+	LogPath  string // only set on the non-hijacked (buffered) path
+	Running  bool
+	ExitCode int
+	exited   bool
 }
 
 // execCreateRequest is the Docker exec create request body.
@@ -40,6 +51,13 @@ type execCreateRequest struct {
 	Cmd          []string `json:"Cmd"`
 	Env          []string `json:"Env"`
 	WorkingDir   string   `json:"WorkingDir"`
+}
+
+// execStartRequest is the Docker exec start request body. All fields are
+// optional; clients often send {} and rely on create-time defaults.
+type execStartRequest struct {
+	Detach bool `json:"Detach"`
+	Tty    bool `json:"Tty"`
 }
 
 // routeExec dispatches /exec/{id}/{action} requests.
@@ -118,32 +136,18 @@ func (s *Server) handleExecCreate(w http.ResponseWriter, r *http.Request, contai
 	}
 	pspec.Env = append(pspec.Env, req.Env...)
 
-	// Create log file for exec output.
-	logDir := filepath.Join(filepath.Dir(s.sockPath), "exec", execID)
-	if err := os.MkdirAll(logDir, 0o755); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"message": fmt.Sprintf("creating exec log dir: %v", err),
-		})
-		return
-	}
-	logPath := filepath.Join(logDir, "output.log")
-
-	proc, err := entry.Task.Exec(ctx, execID, pspec, cio.LogFile(logPath))
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"message": fmt.Sprintf("creating exec: %v", err),
-		})
-		return
-	}
-
+	// Don't call Task.Exec yet — stdio is wired at /exec/start once we
+	// know whether the caller is hijacking for streamed IO or taking the
+	// detached/buffered path.
 	exec := &execEntry{
 		ID:          execID,
 		ContainerID: containerID,
 		Cmd:         req.Cmd,
 		Env:         req.Env,
 		WorkingDir:  pspec.Cwd,
-		Process:     proc,
-		LogPath:     logPath,
+		Tty:         req.Tty,
+		pspec:       pspec,
+		task:        entry.Task,
 	}
 
 	s.mu.Lock()
@@ -160,65 +164,223 @@ func (s *Server) handleExecCreate(w http.ResponseWriter, r *http.Request, contai
 func (s *Server) handleExecStart(w http.ResponseWriter, r *http.Request, execID string) {
 	s.mu.Lock()
 	exec, ok := s.execs[execID]
-	s.mu.Unlock()
 	if !ok {
+		s.mu.Unlock()
 		writeJSON(w, http.StatusNotFound, map[string]string{
 			"message": fmt.Sprintf("exec %s not found", execID),
 		})
 		return
 	}
-
 	if exec.Running || exec.exited {
+		s.mu.Unlock()
 		w.WriteHeader(http.StatusConflict)
 		return
 	}
+	// Claim the slot before releasing the lock so a parallel /exec/start for
+	// the same execID loses the race cleanly (second one sees Running=true).
+	exec.Running = true
+	s.mu.Unlock()
 
-	ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
+	// Parse Detach/Tty from body; body is optional and often empty "{}".
+	var startReq execStartRequest
+	if r.Body != nil && r.ContentLength != 0 {
+		_ = json.NewDecoder(r.Body).Decode(&startReq)
+	}
+	tty := exec.Tty || startReq.Tty
 
-	// Register wait channel BEFORE starting (containerd requirement).
-	statusCh, err := exec.Process.Wait(ctx)
+	if wantsHijack(r) {
+		s.runHijackedExec(w, r, exec, tty)
+		return
+	}
+	// No upgrade headers: pick behavior by Detach flag.
+	s.runBufferedExec(w, r, exec, startReq.Detach)
+}
+
+// runHijackedExec wires the containerd exec process's stdio to a hijacked
+// TCP connection so real Docker SDK clients (buildx, docker CLI) see the
+// expected 101 + raw/multiplexed stream protocol.
+func (s *Server) runHijackedExec(w http.ResponseWriter, r *http.Request, exec *execEntry, tty bool) {
+	contentType := contentTypeMuxStream
+	if tty {
+		contentType = contentTypeRawStream
+	}
+
+	// Take over the connection BEFORE calling Task.Exec — if hijack fails
+	// we roll back cleanly without leaving an exec process dangling.
+	conn, buf, err := hijackConn(w, contentType)
 	if err != nil {
+		s.mu.Lock()
+		exec.Running = false
+		s.mu.Unlock()
+		s.log.Error("exec hijack failed", "exec_id", exec.ID, "error", err)
+		return
+	}
+	defer func() { _ = conn.Close() }()
+
+	ctx := namespaces.WithNamespace(context.Background(), s.jobNamespace)
+
+	// stdin: raw bytes from the hijacked conn (client keeps appending to
+	// the same TCP stream after the 101). Any bytes the HTTP server already
+	// buffered are exposed via buf — read from there first.
+	stdinR, stdinW := io.Pipe()
+	stdinDone := make(chan struct{})
+	go func() {
+		defer close(stdinDone)
+		// The bufio.Reader includes any pipelined pre-hijack bytes; its
+		// underlying reader is the hijacked conn so EOF here = client closed.
+		if _, copyErr := io.Copy(stdinW, buf); copyErr != nil && copyErr != io.EOF {
+			s.log.Debug("exec stdin copy ended", "exec_id", exec.ID, "error", copyErr)
+		}
+		// Closing stdinW makes the process see EOF on its stdin.
+		_ = stdinW.Close()
+	}()
+
+	// stdout/stderr: framed onto the hijacked conn. In TTY mode there's a
+	// single stream (stdout only — Docker attaches both to the PTY there).
+	var stdout, stderr io.Writer
+	if tty {
+		raw := &rawStreamWriter{w: conn}
+		stdout = raw
+		stderr = nil
+	} else {
+		mux := newStreamMux(conn)
+		stdout = &streamMuxWriter{mux: mux, stream: stdcopyStdout}
+		stderr = &streamMuxWriter{mux: mux, stream: stdcopyStderr}
+	}
+
+	ioCreator := cio.NewCreator(cio.WithStreams(stdinR, stdout, stderr))
+	proc, err := exec.task.Exec(ctx, exec.ID, exec.pspec, ioCreator)
+	if err != nil {
+		s.log.Error("exec task.Exec failed", "exec_id", exec.ID, "error", err)
+		s.markExecExited(exec, 1)
+		return
+	}
+	s.mu.Lock()
+	exec.Process = proc
+	s.mu.Unlock()
+
+	statusCh, err := proc.Wait(ctx)
+	if err != nil {
+		s.log.Error("exec wait registration failed", "exec_id", exec.ID, "error", err)
+		s.markExecExited(exec, 1)
+		return
+	}
+	if err := proc.Start(ctx); err != nil {
+		s.log.Error("exec start failed", "exec_id", exec.ID, "error", err)
+		s.markExecExited(exec, 1)
+		return
+	}
+	s.log.Info("exec started (hijacked)", "exec_id", exec.ID, "tty", tty)
+
+	// Wait for process exit or client cancellation. The conn is ours now;
+	// closing it on return unblocks any pending writes and signals EOF to
+	// the client.
+	select {
+	case status := <-statusCh:
+		code := int(status.ExitCode())
+		s.markExecExited(exec, code)
+		s.log.Info("exec exited (hijacked)", "exec_id", exec.ID, "exit_code", code)
+	case <-r.Context().Done():
+		// HTTP request context cancelled — best-effort kill.
+		if _, err := proc.Delete(ctx, client.WithProcessKill); err != nil {
+			s.log.Debug("exec kill after cancel", "exec_id", exec.ID, "error", err)
+		}
+		s.markExecExited(exec, 137)
+	}
+	// Let the stdin goroutine drain (conn.Close will cause it to return).
+	<-stdinDone
+}
+
+// runBufferedExec is the legacy non-streaming path: start the exec with
+// output going to a log file, block until it exits, and return the captured
+// output as the response body. Fine for simple HTTP probe use cases but NOT
+// compatible with Docker SDK clients that hijack. Kept for code paths that
+// deliberately avoid hijack (e.g., JSON-only health probes) and when Detach
+// is set (fire-and-forget).
+func (s *Server) runBufferedExec(w http.ResponseWriter, r *http.Request, exec *execEntry, detach bool) {
+	ctx := namespaces.WithNamespace(context.Background(), s.jobNamespace)
+
+	logDir := filepath.Join(filepath.Dir(s.sockPath), "exec", exec.ID)
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		s.mu.Lock()
+		exec.Running = false
+		s.mu.Unlock()
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"message": fmt.Sprintf("creating exec log dir: %v", err),
+		})
+		return
+	}
+	logPath := filepath.Join(logDir, "output.log")
+	exec.LogPath = logPath
+
+	proc, err := exec.task.Exec(ctx, exec.ID, exec.pspec, cio.LogFile(logPath))
+	if err != nil {
+		s.mu.Lock()
+		exec.Running = false
+		s.mu.Unlock()
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"message": fmt.Sprintf("creating exec: %v", err),
+		})
+		return
+	}
+	s.mu.Lock()
+	exec.Process = proc
+	s.mu.Unlock()
+
+	statusCh, err := proc.Wait(ctx)
+	if err != nil {
+		s.markExecExited(exec, 1)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"message": fmt.Sprintf("waiting for exec: %v", err),
 		})
 		return
 	}
-
-	if err := exec.Process.Start(ctx); err != nil {
+	if err := proc.Start(ctx); err != nil {
+		s.markExecExited(exec, 1)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"message": fmt.Sprintf("starting exec: %v", err),
 		})
 		return
 	}
 
-	exec.Running = true
-	s.log.Info("exec started", "exec_id", execID)
+	if detach {
+		// Fire-and-forget: return immediately, let process run in background.
+		// A goroutine collects the final status so inspect sees the exit code.
+		go func() {
+			status := <-statusCh
+			s.markExecExited(exec, int(status.ExitCode()))
+		}()
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 
-	// Block until process exits, then return output.
-	// Docker uses connection hijacking for streaming; we simplify by
-	// blocking and returning the output as the response body. This is
-	// sufficient for act's usage pattern.
 	select {
 	case status := <-statusCh:
-		exec.ExitCode = int(status.ExitCode())
-		exec.Running = false
-		exec.exited = true
+		s.markExecExited(exec, int(status.ExitCode()))
 	case <-r.Context().Done():
-		exec.Running = false
+		s.markExecExited(exec, 137)
 		writeJSON(w, http.StatusRequestTimeout, map[string]string{
 			"message": "exec timed out",
 		})
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
+	w.Header().Set("Content-Type", contentTypeRawStream)
 	w.WriteHeader(http.StatusOK)
-
-	if data, err := os.ReadFile(exec.LogPath); err == nil {
+	if data, err := os.ReadFile(logPath); err == nil {
 		if _, writeErr := w.Write(data); writeErr != nil {
 			s.log.Debug("writing exec output", "error", writeErr)
 		}
 	}
+}
+
+// markExecExited updates exec state atomically after the process finishes.
+func (s *Server) markExecExited(exec *execEntry, code int) {
+	s.mu.Lock()
+	exec.Running = false
+	exec.exited = true
+	exec.ExitCode = code
+	s.mu.Unlock()
 }
 
 func (s *Server) handleExecInspect(w http.ResponseWriter, r *http.Request, execID string) {

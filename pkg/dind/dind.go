@@ -20,8 +20,26 @@ import (
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/distribution/reference"
 	"github.com/ephpm/ephemerd/pkg/networking"
 )
+
+// normalizeImageRef rewrites a Docker-style short reference like
+// "moby/buildkit:buildx-stable-1" into its fully-qualified containerd form
+// ("docker.io/moby/buildkit:buildx-stable-1"). containerd's client does NOT
+// normalize in the way Docker CLI callers expect — unqualified refs whose
+// first segment lacks a `.` or `:` get treated as hostnames, so the resolver
+// tries to HEAD `https://moby/v2/buildkit/manifests/buildx-stable-1` and
+// fails with a DNS lookup error. ParseNormalizedNamed + TagNameOnly matches
+// the Docker CLI's reference parsing, so the resulting ref pulls against
+// Docker Hub as intended.
+func normalizeImageRef(ref string) (string, error) {
+	named, err := reference.ParseNormalizedNamed(ref)
+	if err != nil {
+		return "", fmt.Errorf("parsing image reference %q: %w", ref, err)
+	}
+	return reference.TagNameOnly(named).String(), nil
+}
 
 // sharedNamespace is the containerd namespace used by ephemerd for runner
 // containers and cached base images. DinD image pulls check here first
@@ -86,8 +104,13 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	return &Server{
-		jobID:        cfg.JobID,
-		jobNamespace: "ephemerd/dind/" + cfg.JobID,
+		jobID: cfg.JobID,
+		// containerd namespaces are flat and must match
+		// `[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*` — `/` is rejected. Use `-`
+		// as the separator so namespace errors don't surface as "image not
+		// found" in buildx. JobID already uses hyphens/underscores so the
+		// concatenation stays valid.
+		jobNamespace: "ephemerd-dind-" + cfg.JobID,
 		sockPath:     sockPath,
 		client:       cfg.Client,
 		network:      cfg.Network,
@@ -109,6 +132,18 @@ func (s *Server) Start() error {
 	ln, err := net.Listen("unix", s.sockPath)
 	if err != nil {
 		return fmt.Errorf("listening on %s: %w", s.sockPath, err)
+	}
+	// net.Listen creates the socket with 0777 & ~umask, typically yielding
+	// 0755 — read-only to non-owners. Connecting to a Unix socket requires
+	// write permission, so the non-root runner inside the job container (uid
+	// 1000 for ghcr.io/actions/actions-runner:latest) gets EACCES without
+	// this chmod. 0666 is fine — this is a per-job socket inside an
+	// isolated container, not a host-wide Docker daemon.
+	if err := os.Chmod(s.sockPath, 0o666); err != nil {
+		if closeErr := ln.Close(); closeErr != nil {
+			s.log.Warn("closing listener after chmod failure", "error", closeErr)
+		}
+		return fmt.Errorf("chmod socket %s: %w", s.sockPath, err)
 	}
 	s.listener = ln
 
@@ -301,6 +336,15 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	normalizedRef, err := normalizeImageRef(ref)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"message": err.Error(),
+		})
+		return
+	}
+	ref = normalizedRef
 
 	s.log.Info("pulling image", "ref", ref)
 
