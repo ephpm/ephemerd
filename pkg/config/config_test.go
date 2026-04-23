@@ -5,9 +5,12 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
+
+func contains(ss []string, s string) bool { return slices.Contains(ss, s) }
 
 func TestLoad_Defaults(t *testing.T) {
 	// Loading with empty path should use defaults (but fail validation without github config)
@@ -620,13 +623,17 @@ func TestProvider_Precedence_GiteaOverGitLab(t *testing.T) {
 	}
 }
 
-func TestProvider_Precedence_GitLabOverGitHub(t *testing.T) {
+func TestProviders_GitLabAndGitHub(t *testing.T) {
 	cfg := &Config{
 		GitHub: GitHubConfig{Token: "ghp_test", Owner: "org"},
 		GitLab: GitLabConfig{InstanceURL: "https://gitlab.com"},
 	}
-	if p := cfg.Provider(); p != "gitlab" {
-		t.Errorf("Provider() = %q, want %q (gitlab takes precedence over github)", p, "gitlab")
+	ps := cfg.Providers()
+	if len(ps) != 2 {
+		t.Fatalf("Providers() = %v, want 2 providers", ps)
+	}
+	if !contains(ps, "github") || !contains(ps, "gitlab") {
+		t.Errorf("Providers() = %v, want both github and gitlab", ps)
 	}
 }
 
@@ -649,13 +656,17 @@ func TestProvider_Precedence_GitLabOverWoodpecker(t *testing.T) {
 	}
 }
 
-func TestProvider_Precedence_WoodpeckerOverGitHub(t *testing.T) {
+func TestProviders_WoodpeckerAndGitHub(t *testing.T) {
 	cfg := &Config{
 		GitHub:     GitHubConfig{Token: "ghp_test", Owner: "org"},
 		Woodpecker: WoodpeckerConfig{ServerURL: "woodpecker:9000"},
 	}
-	if p := cfg.Provider(); p != "woodpecker" {
-		t.Errorf("Provider() = %q, want %q (woodpecker takes precedence over github)", p, "woodpecker")
+	ps := cfg.Providers()
+	if len(ps) != 2 {
+		t.Fatalf("Providers() = %v, want 2 providers", ps)
+	}
+	if !contains(ps, "github") || !contains(ps, "woodpecker") {
+		t.Errorf("Providers() = %v, want both github and woodpecker", ps)
 	}
 }
 
@@ -900,6 +911,286 @@ agent_secret = "my-secret"
 	}
 	if cfg.Woodpecker.AgentSecret != "my-secret" {
 		t.Errorf("AgentSecret = %q, want %q", cfg.Woodpecker.AgentSecret, "my-secret")
+	}
+}
+
+// --- Providers() multi-provider detection ---
+
+func TestProviders_Empty(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{}
+	ps := cfg.Providers()
+	if len(ps) != 0 {
+		t.Errorf("Providers() = %v, want empty", ps)
+	}
+}
+
+func TestProviders_GitHubOnly(t *testing.T) {
+	cfg := &Config{GitHub: GitHubConfig{Token: "ghp_test"}}
+	ps := cfg.Providers()
+	if len(ps) != 1 || ps[0] != "github" {
+		t.Errorf("Providers() = %v, want [github]", ps)
+	}
+}
+
+func TestProviders_GitHubViaOwner(t *testing.T) {
+	cfg := &Config{GitHub: GitHubConfig{Owner: "org"}}
+	ps := cfg.Providers()
+	if len(ps) != 1 || ps[0] != "github" {
+		t.Errorf("Providers() = %v, want [github]", ps)
+	}
+}
+
+func TestProviders_GitHubViaAppID(t *testing.T) {
+	cfg := &Config{GitHub: GitHubConfig{AppID: 12345}}
+	ps := cfg.Providers()
+	if len(ps) != 1 || ps[0] != "github" {
+		t.Errorf("Providers() = %v, want [github]", ps)
+	}
+}
+
+func TestProviders_ForgejoOnly(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{Forgejo: ForgejoConfig{InstanceURL: "https://codeberg.org"}}
+	ps := cfg.Providers()
+	if len(ps) != 1 || ps[0] != "forgejo" {
+		t.Errorf("Providers() = %v, want [forgejo]", ps)
+	}
+}
+
+func TestProviders_AllFiveConfigured(t *testing.T) {
+	cfg := &Config{
+		GitHub:     GitHubConfig{Token: "ghp_test"},
+		Forgejo:    ForgejoConfig{InstanceURL: "https://codeberg.org"},
+		Gitea:      GiteaConfig{InstanceURL: "https://gitea.example.com"},
+		GitLab:     GitLabConfig{InstanceURL: "https://gitlab.com"},
+		Woodpecker: WoodpeckerConfig{ServerURL: "woodpecker:9000"},
+	}
+	ps := cfg.Providers()
+	if len(ps) != 5 {
+		t.Fatalf("Providers() = %v, want 5 providers", ps)
+	}
+	for _, want := range []string{"github", "forgejo", "gitea", "gitlab", "woodpecker"} {
+		if !contains(ps, want) {
+			t.Errorf("Providers() missing %q: %v", want, ps)
+		}
+	}
+}
+
+func TestProviders_GitHubAndForgejo(t *testing.T) {
+	cfg := &Config{
+		GitHub:  GitHubConfig{Owner: "org", Token: "ghp_test"},
+		Forgejo: ForgejoConfig{InstanceURL: "https://codeberg.org"},
+	}
+	ps := cfg.Providers()
+	if len(ps) != 2 {
+		t.Fatalf("Providers() = %v, want 2", ps)
+	}
+	if !contains(ps, "github") || !contains(ps, "forgejo") {
+		t.Errorf("Providers() = %v, want github + forgejo", ps)
+	}
+}
+
+// --- Multi-provider validation ---
+
+func TestValidate_MultiProvider_BothChecked(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	// GitHub has owner but no token — should fail validation
+	cfg := &Config{
+		GitHub:  GitHubConfig{Owner: "org"},
+		Forgejo: ForgejoConfig{InstanceURL: "https://codeberg.org", Token: "tok"},
+		Webhook: WebhookConfig{Tunnel: "none"},
+	}
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("expected error: github configured with owner but no token")
+	}
+}
+
+func TestValidate_MultiProvider_ForgejoMissingToken(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{
+		GitHub:  GitHubConfig{Owner: "org", Token: "ghp_test"},
+		Forgejo: ForgejoConfig{InstanceURL: "https://codeberg.org"},
+		Webhook: WebhookConfig{Tunnel: "none"},
+	}
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("expected error: forgejo configured with instance_url but no token")
+	}
+}
+
+func TestValidate_MultiProvider_AllValid(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{
+		GitHub:  GitHubConfig{Owner: "org", Token: "ghp_test"},
+		Forgejo: ForgejoConfig{InstanceURL: "https://codeberg.org", Token: "tok"},
+		Webhook: WebhookConfig{Tunnel: "none"},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// --- default_image TOML parsing ---
+
+func TestLoad_GitHubDefaultImage(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[github]
+token = "ghp_test"
+owner = "org"
+default_image = "my-custom-runner:v2"
+
+[webhook]
+tunnel = "none"
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.GitHub.DefaultImage != "my-custom-runner:v2" {
+		t.Errorf("GitHub.DefaultImage = %q, want %q", cfg.GitHub.DefaultImage, "my-custom-runner:v2")
+	}
+}
+
+func TestLoad_ForgejoDefaultImage(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[forgejo]
+instance_url = "https://codeberg.org"
+token = "tok"
+default_image = "my-forgejo-runner:latest"
+job_image = "custom-job:v1"
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Forgejo.DefaultImage != "my-forgejo-runner:latest" {
+		t.Errorf("Forgejo.DefaultImage = %q, want %q", cfg.Forgejo.DefaultImage, "my-forgejo-runner:latest")
+	}
+	if cfg.Forgejo.JobImage != "custom-job:v1" {
+		t.Errorf("Forgejo.JobImage = %q, want %q", cfg.Forgejo.JobImage, "custom-job:v1")
+	}
+}
+
+func TestLoad_GiteaDefaultImage(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[gitea]
+instance_url = "https://gitea.example.com"
+token = "tok"
+default_image = "my-gitea-runner:latest"
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Gitea.DefaultImage != "my-gitea-runner:latest" {
+		t.Errorf("Gitea.DefaultImage = %q, want %q", cfg.Gitea.DefaultImage, "my-gitea-runner:latest")
+	}
+}
+
+func TestLoad_GitLabDefaultImage(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[gitlab]
+instance_url = "https://gitlab.com"
+token = "glrt-xxx"
+default_image = "my-gitlab-runner:latest"
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.GitLab.DefaultImage != "my-gitlab-runner:latest" {
+		t.Errorf("GitLab.DefaultImage = %q, want %q", cfg.GitLab.DefaultImage, "my-gitlab-runner:latest")
+	}
+}
+
+func TestLoad_DefaultImageNotSet(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[github]
+token = "ghp_test"
+owner = "org"
+
+[webhook]
+tunnel = "none"
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.GitHub.DefaultImage != "" {
+		t.Errorf("GitHub.DefaultImage = %q, want empty (use provider default)", cfg.GitHub.DefaultImage)
+	}
+}
+
+func TestLoad_MultiProviderConfig(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[github]
+token = "ghp_test"
+owner = "org"
+default_image = "ghcr.io/custom/runner:v3"
+
+[forgejo]
+instance_url = "https://codeberg.org"
+token = "forgejo-tok"
+default_image = "my-forgejo:latest"
+
+[webhook]
+tunnel = "none"
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	ps := cfg.Providers()
+	if len(ps) != 2 {
+		t.Fatalf("Providers() = %v, want 2 providers", ps)
+	}
+	if !contains(ps, "github") || !contains(ps, "forgejo") {
+		t.Errorf("Providers() = %v, want github + forgejo", ps)
+	}
+	if cfg.GitHub.DefaultImage != "ghcr.io/custom/runner:v3" {
+		t.Errorf("GitHub.DefaultImage = %q", cfg.GitHub.DefaultImage)
+	}
+	if cfg.Forgejo.DefaultImage != "my-forgejo:latest" {
+		t.Errorf("Forgejo.DefaultImage = %q", cfg.Forgejo.DefaultImage)
 	}
 }
 

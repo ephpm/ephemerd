@@ -8,6 +8,7 @@ import (
 	"time"
 
 	apiv1 "github.com/ephpm/ephemerd/api/v1"
+	"github.com/ephpm/ephemerd/pkg/providers"
 	"google.golang.org/grpc/codes"
 	grpcStatus "google.golang.org/grpc/status"
 )
@@ -26,11 +27,11 @@ func TestToProto_BasicFields(t *testing.T) {
 	rj := &runningJob{
 		repo:      "my-repo",
 		image:     "ghcr.io/myorg/runner:latest",
-		runnerID:  42,
+		claim:     &providers.Claim{RunnerID: 42},
 		startedAt: started,
 	}
 
-	job := cs.toProto(123, rj)
+	job := cs.toProto(jobKey{JobID: 123}, rj)
 
 	if job.Id != 123 {
 		t.Errorf("Id = %d, want 123", job.Id)
@@ -65,7 +66,7 @@ func TestToProto_DispatchedJob(t *testing.T) {
 		startedAt:  time.Now(),
 	}
 
-	job := cs.toProto(456, rj)
+	job := cs.toProto(jobKey{JobID: 456}, rj)
 
 	if job.Name != "ephemerd-repo-bold_tesla" {
 		t.Errorf("Name = %q, want dispatched name", job.Name)
@@ -81,7 +82,7 @@ func TestToProto_NilEnvAndNoDispatch(t *testing.T) {
 		startedAt: time.Now(),
 	}
 
-	job := cs.toProto(789, rj)
+	job := cs.toProto(jobKey{JobID: 789}, rj)
 
 	// No env and no dispatched — Name should be empty
 	if job.Name != "" {
@@ -98,7 +99,7 @@ func TestToProto_UptimeIncreases(t *testing.T) {
 		startedAt: time.Now().Add(-1 * time.Hour),
 	}
 
-	job := cs.toProto(1, rj)
+	job := cs.toProto(jobKey{JobID: 1}, rj)
 
 	// Uptime should be approximately 1 hour
 	if job.Uptime == "0s" {
@@ -135,8 +136,8 @@ func TestStatus_NoJobs(t *testing.T) {
 
 func TestStatus_WithJobs(t *testing.T) {
 	s := New(Config{MaxConcurrent: 8, Log: silentLogger()})
-	s.running[1] = &runningJob{repo: "r1", startedAt: time.Now()}
-	s.running[2] = &runningJob{repo: "r2", startedAt: time.Now()}
+	s.running[jobKey{JobID: 1}] = &runningJob{repo: "r1", startedAt: time.Now()}
+	s.running[jobKey{JobID: 2}] = &runningJob{repo: "r2", startedAt: time.Now()}
 	cs := &controlServer{sched: s, log: silentLogger()}
 
 	resp, err := cs.Status(context.Background(), &apiv1.StatusRequest{})
@@ -182,8 +183,8 @@ func TestListJobs_Empty(t *testing.T) {
 
 func TestListJobs_WithJobs(t *testing.T) {
 	s := New(Config{Log: silentLogger()})
-	s.running[10] = &runningJob{repo: "repo-a", image: "img-a", runnerID: 1, startedAt: time.Now()}
-	s.running[20] = &runningJob{repo: "repo-b", image: "img-b", runnerID: 2, startedAt: time.Now()}
+	s.running[jobKey{JobID: 10}] = &runningJob{repo: "repo-a", image: "img-a", claim: &providers.Claim{RunnerID: 1}, startedAt: time.Now()}
+	s.running[jobKey{JobID: 20}] = &runningJob{repo: "repo-b", image: "img-b", claim: &providers.Claim{RunnerID: 2}, startedAt: time.Now()}
 	cs := &controlServer{sched: s, log: silentLogger()}
 
 	resp, err := cs.ListJobs(context.Background(), &apiv1.ListJobsRequest{})
@@ -208,7 +209,7 @@ func TestListJobs_WithJobs(t *testing.T) {
 
 func TestGetJob_Found(t *testing.T) {
 	s := New(Config{Log: silentLogger()})
-	s.running[42] = &runningJob{repo: "test-repo", image: "img", runnerID: 7, startedAt: time.Now()}
+	s.running[jobKey{JobID: 42}] = &runningJob{repo: "test-repo", image: "img", claim: &providers.Claim{RunnerID: 7}, startedAt: time.Now()}
 	cs := &controlServer{sched: s, log: silentLogger()}
 
 	job, err := cs.GetJob(context.Background(), &apiv1.GetJobRequest{Id: 42})
@@ -247,7 +248,7 @@ func TestKillJob_Found(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	s.running[50] = &runningJob{
+	s.running[jobKey{JobID: 50}] = &runningJob{
 		repo:      "test",
 		cancel:    cancel,
 		startedAt: time.Now(),

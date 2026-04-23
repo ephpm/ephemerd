@@ -10,11 +10,11 @@ import (
 )
 
 var (
-	// JobsTotal counts completed jobs by repo and status.
+	// JobsTotal counts completed jobs by provider, repo, and status.
 	JobsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "ephemerd_jobs_total",
 		Help: "Total number of jobs processed.",
-	}, []string{"repo", "status"})
+	}, []string{"provider", "repo", "status"})
 
 	// JobsActive tracks currently running jobs.
 	JobsActive = promauto.NewGauge(prometheus.GaugeOpts{
@@ -33,7 +33,7 @@ var (
 		Name:    "ephemerd_job_duration_seconds",
 		Help:    "Time from container creation to destruction.",
 		Buckets: []float64{10, 30, 60, 120, 300, 600, 1800, 3600, 7200},
-	}, []string{"repo"})
+	}, []string{"provider", "repo"})
 
 	// JobStartup tracks time from queued event to runner registered with GitHub.
 	JobStartup = promauto.NewHistogramVec(prometheus.HistogramOpts{

@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/ephpm/ephemerd/pkg/artifacts"
-	"github.com/ephpm/ephemerd/pkg/github"
 	"github.com/ephpm/ephemerd/pkg/metrics"
 	"github.com/ephpm/ephemerd/pkg/names"
 	"github.com/ephpm/ephemerd/pkg/providers"
@@ -28,8 +27,7 @@ import (
 // Config for the scheduler.
 type Config struct {
 	Runtime         *runtime.Runtime
-	GitHub          *github.Client        // used when Provider is nil (GitHub mode)
-	Provider        providers.Poll        // if non-nil, used instead of GitHub for job discovery + lifecycle
+	Providers       []providers.Provider
 	Artifacts       *artifacts.Extractor  // OCI image layer extractor for macOS VM jobs (nil if not available)
 	LinuxDispatcher *DispatchClient       // if non-nil, Linux jobs are dispatched to a Linux VM worker via gRPC
 	MacOSVMConfig     *vm.MacOSVMConfig     // if non-nil, macOS-native jobs are enabled (darwin only)
@@ -50,13 +48,29 @@ type Config struct {
 	Log             *slog.Logger
 }
 
-// Scheduler ties GitHub job events to container lifecycle.
-// When a workflow_job is queued, it provisions a runner environment.
+// jobKey uniquely identifies a job across providers. Different providers
+// can return the same int64 job ID, so we include the provider name.
+type jobKey struct {
+	Provider string
+	JobID    int64
+}
+
+// keyFor returns the composite job key for a given event.
+func keyFor(event providers.JobEvent) jobKey {
+	name := ""
+	if event.Provider != nil {
+		name = event.Provider.Name()
+	}
+	return jobKey{Provider: name, JobID: event.JobID}
+}
+
+// Scheduler ties CI provider job events to container lifecycle.
+// When a job is queued, it provisions a runner environment.
 // When the job completes, it destroys the environment.
 type Scheduler struct {
 	cfg       Config
-	running   map[int64]*runningJob
-	seen      map[int64]time.Time // recently handled job IDs for dedup
+	running   map[jobKey]*runningJob
+	seen      map[jobKey]time.Time // recently handled jobs for dedup
 	mu        sync.Mutex
 	sem       chan struct{} // concurrency limiter
 	macSem    chan struct{} // macOS VM concurrency limiter (Vz has a hard cap)
@@ -106,9 +120,10 @@ func resetBackoff(repo string) {
 
 type runningJob struct {
 	env          *runtime.RunnerEnv
+	provider     providers.Provider // which provider owns this job (for ReleaseJob on shutdown)
+	claim        *providers.Claim   // tracks the provider claim for cleanup (ReleaseJob)
 	repo         string
 	image        string
-	runnerID     int64
 	cancel       context.CancelFunc
 	artifactsDir string    // non-empty if OCI artifacts were extracted for this job
 	dispatched   string    // non-empty if dispatched to Linux VM worker (stores container name)
@@ -144,8 +159,8 @@ func New(cfg Config) *Scheduler {
 
 	return &Scheduler{
 		cfg:       cfg,
-		running:   make(map[int64]*runningJob),
-		seen:      make(map[int64]time.Time),
+		running:   make(map[jobKey]*runningJob),
+		seen:      make(map[jobKey]time.Time),
 		sem:       make(chan struct{}, cfg.MaxConcurrent),
 		macSem:    make(chan struct{}, macVMs),
 		startTime: time.Now(),
@@ -155,7 +170,7 @@ func New(cfg Config) *Scheduler {
 // Run starts the scheduler. It discovers jobs via polling (default) or
 // webhooks (when TLS certs are configured), and manages runner lifecycle.
 func (s *Scheduler) Run(ctx context.Context) error {
-	events := make(chan github.JobEvent, 32)
+	events := make(chan providers.JobEvent, 32)
 
 	// Set static metrics
 	metrics.ConcurrentCapacity.Set(float64(s.cfg.MaxConcurrent))
@@ -215,39 +230,35 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
 
-	// --- Forge provider mode (Gitea/Forgejo/etc) ---
-	var forgeEvents <-chan providers.JobEvent
-	if s.cfg.Provider != nil {
-		pollCfg := providers.PollConfig{}
-		if s.cfg.PollInterval > 0 {
-			pollCfg.PollInterval = int(s.cfg.PollInterval.Seconds())
-		}
-		var err error
-		forgeEvents, err = s.cfg.Provider.Start(ctx, pollCfg)
-		if err != nil {
-			return fmt.Errorf("starting forge provider: %w", err)
-		}
-		defer func() {
-			if stopErr := s.cfg.Provider.Stop(context.Background()); stopErr != nil {
-				s.cfg.Log.Warn("forge provider stop error", "error", stopErr)
-			}
-		}()
-		s.cfg.Log.Info("forge provider started", "provider", s.cfg.Provider.Name())
-	}
-
 	// Determine job discovery mode: webhook if tunnel or secret is set, polling otherwise
-	useWebhook := s.cfg.Provider == nil && (s.cfg.Tunnel != nil || s.cfg.WebhookSecret != "")
+	useWebhook := s.cfg.Tunnel != nil || s.cfg.WebhookSecret != ""
 	useTLS := s.cfg.TLSCert != "" && s.cfg.TLSKey != ""
 
+	// Collect webhook-capable providers and mount per-provider webhook paths.
+	var whProviders []providers.Webhook
 	if useWebhook {
-		handler, webhookEvents := s.cfg.GitHub.WebhookHandler(s.cfg.WebhookSecret)
-		mux.Handle("/webhook", handler)
-
-		go func() {
-			for ev := range webhookEvents {
-				events <- ev
+		for _, p := range s.cfg.Providers {
+			whp, ok := p.(providers.Webhook)
+			if !ok {
+				continue
 			}
-		}()
+			whProviders = append(whProviders, whp)
+			path := "/webhook/" + p.Name()
+			handler, webhookEvents := whp.WebhookHandler(s.cfg.WebhookSecret)
+			mux.Handle(path, handler)
+
+			go func(ch <-chan providers.JobEvent) {
+				for ev := range ch {
+					events <- ev
+				}
+			}(webhookEvents)
+
+			s.cfg.Log.Info("webhook handler registered", "provider", p.Name(), "path", path)
+		}
+		if len(whProviders) == 0 {
+			s.cfg.Log.Warn("webhook mode requested but no provider supports webhooks, falling back to polling")
+			useWebhook = false
+		}
 	}
 
 	server := &http.Server{
@@ -258,27 +269,35 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	// Start HTTP server: via tunnel, TLS, or plain HTTP
 	if s.cfg.Tunnel != nil && useWebhook {
 		// Clean up stale webhooks from previous crashed instances before
-		// registering new ones. Prevents hitting GitHub's 20-hook limit.
-		s.cfg.GitHub.CleanStaleWebhooks(ctx)
+		// registering new ones. Prevents hitting platform per-repo/org hook
+		// limits (e.g. GitHub's 20-hook cap). Providers that don't implement
+		// this are skipped.
+		for _, whp := range whProviders {
+			if cleaner, ok := whp.(interface{ CleanStaleWebhooks(context.Context) }); ok {
+				cleaner.CleanStaleWebhooks(ctx)
+			}
+		}
 
 		// Initial tunnel connection.
 		ln, err := s.cfg.Tunnel.Listen(ctx)
 		if err != nil {
 			return fmt.Errorf("starting webhook tunnel: %w", err)
 		}
-		webhookURL := s.cfg.Tunnel.PublicURL() + "/webhook"
-		s.cfg.Log.Info("webhook tunnel ready", "url", webhookURL)
 
-		hooks, err := s.cfg.GitHub.RegisterWebhooks(ctx, webhookURL, s.cfg.WebhookSecret)
-		if err != nil {
-			return fmt.Errorf("registering webhooks: %w", err)
+		// Register webhooks for each webhook-capable provider.
+		for _, whp := range whProviders {
+			webhookURL := s.cfg.Tunnel.PublicURL() + "/webhook/" + whp.(providers.Provider).Name()
+			s.cfg.Log.Info("webhook tunnel ready", "provider", whp.(providers.Provider).Name(), "url", webhookURL)
+			if err := whp.RegisterWebhooks(ctx, webhookURL, s.cfg.WebhookSecret); err != nil {
+				return fmt.Errorf("registering webhooks for %s: %w", whp.(providers.Provider).Name(), err)
+			}
 		}
 
 		// Serve with automatic reconnect on tunnel drops.
 		// serveTunnelWithReconnect owns the full lifecycle: it creates
 		// fresh HTTP servers on each reconnect, closes old listeners,
 		// and deregisters webhooks on shutdown. No defer needed here.
-		go s.serveTunnelWithReconnect(ctx, mux, ln, hooks, events)
+		go s.serveTunnelWithReconnect(ctx, mux, ln, whProviders, events)
 	} else if useTLS {
 		go func() {
 			s.cfg.Log.Info("webhook server listening (TLS)", "port", s.cfg.WebhookPort)
@@ -300,33 +319,65 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	}
 	defer func() { _ = server.Shutdown(context.Background()) }()
 
-	if s.cfg.Provider == nil && !useWebhook {
+	// Start polling for all poll-capable providers (those not using webhooks,
+	// or all of them when webhook mode is off).
+	if !useWebhook {
 		interval := s.cfg.PollInterval
 		if interval <= 0 {
 			interval = 10 * time.Second
 		}
-		s.cfg.Log.Info("polling mode enabled", "interval", interval)
-		go s.pollLoop(ctx, interval, events)
+		started := 0
+		for _, p := range s.cfg.Providers {
+			pollProvider, ok := p.(providers.Poll)
+			if !ok {
+				s.cfg.Log.Warn("provider does not support polling, skipping", "provider", p.Name())
+				continue
+			}
+			pollCh, err := pollProvider.Start(ctx, providers.PollConfig{
+				PollInterval: int(interval.Seconds()),
+			})
+			if err != nil {
+				s.cfg.Log.Error("failed to start poll provider", "provider", p.Name(), "error", err)
+				continue
+			}
+			go func(ch <-chan providers.JobEvent) {
+				for ev := range ch {
+					events <- ev
+				}
+			}(pollCh)
+			s.cfg.Log.Info("polling started", "provider", p.Name(), "interval", interval)
+			started++
+		}
+		if started == 0 {
+			return fmt.Errorf("no providers started successfully")
+		}
 	}
 
 	// One-time poll on startup to catch jobs that queued while ephemerd
 	// was down. Webhook events only fire at the moment a job transitions
 	// to "queued" — they aren't replayed for jobs already in that state.
-	// Run in a goroutine so it doesn't block if there are more queued jobs
-	// than the channel buffer can hold.
-	if s.cfg.GitHub != nil {
-		s.cfg.Log.Info("startup poll: checking for queued jobs")
-		go s.poll(ctx, events)
+	// Continuous-poll mode catches these on the next tick naturally, but
+	// in webhook mode we need an explicit one-shot. Run in a goroutine so
+	// it doesn't block if there are more queued jobs than the channel buffer.
+	for _, p := range s.cfg.Providers {
+		catcher, ok := p.(interface{ CatchUpPoll(context.Context) error })
+		if !ok {
+			continue
+		}
+		name := p.Name()
+		s.cfg.Log.Info("startup poll: checking for queued jobs", "provider", name)
+		go func() {
+			if err := catcher.CatchUpPoll(ctx); err != nil {
+				s.cfg.Log.Warn("startup poll failed", "provider", name, "error", err)
+			}
+		}()
 	}
 
 	// Periodically clean up the seen-jobs dedup map
 	cleanupTicker := time.NewTicker(5 * time.Minute)
 	defer cleanupTicker.Stop()
 
-	// Process events. When a forge provider is active, we read from
-	// forgeEvents (providers.JobEvent). GitHub mode uses the events channel
-	// (github.JobEvent). Both may be active during transition but typically
-	// only one is non-nil.
+	// Process events from all providers via the unified events channel.
 	for {
 		select {
 		case <-cleanupTicker.C:
@@ -345,55 +396,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			case "completed":
 				go s.handleCompleted(ctx, event)
 			}
-
-		case fev, ok := <-forgeEvents:
-			if !ok {
-				s.cfg.Log.Info("forge provider event channel closed")
-				forgeEvents = nil // stop selecting on closed channel
-				continue
-			}
-			if fev.Action == "queued" {
-				metrics.JobsQueuedTotal.Inc()
-				go s.handleForgeJob(ctx, fev)
-			}
 		}
-	}
-}
-
-// pollLoop periodically checks GitHub for queued jobs and sends them as events.
-func (s *Scheduler) pollLoop(ctx context.Context, interval time.Duration, events chan<- github.JobEvent) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	// Poll immediately on start
-	s.poll(ctx, events)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.poll(ctx, events)
-		}
-	}
-}
-
-func (s *Scheduler) poll(ctx context.Context, events chan<- github.JobEvent) {
-	metrics.GitHubPollTotal.Inc()
-
-	jobs, err := s.cfg.GitHub.PollJobs(ctx)
-	if err != nil {
-		s.cfg.Log.Warn("poll failed", "error", err)
-		return
-	}
-
-	if len(jobs) == 0 {
-		s.cfg.Log.Debug("poll: no queued jobs found")
-	}
-
-	for _, job := range jobs {
-		s.cfg.Log.Debug("poll: found queued job", "job_id", job.Job.GetID(), "repo", job.Repo)
-		events <- job
 	}
 }
 
@@ -462,29 +465,30 @@ func isMacOSJob(labels []string) bool {
 	return false
 }
 
-func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
-	jobID := event.Job.GetID()
+func (s *Scheduler) handleQueued(ctx context.Context, event providers.JobEvent) {
+	jobID := event.JobID
+	key := keyFor(event)
 	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo)
 
 	// Skip jobs whose OS labels don't match this platform
-	if labels := event.Job.Labels; len(labels) > 0 && !s.canHandleJob(labels) {
-		log.Debug("skipping job, OS labels don't match this platform", "labels", labels)
+	if len(event.Labels) > 0 && !s.canHandleJob(event.Labels) {
+		log.Debug("skipping job, OS labels don't match this platform", "labels", event.Labels)
 		return
 	}
 
 	// Dedup: skip if we've already seen this job recently
 	s.mu.Lock()
-	if _, exists := s.running[jobID]; exists {
+	if _, exists := s.running[key]; exists {
 		s.mu.Unlock()
 		log.Debug("ignoring duplicate queued event, job already running")
 		return
 	}
-	if t, seen := s.seen[jobID]; seen && time.Since(t) < seenTTL {
+	if t, seen := s.seen[key]; seen && time.Since(t) < seenTTL {
 		s.mu.Unlock()
 		log.Debug("ignoring duplicate queued event, job recently handled")
 		return
 	}
-	s.seen[jobID] = time.Now()
+	s.seen[key] = time.Now()
 
 	if s.draining {
 		s.mu.Unlock()
@@ -494,13 +498,13 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 	s.mu.Unlock()
 
 	// Dispatch Linux jobs to the Linux VM worker if available
-	if s.cfg.LinuxDispatcher != nil && isLinuxJob(event.Job.Labels) {
+	if s.cfg.LinuxDispatcher != nil && isLinuxJob(event.Labels) {
 		s.handleLinuxJob(ctx, event)
 		return
 	}
 
 	// Route macOS-native jobs to per-job macOS VMs.
-	if isMacOSJob(event.Job.Labels) {
+	if isMacOSJob(event.Labels) {
 		s.mu.Lock()
 		macCfg := s.cfg.MacOSVMConfig
 		s.mu.Unlock()
@@ -511,7 +515,7 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 		// macOS VM disk is still being provisioned — remove from seen so
 		// the next poll retries this job once the install finishes.
 		s.mu.Lock()
-		delete(s.seen, jobID)
+		delete(s.seen, key)
 		s.mu.Unlock()
 		log.Info("macOS VM disk not ready yet, deferring job")
 		return
@@ -524,13 +528,14 @@ func (s *Scheduler) handleQueued(ctx context.Context, event github.JobEvent) {
 // The host registers the JIT runner (with Linux labels) and sends
 // Create/Wait/Destroy RPCs to the dispatch server running inside the VM
 // (WSL on Windows, Virtualization.framework on macOS).
-func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
-	jobID := event.Job.GetID()
+func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent) {
+	jobID := event.JobID
+	key := keyFor(event)
 	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo, "dispatch", "linux")
 
 	unsee := func() {
 		s.mu.Lock()
-		delete(s.seen, jobID)
+		delete(s.seen, key)
 		s.mu.Unlock()
 	}
 
@@ -544,25 +549,24 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
 
 	log.Info("provisioning Linux runner via dispatch")
 
-	image := s.cfg.GitHub.FetchJobImage(ctx, event.Repo, event.Job.GetRunID(), jobID)
+	image := event.Provider.FetchJobImage(ctx, &event)
 	if image != "" {
 		log.Info("using job-specified image", "image", image)
+	} else {
+		image = event.Provider.DefaultImage()
 	}
 
 	labels := buildLabelsForOS("linux", s.cfg.Labels)
 
 	const maxNameRetries = 3
-	name, jitConfig, err := s.registerRunner(ctx, event.Repo, labels, log, maxNameRetries)
+	claim, err := s.claimJob(ctx, &event, labels, log, maxNameRetries)
 	if err != nil {
-		log.Error("failed to register JIT runner", "error", err)
+		log.Error("failed to claim job", "error", err)
 		unsee()
 		time.Sleep(backoffDuration(event.Repo))
 		<-s.sem
 		return
 	}
-
-	encodedConfig := jitConfig.GetEncodedJITConfig()
-	runnerID := jitConfig.GetRunner().GetID()
 
 	var jobCtx context.Context
 	var cancel context.CancelFunc
@@ -572,10 +576,10 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
 		jobCtx, cancel = context.WithCancel(ctx)
 	}
 
-	if err := s.cfg.LinuxDispatcher.Create(jobCtx, name, image, encodedConfig); err != nil {
+	if err := s.cfg.LinuxDispatcher.Create(jobCtx, claim.RunnerName, image, claim.RunnerConfig); err != nil {
 		log.Error("dispatch create failed", "error", err)
-		if rmErr := s.cfg.GitHub.RemoveRunner(ctx, event.Repo, runnerID); rmErr != nil {
-			log.Warn("failed to remove ghost runner", "runner_id", runnerID, "error", rmErr)
+		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
+			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)
 		}
 		unsee()
 		cancel()
@@ -585,24 +589,25 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
 
 	// Track the dispatched job (env is nil — lifecycle managed by Linux VM worker)
 	s.mu.Lock()
-	s.running[jobID] = &runningJob{
-		repo:      event.Repo,
-		image:     image,
-		runnerID:  runnerID,
-		cancel:    cancel,
-		dispatched: name,
-		startedAt: time.Now(),
+	s.running[key] = &runningJob{
+		provider:   event.Provider,
+		claim:      claim,
+		repo:       event.Repo,
+		image:      image,
+		cancel:     cancel,
+		dispatched: claim.RunnerName,
+		startedAt:  time.Now(),
 	}
 	s.mu.Unlock()
 	metrics.JobsActive.Inc()
 
-	log.Info("Linux runner dispatched", "name", name)
+	log.Info("Linux runner dispatched", "name", claim.RunnerName)
 
 	// Wait for the job to finish in the background
 	go func() {
 		defer func() { <-s.sem }()
 
-		exitCode, err := s.cfg.LinuxDispatcher.Wait(jobCtx, name)
+		exitCode, err := s.cfg.LinuxDispatcher.Wait(jobCtx, claim.RunnerName)
 		if err != nil {
 			if jobCtx.Err() != nil {
 				log.Warn("dispatched runner killed (timeout or shutdown)", "error", err)
@@ -617,13 +622,13 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
 
 		// Always clean up
 		s.mu.Lock()
-		_, exists := s.running[jobID]
+		_, exists := s.running[key]
 		if exists {
-			delete(s.running, jobID)
+			delete(s.running, key)
 		}
 		s.mu.Unlock()
 
-		if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), name); err != nil {
+		if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), claim.RunnerName); err != nil {
 			log.Warn("dispatch destroy failed", "error", err)
 		}
 	}()
@@ -632,13 +637,14 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event github.JobEvent) {
 // handleMacOSJob provisions a per-job macOS VM via Virtualization.framework.
 // The base image must have the GitHub Actions runner pre-installed. The JIT
 // config is passed via a virtio-fs shared directory.
-func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
-	jobID := event.Job.GetID()
+func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent) {
+	jobID := event.JobID
+	key := keyFor(event)
 	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo, "platform", "macos")
 
 	unsee := func() {
 		s.mu.Lock()
-		delete(s.seen, jobID)
+		delete(s.seen, key)
 		s.mu.Unlock()
 	}
 
@@ -661,7 +667,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 	log.Info("provisioning macOS VM runner for job")
 
 	// Extract OCI artifacts if an image is specified
-	image := s.cfg.GitHub.FetchJobImage(ctx, event.Repo, event.Job.GetRunID(), jobID)
+	image := event.Provider.FetchJobImage(ctx, &event)
 	var artifactsDir string
 	if image != "" && s.cfg.Artifacts != nil {
 		artifactsDir = artifacts.ArtifactsDir(s.cfg.DataDir, fmt.Sprintf("%d", jobID))
@@ -673,12 +679,12 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 		}
 	}
 
-	// Register runner with macOS labels
+	// Claim job with macOS labels
 	labels := buildLabelsForOS("darwin", s.cfg.Labels)
 	const maxNameRetries = 3
-	name, jitConfig, err := s.registerRunner(ctx, event.Repo, labels, log, maxNameRetries)
+	claim, err := s.claimJob(ctx, &event, labels, log, maxNameRetries)
 	if err != nil {
-		log.Error("failed to register JIT runner", "error", err)
+		log.Error("failed to claim job", "error", err)
 		if artifactsDir != "" {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
@@ -689,15 +695,12 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 		return
 	}
 
-	encodedConfig := jitConfig.GetEncodedJITConfig()
-	runnerID := jitConfig.GetRunner().GetID()
-
 	// Create the macOS VM
 	macVM, err := vm.NewMacOSVM(*s.cfg.MacOSVMConfig, fmt.Sprintf("%d", jobID))
 	if err != nil {
 		log.Error("failed to create macOS VM", "error", err)
-		if rmErr := s.cfg.GitHub.RemoveRunner(ctx, event.Repo, runnerID); rmErr != nil {
-			log.Warn("failed to remove ghost runner", "runner_id", runnerID, "error", rmErr)
+		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
+			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)
 		}
 		if artifactsDir != "" {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
@@ -709,11 +712,11 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 	}
 
 	// Write JIT config to the shared directory before booting
-	if err := macVM.WriteJITConfig(encodedConfig); err != nil {
+	if err := macVM.WriteJITConfig(claim.RunnerConfig); err != nil {
 		log.Error("failed to write JIT config", "error", err)
 		macVM.Stop()
-		if rmErr := s.cfg.GitHub.RemoveRunner(ctx, event.Repo, runnerID); rmErr != nil {
-			log.Warn("failed to remove ghost runner", "runner_id", runnerID, "error", rmErr)
+		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
+			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)
 		}
 		if artifactsDir != "" {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
@@ -736,8 +739,8 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 	if err := macVM.Start(jobCtx); err != nil {
 		log.Error("failed to start macOS VM", "error", err)
 		macVM.Stop()
-		if rmErr := s.cfg.GitHub.RemoveRunner(ctx, event.Repo, runnerID); rmErr != nil {
-			log.Warn("failed to remove ghost runner", "runner_id", runnerID, "error", rmErr)
+		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
+			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)
 		}
 		if artifactsDir != "" {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
@@ -754,8 +757,8 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 	if err != nil {
 		log.Error("macOS VM runner not reachable", "error", err)
 		macVM.Stop()
-		if rmErr := s.cfg.GitHub.RemoveRunner(ctx, event.Repo, runnerID); rmErr != nil {
-			log.Warn("failed to remove ghost runner", "runner_id", runnerID, "error", rmErr)
+		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
+			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)
 		}
 		if artifactsDir != "" {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
@@ -769,10 +772,11 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 
 	// Track the running job
 	s.mu.Lock()
-	s.running[jobID] = &runningJob{
+	s.running[key] = &runningJob{
+		provider:   event.Provider,
+		claim:        claim,
 		repo:         event.Repo,
 		image:        image,
-		runnerID:     runnerID,
 		cancel:       cancel,
 		artifactsDir: artifactsDir,
 		macosVM:      macVM,
@@ -781,7 +785,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 	s.mu.Unlock()
 	metrics.JobsActive.Inc()
 
-	log.Info("macOS VM runner ready", "name", name, "ip", ip)
+	log.Info("macOS VM runner ready", "name", claim.RunnerName, "ip", ip)
 
 	// Wait for the job to finish in the background
 	go func() {
@@ -802,9 +806,9 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 
 		// Clean up
 		s.mu.Lock()
-		rj, exists := s.running[jobID]
+		rj, exists := s.running[key]
 		if exists {
-			delete(s.running, jobID)
+			delete(s.running, key)
 			s.mu.Unlock()
 			rj.macosVM.Stop()
 			if rj.artifactsDir != "" {
@@ -817,14 +821,15 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event github.JobEvent) {
 }
 
 // handleLocalJob provisions a runner using the local containerd Runtime.
-func (s *Scheduler) handleLocalJob(ctx context.Context, event github.JobEvent) {
-	jobID := event.Job.GetID()
+func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent) {
+	jobID := event.JobID
+	key := keyFor(event)
 	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo)
 
 	// On provisioning failure, remove from seen so the next poll retries
 	unsee := func() {
 		s.mu.Lock()
-		delete(s.seen, jobID)
+		delete(s.seen, key)
 		s.mu.Unlock()
 	}
 
@@ -839,9 +844,11 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event github.JobEvent) {
 	log.Info("provisioning runner for job")
 
 	// Fetch the job's container image from the workflow YAML (extra API call)
-	image := s.cfg.GitHub.FetchJobImage(ctx, event.Repo, event.Job.GetRunID(), jobID)
+	image := event.Provider.FetchJobImage(ctx, &event)
 	if image != "" {
 		log.Info("using job-specified image", "image", image)
+	} else {
+		image = event.Provider.DefaultImage()
 	}
 
 	// For macOS VM jobs with an OCI image specified, extract artifact layers
@@ -861,27 +868,27 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event github.JobEvent) {
 	}
 
 	// Build runner labels. When the job requests a specific OS (e.g. `linux`)
-	// we must register the runner with matching labels or GitHub won't route
-	// the job to us — even if we can execute it. On Darwin the host OS is
-	// `darwin` but we run `linux` jobs inside the embedded Linux VM, so
+	// we must register the runner with matching labels or the provider won't
+	// route the job to us — even if we can execute it. On Darwin the host OS
+	// is `darwin` but we run `linux` jobs inside the embedded Linux VM, so
 	// honour the job's labels rather than blindly using the host.
 	var targetOS string
 	switch {
-	case isLinuxJob(event.Job.Labels):
+	case isLinuxJob(event.Labels):
 		targetOS = "linux"
-	case isMacOSJob(event.Job.Labels):
+	case isMacOSJob(event.Labels):
 		targetOS = "darwin"
 	default:
 		targetOS = goruntime.GOOS
 	}
 	labels := buildLabelsForOS(targetOS, s.cfg.Labels)
 
-	// Generate a unique runner name and register with GitHub.
+	// Claim the job with a unique runner name.
 	// Retry with a new name on 409 conflict (stale runner from a previous crash).
 	const maxNameRetries = 3
-	name, jitConfig, err := s.registerRunner(ctx, event.Repo, labels, log, maxNameRetries)
+	claim, err := s.claimJob(ctx, &event, labels, log, maxNameRetries)
 	if err != nil {
-		log.Error("failed to register JIT runner", "error", err)
+		log.Error("failed to claim job", "error", err)
 		if artifactsDir != "" {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
@@ -891,12 +898,7 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event github.JobEvent) {
 		return
 	}
 
-	// The GitHub API returns the JIT config already base64-encoded;
-	// the runner binary expects it as-is.
-	encodedConfig := jitConfig.GetEncodedJITConfig()
-
 	// Create the runner environment with job timeout
-	runnerID := jitConfig.GetRunner().GetID()
 	var jobCtx context.Context
 	var cancel context.CancelFunc
 	if s.cfg.JobTimeout > 0 {
@@ -905,13 +907,17 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event github.JobEvent) {
 		jobCtx, cancel = context.WithCancel(ctx)
 	}
 	env, err := s.cfg.Runtime.Create(jobCtx, runtime.CreateConfig{
-		ID: name, Image: image, JITConfig: encodedConfig,
+		ID:         claim.RunnerName,
+		Image:      image,
+		JITConfig:  claim.RunnerConfig,
+		Env:        claim.Env,
+		Entrypoint: claim.Entrypoint,
 	})
 	if err != nil {
 		log.Error("failed to create runner environment", "error", err)
-		// Remove the ghost runner from GitHub since the container won't start
-		if rmErr := s.cfg.GitHub.RemoveRunner(ctx, event.Repo, runnerID); rmErr != nil {
-			log.Warn("failed to remove ghost runner", "runner_id", runnerID, "error", rmErr)
+		// Remove the ghost runner since the container won't start
+		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
+			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)
 		}
 		if artifactsDir != "" {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
@@ -924,11 +930,11 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event github.JobEvent) {
 
 	// Track the running job
 	s.mu.Lock()
-	s.running[jobID] = &runningJob{
+	s.running[key] = &runningJob{
 		env:          env,
+		claim:        claim,
 		repo:         event.Repo,
 		image:        image,
-		runnerID:     runnerID,
 		cancel:       cancel,
 		artifactsDir: artifactsDir,
 		startedAt:    time.Now(),
@@ -936,7 +942,7 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event github.JobEvent) {
 	s.mu.Unlock()
 	metrics.JobsActive.Inc()
 
-	log.Info("runner environment ready", "name", name)
+	log.Info("runner environment ready", "name", claim.RunnerName)
 
 	// Wait for the job to finish in the background
 	go func() {
@@ -961,9 +967,9 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event github.JobEvent) {
 
 		// Always clean up — whether normal exit, crash, OOM, or timeout
 		s.mu.Lock()
-		rj, exists := s.running[jobID]
+		rj, exists := s.running[key]
 		if exists {
-			delete(s.running, jobID)
+			delete(s.running, key)
 			s.mu.Unlock()
 			_ = s.cfg.Runtime.Destroy(context.Background(), env)
 			if rj.artifactsDir != "" {
@@ -975,149 +981,15 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event github.JobEvent) {
 	}()
 }
 
-// handleForgeJob provisions a runner container for a Gitea/Forgejo task.
-// The container self-registers with the forge and handles one job.
-func (s *Scheduler) handleForgeJob(ctx context.Context, event providers.JobEvent) {
+func (s *Scheduler) handleCompleted(ctx context.Context, event providers.JobEvent) {
 	jobID := event.JobID
-	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo, "provider", s.cfg.Provider.Name())
-
-	// Dedup
-	s.mu.Lock()
-	if _, exists := s.running[jobID]; exists {
-		s.mu.Unlock()
-		return
-	}
-	if t, seen := s.seen[jobID]; seen && time.Since(t) < seenTTL {
-		s.mu.Unlock()
-		return
-	}
-	s.seen[jobID] = time.Now()
-	if s.draining {
-		s.mu.Unlock()
-		log.Info("rejecting job, scheduler is draining")
-		return
-	}
-	s.mu.Unlock()
-
-	unsee := func() {
-		s.mu.Lock()
-		delete(s.seen, jobID)
-		s.mu.Unlock()
-	}
-
-	// Acquire concurrency slot
-	select {
-	case s.sem <- struct{}{}:
-	case <-ctx.Done():
-		unsee()
-		return
-	}
-
-	log.Info("provisioning forge runner for job")
-
-	// Get custom image from workflow payload
-	image := s.cfg.Provider.FetchJobImage(ctx, &event)
-	if image == "" {
-		image = s.cfg.Provider.DefaultImage()
-	}
-	if image != "" {
-		log.Info("using image", "image", image)
-	}
-
-	// Claim the job — get env vars and entrypoint for the runner container
-	runnerName := fmt.Sprintf("ephemerd-%s-%s", s.cfg.Provider.Name(), names.Generate())
-	claim, err := s.cfg.Provider.ClaimJob(ctx, &event, runnerName, s.cfg.Labels)
-	if err != nil {
-		log.Error("failed to claim job", "error", err)
-		unsee()
-		<-s.sem
-		return
-	}
-
-	var jobCtx context.Context
-	var cancel context.CancelFunc
-	if s.cfg.JobTimeout > 0 {
-		jobCtx, cancel = context.WithTimeout(ctx, s.cfg.JobTimeout)
-	} else {
-		jobCtx, cancel = context.WithCancel(ctx)
-	}
-
-	env, err := s.cfg.Runtime.Create(jobCtx, runtime.CreateConfig{
-		ID:         runnerName,
-		Image:      image,
-		Env:        claim.Env,
-		Entrypoint: claim.Entrypoint,
-	})
-	if err != nil {
-		log.Error("failed to create runner environment", "error", err)
-		unsee()
-		cancel()
-		<-s.sem
-		return
-	}
-
-	s.mu.Lock()
-	s.running[jobID] = &runningJob{
-		env:       env,
-		repo:      event.Repo,
-		image:     image,
-		runnerID:  claim.RunnerID,
-		cancel:    cancel,
-		startedAt: time.Now(),
-	}
-	s.mu.Unlock()
-	metrics.JobsActive.Inc()
-
-	log.Info("forge runner environment ready", "name", runnerName)
-
-	go func() {
-		defer func() { <-s.sem }()
-
-		exitCode, err := s.cfg.Runtime.Wait(jobCtx, env)
-		if err != nil {
-			if jobCtx.Err() != nil {
-				log.Warn("forge runner killed (timeout or shutdown)", "error", err)
-			} else {
-				log.Error("forge runner crashed", "error", err)
-			}
-		} else if exitCode != 0 {
-			log.Warn("forge runner exited with failure", "exit_code", exitCode)
-		} else {
-			log.Info("forge runner exited", "exit_code", exitCode)
-		}
-
-		// Cleanup
-		s.mu.Lock()
-		rj, exists := s.running[jobID]
-		if exists {
-			delete(s.running, jobID)
-			s.mu.Unlock()
-			if releaseErr := s.cfg.Provider.ReleaseJob(context.Background(), claim); releaseErr != nil {
-				log.Warn("release job failed", "error", releaseErr)
-			}
-			if destroyErr := s.cfg.Runtime.Destroy(context.Background(), env); destroyErr != nil {
-				log.Warn("destroy failed", "error", destroyErr)
-			}
-			if rj.artifactsDir != "" {
-				artifacts.Cleanup(rj.artifactsDir, s.cfg.Log)
-			}
-			metrics.JobsActive.Dec()
-			metrics.JobsTotal.WithLabelValues(event.Repo, "completed").Inc()
-			metrics.JobDuration.WithLabelValues(event.Repo).Observe(time.Since(rj.startedAt).Seconds())
-		} else {
-			s.mu.Unlock()
-		}
-	}()
-}
-
-func (s *Scheduler) handleCompleted(ctx context.Context, event github.JobEvent) {
-	jobID := event.Job.GetID()
+	key := keyFor(event)
 	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo)
 
 	s.mu.Lock()
-	job, exists := s.running[jobID]
+	job, exists := s.running[key]
 	if exists {
-		delete(s.running, jobID)
+		delete(s.running, key)
 	}
 	s.mu.Unlock()
 
@@ -1125,15 +997,19 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event github.JobEvent) 
 		return
 	}
 
-	conclusion := event.Job.GetConclusion()
+	conclusion := event.Conclusion
 	log.Info("job completed, destroying runner environment",
 		"conclusion", conclusion,
 	)
 
 	// Record metrics
+	providerName := ""
+	if event.Provider != nil {
+		providerName = event.Provider.Name()
+	}
 	metrics.JobsActive.Dec()
-	metrics.JobsTotal.WithLabelValues(event.Repo, conclusion).Inc()
-	metrics.JobDuration.WithLabelValues(event.Repo).Observe(time.Since(job.startedAt).Seconds())
+	metrics.JobsTotal.WithLabelValues(providerName, event.Repo, conclusion).Inc()
+	metrics.JobDuration.WithLabelValues(providerName, event.Repo).Observe(time.Since(job.startedAt).Seconds())
 
 	resetBackoff(event.Repo)
 	job.cancel()
@@ -1195,21 +1071,21 @@ func (s *Scheduler) drain() {
 
 func (s *Scheduler) destroyAll() {
 	s.mu.Lock()
-	jobs := make(map[int64]*runningJob, len(s.running))
+	jobs := make(map[jobKey]*runningJob, len(s.running))
 	for k, v := range s.running {
 		jobs[k] = v
 	}
-	s.running = make(map[int64]*runningJob)
+	s.running = make(map[jobKey]*runningJob)
 	s.mu.Unlock()
 
-	for id, job := range jobs {
-		s.cfg.Log.Info("destroying runner on shutdown", "job_id", id)
+	for key, job := range jobs {
+		s.cfg.Log.Info("destroying runner on shutdown", "job_id", key.JobID, "provider", key.Provider)
 		job.cancel()
 		if job.macosVM != nil {
 			job.macosVM.Stop()
 		} else if job.dispatched != "" && s.cfg.LinuxDispatcher != nil {
 			if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), job.dispatched); err != nil {
-				s.cfg.Log.Warn("failed to destroy dispatched runner", "job_id", id, "error", err)
+				s.cfg.Log.Warn("failed to destroy dispatched runner", "job_id", key.JobID, "error", err)
 			}
 		} else if job.env != nil {
 			_ = s.cfg.Runtime.Destroy(context.Background(), job.env)
@@ -1217,12 +1093,12 @@ func (s *Scheduler) destroyAll() {
 		if job.artifactsDir != "" {
 			artifacts.Cleanup(job.artifactsDir, s.cfg.Log)
 		}
-		// Deregister the runner from GitHub to avoid ghosts
-		if job.runnerID > 0 {
-			if err := s.cfg.GitHub.RemoveRunner(context.Background(), job.repo, job.runnerID); err != nil {
-				s.cfg.Log.Warn("failed to deregister runner on shutdown", "job_id", id, "runner_id", job.runnerID, "error", err)
+		// Deregister the runner from the provider to avoid ghosts
+		if job.claim != nil && job.provider != nil {
+			if err := job.provider.ReleaseJob(context.Background(), job.claim); err != nil {
+				s.cfg.Log.Warn("failed to deregister runner on shutdown", "job_id", key.JobID, "runner_id", job.claim.RunnerID, "error", err)
 			} else {
-				s.cfg.Log.Info("runner deregistered", "job_id", id, "runner_id", job.runnerID)
+				s.cfg.Log.Info("runner deregistered", "job_id", key.JobID, "runner_id", job.claim.RunnerID)
 			}
 		}
 	}
@@ -1285,24 +1161,24 @@ func buildLabelsForOS(targetOS string, extraLabels []string) []string {
 	return labels
 }
 
-// registerRunner generates a runner name and registers a JIT runner with GitHub,
+// claimJob generates a runner name and claims the job via the Provider,
 // retrying with a new name if the name already exists (409 conflict).
-func (s *Scheduler) registerRunner(ctx context.Context, repo string, labels []string, log *slog.Logger, maxRetries int) (string, *gh.JITRunnerConfig, error) {
+func (s *Scheduler) claimJob(ctx context.Context, event *providers.JobEvent, labels []string, log *slog.Logger, maxRetries int) (*providers.Claim, error) {
 	var lastErr error
 	for attempt := range maxRetries {
-		name := fmt.Sprintf("ephemerd-%s-%s", repo, names.Generate())
-		jitConfig, err := s.cfg.GitHub.RegisterJITRunner(ctx, repo, name, labels)
+		name := fmt.Sprintf("ephemerd-%s-%s-%s", event.Provider.Name(), event.Repo, names.Generate())
+		claim, err := event.Provider.ClaimJob(ctx, event, name, labels)
 		if err == nil {
-			return name, jitConfig, nil
+			return claim, nil
 		}
 		lastErr = err
 		if isConflict(err) && attempt < maxRetries-1 {
 			log.Warn("runner name conflict, retrying with new name", "name", name, "attempt", attempt+1)
 			continue
 		}
-		return "", nil, err
+		return nil, err
 	}
-	return "", nil, lastErr
+	return nil, lastErr
 }
 
 // isConflict reports whether an error is a GitHub 409 Conflict (runner name already exists).
@@ -1329,7 +1205,7 @@ const (
 // cannot be reused after Serve() returns — its internal state (shutdown flag,
 // connection tracking) is not reset. The handler mux is shared across all
 // server instances since it's stateless.
-func (s *Scheduler) serveTunnelWithReconnect(ctx context.Context, handler http.Handler, ln net.Listener, hooks []github.ManagedWebhook, events chan<- github.JobEvent) {
+func (s *Scheduler) serveTunnelWithReconnect(ctx context.Context, handler http.Handler, ln net.Listener, whProviders []providers.Webhook, events chan<- providers.JobEvent) {
 	maxRetries := s.cfg.TunnelMaxRetries
 	if maxRetries <= 0 {
 		maxRetries = defaultTunnelMaxRetries
@@ -1337,7 +1213,12 @@ func (s *Scheduler) serveTunnelWithReconnect(ctx context.Context, handler http.H
 
 	// On exit, clean up whichever webhooks are currently active.
 	defer func() {
-		s.cfg.GitHub.DeregisterWebhooks(context.Background(), hooks)
+		for _, whp := range whProviders {
+			if err := whp.DeregisterWebhooks(context.Background()); err != nil {
+				s.cfg.Log.Warn("failed to deregister webhooks on shutdown",
+					"provider", whp.(providers.Provider).Name(), "error", err)
+			}
+		}
 	}()
 
 	consecutiveFailures := 0
@@ -1383,19 +1264,47 @@ func (s *Scheduler) serveTunnelWithReconnect(ctx context.Context, handler http.H
 			s.cfg.Log.Warn("tunnel max retries exceeded, falling back to polling",
 				"failures", consecutiveFailures,
 			)
+			// Best-effort cleanup of all webhook providers.
+			for _, whp := range whProviders {
+				if err := whp.DeregisterWebhooks(ctx); err != nil {
+					s.cfg.Log.Warn("failed to deregister webhooks on tunnel fallback",
+						"provider", whp.(providers.Provider).Name(), "error", err)
+				}
+			}
 
+			// Fall back to polling for all poll-capable providers.
 			interval := s.cfg.PollInterval
 			if interval <= 0 {
 				interval = 10 * time.Second
 			}
-			s.cfg.Log.Info("polling mode enabled (tunnel fallback)", "interval", interval)
-			go s.pollLoop(ctx, interval, events)
+			for _, p := range s.cfg.Providers {
+				pollProvider, ok := p.(providers.Poll)
+				if !ok {
+					continue
+				}
+				s.cfg.Log.Info("polling mode enabled (tunnel fallback)", "provider", p.Name(), "interval", interval)
+				pollCh, err := pollProvider.Start(ctx, providers.PollConfig{
+					PollInterval: int(interval.Seconds()),
+				})
+				if err != nil {
+					s.cfg.Log.Error("failed to start poll fallback", "provider", p.Name(), "error", err)
+					continue
+				}
+				go func(ch <-chan providers.JobEvent) {
+					for ev := range ch {
+						events <- ev
+					}
+				}(pollCh)
+			}
 			return
 		}
 
 		// Deregister old webhooks (best-effort — URL is dead anyway).
-		s.cfg.GitHub.DeregisterWebhooks(ctx, hooks)
-		hooks = nil
+		for _, whp := range whProviders {
+			if err := whp.DeregisterWebhooks(ctx); err != nil {
+				s.cfg.Log.Debug("failed to deregister old webhooks", "error", err)
+			}
+		}
 
 		// Exponential backoff reconnect.
 		select {
@@ -1411,19 +1320,24 @@ func (s *Scheduler) serveTunnelWithReconnect(ctx context.Context, handler http.H
 			continue
 		}
 
-		// Tunnel is back — re-register webhooks with the new URL.
-		webhookURL := s.cfg.Tunnel.PublicURL() + "/webhook"
-		newHooks, err := s.cfg.GitHub.RegisterWebhooks(ctx, webhookURL, s.cfg.WebhookSecret)
-		if err != nil {
-			s.cfg.Log.Error("failed to re-register webhooks after tunnel reconnect", "error", err)
+		// Tunnel is back — re-register webhooks with the new URL for all providers.
+		allOK := true
+		for _, whp := range whProviders {
+			webhookURL := s.cfg.Tunnel.PublicURL() + "/webhook/" + whp.(providers.Provider).Name()
+			if err := whp.RegisterWebhooks(ctx, webhookURL, s.cfg.WebhookSecret); err != nil {
+				s.cfg.Log.Error("failed to re-register webhooks after tunnel reconnect",
+					"provider", whp.(providers.Provider).Name(), "error", err)
+				allOK = false
+			}
+		}
+		if !allOK {
 			_ = newLn.Close()
 			delay = min(delay*2, tunnelMaxReconnectDelay)
 			continue
 		}
 
-		s.cfg.Log.Info("tunnel reconnected", "url", webhookURL)
+		s.cfg.Log.Info("tunnel reconnected", "url", s.cfg.Tunnel.PublicURL())
 		ln = newLn
-		hooks = newHooks
 		consecutiveFailures = 0
 		delay = tunnelReconnectDelay
 	}

@@ -35,9 +35,15 @@ func (s *Scheduler) registerVMSSHHandler(mux *http.ServeMux) {
 		}
 
 		s.mu.Lock()
-		rj, exists := s.running[jobID]
+		var rj *runningJob
+		for key, r := range s.running {
+			if key.JobID == jobID {
+				rj = r
+				break
+			}
+		}
 		s.mu.Unlock()
-		if !exists {
+		if rj == nil {
 			http.Error(w, "job not found", http.StatusNotFound)
 			return
 		}

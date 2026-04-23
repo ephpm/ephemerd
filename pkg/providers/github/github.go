@@ -19,13 +19,14 @@ const defaultImage = "ghcr.io/actions/actions-runner:latest"
 
 // Provider implements providers.Poll and providers.Webhook for GitHub Actions.
 type Provider struct {
-	client   *github.Client
-	log      *slog.Logger
-	events   chan providers.JobEvent
-	webhooks []github.ManagedWebhook
-	whHandler http.Handler
-	whEvents  <-chan providers.JobEvent
-	cancel   context.CancelFunc
+	client       *github.Client
+	log          *slog.Logger
+	events       chan providers.JobEvent
+	webhooks     []github.ManagedWebhook
+	whHandler    http.Handler
+	whEvents     <-chan providers.JobEvent
+	cancel       context.CancelFunc
+	defaultImage string // config override for the runner container image
 }
 
 // Compile-time interface checks.
@@ -35,16 +36,23 @@ var (
 )
 
 // New creates a GitHub provider wrapping an existing GitHub client.
-func New(client *github.Client, log *slog.Logger) *Provider {
+// imageOverride, if non-empty, replaces the default runner container image.
+func New(client *github.Client, log *slog.Logger, imageOverride string) *Provider {
 	return &Provider{
-		client: client,
-		log:    log,
-		events: make(chan providers.JobEvent, 64),
+		client:       client,
+		log:          log,
+		events:       make(chan providers.JobEvent, 64),
+		defaultImage: imageOverride,
 	}
 }
 
-func (p *Provider) Name() string            { return "github" }
-func (p *Provider) DefaultImage() string    { return defaultImage }
+func (p *Provider) Name() string { return "github" }
+func (p *Provider) DefaultImage() string {
+	if p.defaultImage != "" {
+		return p.defaultImage
+	}
+	return defaultImage
+}
 func (p *Provider) DefaultJobImage() string { return "" }
 
 func (p *Provider) Start(ctx context.Context, cfg providers.PollConfig) (<-chan providers.JobEvent, error) {
@@ -75,7 +83,7 @@ func (p *Provider) pollLoop(ctx context.Context, interval time.Duration) {
 			}
 			for _, ev := range events {
 				select {
-				case p.events <- convertEvent(ev):
+				case p.events <- p.convertEvent(ev):
 				case <-ctx.Done():
 					return
 				}
@@ -114,7 +122,7 @@ func (p *Provider) WebhookHandler(secret string) (http.Handler, <-chan providers
 	ch := make(chan providers.JobEvent, 64)
 	go func() {
 		for ev := range ghCh {
-			ch <- convertEvent(ev)
+			ch <- p.convertEvent(ev)
 		}
 		close(ch)
 	}()
@@ -138,6 +146,32 @@ func (p *Provider) DeregisterWebhooks(ctx context.Context) error {
 	return nil
 }
 
+// CleanStaleWebhooks removes any workflow_job webhooks left behind by previous
+// ephemerd instances that crashed or were killed without cleanup. Called on
+// startup before registering new webhooks to avoid hitting GitHub's 20-hook limit.
+func (p *Provider) CleanStaleWebhooks(ctx context.Context) {
+	p.client.CleanStaleWebhooks(ctx)
+}
+
+// CatchUpPoll fires a single poll to discover jobs queued while ephemerd was
+// offline. Used in webhook mode (where continuous polling is disabled) to catch
+// jobs that transitioned to "queued" before webhooks could be registered —
+// webhook events aren't replayed for jobs already in that state.
+func (p *Provider) CatchUpPoll(ctx context.Context) error {
+	events, err := p.client.PollJobs(ctx)
+	if err != nil {
+		return fmt.Errorf("startup poll: %w", err)
+	}
+	for _, ev := range events {
+		select {
+		case p.events <- p.convertEvent(ev):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
 func (p *Provider) Stop(ctx context.Context) error {
 	if p.cancel != nil {
 		p.cancel()
@@ -148,17 +182,18 @@ func (p *Provider) Stop(ctx context.Context) error {
 	return nil
 }
 
-func convertEvent(ev github.JobEvent) providers.JobEvent {
+func (p *Provider) convertEvent(ev github.JobEvent) providers.JobEvent {
 	var labels []string
 	if ev.Job != nil {
 		labels = append(labels, ev.Job.Labels...)
 	}
 
 	fe := providers.JobEvent{
-		Action: ev.Action,
-		Repo:   ev.Repo,
-		Labels: labels,
-		Raw:    ev.Job,
+		Provider: p,
+		Action:   ev.Action,
+		Repo:     ev.Repo,
+		Labels:   labels,
+		Raw:      ev.Job,
 	}
 	if ev.Job != nil {
 		fe.JobID = ev.Job.GetID()
