@@ -21,6 +21,10 @@ jobs:
       - name: Install mage
         run: go install github.com/magefile/mage@latest
 
+      - name: Restore cached build deps
+        run: /opt/ephemerd-ci/entrypoint-cache.sh
+        continue-on-error: true
+
       - name: Lint, test & build
         run: mage ci
 
