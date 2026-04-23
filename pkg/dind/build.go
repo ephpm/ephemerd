@@ -80,7 +80,7 @@ func (s *Server) handleImageBuild(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = os.RemoveAll(contextDir) }()
 
-	writeProgress(fmt.Sprintf("Step 0: Extracting build context"))
+	writeProgress("Step 0: Extracting build context")
 
 	if err := extractBuildContext(r.Body, contextDir); err != nil {
 		writeError(fmt.Sprintf("extracting build context: %v", err))
