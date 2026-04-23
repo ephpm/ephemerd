@@ -5,7 +5,7 @@ Validates the configuration file without starting the daemon. Useful for checkin
 ## Usage
 
 ```
-ephemerd config [--data-dir <path>]
+ephemerd config [--data-dir <path>] [--config <path>]
 ```
 
 ## What it does
@@ -25,7 +25,7 @@ Config file: /var/lib/ephemerd/config.toml
   owner = "myorg"
   token = (set)
   repos = [repo1, repo2]
-  poll_interval = "10s"
+  poll_interval = "30s"
 
 [webhook]
   tunnel = "none"

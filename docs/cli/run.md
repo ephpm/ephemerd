@@ -5,13 +5,16 @@ Run a GitHub Actions workflow locally without pushing to GitHub. Executes workfl
 ## Usage
 
 ```
-ephemerd run [--workflow <path>] [--job <name>]
+ephemerd run [workflow-file] [--job <name>]
 ```
+
+## Arguments
+
+- `workflow-file` — path to the workflow YAML file (positional, optional — default: auto-detect from `.github/workflows/`)
 
 ## Flags
 
-- `--workflow` — path to the workflow YAML file (default: auto-detect from `.github/workflows/`)
-- `--job` — run only a specific job from the workflow (default: run all jobs)
+- `--job`, `-j` — run only a specific job from the workflow (default: run the first job)
 
 ## What it does
 
@@ -20,6 +23,10 @@ ephemerd run [--workflow <path>] [--job <name>]
 3. Bind-mounts the current repository into the container
 4. Executes each `run:` step in sequence
 5. Destroys the container when done
+
+## Platform delegation
+
+On Windows, when the workflow targets Linux, `ephemerd run` automatically creates a WSL distro via `vm.NewRunDistro()` and delegates execution there. This is transparent — the workflow runs in a Linux environment inside WSL.
 
 ## Limitations
 

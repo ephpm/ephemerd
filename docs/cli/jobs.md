@@ -23,7 +23,7 @@ Force-kills a running job by ID. The container is destroyed immediately without 
 
 ### jobs logs
 
-Streams container logs from a running job. Use `--follow` to tail logs in real-time (like `tail -f`). Logs are read from `<data-dir>/logs/<job-id>.log`.
+Streams container logs from a running job. Logs are read from `<data-dir>/logs/<job-id>.log`.
 
 ### jobs ssh
 

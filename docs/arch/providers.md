@@ -1,6 +1,6 @@
 # Providers: Multi-Forge CI Integration
 
-> **Status: Interface defined, GitHub adapter complete. Forgejo, Gitea, and GitLab are stubs.**
+> **Status: Interface defined, GitHub adapter complete. Forgejo, Gitea, GitLab, and Woodpecker providers exist with e2e tests. Scheduler migration to Provider interface is pending (still uses `*github.Client` directly).**
 
 ## Overview
 
@@ -11,9 +11,10 @@ This allows ephemerd to support:
 | Provider | Status | Runner Binary | Runner Image | Job Image | Job Discovery |
 |----------|--------|---------------|--------------|-----------|---------------|
 | **GitHub** | Working | `actions/runner` | `ghcr.io/actions/actions-runner:latest` | same container | Poll or webhook |
-| **Forgejo** | Stub | `forgejo-runner` | `data.forgejo.org/forgejo/runner:12` | `gitea/runner-images:ubuntu-24.04` | Poll (ConnectRPC FetchTask) |
-| **Gitea** | Stub | `act_runner` | `docker.io/gitea/act_runner:latest` | `gitea/runner-images:ubuntu-24.04` | Poll (ConnectRPC FetchTask) |
-| **GitLab** | Stub | `gitlab-runner` | `ghcr.io/ephpm/runner-gitlab:latest` | managed by gitlab-runner | gitlab-runner custom executor |
+| **Forgejo** | E2E tested | `forgejo-runner` | `data.forgejo.org/forgejo/runner:12` | `gitea/runner-images:ubuntu-24.04` | Poll (ConnectRPC FetchTask) |
+| **Gitea** | E2E tested | `act_runner` | `docker.io/gitea/act_runner:latest` | `gitea/runner-images:ubuntu-24.04` | Poll (ConnectRPC FetchTask) |
+| **GitLab** | E2E tested | `gitlab-runner` | `ghcr.io/ephpm/runner-gitlab:latest` | managed by gitlab-runner | gitlab-runner custom executor |
+| **Woodpecker** | E2E tested | `woodpecker-agent` | — | managed by agent | Woodpecker agent gRPC |
 
 **Two-image model (Forgejo/Gitea):** The runner daemon runs in one container and creates job execution containers via the Docker API. ephemerd's fake Docker socket (`pkg/dind`) intercepts these calls. The `job_image` config controls the default execution environment.
 
@@ -25,20 +26,22 @@ This allows ephemerd to support:
 │  (concurrency, dedup, routing, container lifecycle) │
 │                                                    │
 │  Works with providers.Provider — forge-agnostic   │
+│  (NOTE: migration pending — currently uses        │
+│   *github.Client directly)                        │
 └──────────────────┬───────────────────────────────┘
                    │
-         ┌─────────┼──────────┬─────────┐
-         │         │          │         │
-         ▼         ▼          ▼         ▼
-┌─────────────┐ ┌────────┐ ┌───────┐ ┌────────┐
-│   GitHub    │ │Forgejo │ │ Gitea │ │ GitLab │
-│  Provider   │ │Provider│ │Provider│ │Provider│
-└──────┬──────┘ └───┬────┘ └───┬───┘ └───┬────┘
-       │            │          │         │
-       ▼            ▼          ▼         ▼
-   GitHub API  ConnectRPC  ConnectRPC  gitlab-runner
-               (forgejo-   (act_runner  custom executor
-                runner)     binary)
+         ┌─────────┼──────────┬─────────┬──────────┐
+         │         │          │         │          │
+         ▼         ▼          ▼         ▼          ▼
+┌─────────────┐ ┌────────┐ ┌───────┐ ┌────────┐ ┌───────────┐
+│   GitHub    │ │Forgejo │ │ Gitea │ │ GitLab │ │Woodpecker │
+│  Provider   │ │Provider│ │Provider│ │Provider│ │ Provider  │
+└──────┬──────┘ └───┬────┘ └───┬───┘ └───┬────┘ └─────┬─────┘
+       │            │          │         │            │
+       ▼            ▼          ▼         ▼            ▼
+   GitHub API  ConnectRPC  ConnectRPC  gitlab-runner  Woodpecker
+               (forgejo-   (act_runner  custom        agent gRPC
+                runner)     binary)     executor
 ```
 
 ## Interfaces
@@ -75,10 +78,11 @@ type Webhook interface {
 
 | Provider | Implements Poll | Implements Webhook |
 |----------|:-:|:-:|
-| GitHub   | Yes | Yes |
-| Forgejo  | Yes | No  |
-| Gitea    | Yes | No  |
-| GitLab   | Yes | No  |
+| GitHub     | Yes | Yes |
+| Forgejo    | Yes | No  |
+| Gitea      | Yes | No  |
+| GitLab     | Yes | No  |
+| Woodpecker | Yes | No  |
 
 The scheduler type-asserts for `Webhook` when tunnel/TLS is configured:
 
@@ -178,6 +182,16 @@ gitlab-runner                    ephemerd
      │                              │
 ```
 
+### Woodpecker CI
+
+Woodpecker CI uses a server/agent architecture where agents connect to the server via gRPC.
+
+- **Discovery**: The Woodpecker agent connects to the server and polls for jobs via gRPC
+- **ClaimJob**: Agent registration uses a shared secret (`agent_secret`)
+- **ReleaseJob**: Agent reports completion to server
+- **Runner binary**: Woodpecker agent binary
+- **Key difference**: Woodpecker requires a forge backend (Gitea/Forgejo/GitHub/GitLab) for repo management; ephemerd manages the agent lifecycle, not the server
+
 ## Configuration
 
 Provider is auto-detected from which section has credentials:
@@ -212,9 +226,14 @@ owner = "your-org"
 instance_url = "https://gitlab.com"
 token = "glrt-xxxxxxxxxxxx"
 tags = ["linux", "docker", "ephemerd"]
+
+# === Woodpecker CI ===
+[woodpecker]
+server_url = "woodpecker.example.com:9000"
+agent_secret = "your-shared-secret"
 ```
 
-Only one provider should be configured at a time. If multiple sections have credentials, the precedence is: Forgejo > Gitea > GitLab > GitHub (GitHub is the default when nothing else is set).
+Only one provider should be configured at a time. If multiple sections have credentials, the precedence is: Forgejo > Gitea > GitLab > Woodpecker > GitHub (GitHub is the default when nothing else is set).
 
 ## What Stays the Same Across Providers
 
@@ -238,30 +257,30 @@ pkg/providers/
     gitea/
         gitea.go             # Gitea Actions via act_runner (stub)
     gitlab/
-        gitlab.go            # GitLab CI custom executor (stub)
+        gitlab.go            # GitLab CI custom executor
+    woodpecker/
+        woodpecker.go        # Woodpecker CI agent
 ```
 
-## Migration Path
+## Migration Path (Pending)
 
-The scheduler currently takes `*github.Client` directly:
+The scheduler currently takes `*github.Client` directly — this migration has not yet been done:
 
 ```go
+// Current (not yet migrated):
 type Config struct {
     GitHub *github.Client
     // ...
 }
-```
 
-This becomes:
-
-```go
+// Target:
 type Config struct {
     Provider providers.Provider
     // ...
 }
 ```
 
-All `s.cfg.GitHub.*` calls become `s.cfg.Provider.*` calls. The `github.JobEvent` type is replaced by `providers.JobEvent` throughout the scheduler.
+All `s.cfg.GitHub.*` calls will become `s.cfg.Provider.*` calls. The `github.JobEvent` type will be replaced by `providers.JobEvent` throughout the scheduler.
 
 This is a refactor of the scheduler internals only — no changes to container runtime, networking, VM support, or the CLI.
 

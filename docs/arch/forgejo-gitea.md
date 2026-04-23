@@ -1,6 +1,6 @@
 # Forgejo & Gitea Actions Integration
 
-> **Status: Architecture design.** The `pkg/providers/forgejo` and `pkg/providers/gitea` packages are stubs. This document describes the intended implementation and future platform roadmap.
+> **Status: Architecture design with provider stubs and e2e tests.** The `pkg/providers/forgejo` and `pkg/providers/gitea` packages exist with e2e test coverage. The Forgejo e2e test boots a full Forgejo instance in Docker and runs a real workflow end-to-end. Full integration with upstream runners in containers is pending.
 
 ## Overview
 
@@ -146,15 +146,15 @@ sequenceDiagram
 
 ### Current Implementation Status
 
-The fake socket in `pkg/dind/dind.go` currently implements:
+The fake socket in `pkg/dind/dind.go` currently implements health and image operations. Container lifecycle endpoints are needed for full integration:
 
 | Endpoint | Status | Purpose |
 |----------|--------|---------|
-| `GET /_ping` | Implemented | Health check, returns API version headers |
-| `GET /version` | Implemented | Returns Docker 27.0.0-ephemerd |
-| `GET /info` | Implemented | Returns daemon info, image count |
-| `GET /images/json` | Implemented | Lists pulled images (in-memory store) |
-| `POST /images/create` | Implemented | Pulls images via containerd |
+| `GET /_ping` | Done | Health check, returns API version headers |
+| `GET /version` | Done | Returns Docker 27.0.0-ephemerd |
+| `GET /info` | Done | Returns daemon info, image count |
+| `GET /images/json` | Done | Lists pulled images (in-memory store) |
+| `POST /images/create` | Done | Pulls images via containerd |
 | `POST /containers/create` | **Not yet** | Translate to containerd container create |
 | `POST /containers/{id}/start` | **Not yet** | Translate to containerd task start |
 | `POST /containers/{id}/exec` | **Not yet** | Translate to containerd task exec |
@@ -162,7 +162,7 @@ The fake socket in `pkg/dind/dind.go` currently implements:
 | `DELETE /containers/{id}` | **Not yet** | Translate to containerd delete |
 | `POST /networks/create` | **Not yet** | Translate to CNI network setup |
 
-**To complete the Forgejo/Gitea integration, the container lifecycle endpoints must be implemented.** The image operations are already working — the remaining work is container create/start/exec/stop/remove and basic networking.
+**To complete the Forgejo/Gitea integration, the container lifecycle endpoints must be implemented.** The image operations are working — the remaining work is container create/start/exec/stop/remove and basic networking. Enable with `dind.enabled = true` in config or `--dind` flag on `serve`.
 
 ### Socket Mount
 
