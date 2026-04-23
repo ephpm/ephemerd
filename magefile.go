@@ -21,9 +21,14 @@ import (
 var Default = build.Build
 
 // Test runs all Go tests (downloads embedded deps first if needed).
+//
+// The containers_image_openpgp tag swaps buildah's CGo gpgme dep for the
+// pure-Go OpenPGP implementation so packages like pkg/dind compile on CI
+// runners without libgpgme headers. Must match what mage build and
+// .golangci.yml use — if it diverges, lint/build pass but test fails.
 func Test() error {
 	mg.Deps(download.All)
-	return sh.RunV("go", "test", "-count=1", "./...")
+	return sh.RunV("go", "test", "-tags", "containers_image_openpgp", "-count=1", "./...")
 }
 
 // Lint runs golangci-lint (downloads linter and embedded deps first if needed).
