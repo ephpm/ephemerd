@@ -120,6 +120,15 @@ func StartDispatchServer(port int, rt *runtime.Runtime, log *slog.Logger) func()
 	return func() { srv.GracefulStop() }
 }
 
+// LinuxDispatcher is the narrow interface the scheduler uses to control the
+// Linux VM worker. DispatchClient is the production implementation (gRPC);
+// tests provide in-memory stubs.
+type LinuxDispatcher interface {
+	Create(ctx context.Context, id, image, jitConfig string) error
+	Wait(ctx context.Context, id string) (uint32, error)
+	Destroy(ctx context.Context, id string) error
+}
+
 // DispatchClient dispatches Linux jobs to the WSL worker via gRPC.
 type DispatchClient struct {
 	conn   *grpc.ClientConn

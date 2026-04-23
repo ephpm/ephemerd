@@ -31,7 +31,7 @@ type Config struct {
 	GitHub          *github.Client        // used when Provider is nil (GitHub mode)
 	Provider        providers.Poll        // if non-nil, used instead of GitHub for job discovery + lifecycle
 	Artifacts       *artifacts.Extractor  // OCI image layer extractor for macOS VM jobs (nil if not available)
-	LinuxDispatcher *DispatchClient       // if non-nil, Linux jobs are dispatched to a Linux VM worker via gRPC
+	LinuxDispatcher LinuxDispatcher       // if non-nil, Linux jobs are dispatched to a Linux VM worker via gRPC
 	MacOSVMConfig     *vm.MacOSVMConfig     // if non-nil, macOS-native jobs are enabled (darwin only)
 	DataDir           string                // ephemerd data directory (used for artifact extraction paths)
 	MaxConcurrent     int
@@ -1114,8 +1114,48 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event github.JobEvent) 
 	jobID := event.Job.GetID()
 	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo)
 
+	// GitHub's workflow_job webhook carries the name of the runner that
+	// actually picked up the job, which may NOT match our dispatch-time
+	// mapping. When two JIT runners with identical labels are registered
+	// concurrently, GitHub assigns jobs by label-match — we can't predict
+	// which runner gets which job. Use runner_name to rebind our tracking
+	// to GitHub's reality. Fall back to job_id for paths where no
+	// runner_name arrives (macOS VM, local runtime, pre-webhook providers).
+	runnerName := event.Job.GetRunnerName()
+
 	s.mu.Lock()
-	job, exists := s.running[jobID]
+	var job *runningJob
+	exists := false
+	if runnerName != "" {
+		// Find the entry whose dispatched field matches the actual runner.
+		var matchedID int64
+		var matched *runningJob
+		for id, rj := range s.running {
+			if rj.dispatched == runnerName {
+				matchedID, matched = id, rj
+				break
+			}
+		}
+		if matched != nil {
+			if matchedID != jobID {
+				// Cross-assignment correction:
+				//   matched was keyed under matchedID but actually ran jobID.
+				//   Our old entry at jobID (if any) was tracking a different
+				//   runner that's really running matchedID's job. Move it to
+				//   matchedID's slot so that job's webhook lands on it next.
+				other, otherExists := s.running[jobID]
+				delete(s.running, matchedID)
+				if otherExists {
+					s.running[matchedID] = other
+				}
+			}
+			job = matched
+			exists = true
+		}
+	}
+	if !exists {
+		job, exists = s.running[jobID]
+	}
 	if exists {
 		delete(s.running, jobID)
 	}
@@ -1126,25 +1166,35 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event github.JobEvent) 
 	}
 
 	conclusion := event.Job.GetConclusion()
-	log.Info("job completed, destroying runner environment",
-		"conclusion", conclusion,
-	)
 
-	// Record metrics
+	// Record metrics.
 	metrics.JobsActive.Dec()
 	metrics.JobsTotal.WithLabelValues(event.Repo, conclusion).Inc()
 	metrics.JobDuration.WithLabelValues(event.Repo).Observe(time.Since(job.startedAt).Seconds())
-
 	resetBackoff(event.Repo)
-	job.cancel()
+
 	if job.macosVM != nil {
+		// macOS VMs don't self-terminate — explicit stop required.
+		log.Info("job completed, stopping macOS VM", "conclusion", conclusion)
+		job.cancel()
 		job.macosVM.Stop()
 	} else if job.dispatched != "" && s.cfg.LinuxDispatcher != nil {
-		if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), job.dispatched); err != nil {
-			log.Warn("failed to destroy dispatched runner", "error", err)
-		}
+		// Dispatched (Linux VM worker) runners are single-shot JIT: the
+		// actions-runner agent exits cleanly after running whatever job
+		// GitHub gave it, and the Wait() goroutine in handleLinuxJob destroys
+		// the container reactively. Do NOT cancel or Destroy here — our
+		// mapping of job_id→runner is advisory (see comment above about
+		// GitHub's label-match assignment), and killing the wrong runner is
+		// what caused simultaneous Linux jobs to take each other down.
+		log.Info("job completed (dispatched runner will exit naturally)",
+			"conclusion", conclusion, "runner", job.dispatched)
 	} else if job.env != nil {
-		_ = s.cfg.Runtime.Destroy(context.Background(), job.env)
+		// In-process runtime: we own the lifecycle directly, destroy explicitly.
+		log.Info("job completed, destroying runner environment", "conclusion", conclusion)
+		job.cancel()
+		if err := s.cfg.Runtime.Destroy(context.Background(), job.env); err != nil {
+			log.Warn("failed to destroy runner environment", "error", err)
+		}
 	}
 	if job.artifactsDir != "" {
 		artifacts.Cleanup(job.artifactsDir, s.cfg.Log)
