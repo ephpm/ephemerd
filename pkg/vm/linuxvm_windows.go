@@ -460,6 +460,11 @@ func (l *hypervLinuxVM) createAndBootVM() error {
 			"8250_core.nr_uarts=1 8250_core.skip_txen_test=1 console=ttyS0,115200",
 		l.cfg.ContainerdPort, l.cfg.CPUs,
 	)
+	if l.cfg.DindEnabled {
+		// Init script parses ephemerd.dind=1 and appends --dind to the ephemerd
+		// serve exec so Linux jobs get /var/run/docker.sock mounted in containers.
+		cmdline += " ephemerd.dind=1"
+	}
 
 	doc := &hcsComputeSystem{
 		Owner: "ephemerd",

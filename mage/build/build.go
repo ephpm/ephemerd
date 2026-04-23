@@ -31,9 +31,15 @@ func Build() error {
 // 1. Cross-compile static Linux binary with Linux assets embedded
 // 2. Build Windows binary embedding the Linux binary + Alpine rootfs + kernel + initrd
 func Windows() error {
-	// Phase 1: produce the inputs the initrd will bundle (ephemerd-linux binary
-	// and Alpine rootfs tarball), plus downloads that Initrdx86 doesn't touch.
-	mg.Deps(Linuxembed, download.Rootfs, download.Runnerwindows, download.Kernelx86, download.Shimwindows)
+	// Phase 1a: Linuxembed must finish BEFORE Runnerwindows so the Windows
+	// runner zip isn't in pkg/runner/embed during Linuxembed's `go build`.
+	// go:embed resolves whatever's in the directory at compile time — if the
+	// Windows zip lands mid-compile, it gets baked into the Linux binary
+	// too, wasting ~100 MB. Mirrors the Macos() pattern with download.Runner.
+	// Linuxembed itself also stashes as a belt-and-suspenders for cached zips.
+	mg.SerialDeps(Linuxembed, download.Runnerwindows)
+	// Phase 1b: downloads that Initrdx86 needs, independent of Linuxembed.
+	mg.Deps(download.Rootfs, download.Kernelx86, download.Shimwindows)
 	// Phase 2: build the initrd. Must run after Linuxembed + Rootfs — Initrdx86
 	// bundles pkg/vm/embed/ephemerd-linux and pkg/vm/embed/ephemerd-rootfs-*.tar.gz
 	// directly, and will fail on a fresh workspace if those aren't on disk yet.
@@ -57,12 +63,23 @@ func Windows() error {
 }
 
 // Linuxembed cross-compiles a static Linux ephemerd binary for embedding.
+// Stashes non-Linux runners out of pkg/runner/embed for the build — without
+// that, the `//go:embed all:embed` in pkg/runner/runner.go would bake the
+// Windows runner zip (~100 MB) into the Linux binary too whenever the
+// Windows download happens to finish before this cross-compile starts.
 func Linuxembed() error {
 	mg.Deps(download.Runnerlinux, download.Cnilinux, download.Shimlinux)
 
 	if err := os.MkdirAll("pkg/vm/embed", 0o755); err != nil {
 		return err
 	}
+
+	stash, err := stashNonMatchingRunners("actions-runner-linux-x64-")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = restoreStashed(stash) }()
+
 	return sh.RunWith(
 		map[string]string{"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64"},
 		"go", "build", "-tags", "containers_image_openpgp", "-ldflags", ldflags(), "-o", "pkg/vm/embed/ephemerd-linux", "./cmd/ephemerd/",
