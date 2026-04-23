@@ -13,6 +13,7 @@ import (
 
 func installCmd() *cli.Command {
 	var noService bool
+	var configFile string
 	return &cli.Command{
 		Name:  "install",
 		Usage: "Install ephemerd as a system service",
@@ -21,6 +22,12 @@ func installCmd() *cli.Command {
 				Name:        "no-service",
 				Usage:       "skip service installation (just copy binary and create config)",
 				Destination: &noService,
+			},
+			&cli.StringFlag{
+				Name:        "config",
+				Aliases:     []string{"c"},
+				Usage:       "path to config.toml to install into the data directory",
+				Destination: &configFile,
 			},
 		},
 		Action: func(_ context.Context, _ *cli.Command) error {
@@ -37,14 +44,19 @@ func installCmd() *cli.Command {
 			}
 			fmt.Printf("  binary:  %s\n", filepath.Join(installDir, binaryName()))
 
-			// 2. Create data directory and default config
+			// 2. Create data directory and config
 			if err := os.MkdirAll(dataDir, 0o755); err != nil {
 				return fmt.Errorf("creating data directory: %w", err)
 			}
 			fmt.Printf("  datadir: %s\n", dataDir)
 
 			configPath := filepath.Join(dataDir, "config.toml")
-			if err := createDefaultConfig(configPath); err != nil {
+			if configFile != "" {
+				if err := copyFile(configFile, configPath); err != nil {
+					return fmt.Errorf("copying config: %w", err)
+				}
+				fmt.Printf("  config:  %s (from %s)\n", configPath, configFile)
+			} else if err := createDefaultConfig(configPath); err != nil {
 				return fmt.Errorf("creating config: %w", err)
 			}
 
@@ -133,6 +145,29 @@ func installBinary(installDir string) error {
 	}
 
 	return nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := in.Close(); err != nil {
+			fmt.Printf("  warning: error closing source: %v\n", err)
+		}
+	}()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		if cerr := out.Close(); cerr != nil {
+			fmt.Printf("  warning: error closing dest: %v\n", cerr)
+		}
+		return err
+	}
+	return out.Close()
 }
 
 func createDefaultConfig(path string) error {

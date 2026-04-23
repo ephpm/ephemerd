@@ -70,6 +70,55 @@ func (c *Client) DeregisterWebhooks(ctx context.Context, hooks []ManagedWebhook)
 	}
 }
 
+// CleanStaleWebhooks removes any workflow_job webhooks left behind by previous
+// ephemerd instances that crashed or were killed without cleanup. Called on
+// startup before registering new webhooks to avoid hitting GitHub's 20-hook limit.
+func (c *Client) CleanStaleWebhooks(ctx context.Context) {
+	if c.IsOrgLevel() {
+		hooks, _, err := c.client.Organizations.ListHooks(ctx, c.cfg.Owner, nil)
+		if err != nil {
+			c.cfg.Log.Debug("could not list org webhooks for cleanup", "error", err)
+			return
+		}
+		for _, h := range hooks {
+			if hasEvent(h.Events, "workflow_job") {
+				if _, err := c.client.Organizations.DeleteHook(ctx, c.cfg.Owner, h.GetID()); err != nil {
+					c.cfg.Log.Warn("failed to remove stale org webhook", "hook_id", h.GetID(), "error", err)
+				} else {
+					c.cfg.Log.Info("removed stale org webhook", "hook_id", h.GetID(), "url", h.GetURL())
+				}
+			}
+		}
+		return
+	}
+
+	for _, repo := range c.cfg.Repos {
+		hooks, _, err := c.client.Repositories.ListHooks(ctx, c.cfg.Owner, repo, nil)
+		if err != nil {
+			c.cfg.Log.Debug("could not list repo webhooks for cleanup", "repo", repo, "error", err)
+			continue
+		}
+		for _, h := range hooks {
+			if hasEvent(h.Events, "workflow_job") {
+				if _, err := c.client.Repositories.DeleteHook(ctx, c.cfg.Owner, repo, h.GetID()); err != nil {
+					c.cfg.Log.Warn("failed to remove stale webhook", "repo", repo, "hook_id", h.GetID(), "error", err)
+				} else {
+					c.cfg.Log.Info("removed stale webhook", "repo", repo, "hook_id", h.GetID())
+				}
+			}
+		}
+	}
+}
+
+func hasEvent(events []string, target string) bool {
+	for _, e := range events {
+		if e == target {
+			return true
+		}
+	}
+	return false
+}
+
 // PingWebhook triggers a ping event for a managed webhook.
 func (c *Client) PingWebhook(ctx context.Context, m ManagedWebhook) error {
 	if m.Repo == "" {
