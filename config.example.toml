@@ -48,7 +48,7 @@ owner = "your-org"
 # Max concurrent jobs
 max_concurrent = 4
 
-# Default container image for jobs that don't set EPHEMERD_IMAGE.
+# Default container image for jobs that don't specify `container:` in the workflow.
 # Leave blank to auto-detect:
 #   Linux  → ghcr.io/actions/actions-runner:latest
 #   Windows → mcr.microsoft.com/windows/servercore:ltsc20XX (matched to host OS)

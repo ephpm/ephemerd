@@ -355,7 +355,7 @@ func (s *Server) handleRemoveRunner(w http.ResponseWriter, r *http.Request) {
 // handleGetContents returns a fake workflow file (for FetchJobImage).
 // GET /repos/{owner}/{repo}/contents/{path}
 func (s *Server) handleGetContents(w http.ResponseWriter, r *http.Request) {
-	// Return a minimal workflow YAML without EPHEMERD_IMAGE.
+	// Return a minimal workflow YAML without a container field.
 	content := base64.StdEncoding.EncodeToString([]byte(`name: test
 on: push
 jobs:

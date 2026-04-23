@@ -1,9 +1,10 @@
 // Package artifacts handles OCI image layer extraction for macOS VM jobs.
 //
-// When a macOS VM job specifies EPHEMERD_IMAGE, ephemerd pulls the OCI image
-// via containerd and extracts all layers into a flat directory on the host
-// filesystem. This is NOT running a container -- just unpacking the filesystem
-// layers into a regular directory that is shared with the macOS VM via virtio-fs.
+// When a macOS VM job specifies `container: { image: ... }` in its workflow,
+// ephemerd pulls the OCI image via containerd and extracts all layers into a
+// flat directory on the host filesystem. This is NOT running a container --
+// just unpacking the filesystem layers into a regular directory that is shared
+// with the macOS VM via virtio-fs.
 package artifacts
 
 import (

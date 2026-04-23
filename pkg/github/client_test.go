@@ -154,19 +154,24 @@ func TestIsOrgLevel(t *testing.T) {
 	}
 }
 
-// --- parseEphemerdImage tests ---
+// --- parseContainerImage tests ---
 
-func TestParseEphemerdImage(t *testing.T) {
+func TestParseContainerImage(t *testing.T) {
 	workflow := `
 name: CI
 on: push
 jobs:
   build:
     runs-on: [self-hosted, linux]
-    env:
-      EPHEMERD_IMAGE: ghcr.io/myorg/custom:latest
+    container:
+      image: ghcr.io/myorg/custom:latest
     steps:
       - uses: actions/checkout@v4
+  shorthand:
+    runs-on: [self-hosted, linux]
+    container: ghcr.io/myorg/short:v1
+    steps:
+      - run: echo hi
   test:
     runs-on: ubuntu-latest
     steps:
@@ -180,15 +185,21 @@ jobs:
 		want    string
 	}{
 		{
-			name:    "job with EPHEMERD_IMAGE",
+			name:    "job with container.image mapping",
 			jobName: "build",
 			jobID:   1,
 			want:    "ghcr.io/myorg/custom:latest",
 		},
 		{
-			name:    "job without EPHEMERD_IMAGE",
-			jobName: "test",
+			name:    "job with container string shorthand",
+			jobName: "shorthand",
 			jobID:   2,
+			want:    "ghcr.io/myorg/short:v1",
+		},
+		{
+			name:    "job without container",
+			jobName: "test",
+			jobID:   3,
 			want:    "",
 		},
 		{
@@ -207,36 +218,36 @@ jobs:
 					{ID: gh.Ptr(tt.jobID), Name: gh.Ptr(tt.jobName)},
 				}
 			}
-			got := parseEphemerdImage(workflow, jobs, tt.jobID)
+			got := parseContainerImage(workflow, jobs, tt.jobID)
 			if got != tt.want {
-				t.Errorf("parseEphemerdImage() = %q, want %q", got, tt.want)
+				t.Errorf("parseContainerImage() = %q, want %q", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestParseEphemerdImage_InvalidYAML(t *testing.T) {
+func TestParseContainerImage_InvalidYAML(t *testing.T) {
 	jobs := []*gh.WorkflowJob{{ID: gh.Ptr(int64(1)), Name: gh.Ptr("build")}}
-	got := parseEphemerdImage("not: valid: yaml: {{", jobs, 1)
+	got := parseContainerImage("not: valid: yaml: {{", jobs, 1)
 	if got != "" {
 		t.Errorf("expected empty string for invalid YAML, got %q", got)
 	}
 }
 
-func TestParseEphemerdImage_ExplicitJobName(t *testing.T) {
+func TestParseContainerImage_ExplicitJobName(t *testing.T) {
 	// When job has explicit `name:` field that differs from the key
 	workflow := `
 jobs:
   my-build-job:
     name: Build Everything
     runs-on: [self-hosted, linux]
-    env:
-      EPHEMERD_IMAGE: ghcr.io/myorg/builder:v2
+    container:
+      image: ghcr.io/myorg/builder:v2
 `
 	jobs := []*gh.WorkflowJob{{ID: gh.Ptr(int64(1)), Name: gh.Ptr("Build Everything")}}
-	got := parseEphemerdImage(workflow, jobs, 1)
+	got := parseContainerImage(workflow, jobs, 1)
 	if got != "ghcr.io/myorg/builder:v2" {
-		t.Errorf("parseEphemerdImage() = %q, want %q", got, "ghcr.io/myorg/builder:v2")
+		t.Errorf("parseContainerImage() = %q, want %q", got, "ghcr.io/myorg/builder:v2")
 	}
 }
 

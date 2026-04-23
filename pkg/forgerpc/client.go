@@ -275,14 +275,14 @@ func (t *Task) Repo() string {
 	return ""
 }
 
-// EphemerdImage parses the workflow YAML and returns the EPHEMERD_IMAGE
-// env var value, if set in any job definition. Returns "" if not found.
-func (t *Task) EphemerdImage() string {
+// ContainerImage parses the workflow YAML and returns the first job's
+// `container.image` value, if set. Returns "" if not found.
+func (t *Task) ContainerImage() string {
 	yamlBytes, err := t.WorkflowYAML()
 	if err != nil || len(yamlBytes) == 0 {
 		return ""
 	}
-	return parseEphemerdImage(yamlBytes)
+	return parseContainerImage(yamlBytes)
 }
 
 // TaskResult represents the outcome of a task or step.
@@ -568,20 +568,46 @@ func parseFlexInt64(data json.RawMessage) (int64, error) {
 	return 0, fmt.Errorf("cannot parse %s as int64", string(data))
 }
 
-// parseEphemerdImage looks for EPHEMERD_IMAGE in the workflow YAML env.
-func parseEphemerdImage(yamlBytes []byte) string {
+// parseContainerImage looks for the first job's `container.image` in the
+// workflow YAML. Accepts both the mapping form (`container: { image: "..." }`)
+// and the string shorthand (`container: "..."`), matching GitHub Actions.
+func parseContainerImage(yamlBytes []byte) string {
 	var workflow struct {
 		Jobs map[string]struct {
-			Env map[string]string `yaml:"env"`
+			Container containerField `yaml:"container"`
 		} `yaml:"jobs"`
 	}
 	if yaml.Unmarshal(yamlBytes, &workflow) != nil {
 		return ""
 	}
 	for _, job := range workflow.Jobs {
-		if img, ok := job.Env["EPHEMERD_IMAGE"]; ok && img != "" {
-			return img
+		if job.Container.Image != "" {
+			return job.Container.Image
 		}
 	}
 	return ""
+}
+
+// containerField accepts either a string shorthand or a full mapping for the
+// job's `container:` key.
+type containerField struct {
+	Image string `yaml:"image"`
+}
+
+func (c *containerField) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		c.Image = node.Value
+		return nil
+	case yaml.MappingNode:
+		type raw containerField
+		var r raw
+		if err := node.Decode(&r); err != nil {
+			return err
+		}
+		*c = containerField(r)
+		return nil
+	default:
+		return fmt.Errorf("container: expected string or mapping, got %v", node.Kind)
+	}
 }
