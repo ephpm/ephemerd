@@ -12,19 +12,20 @@ require (
 	github.com/containerd/platforms v1.0.0-rc.2
 	github.com/containers/buildah v1.43.1
 	github.com/golang/protobuf v1.5.4
+	github.com/google/go-containerregistry v0.21.5
 	github.com/google/go-github/v72 v72.0.0
 	github.com/magefile/mage v1.17.1
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/opencontainers/runtime-spec v1.3.0
 	github.com/prometheus/client_golang v1.23.2
-	github.com/sirupsen/logrus v1.9.3
+	github.com/sirupsen/logrus v1.9.4
 	github.com/urfave/cli/v3 v3.8.0
 	go.podman.io/image/v5 v5.39.2
 	go.podman.io/storage v1.62.0
 	golang.ngrok.com/ngrok v1.13.0
-	golang.org/x/crypto v0.45.0
-	golang.org/x/sys v0.38.0
-	golang.org/x/term v0.37.0
+	golang.org/x/crypto v0.50.0
+	golang.org/x/sys v0.43.0
+	golang.org/x/term v0.42.0
 	google.golang.org/grpc v1.78.0
 	google.golang.org/protobuf v1.36.10
 	gopkg.in/yaml.v3 v3.0.1
@@ -65,7 +66,7 @@ require (
 	github.com/containerd/nri v0.11.0 // indirect
 	github.com/containerd/otelttrpc v0.1.0 // indirect
 	github.com/containerd/plugin v1.0.0 // indirect
-	github.com/containerd/stargz-snapshotter/estargz v0.17.0 // indirect
+	github.com/containerd/stargz-snapshotter/estargz v0.18.2 // indirect
 	github.com/containerd/ttrpc v1.2.7 // indirect
 	github.com/containerd/typeurl/v2 v2.2.3 // indirect
 	github.com/containerd/zfs/v2 v2.0.0 // indirect
@@ -105,7 +106,6 @@ require (
 	github.com/google/certtostore v1.0.6 // indirect
 	github.com/google/deck v0.0.0-20230104221208-105ad94aa8ae // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
-	github.com/google/go-containerregistry v0.20.6 // indirect
 	github.com/google/go-intervals v0.0.2 // indirect
 	github.com/google/go-querystring v1.1.0 // indirect
 	github.com/google/pprof v0.0.0-20250820193118-f64d9cf942d6 // indirect
@@ -125,7 +125,7 @@ require (
 	github.com/jinzhu/copier v0.4.0 // indirect
 	github.com/jpillora/backoff v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/klauspost/compress v1.18.1 // indirect
+	github.com/klauspost/compress v1.18.5 // indirect
 	github.com/klauspost/pgzip v1.2.6 // indirect
 	github.com/knqyf263/go-plugin v0.9.0 // indirect
 	github.com/letsencrypt/boulder v0.0.0-20240620165639-de9c06129bec // indirect
@@ -148,6 +148,7 @@ require (
 	github.com/moby/locker v1.0.1 // indirect
 	github.com/moby/patternmatcher v0.6.0 // indirect
 	github.com/moby/spdystream v0.5.0 // indirect
+	github.com/moby/sys/atomicwriter v0.1.0 // indirect
 	github.com/moby/sys/capability v0.4.0 // indirect
 	github.com/moby/sys/mountinfo v0.7.2 // indirect
 	github.com/moby/sys/sequential v0.6.0 // indirect
@@ -187,7 +188,7 @@ require (
 	github.com/sigstore/protobuf-specs v0.4.1 // indirect
 	github.com/sigstore/sigstore v1.9.5 // indirect
 	github.com/smallstep/pkcs7 v0.1.1 // indirect
-	github.com/spf13/cobra v1.10.1 // indirect
+	github.com/spf13/cobra v1.10.2 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/stefanberger/go-pkcs11uri v0.0.0-20230803200340-78284954bff6 // indirect
 	github.com/sylabs/sif/v2 v2.22.0 // indirect
@@ -196,7 +197,7 @@ require (
 	github.com/titanous/rocacheck v0.0.0-20171023193734-afe73141d399 // indirect
 	github.com/ulikunitz/xz v0.5.15 // indirect
 	github.com/urfave/cli/v2 v2.27.7 // indirect
-	github.com/vbatts/tar-split v0.12.1 // indirect
+	github.com/vbatts/tar-split v0.12.2 // indirect
 	github.com/vbauerster/mpb/v8 v8.10.2 // indirect
 	github.com/vishvananda/netlink v1.3.1 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
@@ -222,13 +223,13 @@ require (
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.ngrok.com/muxado/v2 v2.0.1 // indirect
-	golang.org/x/mod v0.29.0 // indirect
-	golang.org/x/net v0.47.0 // indirect
-	golang.org/x/oauth2 v0.32.0 // indirect
-	golang.org/x/sync v0.18.0 // indirect
-	golang.org/x/text v0.31.0 // indirect
+	golang.org/x/mod v0.35.0 // indirect
+	golang.org/x/net v0.53.0 // indirect
+	golang.org/x/oauth2 v0.36.0 // indirect
+	golang.org/x/sync v0.20.0 // indirect
+	golang.org/x/text v0.36.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
-	golang.org/x/tools v0.38.0 // indirect
+	golang.org/x/tools v0.44.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20251029180050-ab9386a59fda // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251029180050-ab9386a59fda // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect

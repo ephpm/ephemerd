@@ -268,6 +268,10 @@ func (s *Scheduler) Run(ctx context.Context) error {
 
 	// Start HTTP server: via tunnel, TLS, or plain HTTP
 	if s.cfg.Tunnel != nil && useWebhook {
+		// Clean up stale webhooks from previous crashed instances before
+		// registering new ones. Prevents hitting GitHub's 20-hook limit.
+		s.cfg.GitHub.CleanStaleWebhooks(ctx)
+
 		// Initial tunnel connection.
 		ln, err := s.cfg.Tunnel.Listen(ctx)
 		if err != nil {
@@ -341,6 +345,16 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		if started == 0 {
 			return fmt.Errorf("no providers started successfully")
 		}
+	}
+
+	// One-time poll on startup to catch jobs that queued while ephemerd
+	// was down. Webhook events only fire at the moment a job transitions
+	// to "queued" — they aren't replayed for jobs already in that state.
+	// Run in a goroutine so it doesn't block if there are more queued jobs
+	// than the channel buffer can hold.
+	if s.cfg.GitHub != nil {
+		s.cfg.Log.Info("startup poll: checking for queued jobs")
+		go s.poll(ctx, events)
 	}
 
 	// Periodically clean up the seen-jobs dedup map

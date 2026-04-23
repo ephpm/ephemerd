@@ -14,8 +14,8 @@ func TestLinuxVMConfig_SetDefaults(t *testing.T) {
 	if cfg.CPUs != 1 {
 		t.Errorf("CPUs = %d, want 1", cfg.CPUs)
 	}
-	if cfg.MemoryMB != 1024 {
-		t.Errorf("MemoryMB = %d, want 1024", cfg.MemoryMB)
+	if cfg.MemoryMB != 4096 {
+		t.Errorf("MemoryMB = %d, want 4096", cfg.MemoryMB)
 	}
 	if cfg.DiskSizeGB != 50 {
 		t.Errorf("DiskSizeGB = %d, want 50", cfg.DiskSizeGB)
@@ -55,8 +55,8 @@ func TestLinuxVMConfig_SetDefaults_PartialCustom(t *testing.T) {
 	if cfg.CPUs != 4 {
 		t.Errorf("CPUs = %d, want 4 (custom)", cfg.CPUs)
 	}
-	if cfg.MemoryMB != 1024 {
-		t.Errorf("MemoryMB = %d, want 1024 (default)", cfg.MemoryMB)
+	if cfg.MemoryMB != 4096 {
+		t.Errorf("MemoryMB = %d, want 4096 (default)", cfg.MemoryMB)
 	}
 }
 

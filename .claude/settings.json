@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go:*)",
+      "Bash(mage:*)",
+      "Bash(mage.exe:*)",
+      "Bash(bin/golangci-lint:*)",
+      "Bash(bin/golangci-lint.exe:*)",
+      "Bash(./bin/golangci-lint:*)",
+      "Bash(./bin/golangci-lint.exe:*)",
+      "Bash(docker:*)",
+      "Bash(docker-compose:*)",
+      "Bash(ephemerd:*)",
+      "Bash(ephemerd.exe:*)",
+      "Bash(ephemerd-runner-forgejo:*)",
+      "Bash(ephemerd-runner-forgejo.exe:*)",
+      "Bash(ephemerd-runner-gitea:*)",
+      "Bash(ephemerd-runner-gitea.exe:*)",
+      "Bash(./ephemerd:*)",
+      "Bash(./ephemerd.exe:*)",
+
+      "PowerShell(go:*)",
+      "PowerShell(mage:*)",
+      "PowerShell(mage.exe:*)",
+      "PowerShell(docker:*)",
+      "PowerShell(docker-compose:*)",
+      "PowerShell(ephemerd:*)",
+      "PowerShell(ephemerd.exe:*)",
+      "PowerShell(ephemerd-runner-forgejo:*)",
+      "PowerShell(ephemerd-runner-forgejo.exe:*)",
+      "PowerShell(ephemerd-runner-gitea:*)",
+      "PowerShell(ephemerd-runner-gitea.exe:*)",
+
+      "Read(//c/Program Files/ephemerd/**)",
+      "Read(//c/ProgramData/ephemerd/**)",
+      "Read(/var/lib/ephemerd/**)",
+      "Read(/etc/ephemerd/**)"
+    ]
+  }
+}

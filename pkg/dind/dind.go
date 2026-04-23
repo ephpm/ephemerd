@@ -15,22 +15,34 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/ephpm/ephemerd/pkg/networking"
 )
+
+// sharedNamespace is the containerd namespace used by ephemerd for runner
+// containers and cached base images. DinD image pulls check here first
+// before pulling into the per-job namespace.
+const sharedNamespace = "ephemerd"
 
 // Server is a per-job fake Docker daemon.
 type Server struct {
-	jobID    string
-	sockPath string
-	listener net.Listener
-	server   *http.Server
-	client   *client.Client
-	log      *slog.Logger
+	jobID        string
+	jobNamespace string // per-job containerd namespace for isolation
+	sockPath     string
+	listener     net.Listener
+	server       *http.Server
+	client       *client.Client
+	network      *networking.Manager
+	log          *slog.Logger
 
-	mu     sync.Mutex
-	images map[string]*imageEntry // in-memory image store scoped to this job
+	mu         sync.Mutex
+	images     map[string]*imageEntry    // in-memory image store scoped to this job
+	containers map[string]*containerEntry // containers created through this socket
+	execs      map[string]*execEntry      // exec processes inside containers
 }
 
 type imageEntry struct {
@@ -51,6 +63,10 @@ type Config struct {
 	// Client is the containerd client for image pulls and container ops.
 	Client *client.Client
 
+	// Network is the networking manager for attaching sibling containers
+	// to the CNI bridge. May be nil if networking is not available.
+	Network *networking.Manager
+
 	Log *slog.Logger
 }
 
@@ -70,11 +86,15 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	return &Server{
-		jobID:    cfg.JobID,
-		sockPath: sockPath,
-		client:   cfg.Client,
-		log:      cfg.Log.With("component", "dind", "job_id", cfg.JobID),
-		images:   make(map[string]*imageEntry),
+		jobID:        cfg.JobID,
+		jobNamespace: "ephemerd/dind/" + cfg.JobID,
+		sockPath:     sockPath,
+		client:       cfg.Client,
+		network:      cfg.Network,
+		log:          cfg.Log.With("component", "dind", "job_id", cfg.JobID),
+		images:       make(map[string]*imageEntry),
+		containers:   make(map[string]*containerEntry),
+		execs:        make(map[string]*execEntry),
 	}, nil
 }
 
@@ -107,9 +127,14 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// Stop shuts down the server and cleans up all per-job state.
+// Stop shuts down the server and cleans up all per-job state,
+// including any containers created through this socket.
 func (s *Server) Stop() {
 	s.log.Info("stopping fake docker daemon")
+
+	// Destroy all exec processes and containers created through this socket.
+	s.destroyAllExecs()
+	s.destroyAllContainers()
 
 	if s.server != nil {
 		if err := s.server.Shutdown(context.Background()); err != nil {
@@ -159,6 +184,16 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.handleImageList(w, r)
 	case path == "/images/create" && r.Method == http.MethodPost:
 		s.handleImagePull(w, r)
+	case path == "/build" && r.Method == http.MethodPost:
+		s.handleImageBuild(w, r)
+	case path == "/containers/create" && r.Method == http.MethodPost:
+		s.handleContainerCreate(w, r)
+	case path == "/containers/json" && r.Method == http.MethodGet:
+		s.handleContainerList(w, r)
+	case strings.HasPrefix(path, "/containers/"):
+		s.routeContainer(w, r, path)
+	case strings.HasPrefix(path, "/exec/"):
+		s.routeExec(w, r, path)
 	default:
 		s.handleNotImplemented(w, r)
 	}
@@ -220,10 +255,10 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		"DockerRootDir":     "/var/lib/docker",
 		"RegistryConfig":    map[string]any{"InsecureRegistryCIDRs": []string{}, "IndexConfigs": map[string]any{}},
 		"SecurityOptions":   []string{},
-		"Containers":        0,
-		"ContainersRunning": 0,
+		"Containers":        s.countContainers(),
+		"ContainersRunning": s.countContainersByStatus("running"),
 		"ContainersPaused":  0,
-		"ContainersStopped": 0,
+		"ContainersStopped": s.countContainersByStatus("exited"),
 		"Images":            len(s.images),
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -296,22 +331,26 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 
 	writeProgress(fmt.Sprintf("Pulling from %s", fromImage))
 
-	// Pull via containerd
+	// Check the shared ephemerd namespace first — common base images
+	// (node:20, ubuntu:24.04, etc.) are cached there across all jobs.
 	ctx := r.Context()
-	_, err := s.client.Pull(ctx, ref, client.WithPullUnpack)
-	if err != nil {
-		writeProgress(fmt.Sprintf("Error: %v", err))
-		return
+	sharedCtx := namespaces.WithNamespace(ctx, sharedNamespace)
+	jobCtx := namespaces.WithNamespace(ctx, s.jobNamespace)
+
+	img, err := s.client.GetImage(sharedCtx, ref)
+	if err == nil {
+		writeProgress("Using cached image from shared namespace")
+	} else {
+		// Not in shared namespace — pull into the per-job namespace.
+		// This keeps private registry images isolated to this job.
+		img, err = s.client.Pull(jobCtx, ref, client.WithPullUnpack)
+		if err != nil {
+			writeProgress(fmt.Sprintf("Error: %v", err))
+			return
+		}
 	}
 
-	// Get image info for the in-memory map
-	img, err := s.client.GetImage(ctx, ref)
-	if err != nil {
-		writeProgress(fmt.Sprintf("Error getting image: %v", err))
-		return
-	}
-
-	size, _ := img.Size(ctx)
+	size, _ := img.Size(jobCtx)
 
 	s.mu.Lock()
 	s.images[ref] = &imageEntry{
