@@ -547,6 +547,111 @@ func TestResetBackoff_NonexistentRepo(t *testing.T) {
 	resetBackoff("never-seen-before")
 }
 
+// TestBackoffDuration_CapAt60Seconds asserts that no matter how many failures
+// have accumulated, the backoff never exceeds 60s. The current formula is
+// 1<<min(n,6) which yields 64 (capped to 60) once n >= 6, but we exercise
+// many more iterations to make sure the cap actually holds.
+func TestBackoffDuration_CapAt60Seconds(t *testing.T) {
+	repo := "test-backoff-cap"
+	resetBackoff(repo)
+	defer resetBackoff(repo)
+
+	for i := 0; i < 50; i++ {
+		got := backoffDuration(repo)
+		if got > 60*time.Second {
+			t.Fatalf("call %d: backoffDuration = %v exceeds 60s cap", i+1, got)
+		}
+	}
+}
+
+// TestBackoffDuration_ProviderEventSequence simulates a realistic mix of
+// success/failure events from one or more providers. After a successful
+// claim (resetBackoff), subsequent failures must restart from the beginning
+// (2s), not continue where they left off.
+func TestBackoffDuration_ProviderEventSequence(t *testing.T) {
+	repo := "test-provider-events"
+	resetBackoff(repo)
+	defer resetBackoff(repo)
+
+	// Simulated event stream:
+	//   F = failure (calls backoffDuration)
+	//   S = success (calls resetBackoff)
+	type event struct {
+		kind string        // "F" or "S"
+		want time.Duration // expected backoff duration after F (0 for S)
+	}
+
+	events := []event{
+		{"F", 2 * time.Second},
+		{"F", 4 * time.Second},
+		{"F", 8 * time.Second},
+		{"S", 0}, // success — reset
+		{"F", 2 * time.Second},
+		{"F", 4 * time.Second},
+		{"S", 0}, // success — reset
+		{"F", 2 * time.Second}, // back to base
+	}
+
+	for i, ev := range events {
+		switch ev.kind {
+		case "F":
+			got := backoffDuration(repo)
+			if got != ev.want {
+				t.Errorf("event %d (F): backoffDuration = %v, want %v", i, got, ev.want)
+			}
+		case "S":
+			resetBackoff(repo)
+		}
+	}
+}
+
+// TestBackoffDuration_MultipleReposIsolated verifies that interleaved
+// failures and successes across many repos don't corrupt one another's state.
+// This is a regression test for the per-repo failureCounts map.
+func TestBackoffDuration_MultipleReposIsolated(t *testing.T) {
+	repos := []string{"repo-iso-1", "repo-iso-2", "repo-iso-3"}
+	for _, r := range repos {
+		resetBackoff(r)
+	}
+	defer func() {
+		for _, r := range repos {
+			resetBackoff(r)
+		}
+	}()
+
+	// Interleave failures: r1, r2, r1, r3, r2, r1
+	if got := backoffDuration("repo-iso-1"); got != 2*time.Second {
+		t.Errorf("repo-iso-1 call 1: got %v, want 2s", got)
+	}
+	if got := backoffDuration("repo-iso-2"); got != 2*time.Second {
+		t.Errorf("repo-iso-2 call 1: got %v, want 2s", got)
+	}
+	if got := backoffDuration("repo-iso-1"); got != 4*time.Second {
+		t.Errorf("repo-iso-1 call 2: got %v, want 4s", got)
+	}
+	if got := backoffDuration("repo-iso-3"); got != 2*time.Second {
+		t.Errorf("repo-iso-3 call 1: got %v, want 2s", got)
+	}
+	if got := backoffDuration("repo-iso-2"); got != 4*time.Second {
+		t.Errorf("repo-iso-2 call 2: got %v, want 4s", got)
+	}
+	if got := backoffDuration("repo-iso-1"); got != 8*time.Second {
+		t.Errorf("repo-iso-1 call 3: got %v, want 8s", got)
+	}
+
+	// Reset only repo-iso-2 — others should be unaffected
+	resetBackoff("repo-iso-2")
+	if got := backoffDuration("repo-iso-1"); got != 16*time.Second {
+		t.Errorf("repo-iso-1 after r2 reset: got %v, want 16s", got)
+	}
+	if got := backoffDuration("repo-iso-2"); got != 2*time.Second {
+		t.Errorf("repo-iso-2 after reset: got %v, want 2s", got)
+	}
+	if got := backoffDuration("repo-iso-3"); got != 4*time.Second {
+		t.Errorf("repo-iso-3 unaffected: got %v, want 4s", got)
+	}
+}
+
 // --- registerVMSSHHandler tests ---
 
 // mockMacOSVM is a minimal mock for vm.MacOSVM used by vmssh tests.
