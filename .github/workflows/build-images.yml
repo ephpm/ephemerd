@@ -125,6 +125,20 @@ jobs:
       # (pkg/buildkit, see docs/arch/docker-builds.md). /auth + /images/{ref}/push
       # are handled by pkg/dind/registry.go — auth is cached in-memory, push
       # uses containerd's docker resolver to ship the image to Docker Hub.
+      # docker CLI with DOCKER_BUILDKIT=1 dispatches `docker build` to the
+      # buildx CLI plugin. Download the standalone buildx binary into the
+      # user's cli-plugins dir so the plugin is discoverable. We pin to a
+      # known-good buildx version to keep CI deterministic.
+      - name: Install docker buildx CLI plugin
+        shell: powershell
+        run: |
+          $pluginDir = "$env:USERPROFILE\.docker\cli-plugins"
+          New-Item -ItemType Directory -Path $pluginDir -Force | Out-Null
+          Invoke-WebRequest `
+            -Uri "https://github.com/docker/buildx/releases/download/v0.18.0/buildx-v0.18.0.windows-amd64.exe" `
+            -OutFile "$pluginDir\docker-buildx.exe"
+          docker buildx version
+
       - name: Login to Docker Hub
         shell: powershell
         env:
