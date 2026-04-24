@@ -119,26 +119,24 @@ jobs:
         shell: powershell
         run: echo "DATE_TAG=$(Get-Date -Format 'yyyyMMdd')" >> $env:GITHUB_ENV
 
-      # Windows builds go through the local Docker daemon (ephemerd's dind),
-      # which in turn routes POST /build to ephemerd's embedded BuildKit
-      # solver (pkg/buildkit, see docs/arch/docker-builds.md). The
-      # docker-container driver would need a Windows-native buildkit image,
-      # and moby has retired their windowsservercore tags — so we use the
-      # "docker" driver and let the local daemon handle the build.
-      - uses: docker/setup-buildx-action@v3
-        with:
-          driver: docker
+      # Plain `docker build` + `docker push` — avoids buildx entirely.
+      # setup-buildx-action's --bootstrap tries to pull moby/buildkit:* which
+      # has no Windows variant upstream and no Docker registry at "moby",
+      # so it always fails before any build runs. `docker build` hits our
+      # fake daemon's /build endpoint, which pkg/dind routes into the
+      # embedded BuildKit solver (pkg/buildkit, see docs/arch/docker-builds.md).
+      - name: Login to Docker Hub
+        shell: powershell
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: docker login -u $env:DOCKER_USERNAME -p $env:DOCKER_PASSWORD
 
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-
-      - uses: docker/build-push-action@v6
-        with:
-          context: images/runner-ci-windows
-          platforms: windows/amd64
-          push: true
-          tags: |
-            ${{ env.IMAGE_REPO }}:runner-ci-windows
-            ${{ env.IMAGE_REPO }}:runner-ci-windows-${{ env.DATE_TAG }}
+      - name: Build and push
+        shell: powershell
+        run: |
+          $tagLatest = "${{ env.IMAGE_REPO }}:runner-ci-windows"
+          $tagDated  = "${{ env.IMAGE_REPO }}:runner-ci-windows-$env:DATE_TAG"
+          docker build -t $tagLatest -t $tagDated images/runner-ci-windows
+          docker push $tagLatest
+          docker push $tagDated
