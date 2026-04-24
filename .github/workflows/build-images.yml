@@ -143,9 +143,17 @@ jobs:
       # daemon's BuildKit) instead of the default `docker-container` driver.
       # docker-container would try to spawn a buildkit container by pulling
       # moby/buildkit:buildx-stable-1, which has no Windows variant.
+      #
+      # buildx ships with an implicit "default" builder using docker-container
+      # AND only allows one docker-driver instance per context — `create
+      # --driver docker` errors with "additional instances of driver 'docker'
+      # cannot be created" if we don't drop the default first. So: remove the
+      # existing default, then make a fresh docker-driver "dind" the active
+      # builder.
       - name: Configure buildx for docker driver
         shell: powershell
         run: |
+          docker buildx rm default 2>$null
           docker buildx create --name dind --driver docker --use
           docker buildx ls
 
