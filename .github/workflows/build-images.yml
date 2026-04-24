@@ -139,6 +139,16 @@ jobs:
             -OutFile "$pluginDir\docker-buildx.exe"
           docker buildx version
 
+      # Force buildx to use the `docker` driver (delegates to the local
+      # daemon's BuildKit) instead of the default `docker-container` driver.
+      # docker-container would try to spawn a buildkit container by pulling
+      # moby/buildkit:buildx-stable-1, which has no Windows variant.
+      - name: Configure buildx for docker driver
+        shell: powershell
+        run: |
+          docker buildx create --name dind --driver docker --use
+          docker buildx ls
+
       - name: Login to Docker Hub
         shell: powershell
         env:
