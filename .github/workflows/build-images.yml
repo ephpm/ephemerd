@@ -153,7 +153,11 @@ jobs:
       - name: Configure buildx for docker driver
         shell: powershell
         run: |
-          docker buildx rm default 2>$null
+          # `2>$null` doesn't fully suppress native-command stderr in PowerShell —
+          # the runner's $ErrorActionPreference treats text on stderr as a
+          # terminating error. Merge into stdout, discard, ignore exit.
+          $ErrorActionPreference = 'Continue'
+          & { docker buildx rm default 2>&1 } | Out-Null
           docker buildx create --name dind --driver docker --use
           docker buildx ls
 
