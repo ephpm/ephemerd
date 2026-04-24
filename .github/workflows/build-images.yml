@@ -119,48 +119,18 @@ jobs:
         shell: powershell
         run: echo "DATE_TAG=$(Get-Date -Format 'yyyyMMdd')" >> $env:GITHUB_ENV
 
-      # Plain `docker build` + `docker push` — bypasses buildx (its --bootstrap
-      # path pulls moby/buildkit:* which has no Windows variant). The fake
-      # daemon's /build endpoint routes into the embedded BuildKit solver
-      # (pkg/buildkit, see docs/arch/docker-builds.md). /auth + /images/{ref}/push
-      # are handled by pkg/dind/registry.go — auth is cached in-memory, push
-      # uses containerd's docker resolver to ship the image to Docker Hub.
-      # docker CLI with DOCKER_BUILDKIT=1 dispatches `docker build` to the
-      # buildx CLI plugin. Download the standalone buildx binary into the
-      # user's cli-plugins dir so the plugin is discoverable. We pin to a
-      # known-good buildx version to keep CI deterministic.
-      - name: Install docker buildx CLI plugin
-        shell: powershell
-        run: |
-          $pluginDir = "$env:USERPROFILE\.docker\cli-plugins"
-          New-Item -ItemType Directory -Path $pluginDir -Force | Out-Null
-          Invoke-WebRequest `
-            -Uri "https://github.com/docker/buildx/releases/download/v0.18.0/buildx-v0.18.0.windows-amd64.exe" `
-            -OutFile "$pluginDir\docker-buildx.exe"
-          docker buildx version
-
-      # Force buildx to use the `docker` driver (delegates to the local
-      # daemon's BuildKit) instead of the default `docker-container` driver.
-      # docker-container would try to spawn a buildkit container by pulling
-      # moby/buildkit:buildx-stable-1, which has no Windows variant.
+      # Plain `docker build` against the legacy daemon builder — no
+      # DOCKER_BUILDKIT, no buildx. Buildx's docker-container driver tries
+      # to pull a Windows buildkit image that moby retired, and forcing
+      # the `docker` driver fights buildx's auto-default management. Since
+      # the Dockerfile now puts `# escape=`` ` as the very first line
+      # (parser directives MUST precede comments), the legacy builder
+      # honors the backtick line continuations and Windows path escaping.
       #
-      # buildx ships with an implicit "default" builder using docker-container
-      # AND only allows one docker-driver instance per context — `create
-      # --driver docker` errors with "additional instances of driver 'docker'
-      # cannot be created" if we don't drop the default first. So: remove the
-      # existing default, then make a fresh docker-driver "dind" the active
-      # builder.
-      - name: Configure buildx for docker driver
-        shell: powershell
-        run: |
-          # `2>$null` doesn't fully suppress native-command stderr in PowerShell —
-          # the runner's $ErrorActionPreference treats text on stderr as a
-          # terminating error. Merge into stdout, discard, ignore exit.
-          $ErrorActionPreference = 'Continue'
-          & { docker buildx rm default 2>&1 } | Out-Null
-          docker buildx create --name dind --driver docker --use
-          docker buildx ls
-
+      # This routes through ephemerd's fake daemon's /build endpoint
+      # (pkg/dind), which dispatches into the embedded BuildKit solver
+      # (pkg/buildkit, see docs/arch/docker-builds.md). /auth and
+      # /images/{ref}/push are handled by pkg/dind/registry.go.
       - name: Login to Docker Hub
         shell: powershell
         env:
@@ -170,13 +140,6 @@ jobs:
 
       - name: Build and push
         shell: powershell
-        env:
-          # Force the CLI to send the build to /build with BuildKit semantics.
-          # Otherwise the CLI's daemon-feature probe falls back to the legacy
-          # builder, which doesn't honor the `# escape=` directive used in
-          # this Dockerfile (line 14 is a backtick-continuation that legacy
-          # parses as an unknown `Expand-Archive` instruction).
-          DOCKER_BUILDKIT: "1"
         run: |
           $tagLatest = "${{ env.IMAGE_REPO }}:runner-ci-windows"
           $tagDated  = "${{ env.IMAGE_REPO }}:runner-ci-windows-$env:DATE_TAG"

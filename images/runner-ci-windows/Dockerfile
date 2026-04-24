@@ -1,7 +1,12 @@
+# escape=`
 # CI runner image for Windows — build deps pre-cached.
 # Must be built on a Windows host.
+#
+# Parser directive `# escape=`` ` must be the very first line — before any
+# regular comments — for both the legacy and buildkit Windows parsers to
+# honor it. Without it, backtick line continuations get parsed as unknown
+# instructions and Windows paths (C:\...) eat the next character.
 
-# escape=`
 FROM ghcr.io/actions/actions-runner:latest-win
 
 ARG RUNNER_VERSION=2.333.1
