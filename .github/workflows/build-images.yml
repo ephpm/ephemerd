@@ -134,6 +134,13 @@ jobs:
 
       - name: Build and push
         shell: powershell
+        env:
+          # Force the CLI to send the build to /build with BuildKit semantics.
+          # Otherwise the CLI's daemon-feature probe falls back to the legacy
+          # builder, which doesn't honor the `# escape=` directive used in
+          # this Dockerfile (line 14 is a backtick-continuation that legacy
+          # parses as an unknown `Expand-Archive` instruction).
+          DOCKER_BUILDKIT: "1"
         run: |
           $tagLatest = "${{ env.IMAGE_REPO }}:runner-ci-windows"
           $tagDated  = "${{ env.IMAGE_REPO }}:runner-ci-windows-$env:DATE_TAG"
