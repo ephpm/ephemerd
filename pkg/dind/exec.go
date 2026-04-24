@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -506,24 +507,18 @@ func (s *Server) copyToViaExec(w http.ResponseWriter, r *http.Request, entry *co
 	// Write the incoming tar to a temp file, then exec tar inside the
 	// container to extract it. We can't pipe directly because containerd's
 	// exec API doesn't support stdin streaming via cio.LogFile.
-	tmpFile, err := os.CreateTemp("", "dind-copy-*.tar")
+	tmpPath, err := streamToTempFile(r.Body, "dind-copy-*.tar")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"message": fmt.Sprintf("creating temp file: %v", err),
+			"message": err.Error(),
 		})
 		return
 	}
-	tmpPath := tmpFile.Name()
-	defer func() { _ = os.Remove(tmpPath) }()
-
-	if _, err := io.Copy(tmpFile, r.Body); err != nil {
-		_ = tmpFile.Close()
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"message": fmt.Sprintf("writing temp tar: %v", err),
-		})
-		return
-	}
-	_ = tmpFile.Close()
+	defer func() {
+		if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			s.log.Debug("removing temp tar", "path", tmpPath, "error", rmErr)
+		}
+	}()
 
 	// For the exec approach to work, we need the tar file visible inside
 	// the container. Since the container uses overlayfs, we can write the
@@ -793,6 +788,43 @@ func (s *Server) destroyAllExecs() {
 }
 
 // --- tar helpers ---
+
+// streamToTempFile writes r to a fresh temp file (using pattern as the
+// CreateTemp pattern) and returns the temp file path. The file is always
+// closed before returning. On any error the partial temp file is removed.
+//
+// Extracted so the streaming behavior of copyToViaExec is unit-testable
+// without a real containerd. Errors are returned wrapped with context so
+// callers can surface them to clients.
+func streamToTempFile(r io.Reader, pattern string) (string, error) {
+	tmpFile, err := os.CreateTemp("", pattern)
+	if err != nil {
+		return "", fmt.Errorf("creating temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+
+	if _, copyErr := io.Copy(tmpFile, r); copyErr != nil {
+		// Best-effort cleanup. We surface the copy error to the caller; close
+		// and remove failures are joined into the returned error so callers
+		// can still see them via errors.Is/As.
+		err := fmt.Errorf("writing temp file: %w", copyErr)
+		if closeErr := tmpFile.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("closing temp file: %w", closeErr))
+		}
+		if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			err = errors.Join(err, fmt.Errorf("removing temp file: %w", rmErr))
+		}
+		return "", err
+	}
+	if closeErr := tmpFile.Close(); closeErr != nil {
+		err := fmt.Errorf("closing temp file: %w", closeErr)
+		if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			err = errors.Join(err, fmt.Errorf("removing temp file: %w", rmErr))
+		}
+		return "", err
+	}
+	return tmpPath, nil
+}
 
 func extractTar(r io.Reader, dst string) error {
 	tr := tar.NewReader(r)
