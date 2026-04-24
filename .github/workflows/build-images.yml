@@ -81,6 +81,11 @@ jobs:
           docker manifest push ${{ env.IMAGE_REPO }}:runner-ci-linux-${{ env.DATE_TAG }}
 
   macos-deps:
+    # Runs on a Linux runner (buildx cross-build). Serialized after the linux
+    # matrix because our ephemerd Linux VM can only safely host one CI job at
+    # a time — two concurrent Linux runners on the same VM kill each other
+    # before buildx finishes booting.
+    needs: linux-manifest
     name: Build macOS Deps
     runs-on: [self-hosted, linux, x64]
     steps:
@@ -114,13 +119,26 @@ jobs:
         shell: powershell
         run: echo "DATE_TAG=$(Get-Date -Format 'yyyyMMdd')" >> $env:GITHUB_ENV
 
+      # buildkit has experimental Windows container support since v0.13 (uses
+      # containerd worker). docker-container driver spawns the buildkit
+      # container via our fake Docker daemon, same pattern as the linux
+      # amd64 job. The image must be a Windows-native buildkit variant.
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+          driver-opts: |
+            image=moby/buildkit:buildx-stable-1-windowsservercore-ltsc2022
+
       - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Build and push
-        run: |
-          docker build -t ${{ env.IMAGE_REPO }}:runner-ci-windows -t ${{ env.IMAGE_REPO }}:runner-ci-windows-${{ env.DATE_TAG }} images/runner-ci-windows
-          docker push ${{ env.IMAGE_REPO }}:runner-ci-windows
-          docker push ${{ env.IMAGE_REPO }}:runner-ci-windows-${{ env.DATE_TAG }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: images/runner-ci-windows
+          platforms: windows/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE_REPO }}:runner-ci-windows
+            ${{ env.IMAGE_REPO }}:runner-ci-windows-${{ env.DATE_TAG }}
