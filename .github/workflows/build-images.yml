@@ -119,24 +119,19 @@ jobs:
         shell: powershell
         run: echo "DATE_TAG=$(Get-Date -Format 'yyyyMMdd')" >> $env:GITHUB_ENV
 
-      # Plain `docker build` + `docker push` — avoids buildx entirely.
-      # setup-buildx-action's --bootstrap tries to pull moby/buildkit:* which
-      # has no Windows variant upstream and no Docker registry at "moby",
-      # so it always fails before any build runs. `docker build` hits our
-      # fake daemon's /build endpoint, which pkg/dind routes into the
-      # embedded BuildKit solver (pkg/buildkit, see docs/arch/docker-builds.md).
-      - name: Login to Docker Hub
-        shell: powershell
-        env:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-        run: docker login -u $env:DOCKER_USERNAME -p $env:DOCKER_PASSWORD
-
-      - name: Build and push
+      # Plain `docker build` — hits ephemerd's fake daemon's /build endpoint,
+      # which pkg/dind routes into the embedded BuildKit solver (pkg/buildkit,
+      # see docs/arch/docker-builds.md). setup-buildx-action doesn't work
+      # because its --bootstrap tries to pull moby/buildkit:* which has no
+      # Windows variant upstream and no Docker registry at "moby".
+      #
+      # Docker Hub auth + push are temporarily omitted: pkg/dind doesn't yet
+      # implement POST /auth or registry push for the embedded buildkit path.
+      # Once those land, add a `docker push` step back here.
+      - name: Build (validates ephemerd dind + buildkit path)
         shell: powershell
         run: |
           $tagLatest = "${{ env.IMAGE_REPO }}:runner-ci-windows"
           $tagDated  = "${{ env.IMAGE_REPO }}:runner-ci-windows-$env:DATE_TAG"
           docker build -t $tagLatest -t $tagDated images/runner-ci-windows
-          docker push $tagLatest
-          docker push $tagDated
+          docker image ls
