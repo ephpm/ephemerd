@@ -7,7 +7,7 @@
 # honor it. Without it, backtick line continuations get parsed as unknown
 # instructions and Windows paths (C:\...) eat the next character.
 
-FROM ghcr.io/actions/actions-runner:latest-win
+FROM mcr.microsoft.com/windows/servercore:ltsc2025
 
 ARG RUNNER_VERSION=2.333.1
 ARG GOLANGCI_LINT_VERSION=2.11.4
