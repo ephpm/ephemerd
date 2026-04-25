@@ -13,7 +13,12 @@ ARG RUNNER_VERSION=2.333.1
 ARG GOLANGCI_LINT_VERSION=2.11.4
 ARG GO_VERSION=1.26.1
 
-SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop';"]
+# $ProgressPreference = 'SilentlyContinue' is required for Invoke-WebRequest
+# in non-interactive PowerShell. Without it the cmdlet tries to render its
+# progress bar to a non-existent console and hangs (or runs ~50× slower) on
+# Windows containers — the symptom is RUN steps that download large files
+# stalling indefinitely. See https://github.com/PowerShell/PowerShell/issues/2138
+SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
 
 RUN Invoke-WebRequest -Uri "https://go.dev/dl/go${env:GO_VERSION}.windows-amd64.zip" -OutFile go.zip; `
     Expand-Archive go.zip -DestinationPath C:\; `
