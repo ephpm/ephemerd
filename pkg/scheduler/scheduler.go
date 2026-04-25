@@ -1008,7 +1008,9 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 		if exists {
 			delete(s.running, key)
 			s.mu.Unlock()
-			_ = s.cfg.Runtime.Destroy(context.Background(), env)
+			if err := s.cfg.Runtime.Destroy(context.Background(), env); err != nil {
+				log.Warn("failed to destroy runner environment", "error", err)
+			}
 			if rj.artifactsDir != "" {
 				artifacts.Cleanup(rj.artifactsDir, s.cfg.Log)
 			}
@@ -1057,7 +1059,9 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event providers.JobEven
 			log.Warn("failed to destroy dispatched runner", "error", err)
 		}
 	} else if job.env != nil {
-		_ = s.cfg.Runtime.Destroy(context.Background(), job.env)
+		if err := s.cfg.Runtime.Destroy(context.Background(), job.env); err != nil {
+			log.Warn("failed to destroy runner environment", "error", err)
+		}
 	}
 	if job.artifactsDir != "" {
 		artifacts.Cleanup(job.artifactsDir, s.cfg.Log)
@@ -1125,7 +1129,9 @@ func (s *Scheduler) destroyAll() {
 				s.cfg.Log.Warn("failed to destroy dispatched runner", "job_id", key.JobID, "error", err)
 			}
 		} else if job.env != nil {
-			_ = s.cfg.Runtime.Destroy(context.Background(), job.env)
+			if err := s.cfg.Runtime.Destroy(context.Background(), job.env); err != nil {
+				s.cfg.Log.Warn("failed to destroy runner environment", "job_id", key.JobID, "error", err)
+			}
 		}
 		if job.artifactsDir != "" {
 			artifacts.Cleanup(job.artifactsDir, s.cfg.Log)
