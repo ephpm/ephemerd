@@ -81,11 +81,8 @@ jobs:
           docker manifest push ${{ env.IMAGE_REPO }}:runner-ci-linux-${{ env.DATE_TAG }}
 
   macos-deps:
-    # Runs on a Linux runner (buildx cross-build). Serialized after the linux
-    # matrix because our ephemerd Linux VM can only safely host one CI job at
-    # a time — two concurrent Linux runners on the same VM kill each other
-    # before buildx finishes booting.
-    needs: linux-manifest
+    # Runs on a Linux runner (buildx cross-build). Independent of the linux
+    # matrix — we can dispatch multiple Linux jobs to the VM in parallel.
     name: Build macOS Deps
     runs-on: [self-hosted, linux, x64]
     steps:
