@@ -140,11 +140,25 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 
 	ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
 
-	// Resolve image from containerd, pulling if needed.
+	// Resolve image from containerd, pulling if needed. Docker CLI sends
+	// unqualified refs (e.g. "moby/buildkit:buildx-stable-1") that
+	// containerd's resolver mistakes for "host=moby"; try the original
+	// name first (handleImagePull aliases the qualified pull under the
+	// unqualified name so this hits when buildx pulled before creating),
+	// then fall back to a qualified pull if nothing's there.
 	img, err := s.client.GetImage(ctx, req.Image)
 	if err != nil {
-		s.log.Info("image not found, pulling for container create", "image", req.Image)
-		img, err = s.client.Pull(ctx, req.Image, client.WithPullUnpack)
+		qualified := qualifyDockerHubRef(req.Image)
+		if qualified != req.Image {
+			if alt, gerr := s.client.GetImage(ctx, qualified); gerr == nil {
+				img, err = alt, nil
+			}
+		}
+	}
+	if err != nil {
+		pullRef := qualifyDockerHubRef(req.Image)
+		s.log.Info("image not found, pulling for container create", "image", req.Image, "pull_ref", pullRef)
+		img, err = s.client.Pull(ctx, pullRef, client.WithPullUnpack)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{
 				"message": fmt.Sprintf("image %s not found: %v", req.Image, err),
@@ -154,16 +168,27 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build OCI spec. Always target Linux — dind containers are Linux.
+	//
+	// Apply Docker's entrypoint/cmd override semantics on top of the image config:
+	//   Entrypoint nil  + Cmd nil   → image ENTRYPOINT + image CMD       (image as-is)
+	//   Entrypoint nil  + Cmd set   → image ENTRYPOINT + req.Cmd          (most common, e.g. buildkit)
+	//   Entrypoint set + Cmd  any   → req.Entrypoint   + req.Cmd          (full override)
+	//
+	// WithImageConfigArgs handles the first two: if args is empty it keeps image cmd,
+	// otherwise it substitutes args for the image's CMD while preserving ENTRYPOINT.
+	// For the override case we still want WithImageConfig's env/cwd/user, so we layer
+	// a final SpecOpts that rewrites Process.Args.
 	targetPlatform := "linux/" + goruntime.GOARCH
 	opts := []oci.SpecOpts{
 		oci.WithDefaultSpecForPlatform(targetPlatform),
-		oci.WithImageConfig(img),
 	}
-
-	if len(req.Cmd) > 0 {
-		opts = append(opts, oci.WithProcessArgs(req.Cmd...))
-	} else if len(req.Entrypoint) > 0 {
-		opts = append(opts, oci.WithProcessArgs(req.Entrypoint...))
+	if len(req.Entrypoint) > 0 {
+		opts = append(opts, oci.WithImageConfig(img))
+		merged := append([]string{}, req.Entrypoint...)
+		merged = append(merged, req.Cmd...)
+		opts = append(opts, oci.WithProcessArgs(merged...))
+	} else {
+		opts = append(opts, oci.WithImageConfigArgs(img, req.Cmd))
 	}
 
 	if len(req.Env) > 0 {
@@ -630,3 +655,4 @@ func withBindMount(src, dst string, options []string) oci.SpecOpts {
 		return nil
 	}
 }
+

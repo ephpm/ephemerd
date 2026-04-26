@@ -454,11 +454,15 @@ func (l *hypervLinuxVM) createAndBootVM() error {
 	//   /dev/sda as root and find init there, which fails on an unformatted VHDX.
 	// - 8250_core: enable serial UART for console output via named pipe
 	// - ephemerd.*: custom params parsed by our init script
+	dindFlag := ""
+	if l.cfg.DindEnabled {
+		dindFlag = " ephemerd.dind=1"
+	}
 	cmdline := fmt.Sprintf(
-		"rdinit=/init ephemerd.containerd_port=%d ephemerd.root_disk=/dev/sda "+
+		"rdinit=/init ephemerd.containerd_port=%d ephemerd.root_disk=/dev/sda%s "+
 			"pci=off brd.rd_nr=0 pmtmr=0 nr_cpus=%d "+
 			"8250_core.nr_uarts=1 8250_core.skip_txen_test=1 console=ttyS0,115200",
-		l.cfg.ContainerdPort, l.cfg.CPUs,
+		l.cfg.ContainerdPort, dindFlag, l.cfg.CPUs,
 	)
 
 	doc := &hcsComputeSystem{
