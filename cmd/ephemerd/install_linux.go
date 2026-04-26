@@ -8,6 +8,8 @@ import (
 	"os/exec"
 )
 
+func postInstallBinary(_ string) error { return nil }
+
 func installService(binPath, dataDir string) error {
 	if !hasSystemd() {
 		fmt.Println("  systemd not found, skipping service installation")

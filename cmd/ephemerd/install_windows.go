@@ -8,6 +8,8 @@ import (
 	"os/exec"
 )
 
+func postInstallBinary(_ string) error { return nil }
+
 func installService(binPath, dataDir string) error {
 	// Create the Windows service using sc.exe
 	args := []string{
