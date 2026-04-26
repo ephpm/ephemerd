@@ -53,6 +53,13 @@ type Config struct {
 	// GitLab dispatches jobs to runners whose tags match the job's tags: field.
 	Tags []string
 
+	// LinuxImage / WindowsImage override the runner image per job OS.
+	// Empty values fall through to the built-in default
+	// ("ghcr.io/ephpm/runner-gitlab:latest" for Linux) and (Windows) the
+	// runtime's host-matched servercore default.
+	LinuxImage   string
+	WindowsImage string
+
 	Log *slog.Logger
 }
 
@@ -85,8 +92,22 @@ func New(cfg Config) (*Provider, error) {
 	}, nil
 }
 
-func (p *Provider) Name() string            { return "gitlab" }
-func (p *Provider) DefaultImage() string    { return defaultImage }
+func (p *Provider) Name() string         { return "gitlab" }
+func (p *Provider) DefaultImage() string { return p.DefaultImageFor("linux") }
+
+// DefaultImageFor returns the runner image for the given job OS.
+func (p *Provider) DefaultImageFor(os string) string {
+	switch os {
+	case "linux":
+		if p.cfg.LinuxImage != "" {
+			return p.cfg.LinuxImage
+		}
+		return defaultImage
+	case "windows":
+		return p.cfg.WindowsImage
+	}
+	return ""
+}
 func (p *Provider) DefaultJobImage() string { return "" }
 
 func (p *Provider) Start(ctx context.Context, cfg providers.PollConfig) (<-chan providers.JobEvent, error) {

@@ -25,17 +25,23 @@ type Provider interface {
 	// Name returns the provider identifier (e.g., "github", "forgejo", "gitea", "gitlab").
 	Name() string
 
-	// DefaultImage returns the default OCI container image for this provider.
-	// This is the image that contains the runner binary/daemon:
+	// DefaultImage returns the default OCI container image for this
+	// provider's *Linux* runner. Equivalent to DefaultImageFor("linux").
+	// Kept for callers that haven't migrated to the OS-aware variant.
+	//
+	// Default Linux images:
 	//   - GitHub:  ghcr.io/actions/actions-runner:latest  (runner inside container)
 	//   - Forgejo: data.forgejo.org/forgejo/runner:12     (runner daemon)
 	//   - Gitea:   docker.io/gitea/act_runner:latest      (runner daemon)
 	//   - GitLab:  ghcr.io/ephpm/runner-gitlab:latest     (gitlab-runner)
-	//
-	// For Forgejo/Gitea, this is the runner daemon container. The runner
-	// creates separate job containers via the fake Docker socket (pkg/dind).
-	// See DefaultJobImage() for the job execution environment.
 	DefaultImage() string
+
+	// DefaultImageFor returns the runner image for the given job OS
+	// ("linux" or "windows"). Returns empty string when the provider
+	// has no per-OS override configured — the scheduler then falls
+	// through to the runtime's host-aware default
+	// (pkg/runtime/image_*.go).
+	DefaultImageFor(os string) string
 
 	// DefaultJobImage returns the default OCI image for job execution.
 	// This is the environment where workflow steps actually run.

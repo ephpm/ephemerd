@@ -11,14 +11,14 @@ import (
 )
 
 func TestName(t *testing.T) {
-	p := New(nil, slog.Default(), "")
+	p := New(nil, slog.Default(), "", "")
 	if p.Name() != "github" {
 		t.Errorf("Name() = %q, want %q", p.Name(), "github")
 	}
 }
 
 func TestDefaultImage(t *testing.T) {
-	p := New(nil, slog.Default(), "")
+	p := New(nil, slog.Default(), "", "")
 	want := "ghcr.io/actions/actions-runner:latest"
 	if p.DefaultImage() != want {
 		t.Errorf("DefaultImage() = %q, want %q", p.DefaultImage(), want)
@@ -26,14 +26,14 @@ func TestDefaultImage(t *testing.T) {
 }
 
 func TestDefaultJobImage_Empty(t *testing.T) {
-	p := New(nil, slog.Default(), "")
+	p := New(nil, slog.Default(), "", "")
 	if p.DefaultJobImage() != "" {
 		t.Errorf("DefaultJobImage() = %q, want empty", p.DefaultJobImage())
 	}
 }
 
 func TestConvertEvent_FullJob(t *testing.T) {
-	p := New(nil, slog.Default(), "")
+	p := New(nil, slog.Default(), "", "")
 
 	id := int64(123)
 	runID := int64(456)
@@ -78,7 +78,7 @@ func TestConvertEvent_FullJob(t *testing.T) {
 }
 
 func TestConvertEvent_NilJob(t *testing.T) {
-	p := New(nil, slog.Default(), "")
+	p := New(nil, slog.Default(), "", "")
 	ev := p.convertEvent(ghclient.JobEvent{
 		Action: "completed",
 		Repo:   "myorg/myrepo",
@@ -111,14 +111,14 @@ func TestConvertEvent_NilJob(t *testing.T) {
 }
 
 func TestStop_NilCancel(t *testing.T) {
-	p := New(nil, slog.Default(), "")
+	p := New(nil, slog.Default(), "", "")
 	if err := p.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop with nil cancel: %v", err)
 	}
 }
 
 func TestStop_WithCancel(t *testing.T) {
-	p := New(nil, slog.Default(), "")
+	p := New(nil, slog.Default(), "", "")
 	// Simulate Start having set a cancel func
 	_, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
@@ -129,7 +129,7 @@ func TestStop_WithCancel(t *testing.T) {
 }
 
 func TestConvertEvent_EmptyLabels(t *testing.T) {
-	p := New(nil, slog.Default(), "")
+	p := New(nil, slog.Default(), "", "")
 
 	id := int64(1)
 	job := &gh.WorkflowJob{

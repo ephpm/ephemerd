@@ -45,7 +45,37 @@ type Config struct {
 	JobTimeout        time.Duration
 	ShutdownTimeout time.Duration
 	LogRetention    time.Duration // max age for job log files (default 7d)
-	Log             *slog.Logger
+
+	// RunnerImageForRepo resolves the per-repo, per-OS image override
+	// configured under [runner.images]. Returns "" when no override is
+	// set; the scheduler then falls back to the provider per-OS default
+	// and finally the runtime's host-aware default. Nil-safe.
+	RunnerImageForRepo func(repo, os string) string
+
+	Log *slog.Logger
+}
+
+// resolveImage returns the runner image to launch for an event.
+//
+// Resolution order:
+//
+//	1. Image declared in the workflow YAML (FetchJobImage)
+//	2. Per-repo override from [runner.images.<repo>].<os>
+//	3. Provider per-OS default (DefaultImageFor)
+//	4. Empty — runtime.Create picks its host-aware fallback
+func (s *Scheduler) resolveImage(ctx context.Context, event *providers.JobEvent, os string) string {
+	if event == nil || event.Provider == nil {
+		return ""
+	}
+	if img := event.Provider.FetchJobImage(ctx, event); img != "" {
+		return img
+	}
+	if s.cfg.RunnerImageForRepo != nil {
+		if img := s.cfg.RunnerImageForRepo(event.Repo, os); img != "" {
+			return img
+		}
+	}
+	return event.Provider.DefaultImageFor(os)
 }
 
 // jobKey uniquely identifies a job across providers. Different providers
@@ -549,11 +579,9 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 
 	log.Info("provisioning Linux runner via dispatch")
 
-	image := event.Provider.FetchJobImage(ctx, &event)
+	image := s.resolveImage(ctx, &event, "linux")
 	if image != "" {
-		log.Info("using job-specified image", "image", image)
-	} else {
-		image = event.Provider.DefaultImage()
+		log.Info("using image for job", "image", image, "repo", event.Repo)
 	}
 
 	labels := buildLabelsForOS("linux", s.cfg.Labels)
@@ -843,20 +871,22 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 
 	log.Info("provisioning runner for job")
 
-	// Fetch the job's container image from the workflow YAML (extra API call).
-	// The provider's DefaultImage is typically tied to one OS (e.g. the
-	// GitHub provider defaults to ghcr.io/actions/actions-runner:latest,
-	// which is Linux-only). For cross-OS jobs we leave image empty and let
-	// runtime.Create pick an OS-appropriate default via its host-aware
-	// defaultImage() helper (image_windows.go / image_other.go).
-	image := event.Provider.FetchJobImage(ctx, &event)
-	if image != "" {
-		log.Info("using job-specified image", "image", image)
-	} else if isLinuxJob(event.Labels) || (!isMacOSJob(event.Labels) && goruntime.GOOS == "linux") {
-		image = event.Provider.DefaultImage()
+	// Resolve image for this job. Order:
+	//   1. workflow YAML (FetchJobImage)
+	//   2. [runner.images.<repo>].<os> override
+	//   3. provider per-OS default (DefaultImageFor)
+	//   4. empty → runtime.Create picks host-aware fallback (servercore on Windows)
+	jobOS := "linux"
+	switch {
+	case isMacOSJob(event.Labels):
+		jobOS = "macos"
+	case !isLinuxJob(event.Labels) && goruntime.GOOS == "windows":
+		jobOS = "windows"
 	}
-	// else: Windows (and any mismatched combo) → leave image empty so
-	// runtime.Create falls back to its OS-aware default.
+	image := s.resolveImage(ctx, &event, jobOS)
+	if image != "" {
+		log.Info("using image for job", "image", image, "os", jobOS, "repo", event.Repo)
+	}
 
 	// For macOS VM jobs with an OCI image specified, extract artifact layers
 	// into the shared data directory so they're available inside the VM via virtio-fs.

@@ -19,14 +19,18 @@ const defaultImage = "ghcr.io/actions/actions-runner:latest"
 
 // Provider implements providers.Poll and providers.Webhook for GitHub Actions.
 type Provider struct {
-	client       *github.Client
-	log          *slog.Logger
-	events       chan providers.JobEvent
-	webhooks     []github.ManagedWebhook
-	whHandler    http.Handler
-	whEvents     <-chan providers.JobEvent
-	cancel       context.CancelFunc
-	defaultImage string // config override for the runner container image
+	client    *github.Client
+	log       *slog.Logger
+	events    chan providers.JobEvent
+	webhooks  []github.ManagedWebhook
+	whHandler http.Handler
+	whEvents  <-chan providers.JobEvent
+	cancel    context.CancelFunc
+
+	// Per-OS overrides from config. Empty = use the built-in default for
+	// Linux and "" (let runtime pick) for Windows.
+	defaultLinux   string
+	defaultWindows string
 }
 
 // Compile-time interface checks.
@@ -36,22 +40,41 @@ var (
 )
 
 // New creates a GitHub provider wrapping an existing GitHub client.
-// imageOverride, if non-empty, replaces the default runner container image.
-func New(client *github.Client, log *slog.Logger, imageOverride string) *Provider {
+// linuxImage / windowsImage, if non-empty, override the runner container
+// image for the corresponding job OS. Empty values defer to the built-in
+// Linux default and (for Windows) the runtime's host-matched servercore
+// fallback.
+func New(client *github.Client, log *slog.Logger, linuxImage, windowsImage string) *Provider {
 	return &Provider{
-		client:       client,
-		log:          log,
-		events:       make(chan providers.JobEvent, 64),
-		defaultImage: imageOverride,
+		client:         client,
+		log:            log,
+		events:         make(chan providers.JobEvent, 64),
+		defaultLinux:   linuxImage,
+		defaultWindows: windowsImage,
 	}
 }
 
 func (p *Provider) Name() string { return "github" }
+
+// DefaultImage returns the Linux runner image (legacy alias for the
+// scheduler's per-OS resolution). New callers should use DefaultImageFor.
 func (p *Provider) DefaultImage() string {
-	if p.defaultImage != "" {
-		return p.defaultImage
+	return p.DefaultImageFor("linux")
+}
+
+func (p *Provider) DefaultImageFor(os string) string {
+	switch os {
+	case "linux":
+		if p.defaultLinux != "" {
+			return p.defaultLinux
+		}
+		return defaultImage
+	case "windows":
+		// Empty when not configured — runtime.defaultImage() picks
+		// mcr.microsoft.com/windows/servercore:ltsc20XX matching the host.
+		return p.defaultWindows
 	}
-	return defaultImage
+	return ""
 }
 func (p *Provider) DefaultJobImage() string { return "" }
 

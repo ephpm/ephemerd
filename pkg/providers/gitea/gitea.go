@@ -74,9 +74,14 @@ type Config struct {
 	// If empty, defaults to ["ubuntu-latest:docker://<job_image>"].
 	Labels []string
 
-	// DefaultImage overrides the runner daemon container image.
+	// DefaultImage is the legacy single-image override for the runner
+	// daemon container (Linux). Prefer LinuxImage / WindowsImage.
 	// Default: "docker.io/gitea/act_runner:latest"
 	DefaultImage string
+
+	// LinuxImage / WindowsImage override the runner daemon image per job OS.
+	LinuxImage   string
+	WindowsImage string
 
 	// JobImage is the default OCI image for job execution containers.
 	// The runner daemon creates job containers via the fake Docker socket;
@@ -122,12 +127,28 @@ func New(cfg Config) (*Provider, error) {
 	}, nil
 }
 
-func (p *Provider) Name() string         { return "gitea" }
+func (p *Provider) Name() string { return "gitea" }
 func (p *Provider) DefaultImage() string {
-	if p.cfg.DefaultImage != "" {
-		return p.cfg.DefaultImage
+	return p.DefaultImageFor("linux")
+}
+
+// DefaultImageFor returns the runner-daemon image for the given job OS.
+// Gitea's act_runner is Linux-only upstream; Windows override is honored
+// for callers that ship a custom build.
+func (p *Provider) DefaultImageFor(os string) string {
+	switch os {
+	case "linux":
+		if p.cfg.LinuxImage != "" {
+			return p.cfg.LinuxImage
+		}
+		if p.cfg.DefaultImage != "" {
+			return p.cfg.DefaultImage
+		}
+		return defaultImage
+	case "windows":
+		return p.cfg.WindowsImage
 	}
-	return defaultImage
+	return ""
 }
 func (p *Provider) DefaultJobImage() string {
 	if p.cfg.JobImage != "" {
