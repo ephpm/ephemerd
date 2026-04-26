@@ -36,6 +36,7 @@ jobs:
 
   build-macos:
     name: Build (macOS arm64)
+    needs: ci
     runs-on: [self-hosted, macos, arm64]
     steps:
       - uses: actions/checkout@v6
@@ -57,6 +58,7 @@ jobs:
 
   build-linux-arm64:
     name: Build (Linux arm64)
+    needs: ci
     runs-on: [self-hosted, linux, arm64]
     steps:
       - uses: actions/checkout@v6
@@ -76,6 +78,7 @@ jobs:
 
   build-windows:
     name: Build (Windows amd64)
+    needs: ci
     runs-on: [self-hosted, windows, x64]
     steps:
       - uses: actions/checkout@v6
