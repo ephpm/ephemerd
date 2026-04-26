@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,8 +25,18 @@ const (
 	ContainerdVersion    = "2.2.2"
 	RuncVersion          = "1.3.4"
 	AlpineVersion        = "3.21.3"
-	LinuxVirtVersion     = "6.12.81-r0"
+	LinuxVirtVersion     = "6.12.83-r0"
 	GolangCILintVersion  = "2.11.4"
+
+	// Alpine prunes superseded packages from dl-cdn.alpinelinux.org as soon
+	// as a new revision lands, so any pinned upstream URL goes 404 within
+	// weeks. We mirror linux-virt to a deps/ tag on this repo's GitHub
+	// Releases and verify by SHA256 so a re-upload can't silently swap
+	// content. Bump procedure: download both APKs from upstream, sha256sum,
+	// `gh release create deps/linux-virt-<ver> ...`, upload both, then
+	// bump the constants here. See PR #54 for the first such bump.
+	LinuxVirtSHA256AArch64 = "7f0bdcf7d16339f90cf7ff44c50b6cabc75e9be877224d6e3076fc5b187c1c65"
+	LinuxVirtSHA256X86_64  = "5d06f7833cb19e708a1b74f8cb09f7ddb3eb10e08e9fa716db73287bc7b119c8"
 
 	runnerEmbedDir = "pkg/runner/embed"
 	cniEmbedDir    = "pkg/cni/embed"
@@ -296,12 +307,10 @@ func Kernel() error {
 		return err
 	}
 
-	url := fmt.Sprintf("https://dl-cdn.alpinelinux.org/alpine/v%s/main/aarch64/linux-virt-%s.apk",
-		alpineMajorMinor(AlpineVersion), LinuxVirtVersion)
-	fmt.Printf("  Downloading linux-virt %s (aarch64)...\n", LinuxVirtVersion)
-	data, err := httpGetBytes(url)
+	fmt.Printf("  Downloading linux-virt %s (aarch64) from mirror...\n", LinuxVirtVersion)
+	data, err := fetchLinuxVirtAPK("aarch64")
 	if err != nil {
-		return fmt.Errorf("downloading linux-virt: %w", err)
+		return err
 	}
 
 	// Extract the EFI-wrapped vmlinuz-virt from the APK into a temp buffer,
@@ -432,13 +441,11 @@ func Initrd() error {
 		}
 	}
 
-	// Download linux-virt APK and extract the kernel modules we need
-	kernelURL := fmt.Sprintf("https://dl-cdn.alpinelinux.org/alpine/v%s/main/aarch64/linux-virt-%s.apk",
-		alpineMajorMinor(AlpineVersion), LinuxVirtVersion)
-	fmt.Printf("  Downloading linux-virt %s for kernel modules...\n", LinuxVirtVersion)
-	kernelAPK, err := httpGetBytes(kernelURL)
+	// Download linux-virt APK from our mirror and extract the kernel modules we need.
+	fmt.Printf("  Downloading linux-virt %s (aarch64) for kernel modules...\n", LinuxVirtVersion)
+	kernelAPK, err := fetchLinuxVirtAPK("aarch64")
 	if err != nil {
-		return fmt.Errorf("downloading linux-virt for modules: %w", err)
+		return err
 	}
 	modulePrefix := fmt.Sprintf("lib/modules/%s-0-virt/", linuxKernelReleaseFromVersion(LinuxVirtVersion))
 
@@ -552,12 +559,10 @@ func Kernelx86() error {
 		return err
 	}
 
-	url := fmt.Sprintf("https://dl-cdn.alpinelinux.org/alpine/v%s/main/x86_64/linux-virt-%s.apk",
-		alpineMajorMinor(AlpineVersion), LinuxVirtVersion)
-	fmt.Printf("  Downloading linux-virt %s (x86_64)...\n", LinuxVirtVersion)
-	data, err := httpGetBytes(url)
+	fmt.Printf("  Downloading linux-virt %s (x86_64) from mirror...\n", LinuxVirtVersion)
+	data, err := fetchLinuxVirtAPK("x86_64")
 	if err != nil {
-		return fmt.Errorf("downloading linux-virt: %w", err)
+		return err
 	}
 
 	// Extract the bzImage from the APK to a temp file
@@ -656,13 +661,11 @@ func Initrdx86() error {
 		}
 	}
 
-	// Download linux-virt APK for x86_64 and extract kernel modules
-	kernelURL := fmt.Sprintf("https://dl-cdn.alpinelinux.org/alpine/v%s/main/x86_64/linux-virt-%s.apk",
-		alpineMajorMinor(AlpineVersion), LinuxVirtVersion)
+	// Download linux-virt APK for x86_64 from our mirror and extract kernel modules.
 	fmt.Printf("  Downloading linux-virt %s (x86_64) for kernel modules...\n", LinuxVirtVersion)
-	kernelAPK, err := httpGetBytes(kernelURL)
+	kernelAPK, err := fetchLinuxVirtAPK("x86_64")
 	if err != nil {
-		return fmt.Errorf("downloading linux-virt for modules: %w", err)
+		return err
 	}
 	modulePrefix := fmt.Sprintf("lib/modules/%s-0-virt/", linuxKernelReleaseFromVersion(LinuxVirtVersion))
 
@@ -1907,6 +1910,49 @@ func httpGetBytes(url string) ([]byte, error) {
 		return nil, fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
 	}
 	return io.ReadAll(resp.Body)
+}
+
+// linuxVirtMirrorURL returns the GitHub Releases mirror URL for the
+// linux-virt APK pinned at LinuxVirtVersion. arch is "aarch64" or "x86_64".
+func linuxVirtMirrorURL(arch string) string {
+	return fmt.Sprintf(
+		"https://github.com/ephpm/ephemerd/releases/download/deps/linux-virt-%s/linux-virt-%s-%s.apk",
+		LinuxVirtVersion, LinuxVirtVersion, arch,
+	)
+}
+
+// linuxVirtSHA256 returns the pinned hash for the given arch.
+func linuxVirtSHA256(arch string) string {
+	switch arch {
+	case "aarch64":
+		return LinuxVirtSHA256AArch64
+	case "x86_64":
+		return LinuxVirtSHA256X86_64
+	default:
+		return ""
+	}
+}
+
+// fetchLinuxVirtAPK downloads the linux-virt APK for arch from our mirror and
+// verifies the SHA256 against the pinned constant. arch is "aarch64" or
+// "x86_64". Bypasses the upstream Alpine CDN, which prunes superseded
+// revisions and can't be relied on for reproducible builds.
+func fetchLinuxVirtAPK(arch string) ([]byte, error) {
+	want := linuxVirtSHA256(arch)
+	if want == "" {
+		return nil, fmt.Errorf("linux-virt: unknown arch %q (want aarch64 or x86_64)", arch)
+	}
+	url := linuxVirtMirrorURL(arch)
+	data, err := httpGetBytes(url)
+	if err != nil {
+		return nil, fmt.Errorf("downloading linux-virt: %w", err)
+	}
+	got := fmt.Sprintf("%x", sha256.Sum256(data))
+	if got != want {
+		return nil, fmt.Errorf("linux-virt %s sha256 mismatch: want %s, got %s (URL %s)",
+			arch, want, got, url)
+	}
+	return data, nil
 }
 
 func alpineMajorMinor(version string) string {
