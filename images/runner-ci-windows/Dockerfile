@@ -1,14 +1,24 @@
+# escape=`
 # CI runner image for Windows — build deps pre-cached.
 # Must be built on a Windows host.
+#
+# Parser directive `# escape=`` ` must be the very first line — before any
+# regular comments — for both the legacy and buildkit Windows parsers to
+# honor it. Without it, backtick line continuations get parsed as unknown
+# instructions and Windows paths (C:\...) eat the next character.
 
-# escape=`
-FROM ghcr.io/actions/actions-runner:latest-win
+FROM mcr.microsoft.com/windows/servercore:ltsc2025
 
 ARG RUNNER_VERSION=2.333.1
 ARG GOLANGCI_LINT_VERSION=2.11.4
 ARG GO_VERSION=1.26.1
 
-SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop';"]
+# $ProgressPreference = 'SilentlyContinue' is required for Invoke-WebRequest
+# in non-interactive PowerShell. Without it the cmdlet tries to render its
+# progress bar to a non-existent console and hangs (or runs ~50× slower) on
+# Windows containers — the symptom is RUN steps that download large files
+# stalling indefinitely. See https://github.com/PowerShell/PowerShell/issues/2138
+SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
 
 RUN Invoke-WebRequest -Uri "https://go.dev/dl/go${env:GO_VERSION}.windows-amd64.zip" -OutFile go.zip; `
     Expand-Archive go.zip -DestinationPath C:\; `

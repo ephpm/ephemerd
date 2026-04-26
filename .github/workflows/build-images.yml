@@ -39,21 +39,30 @@ jobs:
       - name: Set date tag
         run: echo "DATE_TAG=$(date +%Y%m%d)" >> "$GITHUB_ENV"
 
-      - uses: docker/setup-buildx-action@v3
-
+      # Plain `docker build` against the ephemerd fake-daemon — no buildx,
+      # no privileged buildkit-in-container. Goes straight to /build, which
+      # dispatches into the embedded BuildKit solver (pkg/buildkit,
+      # docs/arch/docker-builds.md). /auth and /images/{ref}/push are
+      # handled by pkg/dind/registry.go.
       - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - uses: docker/build-push-action@v6
-        with:
-          context: images/runner-ci-linux
-          platforms: linux/${{ matrix.arch }}
-          push: true
-          tags: |
-            ${{ env.IMAGE_REPO }}:runner-ci-linux-${{ matrix.arch }}
-            ${{ env.IMAGE_REPO }}:runner-ci-linux-${{ matrix.arch }}-${{ env.DATE_TAG }}
+      - name: Build and push
+        env:
+          # Modern Docker CLI silently aliases `docker build` to `docker buildx build`,
+          # which spawns moby/buildkit:buildx-stable-1 in a container — that needs
+          # --privileged and we don't allow that. DOCKER_BUILDKIT=0 reverts to the
+          # legacy CLI path which POSTs straight to /build, where ephemerd's fake
+          # daemon dispatches into the embedded BuildKit solver (pkg/buildkit).
+          DOCKER_BUILDKIT: "0"
+        run: |
+          TAG_LATEST="${{ env.IMAGE_REPO }}:runner-ci-linux-${{ matrix.arch }}"
+          TAG_DATED="${{ env.IMAGE_REPO }}:runner-ci-linux-${{ matrix.arch }}-${{ env.DATE_TAG }}"
+          docker build -t "$TAG_LATEST" -t "$TAG_DATED" images/runner-ci-linux
+          docker push "$TAG_LATEST"
+          docker push "$TAG_DATED"
 
   linux-manifest:
     name: Create Linux multi-arch manifest
@@ -81,11 +90,8 @@ jobs:
           docker manifest push ${{ env.IMAGE_REPO }}:runner-ci-linux-${{ env.DATE_TAG }}
 
   macos-deps:
-    # Runs on a Linux runner (buildx cross-build). Serialized after the linux
-    # matrix because our ephemerd Linux VM can only safely host one CI job at
-    # a time — two concurrent Linux runners on the same VM kill each other
-    # before buildx finishes booting.
-    needs: linux-manifest
+    # Runs on a Linux runner. Independent of the linux matrix — we can
+    # dispatch multiple Linux jobs to the VM in parallel.
     name: Build macOS Deps
     runs-on: [self-hosted, linux, x64]
     steps:
@@ -94,18 +100,23 @@ jobs:
       - name: Set date tag
         run: echo "DATE_TAG=$(date +%Y%m%d)" >> "$GITHUB_ENV"
 
+      # Plain `docker build` (no buildx) — routes through ephemerd's /build
+      # endpoint and the embedded BuildKit solver. Avoids the
+      # buildkit-in-a-container path that needs --privileged.
       - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - uses: docker/build-push-action@v6
-        with:
-          context: images/runner-ci-macos
-          push: true
-          tags: |
-            ${{ env.IMAGE_REPO }}:runner-ci-macos-deps
-            ${{ env.IMAGE_REPO }}:runner-ci-macos-deps-${{ env.DATE_TAG }}
+      - name: Build and push
+        env:
+          DOCKER_BUILDKIT: "0"
+        run: |
+          TAG_LATEST="${{ env.IMAGE_REPO }}:runner-ci-macos-deps"
+          TAG_DATED="${{ env.IMAGE_REPO }}:runner-ci-macos-deps-${{ env.DATE_TAG }}"
+          docker build -t "$TAG_LATEST" -t "$TAG_DATED" images/runner-ci-macos
+          docker push "$TAG_LATEST"
+          docker push "$TAG_DATED"
 
   windows:
     name: Build Windows CI Runner
@@ -119,26 +130,30 @@ jobs:
         shell: powershell
         run: echo "DATE_TAG=$(Get-Date -Format 'yyyyMMdd')" >> $env:GITHUB_ENV
 
-      # buildkit has experimental Windows container support since v0.13 (uses
-      # containerd worker). docker-container driver spawns the buildkit
-      # container via our fake Docker daemon, same pattern as the linux
-      # amd64 job. The image must be a Windows-native buildkit variant.
-      - uses: docker/setup-buildx-action@v3
-        with:
-          driver: docker-container
-          driver-opts: |
-            image=moby/buildkit:buildx-stable-1-windowsservercore-ltsc2022
+      # Plain `docker build` against the legacy daemon builder — no
+      # DOCKER_BUILDKIT, no buildx. Buildx's docker-container driver tries
+      # to pull a Windows buildkit image that moby retired, and forcing
+      # the `docker` driver fights buildx's auto-default management. Since
+      # the Dockerfile now puts `# escape=`` ` as the very first line
+      # (parser directives MUST precede comments), the legacy builder
+      # honors the backtick line continuations and Windows path escaping.
+      #
+      # This routes through ephemerd's fake daemon's /build endpoint
+      # (pkg/dind), which dispatches into the embedded BuildKit solver
+      # (pkg/buildkit, see docs/arch/docker-builds.md). /auth and
+      # /images/{ref}/push are handled by pkg/dind/registry.go.
+      - name: Login to Docker Hub
+        shell: powershell
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: $env:DOCKER_PASSWORD | docker login -u $env:DOCKER_USERNAME --password-stdin
 
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-
-      - uses: docker/build-push-action@v6
-        with:
-          context: images/runner-ci-windows
-          platforms: windows/amd64
-          push: true
-          tags: |
-            ${{ env.IMAGE_REPO }}:runner-ci-windows
-            ${{ env.IMAGE_REPO }}:runner-ci-windows-${{ env.DATE_TAG }}
+      - name: Build and push
+        shell: powershell
+        run: |
+          $tagLatest = "${{ env.IMAGE_REPO }}:runner-ci-windows"
+          $tagDated  = "${{ env.IMAGE_REPO }}:runner-ci-windows-$env:DATE_TAG"
+          docker build -t $tagLatest -t $tagDated images/runner-ci-windows
+          docker push $tagLatest
+          docker push $tagDated
