@@ -58,28 +58,13 @@ type MacOSInstallOptions struct {
 	// Default is auto-detected from the host macOS version
 	// (e.g. ghcr.io/cirruslabs/macos-tahoe-base:latest).
 	TartImage string
-
-	// ImagesDir overrides the directory where macOS VM disk files are stored.
-	// Defaults to <data_dir>/vm/macos.
-	ImagesDir string
 }
 
 // EnsureMacOSVMDisk makes sure a bootable macOS disk image exists.
 // If a custom disk image is configured, uses that. Otherwise pulls a
 // pre-built Tart base image from ghcr.io. Idempotent.
 func EnsureMacOSVMDisk(ctx context.Context, dataDir string, opts MacOSInstallOptions, log *slog.Logger) (*MacOSVMDiskFiles, error) {
-	var files MacOSVMDiskFiles
-	if opts.ImagesDir != "" {
-		files = MacOSVMDiskFiles{
-			DataDir:       opts.ImagesDir,
-			DiskImage:     filepath.Join(opts.ImagesDir, "base.img"),
-			AuxStorage:    filepath.Join(opts.ImagesDir, "aux.bin"),
-			MachineID:     filepath.Join(opts.ImagesDir, "machine-id.bin"),
-			HardwareModel: filepath.Join(opts.ImagesDir, "hardware-model.bin"),
-		}
-	} else {
-		files = macOSVMFiles(dataDir)
-	}
+	files := macOSVMFiles(dataDir)
 	if opts.CustomDiskImage != "" {
 		files.DiskImage = opts.CustomDiskImage
 	}

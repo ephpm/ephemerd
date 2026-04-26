@@ -541,7 +541,6 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		go func() {
 			files, err := vm.EnsureMacOSVMDisk(ctx, configDir, vm.MacOSInstallOptions{
 				CustomDiskImage: cfg.VM.MacOS.DiskImage,
-				ImagesDir:       cfg.VM.MacOS.ImagesDir,
 			}, log)
 			if err != nil {
 				log.Error("macOS VM disk provisioning failed — macOS jobs will be unavailable", "error", err)
