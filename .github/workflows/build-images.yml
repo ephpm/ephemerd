@@ -50,6 +50,13 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Build and push
+        env:
+          # Modern Docker CLI silently aliases `docker build` to `docker buildx build`,
+          # which spawns moby/buildkit:buildx-stable-1 in a container — that needs
+          # --privileged and we don't allow that. DOCKER_BUILDKIT=0 reverts to the
+          # legacy CLI path which POSTs straight to /build, where ephemerd's fake
+          # daemon dispatches into the embedded BuildKit solver (pkg/buildkit).
+          DOCKER_BUILDKIT: "0"
         run: |
           TAG_LATEST="${{ env.IMAGE_REPO }}:runner-ci-linux-${{ matrix.arch }}"
           TAG_DATED="${{ env.IMAGE_REPO }}:runner-ci-linux-${{ matrix.arch }}-${{ env.DATE_TAG }}"
@@ -102,6 +109,8 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Build and push
+        env:
+          DOCKER_BUILDKIT: "0"
         run: |
           TAG_LATEST="${{ env.IMAGE_REPO }}:runner-ci-macos-deps"
           TAG_DATED="${{ env.IMAGE_REPO }}:runner-ci-macos-deps-${{ env.DATE_TAG }}"
