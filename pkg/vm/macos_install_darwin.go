@@ -260,8 +260,38 @@ func pullTartImage(ctx context.Context, imageRef string, files *MacOSVMDiskFiles
 	}
 	log.Info("saved NVRAM", "size", len(nvramData))
 
-	// Pull and decompress disk layers (LZ4-compressed, concatenated)
-	diskFile, err := os.Create(files.DiskImage)
+	// Pull and decompress disk layers (LZ4-compressed, concatenated).
+	// Each decompressed layer is exactly 512 MiB, so we can resume from
+	// the last complete layer if a previous pull was interrupted.
+	const decompressedLayerSize = 512 * 1024 * 1024 // 512 MiB per layer
+
+	partialPath := files.DiskImage + ".partial"
+	startLayer := 0
+
+	// Check for a partial download from a previous attempt
+	if info, err := os.Stat(partialPath); err == nil && info.Size() > 0 {
+		completeLayers := int(info.Size() / decompressedLayerSize)
+		if completeLayers > 0 && completeLayers < len(diskLayers) {
+			startLayer = completeLayers
+			log.Info("resuming disk image download",
+				"completed_layers", completeLayers,
+				"total_layers", len(diskLayers),
+				"partial_size_mb", info.Size()/(1024*1024))
+		} else if completeLayers >= len(diskLayers) {
+			// All layers present — just rename
+			if err := os.Rename(partialPath, files.DiskImage); err != nil {
+				return fmt.Errorf("renaming completed disk image: %w", err)
+			}
+			log.Info("disk image assembled from completed partial download", "path", files.DiskImage)
+			return nil
+		}
+	}
+
+	flags := os.O_CREATE | os.O_WRONLY
+	if startLayer == 0 {
+		flags |= os.O_TRUNC
+	}
+	diskFile, err := os.OpenFile(partialPath, flags, 0o644)
 	if err != nil {
 		return fmt.Errorf("creating disk image: %w", err)
 	}
@@ -271,18 +301,35 @@ func pullTartImage(ctx context.Context, imageRef string, files *MacOSVMDiskFiles
 		}
 	}()
 
-	for i, layer := range diskLayers {
+	// Seek to the end of completed layers for resume
+	if startLayer > 0 {
+		if _, err := diskFile.Seek(int64(startLayer)*decompressedLayerSize, io.SeekStart); err != nil {
+			return fmt.Errorf("seeking to resume point: %w", err)
+		}
+	}
+
+	for i := startLayer; i < len(diskLayers); i++ {
+		layer := diskLayers[i]
 		log.Info("pulling disk layer",
 			"layer", fmt.Sprintf("%d/%d", i+1, len(diskLayers)),
 			"size_mb", layer.Size/(1024*1024),
 			"digest", layer.Digest[:19])
 
 		if err := pullAndDecompressDiskLayer(ctx, registry, repo, layer.Digest, token, diskFile, log); err != nil {
-			if rmErr := os.Remove(files.DiskImage); rmErr != nil {
-				log.Warn("removing partial disk image", "error", rmErr)
-			}
+			// Keep the partial file for resume on next startup
+			log.Warn("disk layer failed — partial image preserved for resume",
+				"layer", i+1,
+				"partial", partialPath)
 			return fmt.Errorf("pulling disk layer %d: %w", i+1, err)
 		}
+	}
+
+	// All layers complete — rename to final path
+	if err := diskFile.Close(); err != nil {
+		return fmt.Errorf("closing disk image: %w", err)
+	}
+	if err := os.Rename(partialPath, files.DiskImage); err != nil {
+		return fmt.Errorf("renaming completed disk image: %w", err)
 	}
 
 	log.Info("disk image assembled", "path", files.DiskImage)
