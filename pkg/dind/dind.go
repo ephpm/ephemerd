@@ -15,11 +15,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 
 	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/ephpm/ephemerd/pkg/buildkit"
 	"github.com/ephpm/ephemerd/pkg/networking"
 )
 
@@ -32,17 +35,20 @@ const sharedNamespace = "ephemerd"
 type Server struct {
 	jobID        string
 	jobNamespace string // per-job containerd namespace for isolation
-	sockPath     string
+	sockPath     string // host-side unix socket path (Linux/macOS only)
+	endpoint     string // what the container should set DOCKER_HOST to (e.g. "tcp://gw:port" on Windows)
 	listener     net.Listener
 	server       *http.Server
 	client       *client.Client
 	network      *networking.Manager
+	buildkit     *buildkit.Server // shared embedded BuildKit solver (nil → fall back to platform default)
 	log          *slog.Logger
 
 	mu         sync.Mutex
 	images     map[string]*imageEntry    // in-memory image store scoped to this job
 	containers map[string]*containerEntry // containers created through this socket
 	execs      map[string]*execEntry      // exec processes inside containers
+	auth       authCache                  // per-job docker login cache (registry host → creds)
 }
 
 type imageEntry struct {
@@ -67,6 +73,11 @@ type Config struct {
 	// to the CNI bridge. May be nil if networking is not available.
 	Network *networking.Manager
 
+	// BuildKit is the shared embedded BuildKit solver. When non-nil,
+	// POST /build routes through handleImageBuildBuildkit. When nil, the
+	// platform default (buildah on Linux, 501 elsewhere) is used.
+	BuildKit *buildkit.Server
+
 	Log *slog.Logger
 }
 
@@ -86,11 +97,14 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	return &Server{
-		jobID:        cfg.JobID,
-		jobNamespace: "ephemerd/dind/" + cfg.JobID,
+		jobID: cfg.JobID,
+		// containerd namespace name regex (^[A-Za-z0-9]+(?:[._-](?:[A-Za-z0-9]+))*$)
+		// rejects slashes. Use hyphens to namespace per-job dind state.
+		jobNamespace: "ephemerd-dind-" + cfg.JobID,
 		sockPath:     sockPath,
 		client:       cfg.Client,
 		network:      cfg.Network,
+		buildkit:     cfg.BuildKit,
 		log:          cfg.Log.With("component", "dind", "job_id", cfg.JobID),
 		images:       make(map[string]*imageEntry),
 		containers:   make(map[string]*containerEntry),
@@ -98,17 +112,32 @@ func New(cfg Config) (*Server, error) {
 	}, nil
 }
 
-// SocketPath returns the host path to the Unix socket.
-// Mount this into the container at /var/run/docker.sock.
+// SocketPath returns the host-side Unix socket path (Linux/macOS).
+// Empty on Windows — use Endpoint() to get the DOCKER_HOST value instead.
 func (s *Server) SocketPath() string {
 	return s.sockPath
 }
 
-// Start begins serving the fake Docker API on the Unix socket.
+// Endpoint returns the value a container should set DOCKER_HOST to in order
+// to reach this fake daemon. Linux/macOS return the unix socket path directly
+// (e.g. "unix:///var/run/docker.sock" once bind-mounted); Windows returns a
+// "tcp://<gateway-ip>:<port>" URI pointing at a TCP listener bound on the
+// HCN NAT gateway so containers on the NAT can reach it without any mount.
+func (s *Server) Endpoint() string {
+	return s.endpoint
+}
+
+// Start begins serving the fake Docker API.
+//
+// Linux/macOS: listens on a per-job unix socket at <DataDir>/jobs/<jobID>/docker/d.sock.
+// Windows: listens on TCP on the HCN NAT gateway IP (picked from networking.Manager)
+// so Hyper-V-isolated runner containers on the same NAT can reach it without a
+// runhcs bind mount (which isn't supported) or named pipe sharing (which needs
+// HCS config for isolated containers).
 func (s *Server) Start() error {
-	ln, err := net.Listen("unix", s.sockPath)
+	ln, err := s.listen()
 	if err != nil {
-		return fmt.Errorf("listening on %s: %w", s.sockPath, err)
+		return err
 	}
 	s.listener = ln
 
@@ -123,7 +152,7 @@ func (s *Server) Start() error {
 		}
 	}()
 
-	s.log.Info("fake docker daemon started", "socket", s.sockPath)
+	s.log.Info("fake docker daemon started", "endpoint", s.endpoint)
 	return nil
 }
 
@@ -185,7 +214,24 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	case path == "/images/create" && r.Method == http.MethodPost:
 		s.handleImagePull(w, r)
 	case path == "/build" && r.Method == http.MethodPost:
-		s.handleImageBuild(w, r)
+		// /build always goes through the embedded BuildKit solver. If it
+		// isn't configured (e.g. dind disabled, or worker-mode init failure),
+		// 501 — there is no buildah fallback. The router refuses to silently
+		// pick a different builder and risk a mismatch with the namespace
+		// /push reads from.
+		if s.buildkit == nil {
+			writeJSON(w, http.StatusNotImplemented, map[string]string{
+				"message": "docker build requires BuildKit; ephemerd was not started with --dind or BuildKit init failed",
+			})
+			return
+		}
+		s.handleImageBuildBuildkit(s.buildkit)(w, r)
+	case path == "/auth" && r.Method == http.MethodPost:
+		s.handleAuth(w, r)
+	case strings.HasSuffix(path, "/push") && strings.HasPrefix(path, "/images/") && r.Method == http.MethodPost:
+		// Strip "/images/" prefix and "/push" suffix to get the URL-encoded ref.
+		ref := strings.TrimSuffix(strings.TrimPrefix(path, "/images/"), "/push")
+		s.handleImagePush(w, r, ref)
 	case path == "/containers/create" && r.Method == http.MethodPost:
 		s.handleContainerCreate(w, r)
 	case path == "/containers/json" && r.Method == http.MethodGet:
@@ -218,14 +264,19 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	// Docker CLI's `docker build` cross-checks the daemon's reported "Os"
+	// against the client OS; a mismatch fires the
+	// "building a Docker image from Windows against a non-Windows Docker
+	// host" security warning. Report the host OS we actually run on.
+	osName := goruntime.GOOS
 	resp := map[string]any{
 		"Version":       "27.0.0-ephemerd",
 		"ApiVersion":    "1.45",
 		"MinAPIVersion": "1.24",
 		"GitCommit":     "ephemerd",
 		"GoVersion":     "go1.23",
-		"Os":            "linux",
-		"Arch":          "amd64",
+		"Os":            osName,
+		"Arch":          goruntime.GOARCH,
 		"KernelVersion": "",
 		"BuildTime":     "",
 		"Components": []map[string]any{
@@ -242,17 +293,29 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
+	// Tell the docker CLI we speak BuildKit. Without this, the CLI's
+	// daemon-feature probe falls back to the legacy builder and buildx
+	// defaults to its docker-container driver (which tries to pull
+	// moby/buildkit:* — no Windows variant exists, fails to resolve).
+	// "BuilderVersion": "2" is BuildKit; "1" is legacy.
+	osType := "linux"
+	driver := "overlayfs"
+	if goruntime.GOOS == "windows" {
+		osType = "windows"
+		driver = "windowsfilter"
+	}
 	resp := map[string]any{
 		"ID":                "ephemerd:" + s.jobID,
 		"Name":              "ephemerd-dind",
 		"ServerVersion":     "27.0.0-ephemerd",
 		"OperatingSystem":   "ephemerd (containerd backend)",
-		"OSType":            "linux",
-		"Architecture":      "x86_64",
+		"OSType":            osType,
+		"Architecture":      goruntime.GOARCH,
 		"NCPU":              1,
 		"MemTotal":          0,
-		"Driver":            "overlayfs",
+		"Driver":            driver,
 		"DockerRootDir":     "/var/lib/docker",
+		"BuilderVersion":    "2",
 		"RegistryConfig":    map[string]any{"InsecureRegistryCIDRs": []string{}, "IndexConfigs": map[string]any{}},
 		"SecurityOptions":   []string{},
 		"Containers":        s.countContainers(),
@@ -285,15 +348,24 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 	if tag == "" {
 		tag = "latest"
 	}
-	ref := fromImage
+	unqualifiedRef := fromImage
 	if tag != "" && fromImage != "" {
-		ref = fromImage + ":" + tag
+		unqualifiedRef = fromImage + ":" + tag
 	}
 
-	if ref == "" {
+	if unqualifiedRef == "" {
 		http.Error(w, `{"message":"fromImage is required"}`, http.StatusBadRequest)
 		return
 	}
+
+	// containerd's resolver treats the first path segment of an unqualified
+	// reference as the registry hostname, so "moby/buildkit:buildx-stable-1"
+	// (sent by docker buildx setup) tries to dial host "moby". Force the
+	// docker.io qualifier for the network pull, but ALSO register the image
+	// under the unqualified name so subsequent docker inspect / docker run
+	// calls (which use the original Docker-CLI form) find it without
+	// triggering a re-pull.
+	ref := qualifyDockerHubRef(unqualifiedRef)
 
 	if s.client == nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
@@ -352,16 +424,38 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 
 	size, _ := img.Size(jobCtx)
 
+	// Register the image under both the qualified pull ref and the
+	// original unqualified ref so subsequent docker inspect / run /
+	// containerd lookups (which carry whatever name the CLI sent) find
+	// it without a re-pull.
+	if ref != unqualifiedRef {
+		imgSvc := s.client.ImageService()
+		if _, err := imgSvc.Create(jobCtx, images.Image{
+			Name:   unqualifiedRef,
+			Target: img.Target(),
+			Labels: map[string]string{"ephemerd.alias-of": ref},
+		}); err != nil {
+			// Update if Create says already-exists — happens on second pull.
+			if _, uerr := imgSvc.Update(jobCtx, images.Image{
+				Name:   unqualifiedRef,
+				Target: img.Target(),
+				Labels: map[string]string{"ephemerd.alias-of": ref},
+			}); uerr != nil {
+				s.log.Warn("aliasing image under unqualified name", "ref", unqualifiedRef, "error", uerr)
+			}
+		}
+	}
+
 	s.mu.Lock()
-	s.images[ref] = &imageEntry{
+	s.images[unqualifiedRef] = &imageEntry{
 		ID:   img.Target().Digest.String(),
-		Ref:  ref,
+		Ref:  unqualifiedRef,
 		Size: size,
 	}
 	s.mu.Unlock()
 
 	writeProgress(fmt.Sprintf("Digest: %s", img.Target().Digest.String()))
-	writeProgress(fmt.Sprintf("Status: Downloaded newer image for %s", ref))
+	writeProgress(fmt.Sprintf("Status: Downloaded newer image for %s", unqualifiedRef))
 }
 
 func (s *Server) handleNotImplemented(w http.ResponseWriter, r *http.Request) {

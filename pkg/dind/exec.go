@@ -3,6 +3,7 @@ package dind
 import (
 	"archive/tar"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/cio"
@@ -17,21 +19,28 @@ import (
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-// execEntry tracks an exec process created inside a running container.
+// execEntry tracks an exec process inside a running container.
+//
+// The containerd Process is not created at exec-create time — `cio` (stdin/stdout/stderr)
+// is fixed at process creation, and we don't yet know whether the start request will be
+// a hijacked stream (`docker exec -i` / buildx) or a synchronous run-and-buffer (`act`).
+// So we defer Task.Exec to handleExecStart where we know which IO mode to wire up.
 type execEntry struct {
 	ID          string
 	ContainerID string
 	Cmd         []string
 	Env         []string
 	WorkingDir  string
-	Process     client.Process
-	LogPath     string
-	Running     bool
-	ExitCode    int
-	exited      bool
+	Tty         bool
+	AttachStdin bool
+
+	Process  client.Process
+	LogPath  string
+	Running  bool
+	ExitCode int
+	exited   bool
 }
 
-// execCreateRequest is the Docker exec create request body.
 type execCreateRequest struct {
 	AttachStdin  bool     `json:"AttachStdin"`
 	AttachStdout bool     `json:"AttachStdout"`
@@ -99,51 +108,28 @@ func (s *Server) handleExecCreate(w http.ResponseWriter, r *http.Request, contai
 
 	execID := generateContainerID()[:16]
 
+	cwd := req.WorkingDir
+	if cwd == "" {
+		cwd = "/"
+	}
+
+	// Inherit container env, then overlay exec-specific env. Copy the slice so
+	// we don't mutate the container spec's underlying array.
 	ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
-
-	// Build OCI process spec.
-	pspec := &ocispec.Process{
-		Args: req.Cmd,
-		Cwd:  "/",
-		User: ocispec.User{UID: 0, GID: 0},
+	var env []string
+	if spec, err := entry.Container.Spec(ctx); err == nil && spec.Process != nil {
+		env = append(env, spec.Process.Env...)
 	}
-	if req.WorkingDir != "" {
-		pspec.Cwd = req.WorkingDir
-	}
-
-	// Inherit container env, then overlay exec-specific env.
-	spec, err := entry.Container.Spec(ctx)
-	if err == nil && spec.Process != nil {
-		pspec.Env = spec.Process.Env
-	}
-	pspec.Env = append(pspec.Env, req.Env...)
-
-	// Create log file for exec output.
-	logDir := filepath.Join(filepath.Dir(s.sockPath), "exec", execID)
-	if err := os.MkdirAll(logDir, 0o755); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"message": fmt.Sprintf("creating exec log dir: %v", err),
-		})
-		return
-	}
-	logPath := filepath.Join(logDir, "output.log")
-
-	proc, err := entry.Task.Exec(ctx, execID, pspec, cio.LogFile(logPath))
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"message": fmt.Sprintf("creating exec: %v", err),
-		})
-		return
-	}
+	env = append(env, req.Env...)
 
 	exec := &execEntry{
 		ID:          execID,
 		ContainerID: containerID,
 		Cmd:         req.Cmd,
-		Env:         req.Env,
-		WorkingDir:  pspec.Cwd,
-		Process:     proc,
-		LogPath:     logPath,
+		Env:         env,
+		WorkingDir:  cwd,
+		Tty:         req.Tty,
+		AttachStdin: req.AttachStdin,
 	}
 
 	s.mu.Lock()
@@ -160,6 +146,10 @@ func (s *Server) handleExecCreate(w http.ResponseWriter, r *http.Request, contai
 func (s *Server) handleExecStart(w http.ResponseWriter, r *http.Request, execID string) {
 	s.mu.Lock()
 	exec, ok := s.execs[execID]
+	var entry *containerEntry
+	if ok {
+		entry = s.containers[exec.ContainerID]
+	}
 	s.mu.Unlock()
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{
@@ -167,16 +157,63 @@ func (s *Server) handleExecStart(w http.ResponseWriter, r *http.Request, execID 
 		})
 		return
 	}
-
 	if exec.Running || exec.exited {
 		w.WriteHeader(http.StatusConflict)
 		return
 	}
+	if entry == nil || entry.Task == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"message": "container task not available",
+		})
+		return
+	}
 
+	// Detect HTTP/1.1 hijack request (`docker exec -i` and friends — used by
+	// buildx's docker-container driver to talk to buildkitd over stdio).
+	upgradeHdr := r.Header.Get("Upgrade")
+	connHdr := strings.ToLower(r.Header.Get("Connection"))
+	wantHijack := upgradeHdr != "" && strings.Contains(connHdr, "upgrade")
+	if wantHijack {
+		s.handleExecStartHijack(w, r, exec, entry)
+		return
+	}
+
+	s.handleExecStartLog(w, r, exec, entry)
+}
+
+// handleExecStartLog runs the exec with output captured to a log file and
+// returns the full output once the process exits. This is the synchronous
+// path used by clients that don't request a stream upgrade (e.g. act).
+func (s *Server) handleExecStartLog(w http.ResponseWriter, r *http.Request, exec *execEntry, entry *containerEntry) {
 	ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
 
-	// Register wait channel BEFORE starting (containerd requirement).
-	statusCh, err := exec.Process.Wait(ctx)
+	pspec := &ocispec.Process{
+		Args: exec.Cmd,
+		Cwd:  exec.WorkingDir,
+		Env:  exec.Env,
+		User: ocispec.User{UID: 0, GID: 0},
+	}
+
+	logDir := filepath.Join(filepath.Dir(s.sockPath), "exec", exec.ID)
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"message": fmt.Sprintf("creating exec log dir: %v", err),
+		})
+		return
+	}
+	logPath := filepath.Join(logDir, "output.log")
+	exec.LogPath = logPath
+
+	proc, err := entry.Task.Exec(ctx, exec.ID, pspec, cio.LogFile(logPath))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"message": fmt.Sprintf("creating exec: %v", err),
+		})
+		return
+	}
+	exec.Process = proc
+
+	statusCh, err := proc.Wait(ctx)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"message": fmt.Sprintf("waiting for exec: %v", err),
@@ -184,7 +221,7 @@ func (s *Server) handleExecStart(w http.ResponseWriter, r *http.Request, execID 
 		return
 	}
 
-	if err := exec.Process.Start(ctx); err != nil {
+	if err := proc.Start(ctx); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"message": fmt.Sprintf("starting exec: %v", err),
 		})
@@ -192,12 +229,8 @@ func (s *Server) handleExecStart(w http.ResponseWriter, r *http.Request, execID 
 	}
 
 	exec.Running = true
-	s.log.Info("exec started", "exec_id", execID)
+	s.log.Info("exec started (log mode)", "exec_id", exec.ID)
 
-	// Block until process exits, then return output.
-	// Docker uses connection hijacking for streaming; we simplify by
-	// blocking and returning the output as the response body. This is
-	// sufficient for act's usage pattern.
 	select {
 	case status := <-statusCh:
 		exec.ExitCode = int(status.ExitCode())
@@ -213,12 +246,135 @@ func (s *Server) handleExecStart(w http.ResponseWriter, r *http.Request, execID 
 
 	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
 	w.WriteHeader(http.StatusOK)
-
-	if data, err := os.ReadFile(exec.LogPath); err == nil {
-		if _, writeErr := w.Write(data); writeErr != nil {
-			s.log.Debug("writing exec output", "error", writeErr)
+	if data, err := os.ReadFile(logPath); err == nil {
+		if _, werr := w.Write(data); werr != nil {
+			s.log.Debug("writing exec output", "error", werr)
 		}
 	}
+}
+
+// handleExecStartHijack is the path used by `docker exec -i`. It hijacks the
+// HTTP/1.1 connection, writes the 101 Switching Protocols response, then
+// bridges raw bytes between the connection and the exec process's stdio.
+//
+// With Tty=false, stdout/stderr are multiplexed using Docker's stdcopy
+// framing (8-byte header per chunk) so the client can demultiplex them.
+// With Tty=true, all output is raw on a single stream.
+func (s *Server) handleExecStartHijack(w http.ResponseWriter, r *http.Request, exec *execEntry, entry *containerEntry) {
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"message": "server does not support hijacking",
+		})
+		return
+	}
+	conn, brw, err := hijacker.Hijack()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"message": fmt.Sprintf("hijack failed: %v", err),
+		})
+		return
+	}
+	defer func() {
+		if cerr := conn.Close(); cerr != nil {
+			s.log.Debug("closing hijacked conn", "exec_id", exec.ID, "error", cerr)
+		}
+	}()
+
+	upgradeResp := "HTTP/1.1 101 UPGRADED\r\n" +
+		"Content-Type: application/vnd.docker.raw-stream\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Upgrade: tcp\r\n\r\n"
+	if _, werr := conn.Write([]byte(upgradeResp)); werr != nil {
+		s.log.Warn("writing upgrade header", "exec_id", exec.ID, "error", werr)
+		return
+	}
+
+	// brw.Reader holds any bytes already read past the request headers (start of
+	// the upgraded stream). Use it as stdin so those bytes aren't lost; it
+	// transparently keeps reading from conn after its buffer drains.
+	stdinR := io.Reader(brw.Reader)
+
+	// Wire stdout/stderr writers. Multiplex with stdcopy framing when Tty=false.
+	var stdoutW, stderrW io.Writer
+	if exec.Tty {
+		stdoutW = conn
+		stderrW = conn
+	} else {
+		mu := &sync.Mutex{}
+		stdoutW = &stdcopyWriter{mu: mu, w: conn, streamType: 1}
+		stderrW = &stdcopyWriter{mu: mu, w: conn, streamType: 2}
+	}
+
+	// Use a background context — r.Context() is cancelled when the hijacked
+	// HTTP handler returns, but we still need containerd ops to run.
+	ctx := namespaces.WithNamespace(context.Background(), s.jobNamespace)
+
+	pspec := &ocispec.Process{
+		Args:     exec.Cmd,
+		Cwd:      exec.WorkingDir,
+		Env:      exec.Env,
+		User:     ocispec.User{UID: 0, GID: 0},
+		Terminal: exec.Tty,
+	}
+
+	proc, err := entry.Task.Exec(ctx, exec.ID, pspec, cio.NewCreator(cio.WithStreams(stdinR, stdoutW, stderrW)))
+	if err != nil {
+		s.log.Warn("creating hijacked exec", "exec_id", exec.ID, "error", err)
+		return
+	}
+	exec.Process = proc
+	defer func() {
+		if _, derr := proc.Delete(ctx, client.WithProcessKill); derr != nil {
+			s.log.Debug("deleting hijacked exec", "exec_id", exec.ID, "error", derr)
+		}
+	}()
+
+	statusCh, err := proc.Wait(ctx)
+	if err != nil {
+		s.log.Warn("waiting for hijacked exec", "exec_id", exec.ID, "error", err)
+		return
+	}
+
+	if err := proc.Start(ctx); err != nil {
+		s.log.Warn("starting hijacked exec", "exec_id", exec.ID, "error", err)
+		return
+	}
+
+	exec.Running = true
+	s.log.Info("exec started (hijacked)", "exec_id", exec.ID, "tty", exec.Tty)
+
+	status := <-statusCh
+	exec.ExitCode = int(status.ExitCode())
+	exec.Running = false
+	exec.exited = true
+
+	s.log.Info("exec finished (hijacked)", "exec_id", exec.ID, "exit_code", exec.ExitCode)
+}
+
+// stdcopyWriter frames each write with Docker's 8-byte stream-type header so a
+// client can demultiplex stdout (1) and stderr (2) over a single connection.
+//
+// Frame layout: header[0] = stream type, header[1..4] = 0, header[4..8] = BE size, then payload.
+//
+// Concurrent stdout/stderr writers share a mutex so a partial header and
+// payload from one stream are never split by the other stream's frame.
+type stdcopyWriter struct {
+	mu         *sync.Mutex
+	w          io.Writer
+	streamType byte
+}
+
+func (s *stdcopyWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var hdr [8]byte
+	hdr[0] = s.streamType
+	binary.BigEndian.PutUint32(hdr[4:8], uint32(len(p)))
+	if _, err := s.w.Write(hdr[:]); err != nil {
+		return 0, err
+	}
+	return s.w.Write(p)
 }
 
 func (s *Server) handleExecInspect(w http.ResponseWriter, r *http.Request, execID string) {

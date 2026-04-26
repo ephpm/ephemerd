@@ -19,6 +19,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/ephpm/ephemerd/pkg/buildkit"
 	"github.com/ephpm/ephemerd/pkg/dind"
 	"github.com/ephpm/ephemerd/pkg/networking"
 	craneTarball "github.com/google/go-containerregistry/pkg/v1/tarball"
@@ -65,7 +66,11 @@ type Config struct {
 	DindEnabled      bool     // mount a fake Docker socket into each container
 	CacheProxyEnv    []string // extra env vars from cache proxies (e.g., GOPROXY=...)
 	Network          *networking.Manager
-	Log              *slog.Logger
+	// BuildKit is the shared embedded BuildKit solver handed to each per-job
+	// dind.Server for `docker build` support. Optional; nil means `docker build`
+	// falls back to the platform default (buildah on Linux, 501 elsewhere).
+	BuildKit *buildkit.Server
+	Log      *slog.Logger
 }
 
 // Runtime manages container lifecycle for runner environments.
@@ -442,8 +447,8 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	// If runner.default_image is set in config, use that.
 	// Otherwise: Linux uses the official GHA runner image,
 	// Windows auto-selects a Server Core image matching the host OS build.
-	customImage := image != ""
-	if !customImage {
+	customImage := image != "" && !isOfficialRunnerImage(image)
+	if image == "" {
 		if r.cfg.DefaultImage != "" {
 			image = r.cfg.DefaultImage
 		} else {
@@ -526,7 +531,10 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		opts = append(opts, oci.WithProcessArgs(cfg.Entrypoint...))
 	case jitConfig != "" && goruntime.GOOS == "windows":
 		// GitHub on Windows: wrap in cmd.exe redirect for log capture.
-		cmdLine := fmt.Sprintf(`%s --jitconfig %s > C:\actions-runner\runner.log 2>&1`, entrypoint, jitConfig)
+		// Prepend C:\actions-runner to PATH so the docker.exe we copy into
+		// the runner dir (alongside run.cmd) is discoverable by job steps —
+		// docker/setup-buildx-action and friends look up `docker` in PATH.
+		cmdLine := fmt.Sprintf(`set PATH=C:\actions-runner;%%PATH%% && %s --jitconfig %s > C:\actions-runner\runner.log 2>&1`, entrypoint, jitConfig)
 		opts = append(opts, oci.WithProcessArgs("cmd.exe", "/c", cmdLine))
 	case jitConfig != "":
 		// GitHub on Linux/macOS: pass JIT config directly.
@@ -580,16 +588,24 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		opts = append(opts, withDNSMount(hostDataDir, containerDataDir, id))
 	}
 
-	// Start per-job fake Docker daemon and mount socket into container
+	// Start per-job fake Docker daemon. Exposure to the container differs
+	// by platform:
+	//   - Linux/macOS: bind-mount the unix socket at /var/run/docker.sock
+	//     (standard Docker CLI auto-discovery).
+	//   - Windows: DOCKER_HOST=tcp://<hcn-gateway>:<port> env var, because
+	//     the OCI Type:"bind" mount isn't supported by runhcs and named pipe
+	//     sharing into Hyper-V-isolated containers needs extra HCS plumbing.
+	//     docker.exe inside the container picks up DOCKER_HOST and talks TCP.
 	var dindServer *dind.Server
-	if r.cfg.DindEnabled && goruntime.GOOS != "windows" {
+	if r.cfg.DindEnabled {
 		var err error
 		dindServer, err = dind.New(dind.Config{
-			JobID:   id,
-			DataDir: r.cfg.DataDir,
-			Client:  r.client,
-			Network: r.cfg.Network,
-			Log:     r.cfg.Log,
+			JobID:    id,
+			DataDir:  r.cfg.DataDir,
+			Client:   r.client,
+			Network:  r.cfg.Network,
+			BuildKit: r.cfg.BuildKit,
+			Log:      r.cfg.Log,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("creating dind server for %s: %w", id, err)
@@ -597,7 +613,15 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		if err := dindServer.Start(); err != nil {
 			return nil, fmt.Errorf("starting dind server for %s: %w", id, err)
 		}
-		opts = append(opts, withDockerSocket(dindServer.SocketPath()))
+		if goruntime.GOOS == "windows" {
+			// oci.WithEnv appends/overrides — safe to call after the initial
+			// WithEnv on line 517. The runner's docker CLI (mounted from
+			// r.cfg.RunnerDir) sees DOCKER_HOST and talks TCP to our fake
+			// daemon on the HCN gateway.
+			opts = append(opts, oci.WithEnv([]string{"DOCKER_HOST=" + dindServer.Endpoint()}))
+		} else {
+			opts = append(opts, withDockerSocket(dindServer.SocketPath()))
+		}
 	}
 
 	// Add Hyper-V isolation on Windows
@@ -805,8 +829,31 @@ func (r *Runtime) Destroy(ctx context.Context, env *RunnerEnv) error {
 		r.cfg.Log.Warn("failed to delete container", "id", env.ID, "error", err)
 	}
 
-	// Clean up per-job runner directory copy
+	// Clean up per-job runner directory copy.
+	// DEBUG: preserve runner.log for diagnostics — remove this block when done.
 	if env.RunnerDir != "" {
+		logPath := filepath.Join(env.RunnerDir, "runner.log")
+		dirListing, _ := os.ReadDir(env.RunnerDir)
+		names := []string{}
+		for _, d := range dirListing {
+			names = append(names, d.Name())
+		}
+		r.cfg.Log.Info("DEBUG runner dir contents before destroy", "id", env.ID, "dir", env.RunnerDir, "entries", names)
+		if logData, readErr := os.ReadFile(logPath); readErr == nil {
+			saveDir := r.cfg.LogDir
+			if saveDir == "" {
+				saveDir = `C:\tmp`
+			}
+			_ = os.MkdirAll(saveDir, 0o755)
+			savePath := filepath.Join(saveDir, env.ID+"-runner.log")
+			if werr := os.WriteFile(savePath, logData, 0o644); werr != nil {
+				r.cfg.Log.Warn("DEBUG failed to save runner.log", "id", env.ID, "error", werr)
+			} else {
+				r.cfg.Log.Info("DEBUG preserved runner.log", "id", env.ID, "path", savePath, "bytes", len(logData))
+			}
+		} else {
+			r.cfg.Log.Warn("DEBUG runner.log missing", "id", env.ID, "path", logPath, "error", readErr)
+		}
 		if err := os.RemoveAll(env.RunnerDir); err != nil {
 			r.cfg.Log.Warn("failed to remove job runner dir", "id", env.ID, "path", env.RunnerDir, "error", err)
 		}
@@ -972,6 +1019,26 @@ func copyDirForJob(src, dst string) error {
 		return exec.Command("xcopy", src, dst, "/E", "/I", "/Q", "/Y").Run()
 	}
 	return exec.Command("cp", "-al", src, dst).Run()
+}
+
+// isOfficialRunnerImage reports whether image is a stock GitHub Actions
+// runner image — those put run.sh under /home/runner, while every other
+// image gets our embedded runner bind-mounted at /actions-runner. The
+// scheduler resolves the default image on the host before dispatching to
+// the Linux VM, so by the time runtime.Create sees the ref the "image was
+// not specified by the caller" signal is already lost; we recover it by
+// matching the well-known official refs here.
+func isOfficialRunnerImage(image string) bool {
+	for _, prefix := range []string{
+		"ghcr.io/actions/actions-runner:",
+		"ghcr.io/actions/actions-runner@",
+		"ghcr.io/actions/runner-images-runner:",
+	} {
+		if strings.HasPrefix(image, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // withHyperVIsolation is a spec option that enables Hyper-V isolation on Windows.

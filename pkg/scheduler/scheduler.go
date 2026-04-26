@@ -843,13 +843,20 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 
 	log.Info("provisioning runner for job")
 
-	// Fetch the job's container image from the workflow YAML (extra API call)
+	// Fetch the job's container image from the workflow YAML (extra API call).
+	// The provider's DefaultImage is typically tied to one OS (e.g. the
+	// GitHub provider defaults to ghcr.io/actions/actions-runner:latest,
+	// which is Linux-only). For cross-OS jobs we leave image empty and let
+	// runtime.Create pick an OS-appropriate default via its host-aware
+	// defaultImage() helper (image_windows.go / image_other.go).
 	image := event.Provider.FetchJobImage(ctx, &event)
 	if image != "" {
 		log.Info("using job-specified image", "image", image)
-	} else {
+	} else if isLinuxJob(event.Labels) || (!isMacOSJob(event.Labels) && goruntime.GOOS == "linux") {
 		image = event.Provider.DefaultImage()
 	}
+	// else: Windows (and any mismatched combo) → leave image empty so
+	// runtime.Create falls back to its OS-aware default.
 
 	// For macOS VM jobs with an OCI image specified, extract artifact layers
 	// into the shared data directory so they're available inside the VM via virtio-fs.

@@ -27,9 +27,14 @@ import (
 // Config for the embedded containerd instance.
 type Config struct {
 	DataDir string
-	TCPPort uint32 // optional: also listen on TCP for remote access (e.g. from WSL host)
-	TCPAddr string // optional bind address for TCP listener (default "127.0.0.1")
-	Log     *slog.Logger
+	// SocketPath optionally overrides the gRPC listener path. Empty falls
+	// back to the platform default (\\.\pipe\ephemerd-containerd on Windows,
+	// <DataDir>/containerd/containerd.sock on Unix). Used by tests so
+	// multiple containerd instances can co-exist with the running daemon.
+	SocketPath string
+	TCPPort    uint32 // optional: also listen on TCP for remote access (e.g. from WSL host)
+	TCPAddr    string // optional bind address for TCP listener (default "127.0.0.1")
+	Log        *slog.Logger
 }
 
 // Server manages the in-process containerd lifecycle.
@@ -119,6 +124,15 @@ func SocketPath(dataDir string) string {
 	return filepath.Join(dataDir, "containerd", "containerd.sock")
 }
 
+// socketPath returns the configured socket path, falling back to the
+// platform default when Config.SocketPath is empty.
+func (s *Server) socketPath() string {
+	if s.cfg.SocketPath != "" {
+		return s.cfg.SocketPath
+	}
+	return SocketPath(s.cfg.DataDir)
+}
+
 func (s *Server) setup() error {
 	dirs := []string{
 		filepath.Join(s.cfg.DataDir, "containerd", "state"),
@@ -139,7 +153,7 @@ func (s *Server) start() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
 
-	socket := SocketPath(s.cfg.DataDir)
+	socket := s.socketPath()
 	rootDir := filepath.Join(s.cfg.DataDir, "containerd", "root")
 	stateDir := filepath.Join(s.cfg.DataDir, "containerd", "state")
 

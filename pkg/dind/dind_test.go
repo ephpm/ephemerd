@@ -12,15 +12,23 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
-// dialSocket returns an http.Client that connects via the given Unix socket.
-func dialSocket(sockPath string) *http.Client {
+// dialServer returns an http.Client that connects to the given dind.Server.
+// Linux/macOS: dials the unix socket at s.SocketPath().
+// Windows: dials the TCP endpoint at s.Endpoint() (tcp://host:port).
+// Tests issue requests against a placeholder "http://docker/..." URL; the
+// DialContext hook ignores the URL and connects to the real transport.
+func dialServer(s *Server) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				return net.Dial("unix", sockPath)
+				if runtime.GOOS == "windows" {
+					return net.Dial("tcp", strings.TrimPrefix(s.Endpoint(), "tcp://"))
+				}
+				return net.Dial("unix", s.SocketPath())
 			},
 		},
 	}
@@ -49,7 +57,7 @@ func newTestServer(t *testing.T) *Server {
 
 func TestPing(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	resp, err := client.Get("http://docker/_ping")
 	if err != nil {
@@ -75,7 +83,7 @@ func TestPing(t *testing.T) {
 
 func TestVersion(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	// Test both versioned and unversioned paths
 	for _, path := range []string{"/version", "/v1.45/version"} {
@@ -108,7 +116,7 @@ func TestVersion(t *testing.T) {
 
 func TestInfo(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	resp, err := client.Get("http://docker/info")
 	if err != nil {
@@ -135,7 +143,7 @@ func TestInfo(t *testing.T) {
 
 func TestImageListEmpty(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	resp, err := client.Get("http://docker/images/json")
 	if err != nil {
@@ -162,7 +170,7 @@ func TestImageListEmpty(t *testing.T) {
 
 func TestContainerListEmpty(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	resp, err := client.Get("http://docker/containers/json")
 	if err != nil {
@@ -189,7 +197,7 @@ func TestContainerListEmpty(t *testing.T) {
 
 func TestContainerCreateNoClient(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	body, _ := json.Marshal(map[string]any{"Image": "alpine:latest"})
 	resp, err := client.Post("http://docker/containers/create", "application/json", bytes.NewReader(body))
@@ -209,7 +217,7 @@ func TestContainerCreateNoClient(t *testing.T) {
 
 func TestContainerCreateNoImage(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	body, _ := json.Marshal(map[string]any{"Cmd": []string{"echo", "hello"}})
 	resp, err := client.Post("http://docker/containers/create", "application/json", bytes.NewReader(body))
@@ -231,7 +239,7 @@ func TestContainerCreateNoImage(t *testing.T) {
 
 func TestContainerInspectNotFound(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	resp, err := client.Get("http://docker/containers/nonexistent/json")
 	if err != nil {
@@ -250,7 +258,7 @@ func TestContainerInspectNotFound(t *testing.T) {
 
 func TestContainerStartNotFound(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	resp, err := client.Post("http://docker/containers/nonexistent/start", "", nil)
 	if err != nil {
@@ -269,7 +277,7 @@ func TestContainerStartNotFound(t *testing.T) {
 
 func TestContainerWaitNotFound(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	resp, err := client.Post("http://docker/containers/nonexistent/wait", "", nil)
 	if err != nil {
@@ -288,7 +296,7 @@ func TestContainerWaitNotFound(t *testing.T) {
 
 func TestContainerLogsNotFound(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	resp, err := client.Get("http://docker/containers/nonexistent/logs")
 	if err != nil {
@@ -307,7 +315,7 @@ func TestContainerLogsNotFound(t *testing.T) {
 
 func TestNotImplemented(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	// networks endpoint is not implemented
 	resp, err := client.Get("http://docker/networks")
@@ -326,6 +334,9 @@ func TestNotImplemented(t *testing.T) {
 }
 
 func TestSocketCleanup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("socket cleanup is unix-socket-specific; Windows uses a TCP endpoint with no filesystem artifact")
+	}
 	dataDir := t.TempDir()
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
@@ -360,7 +371,7 @@ func TestSocketCleanup(t *testing.T) {
 
 func TestImagePullNoClient(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	// Pull without a containerd client should return 500
 	resp, err := client.Post("http://docker/images/create?fromImage=alpine&tag=latest", "", nil)
@@ -380,7 +391,7 @@ func TestImagePullNoClient(t *testing.T) {
 
 func TestImagePullMissingFromImage(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	resp, err := client.Post("http://docker/images/create", "", nil)
 	if err != nil {
@@ -399,7 +410,7 @@ func TestImagePullMissingFromImage(t *testing.T) {
 
 func TestExecCreateNoContainer(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	body, _ := json.Marshal(map[string]any{"Cmd": []string{"echo", "hi"}})
 	resp, err := client.Post("http://docker/containers/nonexistent/exec", "application/json", bytes.NewReader(body))
@@ -419,7 +430,7 @@ func TestExecCreateNoContainer(t *testing.T) {
 
 func TestExecStartNotFound(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	resp, err := client.Post("http://docker/exec/nonexistent/start", "application/json", nil)
 	if err != nil {
@@ -438,7 +449,7 @@ func TestExecStartNotFound(t *testing.T) {
 
 func TestExecInspectNotFound(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	resp, err := client.Get("http://docker/exec/nonexistent/json")
 	if err != nil {
@@ -457,7 +468,7 @@ func TestExecInspectNotFound(t *testing.T) {
 
 func TestCopyToNotFound(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	req, _ := http.NewRequest("PUT", "http://docker/containers/nonexistent/archive?path=/tmp", nil)
 	resp, err := client.Do(req)
@@ -477,7 +488,7 @@ func TestCopyToNotFound(t *testing.T) {
 
 func TestCopyFromNotFound(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	resp, err := client.Get("http://docker/containers/nonexistent/archive?path=/tmp")
 	if err != nil {
@@ -496,9 +507,13 @@ func TestCopyFromNotFound(t *testing.T) {
 
 func TestBuildRoute(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
-	// On Linux with no client: 500. On non-Linux: 501.
+	// /build always routes through embedded BuildKit. The test server has
+	// neither a buildkit nor a containerd client wired up, so we expect
+	// 501 on every platform. (When BuildKit is configured, missing
+	// containerd would surface inside the solver as a 500 build error,
+	// but the route gate fires first when buildkit is nil.)
 	resp, err := client.Post("http://docker/v1.45/build?t=myapp", "application/x-tar", nil)
 	if err != nil {
 		t.Fatalf("POST /v1.45/build: %v", err)
@@ -509,14 +524,8 @@ func TestBuildRoute(t *testing.T) {
 		}
 	}()
 
-	if runtime.GOOS == "linux" {
-		if resp.StatusCode != http.StatusInternalServerError {
-			t.Errorf("status = %d, want 500 (no containerd client)", resp.StatusCode)
-		}
-	} else {
-		if resp.StatusCode != http.StatusNotImplemented {
-			t.Errorf("status = %d, want 501 (not supported on %s)", resp.StatusCode, runtime.GOOS)
-		}
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Errorf("status = %d, want 501 (BuildKit not configured)", resp.StatusCode)
 	}
 }
 
@@ -572,7 +581,7 @@ func TestImageList(t *testing.T) {
 	s.images["ubuntu:22.04"] = &imageEntry{ID: "sha256:def456", Ref: "ubuntu:22.04", Size: 30000000}
 	s.mu.Unlock()
 
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 	resp, err := client.Get("http://docker/images/json")
 	if err != nil {
 		t.Fatalf("GET /images/json: %v", err)
@@ -611,7 +620,7 @@ func TestInfoCount(t *testing.T) {
 	s.images["img3"] = &imageEntry{ID: "sha256:3", Ref: "img3", Size: 300}
 	s.mu.Unlock()
 
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 	resp, err := client.Get("http://docker/info")
 	if err != nil {
 		t.Fatalf("GET /info: %v", err)
@@ -655,7 +664,7 @@ func TestIndexOf(t *testing.T) {
 
 func TestRouteVer(t *testing.T) {
 	s := newTestServer(t)
-	client := dialSocket(s.SocketPath())
+	client := dialServer(s)
 
 	paths := []struct {
 		path       string

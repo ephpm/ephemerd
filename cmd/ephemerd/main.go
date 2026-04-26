@@ -13,6 +13,7 @@ import (
 
 	apiv1 "github.com/ephpm/ephemerd/api/v1"
 	"github.com/ephpm/ephemerd/pkg/artifacts"
+	"github.com/ephpm/ephemerd/pkg/buildkit"
 	"github.com/ephpm/ephemerd/pkg/cni"
 	"github.com/ephpm/ephemerd/pkg/config"
 	"github.com/ephpm/ephemerd/pkg/containerd"
@@ -30,6 +31,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/scheduler"
 	"github.com/ephpm/ephemerd/pkg/tunnel"
 	"github.com/ephpm/ephemerd/pkg/vm"
+	"github.com/moby/sys/reexec"
 	"github.com/urfave/cli/v3"
 )
 
@@ -39,6 +41,15 @@ var (
 )
 
 func main() {
+	// BuildKit mounts our binary into Windows build containers and re-execs
+	// it with argv[0]="get-user-info" to resolve user SIDs. The handler is
+	// registered via the getuserinfo init() above; reexec.Init dispatches
+	// when argv[0] matches and returns true so we exit instead of starting
+	// the daemon.
+	if reexec.Init() {
+		return
+	}
+
 	// When running as a Windows Service, the SCM invokes the binary directly.
 	// Detect this and run the service handler instead of the CLI.
 	if runAsWindowsService() {
@@ -228,6 +239,37 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		}
 		defer net.Cleanup()
 
+		// Initialize embedded BuildKit when --dind is on. Without this,
+		// dind.Server gets BuildKit=nil and POST /build falls through to the
+		// buildah path; built images then live in containers/storage instead
+		// of the "buildkit" containerd namespace, and POST /images/.../push
+		// can't find them. Mirrors the non-containerd-only branch below.
+		var bk *buildkit.Server
+		if cfg.Dind.Enabled {
+			bkCfg := buildkit.Config{
+				DataDir:             joinPath(configDir, "buildkit"),
+				ContainerdAddress:   containerd.SocketPath(configDir),
+				ContainerdNamespace: "buildkit",
+				Network:             net,
+				Log:                 log.With("component", "buildkit"),
+			}
+			bk, err = buildkit.NewServer(ctx, bkCfg)
+			if err != nil {
+				log.Warn("buildkit init failed in worker mode; docker build will fall back",
+					"error", err)
+				bk = nil
+			} else {
+				defer func() {
+					if err := bk.Close(); err != nil {
+						log.Warn("closing buildkit server", "error", err)
+					}
+				}()
+				log.Info("buildkit ready (worker mode)",
+					"data_dir", bkCfg.DataDir,
+					"namespace", bkCfg.ContainerdNamespace)
+			}
+		}
+
 		rt, err := runtime.New(runtime.Config{
 			Client:      ctrdClient,
 			RunnerDir:   rm.Dir(),
@@ -236,6 +278,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			DataDir:     configDir,
 			DindEnabled: cfg.Dind.Enabled,
 			Network:     net,
+			BuildKit:    bk,
 			Log:         log,
 		})
 		if err != nil {
@@ -332,6 +375,38 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		cacheProxyEnvVars = append(cacheProxyEnvVars, cp.EnvVars()...)
 	}
 
+	// Start the shared embedded BuildKit solver. One solver serves every
+	// job's `docker build` calls through pkg/dind. Only enabled when dind
+	// is enabled and on platforms buildkit supports (linux, windows).
+	// macOS jobs run in the Linux VM which has its own ephemerd + buildkit.
+	log.Info("buildkit gate", "dind_enabled", cfg.Dind.Enabled, "goos", runtime_.GOOS)
+	var bk *buildkit.Server
+	if cfg.Dind.Enabled && runtime_.GOOS != "darwin" {
+		bkCfg := buildkit.Config{
+			DataDir:             joinPath(configDir, "buildkit"),
+			ContainerdAddress:   containerd.SocketPath(configDir),
+			ContainerdNamespace: "buildkit",
+			Network:             net,
+			Log:                 log.With("component", "buildkit"),
+		}
+		bk, err = buildkit.NewServer(ctx, bkCfg)
+		if err != nil {
+			log.Warn("buildkit init failed; docker build will fall back to platform default",
+				"error", err)
+			bk = nil
+		} else {
+			defer func() {
+				if err := bk.Close(); err != nil {
+					log.Warn("closing buildkit server", "error", err)
+				}
+			}()
+			log.Info("buildkit ready",
+				"data_dir", bkCfg.DataDir,
+				"containerd", bkCfg.ContainerdAddress,
+				"namespace", bkCfg.ContainerdNamespace)
+		}
+	}
+
 	// Create runtime (container lifecycle manager).
 	// On Darwin the Linux VM sees the host's DataDir at /mnt/ephemerd.
 	containerDataDir := configDir
@@ -350,6 +425,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		DindEnabled:      cfg.Dind.Enabled,
 		CacheProxyEnv:    cacheProxyEnvVars,
 		Network:          net,
+		BuildKit:         bk,
 		Log:              log,
 	})
 	if err != nil {

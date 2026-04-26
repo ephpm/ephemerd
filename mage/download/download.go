@@ -1346,10 +1346,12 @@ sleep 1
 # Parse kernel command line
 CONTAINERD_PORT="10000"
 ROOT_DISK=""
+DIND="0"
 for param in $(cat /proc/cmdline); do
     case "$param" in
         ephemerd.containerd_port=*) CONTAINERD_PORT="${param#*=}" ;;
         ephemerd.root_disk=*) ROOT_DISK="${param#*=}" ;;
+        ephemerd.dind=1) DIND="1" ;;
     esac
 done
 echo "ephemerd-init: containerd_port=$CONTAINERD_PORT root_disk=$ROOT_DISK"
@@ -1445,8 +1447,6 @@ if [ "$NEED_POPULATE" = "1" ]; then
     echo "ephemerd-init: populating rootfs on $ROOT_DISK"
     tar xzf /assets/rootfs.tar.gz -C /newroot
     mkdir -p /newroot/usr/local/bin
-    cp /assets/ephemerd-linux /newroot/usr/local/bin/ephemerd-linux
-    chmod 755 /newroot/usr/local/bin/ephemerd-linux
 
     # Create a 4 GiB swapfile so a 4 GiB VM can survive image-unpack peaks.
     # dd is a busybox applet and handles sparse allocation fine on ext4.
@@ -1459,6 +1459,16 @@ if [ "$NEED_POPULATE" = "1" ]; then
         echo "ephemerd-init: WARNING: mkswap failed"
 else
     echo "ephemerd-init: existing ephemerd rootfs on $ROOT_DISK"
+fi
+
+# Always overwrite ephemerd-linux from the bundled assets on every boot.
+# The persistent root.vhdx caches user data (image content, container
+# state) but the binary itself must track whatever's baked into the
+# initrd so a fresh ephemerd build actually takes effect in the VM.
+if [ -f /assets/ephemerd-linux ]; then
+    echo "ephemerd-init: refreshing ephemerd-linux from initrd"
+    cp /assets/ephemerd-linux /newroot/usr/local/bin/ephemerd-linux
+    chmod 755 /newroot/usr/local/bin/ephemerd-linux
 fi
 
 # Activate swap every boot (no-op if unavailable).
@@ -1492,12 +1502,16 @@ mount -t cgroup2 none /newroot/sys/fs/cgroup || \
 export PATH=/usr/bin:/usr/sbin:/bin:/sbin
 export HOME=/root
 
-echo "ephemerd-init: launching ephemerd-linux"
+DIND_FLAG=""
+if [ "$DIND" = "1" ]; then
+    DIND_FLAG="--dind"
+fi
+echo "ephemerd-init: launching ephemerd-linux (dind=$DIND)"
 exec switch_root /newroot /usr/local/bin/ephemerd-linux serve \
     --data-dir /var/lib/ephemerd \
     --containerd-tcp-port "$CONTAINERD_PORT" \
     --containerd-tcp-addr 0.0.0.0 \
-    --containerd-only
+    --containerd-only $DIND_FLAG
 `
 	// Substitute the resolved module load order
 	modNames := make([]string, 0, len(loadOrder))
