@@ -102,7 +102,8 @@ type Scheduler struct {
 	running   map[jobKey]*runningJob
 	seen      map[jobKey]time.Time // recently handled jobs for dedup
 	mu        sync.Mutex
-	sem       chan struct{} // concurrency limiter
+	sem       chan struct{} // local/native job concurrency limiter
+	linuxSem  chan struct{} // Linux dispatch (VM) concurrency limiter
 	macSem    chan struct{} // macOS VM concurrency limiter (Vz has a hard cap)
 	draining  bool         // true when shutting down, rejects new jobs
 	startTime time.Time
@@ -192,6 +193,7 @@ func New(cfg Config) *Scheduler {
 		running:   make(map[jobKey]*runningJob),
 		seen:      make(map[jobKey]time.Time),
 		sem:       make(chan struct{}, cfg.MaxConcurrent),
+		linuxSem:  make(chan struct{}, cfg.MaxConcurrent),
 		macSem:    make(chan struct{}, macVMs),
 		startTime: time.Now(),
 	}
@@ -569,9 +571,9 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		s.mu.Unlock()
 	}
 
-	// Acquire concurrency slot
+	// Acquire Linux dispatch concurrency slot (separate from local/macOS)
 	select {
-	case s.sem <- struct{}{}:
+	case s.linuxSem <- struct{}{}:
 	case <-ctx.Done():
 		unsee()
 		return
@@ -592,7 +594,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		log.Error("failed to claim job", "error", err)
 		unsee()
 		time.Sleep(backoffDuration(event.Repo))
-		<-s.sem
+		<-s.linuxSem
 		return
 	}
 
@@ -611,7 +613,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		}
 		unsee()
 		cancel()
-		<-s.sem
+		<-s.linuxSem
 		return
 	}
 
@@ -633,7 +635,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 
 	// Wait for the job to finish in the background
 	go func() {
-		defer func() { <-s.sem }()
+		defer func() { <-s.linuxSem }()
 
 		exitCode, err := s.cfg.LinuxDispatcher.Wait(jobCtx, claim.RunnerName)
 		if err != nil {
@@ -676,18 +678,10 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		s.mu.Unlock()
 	}
 
-	// Acquire concurrency slots: general + macOS VM limit.
-	// Vz caps the number of simultaneous VMs based on host resources.
-	select {
-	case s.sem <- struct{}{}:
-	case <-ctx.Done():
-		unsee()
-		return
-	}
+	// Acquire macOS VM concurrency slot (separate from Linux/local sem).
 	select {
 	case s.macSem <- struct{}{}:
 	case <-ctx.Done():
-		<-s.sem
 		unsee()
 		return
 	}
@@ -719,7 +713,6 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		unsee()
 		time.Sleep(backoffDuration(event.Repo))
 		<-s.macSem
-		<-s.sem
 		return
 	}
 
@@ -735,7 +728,6 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		}
 		unsee()
 		<-s.macSem
-		<-s.sem
 		return
 	}
 
@@ -751,7 +743,6 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		}
 		unsee()
 		<-s.macSem
-		<-s.sem
 		return
 	}
 
@@ -776,7 +767,6 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		unsee()
 		cancel()
 		<-s.macSem
-		<-s.sem
 		return
 	}
 
@@ -794,7 +784,6 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		unsee()
 		cancel()
 		<-s.macSem
-		<-s.sem
 		return
 	}
 
@@ -817,7 +806,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 
 	// Wait for the job to finish in the background
 	go func() {
-		defer func() { <-s.macSem; <-s.sem }()
+		defer func() { <-s.macSem }()
 
 		exitCode, err := macVM.Wait(jobCtx)
 		if err != nil {
