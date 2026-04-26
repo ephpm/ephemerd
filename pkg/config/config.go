@@ -152,6 +152,11 @@ type MacOSVMToml struct {
 	// <data_dir>/vm/macos/base.img. Distinct from the OCI base image
 	// overlaid per job — that's fetched from the job's image label.
 	DiskImage    string `toml:"disk_image"`
+	// ImagesDir overrides where macOS VM disk files (base.img, NVRAM, etc.)
+	// are stored. Defaults to <data_dir>/vm/macos. Set this to a path outside
+	// the data dir (e.g. ~/Library/ephemerd/images) so the Tart base image
+	// survives uninstalls.
+	ImagesDir     string `toml:"images_dir"`
 	CPUs         uint   `toml:"cpus"`          // CPUs per VM (default: 4)
 	MemoryMB     uint64 `toml:"memory_mb"`     // memory per VM in MB (default: 8192)
 	MaxConcurrent int   `toml:"max_concurrent"` // max simultaneous macOS VMs (default: auto-detected from host CPUs)

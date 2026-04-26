@@ -21,6 +21,7 @@ type MacOSVMDiskFiles struct {
 type MacOSInstallOptions struct {
 	CustomDiskImage string
 	TartImage       string
+	ImagesDir       string
 }
 
 // EnsureMacOSVMDisk is only implemented on darwin.
