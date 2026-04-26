@@ -509,7 +509,11 @@ func TestBuildRoute(t *testing.T) {
 	s := newTestServer(t)
 	client := dialServer(s)
 
-	// On Linux with no client: 500. On non-Linux: 501.
+	// /build always routes through embedded BuildKit. The test server has
+	// neither a buildkit nor a containerd client wired up, so we expect
+	// 501 on every platform. (When BuildKit is configured, missing
+	// containerd would surface inside the solver as a 500 build error,
+	// but the route gate fires first when buildkit is nil.)
 	resp, err := client.Post("http://docker/v1.45/build?t=myapp", "application/x-tar", nil)
 	if err != nil {
 		t.Fatalf("POST /v1.45/build: %v", err)
@@ -520,14 +524,8 @@ func TestBuildRoute(t *testing.T) {
 		}
 	}()
 
-	if runtime.GOOS == "linux" {
-		if resp.StatusCode != http.StatusInternalServerError {
-			t.Errorf("status = %d, want 500 (no containerd client)", resp.StatusCode)
-		}
-	} else {
-		if resp.StatusCode != http.StatusNotImplemented {
-			t.Errorf("status = %d, want 501 (not supported on %s)", resp.StatusCode, runtime.GOOS)
-		}
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Errorf("status = %d, want 501 (BuildKit not configured)", resp.StatusCode)
 	}
 }
 
