@@ -24,7 +24,7 @@ const (
 	ContainerdVersion    = "2.2.2"
 	RuncVersion          = "1.3.4"
 	AlpineVersion        = "3.21.3"
-	LinuxVirtVersion     = "6.12.81-r0"
+	LinuxVirtVersion     = "6.12.83-r0"
 	GolangCILintVersion  = "2.11.4"
 
 	runnerEmbedDir = "pkg/runner/embed"
