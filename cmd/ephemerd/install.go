@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,6 +15,7 @@ import (
 func installCmd() *cli.Command {
 	var noService bool
 	var configFile string
+	var imagesDir string
 	return &cli.Command{
 		Name:  "install",
 		Usage: "Install ephemerd as a system service",
@@ -28,6 +30,11 @@ func installCmd() *cli.Command {
 				Aliases:     []string{"c"},
 				Usage:       "path to config.toml to install into the data directory",
 				Destination: &configFile,
+			},
+			&cli.StringFlag{
+				Name:        "images-dir",
+				Usage:       "directory of OCI image tarballs (*.tar) to stage into <data-dir>/images/ at install time",
+				Destination: &imagesDir,
 			},
 		},
 		Action: func(_ context.Context, _ *cli.Command) error {
@@ -60,7 +67,20 @@ func installCmd() *cli.Command {
 				return fmt.Errorf("creating config: %w", err)
 			}
 
-			// 3. Install system service
+			// 3. Stage OCI image tarballs into <data-dir>/images/. serve(...)
+			//    will import them on next startup. Doing the copy here means
+			//    operators don't need to keep the source dir mounted to the
+			//    box just so a daemon restart finds the same images.
+			if imagesDir != "" {
+				imagesTarget := filepath.Join(dataDir, "images")
+				log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+				if err := copyTarballs(imagesDir, imagesTarget, log); err != nil {
+					return fmt.Errorf("staging images from --images-dir: %w", err)
+				}
+				fmt.Printf("  images:  %s (from %s)\n", imagesTarget, imagesDir)
+			}
+
+			// 4. Install system service
 			if !noService {
 				binPath := filepath.Join(installDir, binaryName())
 				if err := installService(binPath, dataDir); err != nil {
