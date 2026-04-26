@@ -1116,7 +1116,8 @@ exec switch_root /newroot "$EPHEMERD_BIN" serve \
     --data-dir /var/lib/ephemerd \
     --containerd-tcp-port "$CONTAINERD_PORT" \
     --containerd-tcp-addr 0.0.0.0 \
-    --containerd-only
+    --containerd-only \
+    --dind
 `
 	// Substitute the resolved module load order. Strip the `kernel/.../`
 	// directory and `.ko.gz` suffix to get the basename insmod expects.
