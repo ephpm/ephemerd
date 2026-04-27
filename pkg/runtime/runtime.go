@@ -1158,6 +1158,14 @@ func isOfficialRunnerImage(image string) bool {
 		"ghcr.io/actions/actions-runner:",
 		"ghcr.io/actions/actions-runner@",
 		"ghcr.io/actions/runner-images-runner:",
+		// ephemerd's runner-ci-* images are FROM ghcr.io/actions/actions-runner
+		// with extra build deps baked in, so the runner is at the same path
+		// (/home/runner/run.sh). Without this entry the runtime treats them
+		// as foreign images and bind-mounts /actions-runner over the rootfs,
+		// then runs /actions-runner/run.sh — which the image doesn't have,
+		// so the entrypoint exits 127 ("command not found").
+		"ephpm/ephemerd:runner-ci-linux-",
+		"docker.io/ephpm/ephemerd:runner-ci-linux-",
 	} {
 		if strings.HasPrefix(image, prefix) {
 			return true
