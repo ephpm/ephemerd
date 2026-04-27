@@ -271,15 +271,17 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		}
 
 		rt, err := runtime.New(runtime.Config{
-			Client:      ctrdClient,
-			RunnerDir:   rm.Dir(),
-			RunnerMount: rm.ContainerDir(),
-			LogDir:      joinPath(configDir, "logs"),
-			DataDir:     configDir,
-			DindEnabled: cfg.Dind.Enabled,
-			Network:     net,
-			BuildKit:    bk,
-			Log:         log,
+			Client:             ctrdClient,
+			RunnerDir:          rm.Dir(),
+			RunnerMount:        rm.ContainerDir(),
+			LogDir:             joinPath(configDir, "logs"),
+			DataDir:            configDir,
+			DindEnabled:        cfg.Dind.Enabled,
+			Network:            net,
+			WindowsMemoryBytes: cfg.Runner.Windows.MemoryBytes(),
+			WindowsCPUs:        cfg.Runner.Windows.CPUCount(),
+			BuildKit:           bk,
+			Log:                log,
 		})
 		if err != nil {
 			return fmt.Errorf("creating runtime: %w", err)
@@ -414,19 +416,21 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		containerDataDir = "/mnt/ephemerd"
 	}
 	rt, err := runtime.New(runtime.Config{
-		Client:           ctrdClient,
-		RunnerDir:        rm.Dir(),
-		RunnerMount:      rm.ContainerDir(),
-		DefaultImage:     cfg.Runner.DefaultImage,
-		ImagesDir:        joinPath(configDir, "images"),
-		LogDir:           joinPath(configDir, "logs"),
-		DataDir:          configDir,
-		ContainerDataDir: containerDataDir,
-		DindEnabled:      cfg.Dind.Enabled,
-		CacheProxyEnv:    cacheProxyEnvVars,
-		Network:          net,
-		BuildKit:         bk,
-		Log:              log,
+		Client:             ctrdClient,
+		RunnerDir:          rm.Dir(),
+		RunnerMount:        rm.ContainerDir(),
+		DefaultImage:       cfg.Runner.DefaultImage,
+		ImagesDir:          joinPath(configDir, "images"),
+		LogDir:             joinPath(configDir, "logs"),
+		DataDir:            configDir,
+		ContainerDataDir:   containerDataDir,
+		DindEnabled:        cfg.Dind.Enabled,
+		CacheProxyEnv:      cacheProxyEnvVars,
+		Network:            net,
+		WindowsMemoryBytes: cfg.Runner.Windows.MemoryBytes(),
+		WindowsCPUs:        cfg.Runner.Windows.CPUCount(),
+		BuildKit:           bk,
+		Log:                log,
 	})
 	if err != nil {
 		return fmt.Errorf("creating runtime: %w", err)

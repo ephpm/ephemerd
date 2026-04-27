@@ -68,6 +68,15 @@ type Config struct {
 	DindEnabled      bool     // mount a fake Docker socket into each container
 	CacheProxyEnv    []string // extra env vars from cache proxies (e.g., GOPROXY=...)
 	Network          *networking.Manager
+	// WindowsMemoryBytes is the memory limit for Hyper-V isolated Windows
+	// runner containers. Zero leaves the OCI spec field unset, which gives
+	// the HCS default (~1 GB) — too small for MSVC builds. Caller should
+	// pass config.WindowsRunnerToml.MemoryBytes() which defaults to 4 GB.
+	WindowsMemoryBytes uint64
+	// WindowsCPUs is the virtual CPU count for Hyper-V isolated Windows
+	// runner containers. Zero leaves the OCI spec field unset. Caller
+	// should pass config.WindowsRunnerToml.CPUCount() which defaults to 2.
+	WindowsCPUs uint64
 	// BuildKit is the shared embedded BuildKit solver handed to each per-job
 	// dind.Server for `docker build` support. Optional; nil means `docker build`
 	// falls back to the platform default (buildah on Linux, 501 elsewhere).
@@ -677,6 +686,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	// Add Hyper-V isolation on Windows
 	if goruntime.GOOS == "windows" {
 		opts = append(opts, withHyperVIsolation())
+		opts = append(opts, withWindowsResources(r.cfg.WindowsMemoryBytes, r.cfg.WindowsCPUs))
 	}
 
 	// On Windows, create HCN endpoint + namespace before the container so
@@ -1163,6 +1173,33 @@ func withHyperVIsolation() oci.SpecOpts {
 			s.Windows = &ocispec.Windows{}
 		}
 		s.Windows.HyperV = &ocispec.WindowsHyperV{}
+		return nil
+	}
+}
+
+// withWindowsResources sets memory and CPU limits on a Windows container.
+// Without limits, Hyper-V isolated containers default to ~1 GB RAM, which
+// is too small for MSVC + parallel cl.exe builds. Either argument being 0
+// leaves the corresponding OCI spec field unset (HCS default applies).
+func withWindowsResources(memoryBytes, cpus uint64) oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
+		if memoryBytes == 0 && cpus == 0 {
+			return nil
+		}
+		if s.Windows == nil {
+			s.Windows = &ocispec.Windows{}
+		}
+		if s.Windows.Resources == nil {
+			s.Windows.Resources = &ocispec.WindowsResources{}
+		}
+		if memoryBytes > 0 {
+			limit := memoryBytes
+			s.Windows.Resources.Memory = &ocispec.WindowsMemoryResources{Limit: &limit}
+		}
+		if cpus > 0 {
+			count := cpus
+			s.Windows.Resources.CPU = &ocispec.WindowsCPUResources{Count: &count}
+		}
 		return nil
 	}
 }
