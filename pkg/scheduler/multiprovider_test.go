@@ -37,6 +37,12 @@ func newMockProvider(name string) *mockProvider {
 
 func (m *mockProvider) Name() string         { return m.name }
 func (m *mockProvider) DefaultImage() string { return m.defaultImage }
+func (m *mockProvider) DefaultImageFor(os string) string {
+	if os == "linux" {
+		return m.defaultImage
+	}
+	return ""
+}
 func (m *mockProvider) DefaultJobImage() string { return "" }
 
 func (m *mockProvider) Start(_ context.Context, _ providers.PollConfig) (<-chan providers.JobEvent, error) {

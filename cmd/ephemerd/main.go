@@ -509,10 +509,11 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		TLSKey:           cfg.Webhook.TLSKey,
 		Tunnel:           tunnelProvider,
 		TunnelMaxRetries: cfg.Webhook.TunnelMaxRetries,
-		JobTimeout:       cfg.Runner.ParsedJobTimeout(),
-		ShutdownTimeout:  cfg.Runner.ParsedShutdownTimeout(),
-		LogRetention:     cfg.Log.LogRetentionDuration(),
-		Log:              log,
+		JobTimeout:         cfg.Runner.ParsedJobTimeout(),
+		ShutdownTimeout:    cfg.Runner.ParsedShutdownTimeout(),
+		LogRetention:       cfg.Log.LogRetentionDuration(),
+		RunnerImageForRepo: cfg.Runner.ImageForRepoOS,
+		Log:                log,
 	})
 
 	// Start metrics server if enabled
@@ -603,7 +604,9 @@ func initProviders(cfg *config.Config, log *slog.Logger) ([]providers.Provider, 
 			cleanup()
 			return nil, nil, fmt.Errorf("creating github client: %w", err)
 		}
-		active = append(active, githubProv.New(ghClient, log, cfg.GitHub.DefaultImage))
+		active = append(active, githubProv.New(ghClient, log,
+			cfg.GitHub.DefaultImageFor("linux"),
+			cfg.GitHub.DefaultImageFor("windows")))
 		log.Info("provider enabled", "provider", "github", "owner", cfg.GitHub.Owner)
 	}
 
@@ -617,6 +620,8 @@ func initProviders(cfg *config.Config, log *slog.Logger) ([]providers.Provider, 
 			Repos:        cfg.Forgejo.Repos,
 			Labels:       cfg.Forgejo.Labels,
 			DefaultImage: cfg.Forgejo.DefaultImage,
+			LinuxImage:   cfg.Forgejo.DefaultImageLinux,
+			WindowsImage: cfg.Forgejo.DefaultImageWindows,
 			JobImage:     cfg.Forgejo.JobImage,
 			Log:          log,
 		})
@@ -638,6 +643,8 @@ func initProviders(cfg *config.Config, log *slog.Logger) ([]providers.Provider, 
 			Repos:        cfg.Gitea.Repos,
 			Labels:       cfg.Gitea.Labels,
 			DefaultImage: cfg.Gitea.DefaultImage,
+			LinuxImage:   cfg.Gitea.DefaultImageLinux,
+			WindowsImage: cfg.Gitea.DefaultImageWindows,
 			JobImage:     cfg.Gitea.JobImage,
 			Log:          log,
 		})

@@ -368,29 +368,88 @@ func TestParsedShutdownTimeout_Invalid(t *testing.T) {
 	}
 }
 
-// --- ImageForRepo tests ---
+// --- ImageForRepoOS tests ---
+
+func TestImageForRepoOS_PerOSOverride(t *testing.T) {
+	r := &RunnerConfig{
+		DefaultImage: "default:latest",
+		Images: map[string]map[string]string{
+			"ephemerd": {
+				"linux":   "ephpm/ephemerd:runner-ci-linux-amd64",
+				"windows": "ephpm/ephemerd:runner-ci-windows",
+			},
+			"ephpm": {
+				"linux": "ephpm/ephpm:ci-runner",
+			},
+		},
+	}
+	if img := r.ImageForRepoOS("ephemerd", "linux"); img != "ephpm/ephemerd:runner-ci-linux-amd64" {
+		t.Errorf("ephemerd/linux = %q", img)
+	}
+	if img := r.ImageForRepoOS("ephemerd", "windows"); img != "ephpm/ephemerd:runner-ci-windows" {
+		t.Errorf("ephemerd/windows = %q", img)
+	}
+	if img := r.ImageForRepoOS("ephpm", "linux"); img != "ephpm/ephpm:ci-runner" {
+		t.Errorf("ephpm/linux = %q", img)
+	}
+}
+
+func TestImageForRepoOS_RepoMissingOSReturnsEmpty(t *testing.T) {
+	// A repo that only declares Linux must return "" for Windows so the
+	// caller falls through to the provider/runtime defaults — *not* leak
+	// the Linux image into a Windows job.
+	r := &RunnerConfig{
+		Images: map[string]map[string]string{
+			"ephpm": {"linux": "ephpm/ephpm:ci-runner"},
+		},
+	}
+	if img := r.ImageForRepoOS("ephpm", "windows"); img != "" {
+		t.Errorf("ephpm/windows = %q, want empty (not Linux image)", img)
+	}
+}
+
+func TestImageForRepoOS_UnknownRepoReturnsEmpty(t *testing.T) {
+	r := &RunnerConfig{
+		DefaultImage: "default:latest",
+		Images: map[string]map[string]string{
+			"ephemerd": {"linux": "custom:latest"},
+		},
+	}
+	if img := r.ImageForRepoOS("other-repo", "linux"); img != "" {
+		t.Errorf("ImageForRepoOS(other-repo, linux) = %q, want empty", img)
+	}
+}
+
+func TestImageForRepoOS_NilSafe(t *testing.T) {
+	var r *RunnerConfig
+	if img := r.ImageForRepoOS("any", "linux"); img != "" {
+		t.Errorf("nil receiver = %q, want empty", img)
+	}
+}
+
+// --- ImageForRepo (legacy helper) tests ---
 
 func TestImageForRepo_Override(t *testing.T) {
 	r := &RunnerConfig{
 		DefaultImage: "default:latest",
-		Images: map[string]string{
-			"ephemerd": "ephpm/ephemerd:runner-ci-linux",
-			"ephpm":    "ephpm/ephpm:ci-runner",
+		Images: map[string]map[string]string{
+			"ephemerd": {"linux": "ephpm/ephemerd:runner-ci-linux"},
+			"ephpm":    {"linux": "ephpm/ephpm:ci-runner"},
 		},
 	}
 	if img := r.ImageForRepo("ephemerd"); img != "ephpm/ephemerd:runner-ci-linux" {
-		t.Errorf("ImageForRepo(ephemerd) = %q, want ephpm/ephemerd:runner-ci-linux", img)
+		t.Errorf("ImageForRepo(ephemerd) = %q", img)
 	}
 	if img := r.ImageForRepo("ephpm"); img != "ephpm/ephpm:ci-runner" {
-		t.Errorf("ImageForRepo(ephpm) = %q, want ephpm/ephpm:ci-runner", img)
+		t.Errorf("ImageForRepo(ephpm) = %q", img)
 	}
 }
 
 func TestImageForRepo_FallbackToDefault(t *testing.T) {
 	r := &RunnerConfig{
 		DefaultImage: "default:latest",
-		Images: map[string]string{
-			"ephemerd": "custom:latest",
+		Images: map[string]map[string]string{
+			"ephemerd": {"linux": "custom:latest"},
 		},
 	}
 	if img := r.ImageForRepo("other-repo"); img != "default:latest" {
@@ -401,7 +460,7 @@ func TestImageForRepo_FallbackToDefault(t *testing.T) {
 func TestImageForRepo_NoImagesMap(t *testing.T) {
 	r := &RunnerConfig{DefaultImage: "default:latest"}
 	if img := r.ImageForRepo("anything"); img != "default:latest" {
-		t.Errorf("ImageForRepo(anything) = %q, want default:latest", img)
+		t.Errorf("ImageForRepo(anything) = %q", img)
 	}
 }
 
@@ -409,6 +468,43 @@ func TestImageForRepo_EmptyDefault(t *testing.T) {
 	r := &RunnerConfig{}
 	if img := r.ImageForRepo("anything"); img != "" {
 		t.Errorf("ImageForRepo(anything) = %q, want empty", img)
+	}
+}
+
+// --- DefaultImageFor tests (provider-level) ---
+
+func TestGitHubConfig_DefaultImageFor_PerOS(t *testing.T) {
+	c := &GitHubConfig{
+		DefaultImageLinux:   "lin",
+		DefaultImageWindows: "win",
+	}
+	if c.DefaultImageFor("linux") != "lin" {
+		t.Errorf("linux = %q", c.DefaultImageFor("linux"))
+	}
+	if c.DefaultImageFor("windows") != "win" {
+		t.Errorf("windows = %q", c.DefaultImageFor("windows"))
+	}
+}
+
+func TestGitHubConfig_DefaultImageFor_LegacyFallsBackForLinuxOnly(t *testing.T) {
+	// default_image should keep working as a Linux default for old configs,
+	// but must NOT be returned for Windows lookups.
+	c := &GitHubConfig{DefaultImage: "legacy"}
+	if c.DefaultImageFor("linux") != "legacy" {
+		t.Errorf("linux = %q, want legacy", c.DefaultImageFor("linux"))
+	}
+	if c.DefaultImageFor("windows") != "" {
+		t.Errorf("windows = %q, want empty (legacy is Linux only)", c.DefaultImageFor("windows"))
+	}
+}
+
+func TestGitHubConfig_DefaultImageFor_LinuxOverridesLegacy(t *testing.T) {
+	c := &GitHubConfig{
+		DefaultImage:      "legacy",
+		DefaultImageLinux: "new",
+	}
+	if c.DefaultImageFor("linux") != "new" {
+		t.Errorf("linux = %q, want new (overrides legacy)", c.DefaultImageFor("linux"))
 	}
 }
 

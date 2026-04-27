@@ -70,7 +70,17 @@ func New(cfg Config) (*Provider, error) {
 }
 
 func (p *Provider) Name() string         { return "woodpecker" }
-func (p *Provider) DefaultImage() string { return defaultImage }
+func (p *Provider) DefaultImage() string { return p.DefaultImageFor("linux") }
+
+// DefaultImageFor returns the agent image for the given job OS.
+// Woodpecker's agent is Linux-only upstream; Windows returns empty so the
+// runtime can pick its host fallback if a workflow ever targets Windows.
+func (p *Provider) DefaultImageFor(os string) string {
+	if os == "linux" {
+		return defaultImage
+	}
+	return ""
+}
 
 // DefaultJobImage returns empty — the Woodpecker agent creates job containers
 // based on the image: field in .woodpecker.yml pipeline steps.

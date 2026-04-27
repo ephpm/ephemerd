@@ -1928,9 +1928,11 @@ func httpGetBytes(url string) ([]byte, error) {
 
 // linuxVirtMirrorURL returns the GitHub Releases mirror URL for the
 // linux-virt APK pinned at LinuxVirtVersion. arch is "aarch64" or "x86_64".
+// Note: GitHub Releases doesn't tolerate slashes in tag names (they 404
+// the asset URL), so we use a dash-separated tag.
 func linuxVirtMirrorURL(arch string) string {
 	return fmt.Sprintf(
-		"https://github.com/ephpm/ephemerd/releases/download/deps/linux-virt-%s/linux-virt-%s-%s.apk",
+		"https://github.com/ephpm/ephemerd/releases/download/deps-linux-virt-%s/linux-virt-%s-%s.apk",
 		LinuxVirtVersion, LinuxVirtVersion, arch,
 	)
 }
@@ -1947,26 +1949,41 @@ func linuxVirtSHA256(arch string) string {
 	}
 }
 
-// fetchLinuxVirtAPK downloads the linux-virt APK for arch from our mirror and
-// verifies the SHA256 against the pinned constant. arch is "aarch64" or
-// "x86_64". Bypasses the upstream Alpine CDN, which prunes superseded
-// revisions and can't be relied on for reproducible builds.
+// fetchLinuxVirtAPK downloads the linux-virt APK for arch and verifies its
+// SHA256 against the pinned constant. arch is "aarch64" or "x86_64".
+//
+// Tries the mirror (a deps tag on this repo's GitHub Releases) first; falls
+// back to upstream dl-cdn.alpinelinux.org if the mirror is unreachable
+// (e.g. anonymous 404 on a private repo, deps tag deleted). The SHA256
+// check still pins the bytes either way, so the upstream fallback is safe
+// — it just stops working if Alpine prunes the revision, which is exactly
+// what the mirror exists to insulate us from.
 func fetchLinuxVirtAPK(arch string) ([]byte, error) {
 	want := linuxVirtSHA256(arch)
 	if want == "" {
 		return nil, fmt.Errorf("linux-virt: unknown arch %q (want aarch64 or x86_64)", arch)
 	}
-	url := linuxVirtMirrorURL(arch)
-	data, err := httpGetBytes(url)
-	if err != nil {
-		return nil, fmt.Errorf("downloading linux-virt: %w", err)
+	candidates := []string{
+		linuxVirtMirrorURL(arch),
+		fmt.Sprintf("https://dl-cdn.alpinelinux.org/alpine/v%s/main/%s/linux-virt-%s.apk",
+			alpineMajorMinor(AlpineVersion), arch, LinuxVirtVersion),
 	}
-	got := fmt.Sprintf("%x", sha256.Sum256(data))
-	if got != want {
-		return nil, fmt.Errorf("linux-virt %s sha256 mismatch: want %s, got %s (URL %s)",
-			arch, want, got, url)
+	var lastErr error
+	for _, url := range candidates {
+		data, err := httpGetBytes(url)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		got := fmt.Sprintf("%x", sha256.Sum256(data))
+		if got != want {
+			lastErr = fmt.Errorf("sha256 mismatch from %s: want %s, got %s",
+				url, want, got)
+			continue
+		}
+		return data, nil
 	}
-	return data, nil
+	return nil, fmt.Errorf("downloading linux-virt %s: %w", arch, lastErr)
 }
 
 func alpineMajorMinor(version string) string {

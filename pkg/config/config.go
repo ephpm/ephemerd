@@ -171,44 +171,126 @@ type GitHubConfig struct {
 	// Job discovery: polling interval (default "30s")
 	PollInterval string `toml:"poll_interval"`
 
-	// DefaultImage overrides the runner container image.
-	// Default: "ghcr.io/actions/actions-runner:latest"
+	// DefaultImage is the legacy single-image override (Linux only).
+	// Kept for backward compatibility — prefer DefaultImageLinux /
+	// DefaultImageWindows for new configs. When DefaultImageLinux is empty
+	// and this is set, it's treated as the Linux default.
+	// Linux fallback (when nothing is set): "ghcr.io/actions/actions-runner:latest".
 	DefaultImage string `toml:"default_image"`
+
+	// DefaultImageLinux is the provider-level default image for Linux jobs.
+	// Per-repo entries in [runner.images.<repo>].linux win over this.
+	DefaultImageLinux string `toml:"default_image_linux"`
+
+	// DefaultImageWindows is the provider-level default image for Windows
+	// jobs. Per-repo entries in [runner.images.<repo>].windows win over
+	// this. Falls through to the runtime's host-matched servercore default
+	// (pkg/runtime/image_windows.go) when unset.
+	DefaultImageWindows string `toml:"default_image_windows"`
+}
+
+// DefaultImageFor returns the provider-level default image for the given OS.
+// Resolution: per-OS field → legacy DefaultImage (Linux only) → empty.
+// Empty means "no provider default — let the runtime pick its OS-native
+// fallback (e.g. mcr.microsoft.com/windows/servercore:ltsc20XX on Windows)".
+func (g *GitHubConfig) DefaultImageFor(os string) string {
+	switch os {
+	case "linux":
+		if g.DefaultImageLinux != "" {
+			return g.DefaultImageLinux
+		}
+		return g.DefaultImage
+	case "windows":
+		return g.DefaultImageWindows
+	}
+	return ""
 }
 
 // ForgejoConfig configures the Forgejo Actions provider.
 // Set instance_url and token to enable Forgejo instead of GitHub.
 // Uses forgejo-runner binary with one-job --handle mode.
+//
+// Forgejo's runner daemon (DefaultImage) is Linux-only; setting
+// DefaultImageWindows is allowed for completeness but no upstream Windows
+// build of forgejo-runner exists today.
 type ForgejoConfig struct {
-	InstanceURL  string   `toml:"instance_url"`  // Forgejo instance URL (e.g., "https://codeberg.org")
-	Token        string   `toml:"token"`         // runner registration token from Forgejo admin
-	Owner        string   `toml:"owner"`         // org or user (empty = instance-level runner)
-	Repos        []string `toml:"repos"`         // limit to specific repos (empty = all)
-	Labels       []string `toml:"labels"`        // runner labels (default: ["ubuntu-latest:docker://<job_image>"])
-	DefaultImage string   `toml:"default_image"` // runner daemon image (default: "data.forgejo.org/forgejo/runner:12")
-	JobImage     string   `toml:"job_image"`     // job execution image (default: "gitea/runner-images:ubuntu-24.04")
+	InstanceURL         string   `toml:"instance_url"`          // Forgejo instance URL (e.g., "https://codeberg.org")
+	Token               string   `toml:"token"`                 // runner registration token from Forgejo admin
+	Owner               string   `toml:"owner"`                 // org or user (empty = instance-level runner)
+	Repos               []string `toml:"repos"`                 // limit to specific repos (empty = all)
+	Labels              []string `toml:"labels"`                // runner labels (default: ["ubuntu-latest:docker://<job_image>"])
+	DefaultImage        string   `toml:"default_image"`         // runner daemon image (default: "data.forgejo.org/forgejo/runner:12")
+	DefaultImageLinux   string   `toml:"default_image_linux"`   // per-OS Linux runner image (wins over default_image when set)
+	DefaultImageWindows string   `toml:"default_image_windows"` // per-OS Windows runner image
+	JobImage            string   `toml:"job_image"`             // job execution image (default: "gitea/runner-images:ubuntu-24.04")
+}
+
+// DefaultImageFor returns the provider-level default for the given OS.
+func (f *ForgejoConfig) DefaultImageFor(os string) string {
+	switch os {
+	case "linux":
+		if f.DefaultImageLinux != "" {
+			return f.DefaultImageLinux
+		}
+		return f.DefaultImage
+	case "windows":
+		return f.DefaultImageWindows
+	}
+	return ""
 }
 
 // GiteaConfig configures the Gitea Actions provider.
 // Set instance_url and token to enable Gitea instead of GitHub.
 // Uses act_runner binary with --ephemeral mode.
 type GiteaConfig struct {
-	InstanceURL  string   `toml:"instance_url"`  // Gitea instance URL (e.g., "https://gitea.example.com")
-	Token        string   `toml:"token"`         // runner registration token from Gitea admin
-	Owner        string   `toml:"owner"`         // org or user (empty = instance-level runner)
-	Repos        []string `toml:"repos"`         // limit to specific repos (empty = all)
-	Labels       []string `toml:"labels"`        // runner labels (default: ["ubuntu-latest:docker://<job_image>"])
-	DefaultImage string   `toml:"default_image"` // runner daemon image (default: "docker.io/gitea/act_runner:latest")
-	JobImage     string   `toml:"job_image"`     // job execution image (default: "gitea/runner-images:ubuntu-24.04")
+	InstanceURL         string   `toml:"instance_url"`          // Gitea instance URL (e.g., "https://gitea.example.com")
+	Token               string   `toml:"token"`                 // runner registration token from Gitea admin
+	Owner               string   `toml:"owner"`                 // org or user (empty = instance-level runner)
+	Repos               []string `toml:"repos"`                 // limit to specific repos (empty = all)
+	Labels              []string `toml:"labels"`                // runner labels (default: ["ubuntu-latest:docker://<job_image>"])
+	DefaultImage        string   `toml:"default_image"`         // runner daemon image (default: "docker.io/gitea/act_runner:latest")
+	DefaultImageLinux   string   `toml:"default_image_linux"`   // per-OS Linux runner image (wins over default_image when set)
+	DefaultImageWindows string   `toml:"default_image_windows"` // per-OS Windows runner image
+	JobImage            string   `toml:"job_image"`             // job execution image (default: "gitea/runner-images:ubuntu-24.04")
+}
+
+// DefaultImageFor returns the provider-level default for the given OS.
+func (g *GiteaConfig) DefaultImageFor(os string) string {
+	switch os {
+	case "linux":
+		if g.DefaultImageLinux != "" {
+			return g.DefaultImageLinux
+		}
+		return g.DefaultImage
+	case "windows":
+		return g.DefaultImageWindows
+	}
+	return ""
 }
 
 // GitLabConfig configures the GitLab CI provider.
 // Set instance_url and token to enable GitLab instead of GitHub.
 type GitLabConfig struct {
-	InstanceURL  string   `toml:"instance_url"`  // GitLab instance URL (e.g., "https://gitlab.com")
-	Token        string   `toml:"token"`         // runner authentication token (glrt-xxx for GitLab 16+)
-	Tags         []string `toml:"tags"`          // runner tags for job matching
-	DefaultImage string   `toml:"default_image"` // runner image (default: "ghcr.io/ephpm/runner-gitlab:latest")
+	InstanceURL         string   `toml:"instance_url"`          // GitLab instance URL (e.g., "https://gitlab.com")
+	Token               string   `toml:"token"`                 // runner authentication token (glrt-xxx for GitLab 16+)
+	Tags                []string `toml:"tags"`                  // runner tags for job matching
+	DefaultImage        string   `toml:"default_image"`         // runner image (default: "ghcr.io/ephpm/runner-gitlab:latest")
+	DefaultImageLinux   string   `toml:"default_image_linux"`   // per-OS Linux runner image (wins over default_image when set)
+	DefaultImageWindows string   `toml:"default_image_windows"` // per-OS Windows runner image
+}
+
+// DefaultImageFor returns the provider-level default for the given OS.
+func (g *GitLabConfig) DefaultImageFor(os string) string {
+	switch os {
+	case "linux":
+		if g.DefaultImageLinux != "" {
+			return g.DefaultImageLinux
+		}
+		return g.DefaultImage
+	case "windows":
+		return g.DefaultImageWindows
+	}
+	return ""
 }
 
 // WoodpeckerConfig configures the Woodpecker CI provider.
@@ -221,10 +303,20 @@ type WoodpeckerConfig struct {
 }
 
 type RunnerConfig struct {
-	MaxConcurrent   int               `toml:"max_concurrent"`
-	ExtraLabels     []string          `toml:"extra_labels"`
-	DefaultImage    string            `toml:"default_image"`
-	Images          map[string]string `toml:"images"`          // per-repo image overrides (repo name → image)
+	MaxConcurrent int      `toml:"max_concurrent"`
+	ExtraLabels   []string `toml:"extra_labels"`
+	DefaultImage  string   `toml:"default_image"`
+
+	// Images maps repo → OS → image. TOML shape:
+	//
+	//   [runner.images.ephemerd]
+	//   linux   = "ephpm/ephemerd:runner-ci-linux-amd64"
+	//   windows = "ephpm/ephemerd:runner-ci-windows"
+	//
+	// A repo can specify just one OS — the others fall through to the
+	// provider per-OS default and then the runtime fallback.
+	Images map[string]map[string]string `toml:"images"`
+
 	JobTimeout      string            `toml:"job_timeout"`
 	ShutdownTimeout string            `toml:"shutdown_timeout"`
 	Windows         WindowsRunnerToml `toml:"windows"`
@@ -255,11 +347,26 @@ func (w WindowsRunnerToml) CPUCount() uint64 {
 	return w.CPUs
 }
 
-// ImageForRepo returns the container image for a given repo.
-// Checks per-repo overrides first, then falls back to default_image.
-// Returns empty string if neither is set (caller should use provider default).
+// ImageForRepoOS returns the per-repo, per-OS image override, or empty if
+// no override is configured for that combination. Caller falls back to the
+// provider default and then the runtime default.
+func (r *RunnerConfig) ImageForRepoOS(repo, os string) string {
+	if r == nil {
+		return ""
+	}
+	if perOS, ok := r.Images[repo]; ok {
+		if img, ok := perOS[os]; ok {
+			return img
+		}
+	}
+	return ""
+}
+
+// ImageForRepo is the legacy helper kept for callers that haven't migrated.
+// Prefer ImageForRepoOS. Returns the Linux image override (if set), then
+// DefaultImage. Empty when neither is set.
 func (r *RunnerConfig) ImageForRepo(repo string) string {
-	if img, ok := r.Images[repo]; ok {
+	if img := r.ImageForRepoOS(repo, "linux"); img != "" {
 		return img
 	}
 	return r.DefaultImage
