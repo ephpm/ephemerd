@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
@@ -397,7 +399,16 @@ func (r *Runtime) PullImage(ctx context.Context, ref string) error {
 		}
 	}
 
-	r.cfg.Log.Info("pulling image", "ref", ref)
+	// Qualify unqualified Docker Hub refs ("ephpm/ephemerd:tag", "alpine:3")
+	// so containerd's resolver doesn't dial the first path segment as a
+	// registry host. Refs already containing a registry (host has '.', ':',
+	// or is "localhost") pass through unchanged.
+	pullRef := qualifyImageRef(ref)
+	if pullRef != ref {
+		r.cfg.Log.Info("qualifying unqualified image ref for pull",
+			"original", ref, "qualified", pullRef)
+	}
+	r.cfg.Log.Info("pulling image", "ref", pullRef)
 
 	pullOpts := []client.RemoteOpt{
 		client.WithPullUnpack,
@@ -406,13 +417,52 @@ func (r *Runtime) PullImage(ctx context.Context, ref string) error {
 		pullOpts = append(pullOpts, client.WithPlatform("windows/amd64"))
 	}
 	pullOpts = append(pullOpts, client.WithPullSnapshotter(snapshotter))
-	_, err := r.client.Pull(ctx, ref, pullOpts...)
+	_, err := r.client.Pull(ctx, pullRef, pullOpts...)
 	if err != nil {
-		return fmt.Errorf("pulling image %s: %w", ref, err)
+		return fmt.Errorf("pulling image %s: %w", pullRef, err)
 	}
 
-	r.cfg.Log.Info("image ready", "ref", ref)
+	// Alias the pulled image under the unqualified name so later
+	// GetImage(ref) lookups (config-supplied short refs) succeed.
+	if pullRef != ref {
+		if img, gerr := r.client.GetImage(ctx, pullRef); gerr == nil {
+			imgSvc := r.client.ImageService()
+			imgRecord := images.Image{
+				Name:   ref,
+				Target: img.Target(),
+				Labels: map[string]string{"ephemerd.alias-of": pullRef},
+			}
+			if _, cerr := imgSvc.Create(ctx, imgRecord); cerr != nil {
+				if _, uerr := imgSvc.Update(ctx, imgRecord); uerr != nil {
+					r.cfg.Log.Warn("aliasing pulled image under unqualified name failed",
+						"name", ref, "qualified", pullRef,
+						"create_err", cerr, "update_err", uerr)
+				}
+			}
+		}
+	}
+
+	r.cfg.Log.Info("image ready", "ref", pullRef)
 	return nil
+}
+
+// qualifyImageRef ensures a reference carries an explicit registry host.
+// Bare names ("alpine") become "docker.io/library/alpine"; namespaced names
+// ("ephpm/ephemerd:tag") become "docker.io/ephpm/ephemerd:tag". Refs whose
+// first path segment looks like a host (contains '.' or ':', or equals
+// "localhost") are returned unchanged.
+func qualifyImageRef(ref string) string {
+	first := ref
+	if i := strings.IndexByte(ref, '/'); i >= 0 {
+		first = ref[:i]
+	}
+	if strings.ContainsAny(first, ".:") || first == "localhost" {
+		return ref
+	}
+	if !strings.Contains(ref, "/") {
+		return "docker.io/library/" + ref
+	}
+	return "docker.io/" + ref
 }
 
 // CreateConfig holds parameters for creating a runner environment.
@@ -1010,15 +1060,80 @@ func withRunnerMount(hostDir, containerDir string) oci.SpecOpts {
 
 // copyDirForJob creates a writable copy of src at dst for a single job.
 // On Linux, uses hardlinks (cp -al) for instant, space-efficient copies.
-// On Windows, uses xcopy.
+// On Windows, uses a native Go walk+copy — xcopy returned exit 4 (init
+// error) intermittently when invoked under the SYSTEM service account,
+// even though manual runs from the same user worked. Going native avoids
+// the external-command dependency and surfaces real I/O errors.
 func copyDirForJob(src, dst string) error {
 	if err := os.RemoveAll(dst); err != nil {
 		return err
 	}
 	if goruntime.GOOS == "windows" {
-		return exec.Command("xcopy", src, dst, "/E", "/I", "/Q", "/Y").Run()
+		return copyDirNative(src, dst)
 	}
 	return exec.Command("cp", "-al", src, dst).Run()
+}
+
+// copyDirNative recursively copies src to dst using only the standard
+// library. Symlinks are resolved (the GitHub Actions runner directory
+// doesn't contain any symlinks on Windows).
+func copyDirNative(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		switch {
+		case info.IsDir():
+			return os.MkdirAll(target, info.Mode())
+		case info.Mode()&os.ModeSymlink != 0:
+			realPath, rerr := filepath.EvalSymlinks(path)
+			if rerr != nil {
+				return fmt.Errorf("resolving symlink %s: %w", path, rerr)
+			}
+			ri, rerr := os.Stat(realPath)
+			if rerr != nil {
+				return fmt.Errorf("stat symlink target %s: %w", realPath, rerr)
+			}
+			if ri.IsDir() {
+				return copyDirNative(realPath, target)
+			}
+			return copyFileNative(realPath, target, ri.Mode())
+		default:
+			return copyFileNative(path, target, info.Mode())
+		}
+	})
+}
+
+func copyFileNative(src, dst string, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := in.Close(); cerr != nil {
+			// Read-side close errors are typically harmless but worth surfacing.
+			_ = cerr
+		}
+	}()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		if cerr := out.Close(); cerr != nil {
+			return errors.Join(fmt.Errorf("copying %s: %w", src, err), fmt.Errorf("close %s: %w", dst, cerr))
+		}
+		return err
+	}
+	return out.Close()
 }
 
 // isOfficialRunnerImage reports whether image is a stock GitHub Actions
