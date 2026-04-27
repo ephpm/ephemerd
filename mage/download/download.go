@@ -640,8 +640,16 @@ func extractVmlinuxFromBzImage(bzImagePath, dest string) error {
 // exec's ephemerd-linux as PID 1.
 func Initrdx86() error {
 	dest := filepath.Join(vmEmbedDir, "initrd")
-	if fileExists(dest) {
-		fmt.Printf("  %s already exists, skipping\n", dest)
+	// Initrd embeds ephemerd-linux, the rootfs tarball, and the kernel
+	// modules from linux-virt. If any of those is newer than the existing
+	// initrd, the embedded copy is stale and we must rebuild — otherwise a
+	// fresh ephemerd-linux silently runs an old initrd's binary copy.
+	inputs := []string{
+		filepath.Join(vmEmbedDir, "ephemerd-linux"),
+		filepath.Join(vmEmbedDir, "ephemerd-rootfs-"+AlpineVersion+"-x86_64.tar.gz"),
+	}
+	if !outOfDate(dest, inputs...) {
+		fmt.Printf("  %s already up to date, skipping\n", dest)
 		return nil
 	}
 	if err := os.MkdirAll(vmEmbedDir, 0o755); err != nil {
@@ -2108,6 +2116,30 @@ func fileExists(path string) bool {
 	// Treat 0-byte files as missing — EnsurePlaceholders creates empty
 	// files so go:embed compiles, but they must be replaced by real assets.
 	return info.Size() > 0
+}
+
+// outOfDate reports whether dest needs to be rebuilt — true if it's missing,
+// empty, or any of the listed input paths exists and is newer than dest.
+// Inputs that don't exist are ignored (the build target hasn't produced them
+// yet, so they can't make dest stale). The mtime comparison is what stops
+// `mage build:windows` from happily embedding yesterday's ephemerd-linux into
+// initrd because today's `download:Initrdx86` short-circuited on a file that
+// already existed.
+func outOfDate(dest string, inputs ...string) bool {
+	destInfo, err := os.Stat(dest)
+	if err != nil || destInfo.Size() == 0 {
+		return true
+	}
+	for _, in := range inputs {
+		ii, err := os.Stat(in)
+		if err != nil {
+			continue
+		}
+		if ii.ModTime().After(destInfo.ModTime()) {
+			return true
+		}
+	}
+	return false
 }
 
 func runnerPlatform(goos, goarch string) (os_, arch string) {
