@@ -264,6 +264,57 @@ func TestWithHyperVIsolation_ExistingWindows(t *testing.T) {
 	}
 }
 
+// --- withWindowsResources tests ---
+
+func TestWithWindowsResources(t *testing.T) {
+	s := &ocispec.Spec{}
+	opt := withWindowsResources(4*1024*1024*1024, 2)
+	if err := opt(nil, nil, nil, s); err != nil {
+		t.Fatalf("withWindowsResources error: %v", err)
+	}
+	if s.Windows == nil || s.Windows.Resources == nil {
+		t.Fatal("Resources should be set")
+	}
+	if s.Windows.Resources.Memory == nil || s.Windows.Resources.Memory.Limit == nil {
+		t.Fatal("Memory.Limit should be set")
+	}
+	if got, want := *s.Windows.Resources.Memory.Limit, uint64(4*1024*1024*1024); got != want {
+		t.Errorf("Memory.Limit = %d, want %d", got, want)
+	}
+	if s.Windows.Resources.CPU == nil || s.Windows.Resources.CPU.Count == nil {
+		t.Fatal("CPU.Count should be set")
+	}
+	if got, want := *s.Windows.Resources.CPU.Count, uint64(2); got != want {
+		t.Errorf("CPU.Count = %d, want %d", got, want)
+	}
+}
+
+func TestWithWindowsResources_ZeroLeavesUnset(t *testing.T) {
+	s := &ocispec.Spec{}
+	opt := withWindowsResources(0, 0)
+	if err := opt(nil, nil, nil, s); err != nil {
+		t.Fatal(err)
+	}
+	// With both zero, the helper should be a no-op — don't even create
+	// the Windows section, so other helpers can initialize it lazily.
+	if s.Windows != nil && s.Windows.Resources != nil {
+		t.Error("Resources should not be set when both args are zero")
+	}
+}
+
+func TestWithWindowsResources_OnlyMemory(t *testing.T) {
+	s := &ocispec.Spec{}
+	if err := withWindowsResources(1024*1024*1024, 0)(nil, nil, nil, s); err != nil {
+		t.Fatal(err)
+	}
+	if s.Windows.Resources.Memory == nil {
+		t.Error("Memory should be set")
+	}
+	if s.Windows.Resources.CPU != nil {
+		t.Error("CPU should remain unset when cpus arg is 0")
+	}
+}
+
 // --- withWindowsNetwork tests ---
 
 func TestWithWindowsNetwork(t *testing.T) {
