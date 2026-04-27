@@ -1399,16 +1399,20 @@ if [ -z "$ROOT_DISK" ]; then
     exec /bin/sh
 fi
 
-# hv_storvsc is built into linux-virt but SCSI enumeration can trail the end of
-# module loading by seconds. Wait up to 15s for the device to appear before
-# giving up. Busybox sleep only takes integer seconds.
+# hv_storvsc is built into linux-virt but SCSI enumeration can trail the end
+# of module loading by tens of seconds — the Hyper-V host is sometimes slow
+# to attach the VHDX, especially when other VMs are also starting. 15s was
+# too tight and intermittently tripped a FATAL on otherwise-fine boots.
+# 60s gives plenty of headroom without measurably slowing the happy path
+# (we exit the loop the instant the block device appears). Busybox sleep
+# only takes integer seconds.
 i=0
-while [ ! -b "$ROOT_DISK" ] && [ $i -lt 15 ]; do
+while [ ! -b "$ROOT_DISK" ] && [ $i -lt 60 ]; do
     sleep 1
     i=$((i + 1))
 done
 if [ ! -b "$ROOT_DISK" ]; then
-    echo "ephemerd-init: FATAL: root disk $ROOT_DISK did not appear after 15s"
+    echo "ephemerd-init: FATAL: root disk $ROOT_DISK did not appear after 60s"
     ls -la /dev/sd* 2>/dev/null || echo "  no /dev/sd* devices present"
     exec /bin/sh
 fi
