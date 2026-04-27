@@ -227,6 +227,32 @@ type RunnerConfig struct {
 	Images          map[string]string `toml:"images"`          // per-repo image overrides (repo name → image)
 	JobTimeout      string            `toml:"job_timeout"`
 	ShutdownTimeout string            `toml:"shutdown_timeout"`
+	Windows         WindowsRunnerToml `toml:"windows"`
+}
+
+// WindowsRunnerToml configures resource limits for Hyper-V isolated Windows
+// runner containers. Without limits Hyper-V containers default to ~1 GB RAM,
+// which is too small for MSVC + parallel cl.exe builds.
+type WindowsRunnerToml struct {
+	MemoryMB uint64 `toml:"memory_mb"` // memory in MB (default: 4096)
+	CPUs     uint64 `toml:"cpus"`      // virtual CPUs (default: 2)
+}
+
+// MemoryBytes returns the memory limit in bytes, applying the default if unset.
+func (w WindowsRunnerToml) MemoryBytes() uint64 {
+	mb := w.MemoryMB
+	if mb == 0 {
+		mb = 4096
+	}
+	return mb * 1024 * 1024
+}
+
+// CPUCount returns the CPU count, applying the default if unset.
+func (w WindowsRunnerToml) CPUCount() uint64 {
+	if w.CPUs == 0 {
+		return 2
+	}
+	return w.CPUs
 }
 
 // ImageForRepo returns the container image for a given repo.

@@ -317,6 +317,36 @@ func TestParsedJobTimeout_Invalid(t *testing.T) {
 	}
 }
 
+// --- WindowsRunnerToml tests ---
+
+func TestWindowsRunnerToml_DefaultMemory(t *testing.T) {
+	w := WindowsRunnerToml{}
+	if got, want := w.MemoryBytes(), uint64(4096)*1024*1024; got != want {
+		t.Errorf("MemoryBytes() default = %d, want %d (4 GB)", got, want)
+	}
+}
+
+func TestWindowsRunnerToml_DefaultCPUs(t *testing.T) {
+	w := WindowsRunnerToml{}
+	if got, want := w.CPUCount(), uint64(2); got != want {
+		t.Errorf("CPUCount() default = %d, want %d", got, want)
+	}
+}
+
+func TestWindowsRunnerToml_OverrideMemory(t *testing.T) {
+	w := WindowsRunnerToml{MemoryMB: 16384}
+	if got, want := w.MemoryBytes(), uint64(16384)*1024*1024; got != want {
+		t.Errorf("MemoryBytes() = %d, want %d", got, want)
+	}
+}
+
+func TestWindowsRunnerToml_OverrideCPUs(t *testing.T) {
+	w := WindowsRunnerToml{CPUs: 8}
+	if got, want := w.CPUCount(), uint64(8); got != want {
+		t.Errorf("CPUCount() = %d, want %d", got, want)
+	}
+}
+
 func TestParsedShutdownTimeout_Default(t *testing.T) {
 	r := &RunnerConfig{}
 	if d := r.ParsedShutdownTimeout(); d != 5*time.Minute {
