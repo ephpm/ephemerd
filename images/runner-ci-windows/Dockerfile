@@ -24,7 +24,11 @@ RUN Invoke-WebRequest -Uri "https://go.dev/dl/go${env:GO_VERSION}.windows-amd64.
     Expand-Archive go.zip -DestinationPath C:\; `
     Remove-Item go.zip
 
-ENV PATH="C:\go\bin;C:\Users\ContainerUser\go\bin;${PATH}"
+# Set PATH explicitly. ${PATH} substitution in Windows Dockerfiles is
+# unreliable across SHELL changes; the GitHub Actions runner spawns
+# powershell.exe by bare name, so we have to pin the standard System32
+# dirs (Wbem, WindowsPowerShell\v1.0) ourselves.
+ENV PATH="C:\go\bin;C:\Users\ContainerUser\go\bin;C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0;C:\Windows\System32\OpenSSH"
 
 RUN go install github.com/magefile/mage@latest
 
