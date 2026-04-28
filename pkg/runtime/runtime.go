@@ -893,7 +893,10 @@ func (r *Runtime) Destroy(ctx context.Context, env *RunnerEnv) error {
 	// DEBUG: preserve runner.log for diagnostics — remove this block when done.
 	if env.RunnerDir != "" {
 		logPath := filepath.Join(env.RunnerDir, "runner.log")
-		dirListing, _ := os.ReadDir(env.RunnerDir)
+		dirListing, dirErr := os.ReadDir(env.RunnerDir)
+		if dirErr != nil {
+			r.cfg.Log.Warn("DEBUG failed to list runner dir", "id", env.ID, "dir", env.RunnerDir, "error", dirErr)
+		}
 		names := []string{}
 		for _, d := range dirListing {
 			names = append(names, d.Name())
@@ -904,7 +907,9 @@ func (r *Runtime) Destroy(ctx context.Context, env *RunnerEnv) error {
 			if saveDir == "" {
 				saveDir = `C:\tmp`
 			}
-			_ = os.MkdirAll(saveDir, 0o755)
+			if err := os.MkdirAll(saveDir, 0o755); err != nil {
+				r.cfg.Log.Warn("DEBUG failed to create log save dir", "id", env.ID, "dir", saveDir, "error", err)
+			}
 			savePath := filepath.Join(saveDir, env.ID+"-runner.log")
 			if werr := os.WriteFile(savePath, logData, 0o644); werr != nil {
 				r.cfg.Log.Warn("DEBUG failed to save runner.log", "id", env.ID, "error", werr)
@@ -1119,7 +1124,7 @@ func copyDirNative(src, dst string) error {
 	})
 }
 
-func copyFileNative(src, dst string, mode os.FileMode) error {
+func copyFileNative(src, dst string, mode os.FileMode) (retErr error) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
@@ -1129,8 +1134,7 @@ func copyFileNative(src, dst string, mode os.FileMode) error {
 	}
 	defer func() {
 		if cerr := in.Close(); cerr != nil {
-			// Read-side close errors are typically harmless but worth surfacing.
-			_ = cerr
+			retErr = errors.Join(retErr, fmt.Errorf("close %s: %w", src, cerr))
 		}
 	}()
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
