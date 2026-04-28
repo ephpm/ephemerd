@@ -695,7 +695,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 	log.Info("provisioning macOS VM runner for job")
 
 	// Extract OCI artifacts if an image is specified
-	image := event.Provider.FetchJobImage(ctx, &event)
+	image := s.resolveImage(ctx, &event, "darwin")
 	var artifactsDir string
 	if image != "" && s.cfg.Artifacts != nil {
 		artifactsDir = artifacts.ArtifactsDir(s.cfg.DataDir, fmt.Sprintf("%d", jobID))
