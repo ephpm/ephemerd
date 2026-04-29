@@ -46,6 +46,9 @@ func TestNew_Defaults(t *testing.T) {
 	if s.seen == nil {
 		t.Error("seen map is nil")
 	}
+	if s.pending == nil {
+		t.Error("pending map is nil")
+	}
 }
 
 func TestNew_CustomValues(t *testing.T) {

@@ -100,7 +100,8 @@ func keyFor(event providers.JobEvent) jobKey {
 type Scheduler struct {
 	cfg       Config
 	running   map[jobKey]*runningJob
-	seen      map[jobKey]time.Time // recently handled jobs for dedup
+	seen      map[jobKey]time.Time    // recently handled jobs for dedup
+	pending   map[jobKey]struct{}     // jobs dispatched to a handler but not yet holding sem
 	mu        sync.Mutex
 	sem       chan struct{} // local/native job concurrency limiter
 	linuxSem  chan struct{} // Linux dispatch (VM) concurrency limiter
@@ -192,6 +193,7 @@ func New(cfg Config) *Scheduler {
 		cfg:       cfg,
 		running:   make(map[jobKey]*runningJob),
 		seen:      make(map[jobKey]time.Time),
+		pending:   make(map[jobKey]struct{}),
 		sem:       make(chan struct{}, cfg.MaxConcurrent),
 		linuxSem:  make(chan struct{}, cfg.MaxConcurrent),
 		macSem:    make(chan struct{}, macVMs),
@@ -515,11 +517,17 @@ func (s *Scheduler) handleQueued(ctx context.Context, event providers.JobEvent) 
 		log.Debug("ignoring duplicate queued event, job already running")
 		return
 	}
+	if _, exists := s.pending[key]; exists {
+		s.mu.Unlock()
+		log.Debug("ignoring duplicate queued event, job pending semaphore")
+		return
+	}
 	if t, seen := s.seen[key]; seen && time.Since(t) < seenTTL {
 		s.mu.Unlock()
 		log.Debug("ignoring duplicate queued event, job recently handled")
 		return
 	}
+	s.pending[key] = struct{}{}
 	s.seen[key] = time.Now()
 
 	if s.draining {
@@ -544,10 +552,11 @@ func (s *Scheduler) handleQueued(ctx context.Context, event providers.JobEvent) 
 			s.handleMacOSJob(ctx, event)
 			return
 		}
-		// macOS VM disk is still being provisioned — remove from seen so
-		// the next poll retries this job once the install finishes.
+		// macOS VM disk is still being provisioned — remove from seen/pending
+		// so the next poll retries this job once the install finishes.
 		s.mu.Lock()
 		delete(s.seen, key)
+		delete(s.pending, key)
 		s.mu.Unlock()
 		log.Info("macOS VM disk not ready yet, deferring job")
 		return
@@ -568,6 +577,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 	unsee := func() {
 		s.mu.Lock()
 		delete(s.seen, key)
+		delete(s.pending, key)
 		s.mu.Unlock()
 	}
 
@@ -578,6 +588,9 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		unsee()
 		return
 	}
+	s.mu.Lock()
+	delete(s.pending, key)
+	s.mu.Unlock()
 
 	log.Info("provisioning Linux runner via dispatch")
 
@@ -652,7 +665,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 
 		// Always clean up
 		s.mu.Lock()
-		_, exists := s.running[key]
+		rj, exists := s.running[key]
 		if exists {
 			delete(s.running, key)
 		}
@@ -660,6 +673,16 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 
 		if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), claim.RunnerName); err != nil {
 			log.Warn("dispatch destroy failed", "error", err)
+		}
+
+		// Deregister the runner from the provider so it doesn't linger as
+		// offline on GitHub. On normal completion the provider may have
+		// already removed it (JIT runners auto-remove), but the call is
+		// idempotent — a 404 just means it's already gone.
+		if exists && rj.provider != nil && rj.claim != nil {
+			if err := rj.provider.ReleaseJob(context.Background(), rj.claim); err != nil {
+				log.Debug("deregister runner after dispatch cleanup", "error", err)
+			}
 		}
 	}()
 }
@@ -675,6 +698,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 	unsee := func() {
 		s.mu.Lock()
 		delete(s.seen, key)
+		delete(s.pending, key)
 		s.mu.Unlock()
 	}
 
@@ -685,6 +709,9 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		unsee()
 		return
 	}
+	s.mu.Lock()
+	delete(s.pending, key)
+	s.mu.Unlock()
 
 	log.Info("provisioning macOS VM runner for job")
 
@@ -831,6 +858,11 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 			if rj.artifactsDir != "" {
 				artifacts.Cleanup(rj.artifactsDir, s.cfg.Log)
 			}
+			if rj.provider != nil && rj.claim != nil {
+				if err := rj.provider.ReleaseJob(context.Background(), rj.claim); err != nil {
+					log.Debug("deregister runner after macOS VM cleanup", "error", err)
+				}
+			}
 		} else {
 			s.mu.Unlock()
 		}
@@ -843,10 +875,11 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 	key := keyFor(event)
 	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo)
 
-	// On provisioning failure, remove from seen so the next poll retries
+	// On provisioning failure, remove from seen/pending so the next poll retries
 	unsee := func() {
 		s.mu.Lock()
 		delete(s.seen, key)
+		delete(s.pending, key)
 		s.mu.Unlock()
 	}
 
@@ -857,6 +890,9 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 		unsee()
 		return
 	}
+	s.mu.Lock()
+	delete(s.pending, key)
+	s.mu.Unlock()
 
 	log.Info("provisioning runner for job")
 
@@ -997,9 +1033,16 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 		if exists {
 			delete(s.running, key)
 			s.mu.Unlock()
-			_ = s.cfg.Runtime.Destroy(context.Background(), env)
+			if err := s.cfg.Runtime.Destroy(context.Background(), env); err != nil {
+				log.Warn("failed to destroy runner environment", "error", err)
+			}
 			if rj.artifactsDir != "" {
 				artifacts.Cleanup(rj.artifactsDir, s.cfg.Log)
+			}
+			if rj.provider != nil && rj.claim != nil {
+				if err := rj.provider.ReleaseJob(context.Background(), rj.claim); err != nil {
+					log.Debug("deregister runner after local cleanup", "error", err)
+				}
 			}
 		} else {
 			s.mu.Unlock()
@@ -1046,7 +1089,9 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event providers.JobEven
 			log.Warn("failed to destroy dispatched runner", "error", err)
 		}
 	} else if job.env != nil {
-		_ = s.cfg.Runtime.Destroy(context.Background(), job.env)
+		if err := s.cfg.Runtime.Destroy(context.Background(), job.env); err != nil {
+			log.Warn("failed to destroy runner environment", "error", err)
+		}
 	}
 	if job.artifactsDir != "" {
 		artifacts.Cleanup(job.artifactsDir, s.cfg.Log)
@@ -1114,7 +1159,9 @@ func (s *Scheduler) destroyAll() {
 				s.cfg.Log.Warn("failed to destroy dispatched runner", "job_id", key.JobID, "error", err)
 			}
 		} else if job.env != nil {
-			_ = s.cfg.Runtime.Destroy(context.Background(), job.env)
+			if err := s.cfg.Runtime.Destroy(context.Background(), job.env); err != nil {
+				s.cfg.Log.Warn("failed to destroy runner on shutdown", "job_id", key.JobID, "error", err)
+			}
 		}
 		if job.artifactsDir != "" {
 			artifacts.Cleanup(job.artifactsDir, s.cfg.Log)
