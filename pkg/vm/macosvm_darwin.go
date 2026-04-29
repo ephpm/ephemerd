@@ -483,10 +483,10 @@ func (m *darwinMacOSVM) monitorRunner(ctx context.Context, ip string) {
 		}
 
 		out, err := session.CombinedOutput("pgrep -f Runner.Listener || echo EXITED")
-		if closeErr := session.Close(); closeErr != nil {
+		if closeErr := session.Close(); closeErr != nil && closeErr.Error() != "EOF" {
 			m.cfg.Log.Debug("closing monitor session", "error", closeErr)
 		}
-		if closeErr := client.Close(); closeErr != nil {
+		if closeErr := client.Close(); closeErr != nil && closeErr.Error() != "EOF" {
 			m.cfg.Log.Debug("closing monitor client", "error", closeErr)
 		}
 

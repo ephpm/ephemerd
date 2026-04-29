@@ -294,7 +294,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		dispatchCleanup := scheduler.StartDispatchServer(dispatchPort, rt, log)
 		defer dispatchCleanup()
 
-		log.Info("worker mode ready", "containerd_port", containerdTCPPort, "dispatch_port", dispatchPort)
+		log.Info("worker mode ready", "containerd_port", containerdTCPPort, "dispatch_port", dispatchPort, "dind", cfg.Dind.Enabled)
 		<-ctx.Done()
 		return nil
 	}
@@ -477,6 +477,9 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	linuxDispatcher, _ := waitDispatch()
 	if linuxDispatcher != nil {
 		log.Info("Linux job dispatch enabled")
+	}
+	if cfg.Dind.Enabled {
+		log.Info("DinD enabled — containers will have /var/run/docker.sock")
 	}
 
 	// Set up webhook tunnel if configured

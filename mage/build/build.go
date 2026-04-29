@@ -13,6 +13,40 @@ import (
 	"github.com/magefile/mage/sh"
 )
 
+// Install builds ephemerd and installs it to ~/bin, re-signing on macOS.
+func Install() error {
+	mg.Deps(Build)
+
+	src := "ephemerd"
+	if runtime.GOOS == "windows" {
+		src = "ephemerd.exe"
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("finding home directory: %w", err)
+	}
+	destDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return fmt.Errorf("creating %s: %w", destDir, err)
+	}
+	dest := filepath.Join(destDir, src)
+
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", src, err)
+	}
+	if err := os.WriteFile(dest, data, 0o755); err != nil {
+		return fmt.Errorf("writing %s: %w", dest, err)
+	}
+	fmt.Printf("  Installed %s\n", dest)
+
+	if runtime.GOOS == "darwin" {
+		return codesign(dest)
+	}
+	return nil
+}
+
 // Build compiles ephemerd for the current OS/arch.
 // On Windows this requires the two-stage build (Linux binary + rootfs embed).
 func Build() error {
@@ -24,7 +58,13 @@ func Build() error {
 	if env := os.Getenv("OUTPUT"); env != "" {
 		output = env
 	}
-	return sh.RunV("go", "build", "-tags", "containers_image_openpgp", "-ldflags", ldflags(), "-o", output, "./cmd/ephemerd/")
+	if err := sh.RunV("go", "build", "-tags", "containers_image_openpgp", "-ldflags", ldflags(), "-o", output, "./cmd/ephemerd/"); err != nil {
+		return err
+	}
+	if runtime.GOOS == "darwin" {
+		return codesign(output)
+	}
+	return nil
 }
 
 // Windows performs the two-stage Windows build:
@@ -109,17 +149,7 @@ func Macos() error {
 		return err
 	}
 
-	// Codesign with virtualization entitlement — required by Virtualization.framework.
-	// Ad-hoc signing (-s -) is fine for local development; set CODESIGN_IDENTITY
-	// for a proper Developer ID signature.
-	identity := "-"
-	if env := os.Getenv("CODESIGN_IDENTITY"); env != "" {
-		identity = env
-	}
-	entitlements := filepath.Join("mage", "build", "ephemerd.entitlements")
-	fmt.Printf("  Codesigning %s with entitlements (%s)...\n", output, identity)
-	return sh.RunV("codesign", "--force", "--sign", identity,
-		"--entitlements", entitlements, output)
+	return codesign(output)
 }
 
 // Linuxembedarm64 cross-compiles a static Linux ephemerd binary for arm64 embedding.
@@ -241,6 +271,19 @@ func crossBuildRunner(name, goos, goarch string) error {
 		map[string]string{"CGO_ENABLED": "0", "GOOS": goos, "GOARCH": goarch},
 		"go", "build", "-ldflags", runnerLdflags(), "-o", output, fmt.Sprintf("./cmd/%s/", name),
 	)
+}
+
+// codesign ad-hoc signs the binary with the virtualization entitlement.
+// Set CODESIGN_IDENTITY for a proper Developer ID signature.
+func codesign(output string) error {
+	identity := "-"
+	if env := os.Getenv("CODESIGN_IDENTITY"); env != "" {
+		identity = env
+	}
+	entitlements := filepath.Join("mage", "build", "ephemerd.entitlements")
+	fmt.Printf("  Codesigning %s with entitlements (%s)...\n", output, identity)
+	return sh.RunV("codesign", "--force", "--sign", identity,
+		"--entitlements", entitlements, output)
 }
 
 func runnerLdflags() string {
