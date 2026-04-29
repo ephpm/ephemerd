@@ -148,10 +148,14 @@ func TestMultiProvider_HandleQueuedRoutesToCorrectProvider(t *testing.T) {
 	key := keyFor(event)
 	s.mu.Lock()
 	_, seen := s.seen[key]
+	_, pending := s.pending[key]
 	s.mu.Unlock()
 
 	if !seen {
 		t.Error("event should be recorded in seen map with forgejo composite key")
+	}
+	if !pending {
+		t.Error("event should be recorded in pending map with forgejo composite key")
 	}
 
 	if key.Provider != "forgejo" {
