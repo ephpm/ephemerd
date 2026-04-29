@@ -231,10 +231,10 @@ func TestPushHandlerEndToEnd(t *testing.T) {
 func stageSyntheticImage(ctx context.Context, client containerdClient, name string) (ocispec.Descriptor, error) {
 	cs := client.ContentStore()
 
-	// Empty layer (gzipped empty tar would be ideal; for the push test the
-	// content doesn't need to be a real layer — the registry mock accepts
-	// anything).
-	layerBytes := []byte{}
+	// Non-empty synthetic layer — containerd's content store does not persist
+	// zero-length blobs, so the push handler would fail to resolve the digest.
+	// The registry mock accepts anything; it doesn't need to be a real tar.
+	layerBytes := []byte("synthetic-layer-for-push-e2e")
 	layerDigest := digest.FromBytes(layerBytes)
 	layerDesc := ocispec.Descriptor{
 		MediaType: ocispec.MediaTypeImageLayerGzip,
