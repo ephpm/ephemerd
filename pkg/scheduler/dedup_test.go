@@ -45,6 +45,47 @@ func TestHandleQueued_SkipsAlreadyRunning(t *testing.T) {
 	}
 }
 
+// --- handleQueued dedup: pending (waiting for semaphore) ---
+
+func TestHandleQueued_SkipsPendingJob(t *testing.T) {
+	s := New(Config{Log: quietLogger()})
+	ctx := context.Background()
+
+	s.pending[jobKey{JobID: 150}] = struct{}{}
+
+	event := makeEvent(150, []string{"self-hosted"})
+	s.handleQueued(ctx, event)
+
+	s.mu.Lock()
+	_, isRunning := s.running[jobKey{JobID: 150}]
+	s.mu.Unlock()
+	if isRunning {
+		t.Error("pending job should not be started again")
+	}
+}
+
+// --- handleQueued dedup: pending blocks even after seen expires ---
+
+func TestHandleQueued_PendingBlocksAfterSeenExpires(t *testing.T) {
+	s := New(Config{Log: quietLogger()})
+	ctx := context.Background()
+
+	key := jobKey{JobID: 160}
+	s.pending[key] = struct{}{}
+	s.seen[key] = time.Now().Add(-seenTTL - time.Minute) // expired
+
+	event := makeEvent(160, []string{"self-hosted"})
+	s.handleQueued(ctx, event)
+
+	// pending check fires before seen check, so the job is blocked
+	s.mu.Lock()
+	_, isRunning := s.running[key]
+	s.mu.Unlock()
+	if isRunning {
+		t.Error("pending should block same job even after seen TTL expires")
+	}
+}
+
 // --- handleQueued dedup: recently seen ---
 
 func TestHandleQueued_SkipsRecentlySeen(t *testing.T) {
@@ -81,6 +122,31 @@ func TestHandleQueued_AllowsExpiredSeen(t *testing.T) {
 
 	if time.Since(seenTime) < seenTTL {
 		t.Error("test setup: seen entry should be expired")
+	}
+}
+
+// --- handleQueued: adds to pending before dispatch ---
+
+func TestHandleQueued_AddsToPending(t *testing.T) {
+	s := New(Config{Log: quietLogger()})
+	ctx := context.Background()
+
+	// draining stops execution after dedup but after pending/seen are stamped
+	s.draining = true
+
+	event := makeEvent(350, []string{"self-hosted"})
+	s.handleQueued(ctx, event)
+
+	s.mu.Lock()
+	_, isPending := s.pending[jobKey{JobID: 350}]
+	_, isSeen := s.seen[jobKey{JobID: 350}]
+	s.mu.Unlock()
+
+	if !isPending {
+		t.Error("job should be in pending after dedup check passes")
+	}
+	if !isSeen {
+		t.Error("job should be in seen after dedup check passes")
 	}
 }
 

@@ -164,6 +164,10 @@ func installBinary(installDir string) error {
 		return fmt.Errorf("closing destination binary: %w", err)
 	}
 
+	if err := postInstallBinary(dest); err != nil {
+		return fmt.Errorf("post-install binary: %w", err)
+	}
+
 	return nil
 }
 

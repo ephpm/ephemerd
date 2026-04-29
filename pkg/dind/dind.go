@@ -139,6 +139,10 @@ func (s *Server) Start() error {
 	if err != nil {
 		return err
 	}
+	// Make socket world-accessible so non-root container processes can connect.
+	if err := os.Chmod(s.sockPath, 0o666); err != nil {
+		s.log.Warn("failed to chmod docker socket", "error", err)
+	}
 	s.listener = ln
 
 	mux := http.NewServeMux()

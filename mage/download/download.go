@@ -1089,6 +1089,16 @@ mount -t cgroup2 none /newroot/sys/fs/cgroup || \
 mount -t virtiofs "$SHARE_TAG" /newroot/mnt/ephemerd || \
     echo "ephemerd-init: WARNING: could not mount virtio-fs share"
 
+# DNS config — the Vz NAT gateway forwards DNS to the host's resolvers.
+# DHCP sometimes returns ::1 (IPv6 loopback) which has nothing listening.
+GW=$(ip route | sed -n 's/^default via \([^ ]*\).*/\1/p')
+if [ -n "$GW" ]; then
+    echo "nameserver $GW" > /newroot/etc/resolv.conf
+    echo "ephemerd-init: DNS set to gateway $GW"
+else
+    echo "ephemerd-init: WARNING: no default gateway, DNS may not work"
+fi
+
 # Pivot to real root and exec ephemerd-linux as PID 1.
 # The binary lives in the host's data dir, accessed via the virtio-fs share.
 EPHEMERD_BIN=/mnt/ephemerd/vm/linux/ephemerd-linux
@@ -1106,7 +1116,8 @@ exec switch_root /newroot "$EPHEMERD_BIN" serve \
     --data-dir /var/lib/ephemerd \
     --containerd-tcp-port "$CONTAINERD_PORT" \
     --containerd-tcp-addr 0.0.0.0 \
-    --containerd-only
+    --containerd-only \
+    --dind
 `
 	// Substitute the resolved module load order. Strip the `kernel/.../`
 	// directory and `.ko.gz` suffix to get the basename insmod expects.

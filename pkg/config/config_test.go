@@ -508,6 +508,70 @@ func TestGitHubConfig_DefaultImageFor_LinuxOverridesLegacy(t *testing.T) {
 	}
 }
 
+func TestForgejoConfig_DefaultImageFor(t *testing.T) {
+	c := &ForgejoConfig{
+		DefaultImage:        "legacy",
+		DefaultImageLinux:   "lin",
+		DefaultImageWindows: "win",
+	}
+	if c.DefaultImageFor("linux") != "lin" {
+		t.Errorf("linux = %q, want lin", c.DefaultImageFor("linux"))
+	}
+	if c.DefaultImageFor("windows") != "win" {
+		t.Errorf("windows = %q, want win", c.DefaultImageFor("windows"))
+	}
+	// Legacy fallback for Linux when per-OS not set.
+	c2 := &ForgejoConfig{DefaultImage: "legacy"}
+	if c2.DefaultImageFor("linux") != "legacy" {
+		t.Errorf("linux fallback = %q, want legacy", c2.DefaultImageFor("linux"))
+	}
+	if c2.DefaultImageFor("windows") != "" {
+		t.Errorf("windows = %q, want empty (legacy is Linux only)", c2.DefaultImageFor("windows"))
+	}
+}
+
+func TestGiteaConfig_DefaultImageFor(t *testing.T) {
+	c := &GiteaConfig{
+		DefaultImage:        "legacy",
+		DefaultImageLinux:   "lin",
+		DefaultImageWindows: "win",
+	}
+	if c.DefaultImageFor("linux") != "lin" {
+		t.Errorf("linux = %q, want lin", c.DefaultImageFor("linux"))
+	}
+	if c.DefaultImageFor("windows") != "win" {
+		t.Errorf("windows = %q, want win", c.DefaultImageFor("windows"))
+	}
+	c2 := &GiteaConfig{DefaultImage: "legacy"}
+	if c2.DefaultImageFor("linux") != "legacy" {
+		t.Errorf("linux fallback = %q, want legacy", c2.DefaultImageFor("linux"))
+	}
+	if c2.DefaultImageFor("windows") != "" {
+		t.Errorf("windows = %q, want empty (legacy is Linux only)", c2.DefaultImageFor("windows"))
+	}
+}
+
+func TestGitLabConfig_DefaultImageFor(t *testing.T) {
+	c := &GitLabConfig{
+		DefaultImage:        "legacy",
+		DefaultImageLinux:   "lin",
+		DefaultImageWindows: "win",
+	}
+	if c.DefaultImageFor("linux") != "lin" {
+		t.Errorf("linux = %q, want lin", c.DefaultImageFor("linux"))
+	}
+	if c.DefaultImageFor("windows") != "win" {
+		t.Errorf("windows = %q, want win", c.DefaultImageFor("windows"))
+	}
+	c2 := &GitLabConfig{DefaultImage: "legacy"}
+	if c2.DefaultImageFor("linux") != "legacy" {
+		t.Errorf("linux fallback = %q, want legacy", c2.DefaultImageFor("linux"))
+	}
+	if c2.DefaultImageFor("windows") != "" {
+		t.Errorf("windows = %q, want empty (legacy is Linux only)", c2.DefaultImageFor("windows"))
+	}
+}
+
 // --- Logger tests ---
 
 func TestLogger_Levels(t *testing.T) {
