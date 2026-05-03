@@ -383,9 +383,23 @@ func tarballImageRef(path string) (string, error) {
 // Serialized with a mutex to avoid concurrent pulls contending on
 // the content store (which produces noisy lock errors).
 func (r *Runtime) PullImage(ctx context.Context, ref string) error {
+	return r.withPullLock(func() error {
+		return r.pullImageLocked(ctx, ref)
+	})
+}
+
+// withPullLock runs fn while holding pullMu. Unlock is deferred so a
+// panic or error inside fn still releases the lock (no poisoning).
+// Extracted for testability — a unit test can swap in a fake fn to
+// verify the mutex serializes callers without needing a real
+// containerd client.
+func (r *Runtime) withPullLock(fn func() error) error {
 	r.pullMu.Lock()
 	defer r.pullMu.Unlock()
+	return fn()
+}
 
+func (r *Runtime) pullImageLocked(ctx context.Context, ref string) error {
 	ctx = namespaces.WithNamespace(ctx, namespace)
 
 	// Check if another goroutine already pulled/imported it while we waited.

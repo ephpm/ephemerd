@@ -67,12 +67,16 @@ func startFakeDispatchServer(t *testing.T, impl *fakeDispatchServer) (string, fu
 	apiv1.RegisterDispatchServer(srv, impl)
 
 	go func() {
-		_ = srv.Serve(lis)
+		if err := srv.Serve(lis); err != nil {
+			t.Logf("fake dispatch serve: %v", err)
+		}
 	}()
 
 	cleanup := func() {
 		srv.Stop()
-		_ = lis.Close()
+		if err := lis.Close(); err != nil {
+			t.Logf("listener close: %v", err)
+		}
 	}
 	return lis.Addr().String(), cleanup
 }
@@ -112,7 +116,11 @@ func TestDispatchClient_Create(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDispatchClient: %v", err)
 	}
-	defer func() { _ = c.Close() }()
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Logf("close: %v", err)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -144,7 +152,11 @@ func TestDispatchClient_Create_PropagatesError(t *testing.T) {
 	defer cleanup()
 
 	c, _ := NewDispatchClient(addr)
-	defer func() { _ = c.Close() }()
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Logf("close: %v", err)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -167,7 +179,11 @@ func TestDispatchClient_Wait_Success(t *testing.T) {
 	defer cleanup()
 
 	c, _ := NewDispatchClient(addr)
-	defer func() { _ = c.Close() }()
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Logf("close: %v", err)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -186,7 +202,11 @@ func TestDispatchClient_Wait_NonZeroExit(t *testing.T) {
 	defer cleanup()
 
 	c, _ := NewDispatchClient(addr)
-	defer func() { _ = c.Close() }()
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Logf("close: %v", err)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -207,7 +227,11 @@ func TestDispatchClient_Wait_Error(t *testing.T) {
 	defer cleanup()
 
 	c, _ := NewDispatchClient(addr)
-	defer func() { _ = c.Close() }()
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Logf("close: %v", err)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -226,7 +250,11 @@ func TestDispatchClient_Destroy(t *testing.T) {
 	defer cleanup()
 
 	c, _ := NewDispatchClient(addr)
-	defer func() { _ = c.Close() }()
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Logf("close: %v", err)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -249,7 +277,11 @@ func TestDispatchClient_Destroy_PropagatesError(t *testing.T) {
 	defer cleanup()
 
 	c, _ := NewDispatchClient(addr)
-	defer func() { _ = c.Close() }()
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Logf("close: %v", err)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -269,6 +301,8 @@ func TestDispatchClient_Close_Idempotent(t *testing.T) {
 		t.Errorf("first close: %v", err)
 	}
 	// Second close — gRPC reports an "already closed" error, not a panic.
-	_ = c.Close()
+	if err := c.Close(); err != nil {
+		t.Logf("second close (expected): %v", err)
+	}
 }
 

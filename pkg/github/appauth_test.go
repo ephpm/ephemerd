@@ -14,6 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -353,5 +355,223 @@ func TestNewAppAuth_InvalidPrivateKey(t *testing.T) {
 	_, err := NewAppAuth(1, 1, path, discardLogger())
 	if err == nil {
 		t.Fatal("expected error for garbage private key")
+	}
+}
+
+// --- concurrent Token() refresh tests ---
+
+// countingTransport counts the total number of HTTP requests it intercepts.
+// Used to assert that concurrent Token() callers collapse into a single
+// upstream refresh.
+type countingTransport struct {
+	count atomic.Int32
+	inner http.RoundTripper
+}
+
+func (c *countingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	c.count.Add(1)
+	return c.inner.RoundTrip(req)
+}
+
+// fakeTokenServer returns a httptest.Server that always responds with a
+// valid token-exchange payload whose token includes a per-call counter.
+// callCount is incremented on every request so tests can assert how many
+// upstream HTTP exchanges actually happened.
+func fakeTokenServer(t *testing.T, callCount *atomic.Int32, expiresIn time.Duration) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := callCount.Add(1)
+		expires := time.Now().Add(expiresIn).UTC().Format(time.RFC3339)
+		w.WriteHeader(201)
+		body := map[string]string{
+			"token":      "ghs_token_" + strconvI(n),
+			"expires_at": expires,
+		}
+		if err := json.NewEncoder(w).Encode(body); err != nil {
+			t.Logf("encoding token response: %v", err)
+		}
+	}))
+}
+
+// strconvI is a minimal int->string helper to avoid importing strconv just
+// for one call.
+func strconvI(n int32) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var buf [12]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
+}
+
+// TestAppAuth_Token_ConcurrentRefreshSerialized fires many goroutines hitting
+// Token() while the cached token is inside the 5-minute expiry window.
+// All callers must observe a valid (non-empty) token and the refresh
+// endpoint must be hit exactly once.
+func TestAppAuth_Token_ConcurrentRefreshSerialized(t *testing.T) {
+	key, _ := generateTestKey(t)
+
+	var serverHits atomic.Int32
+	srv := fakeTokenServer(t, &serverHits, 1*time.Hour)
+	defer srv.Close()
+
+	transport := &countingTransport{inner: http.DefaultTransport}
+	a := &AppAuth{
+		appID:          1,
+		installationID: 42,
+		key:            key,
+		log:            discardLogger(),
+		tokenURL:       srv.URL,
+		httpClient:     &http.Client{Transport: transport},
+		done:           make(chan struct{}),
+	}
+
+	// Pre-populate a stale token (expires in 1 minute — well inside the
+	// 5-minute on-demand refresh threshold).
+	a.mu.Lock()
+	a.token = "stale-token"
+	a.expires = time.Now().Add(1 * time.Minute)
+	a.mu.Unlock()
+
+	const goroutines = 32
+	var (
+		wg      sync.WaitGroup
+		start   = make(chan struct{})
+		results = make(chan string, goroutines)
+	)
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			<-start // synchronize all goroutines
+			results <- a.Token()
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(results)
+
+	// Every goroutine should have observed a refreshed (non-empty) token.
+	for got := range results {
+		if got == "" {
+			t.Error("Token() returned empty string from a goroutine")
+		}
+	}
+
+	// Critically: only ONE upstream refresh should have occurred. The
+	// remaining 31 callers must have hit the post-lock fast-path that
+	// re-checks expiry.
+	hits := serverHits.Load()
+	if hits != 1 {
+		t.Errorf("token server received %d requests, want exactly 1 (refresh should be serialized)", hits)
+	}
+	if got := transport.count.Load(); got != 1 {
+		t.Errorf("transport saw %d round-trips, want 1", got)
+	}
+}
+
+// TestAppAuth_Token_NoRefreshWhenFresh asserts that Token() callers do NOT
+// trigger a refresh if the cached token is well outside the 5-minute window.
+func TestAppAuth_Token_NoRefreshWhenFresh(t *testing.T) {
+	key, _ := generateTestKey(t)
+
+	var serverHits atomic.Int32
+	srv := fakeTokenServer(t, &serverHits, 1*time.Hour)
+	defer srv.Close()
+
+	transport := &countingTransport{inner: http.DefaultTransport}
+	a := &AppAuth{
+		appID:          1,
+		installationID: 42,
+		key:            key,
+		log:            discardLogger(),
+		tokenURL:       srv.URL,
+		httpClient:     &http.Client{Transport: transport},
+		done:           make(chan struct{}),
+	}
+
+	a.mu.Lock()
+	a.token = "fresh-token"
+	a.expires = time.Now().Add(30 * time.Minute) // way outside threshold
+	a.mu.Unlock()
+
+	for i := 0; i < 100; i++ {
+		if got := a.Token(); got != "fresh-token" {
+			t.Fatalf("Token() = %q, want fresh-token", got)
+		}
+	}
+
+	if hits := serverHits.Load(); hits != 0 {
+		t.Errorf("expected zero refreshes for a fresh token, got %d server hits", hits)
+	}
+}
+
+// TestAppAuth_Token_RefreshSwingsToFastPath asserts that once a successful
+// refresh produces a token outside the 5-minute expiry window, subsequent
+// concurrent Token() callers exit on the RLock-only fast path and never
+// touch the token endpoint.
+func TestAppAuth_Token_RefreshSwingsToFastPath(t *testing.T) {
+	key, _ := generateTestKey(t)
+
+	var serverHits atomic.Int32
+	// First refresh produces a long-lived token (1h), well outside the
+	// 5-minute threshold.
+	srv := fakeTokenServer(t, &serverHits, 1*time.Hour)
+	defer srv.Close()
+
+	a := &AppAuth{
+		appID:          1,
+		installationID: 42,
+		key:            key,
+		log:            discardLogger(),
+		tokenURL:       srv.URL,
+		httpClient:     srv.Client(),
+		done:           make(chan struct{}),
+	}
+
+	// Initial stale token forces a refresh.
+	a.mu.Lock()
+	a.token = "stale"
+	a.expires = time.Now().Add(1 * time.Minute)
+	a.mu.Unlock()
+
+	// First call: triggers a refresh.
+	if got := a.Token(); got == "" {
+		t.Fatal("first Token() call returned empty")
+	}
+	if got := serverHits.Load(); got != 1 {
+		t.Fatalf("after first call: hits = %d, want 1", got)
+	}
+
+	// Subsequent concurrent calls: fast path, no refresh.
+	var wg sync.WaitGroup
+	const n = 64
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			if a.Token() == "" {
+				t.Error("Token() returned empty in burst")
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := serverHits.Load(); got != 1 {
+		t.Errorf("burst against fresh token caused %d additional refreshes, want 0", got-1)
 	}
 }

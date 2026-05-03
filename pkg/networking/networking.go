@@ -24,7 +24,16 @@ type Config struct {
 // pickSubnet tries the default subnet first. If it conflicts with an existing
 // interface, picks a random 10.x.0.0/16 subnet that's free.
 func pickSubnet(log *slog.Logger) string {
-	if !subnetInUse(DefaultSubnet) {
+	return pickSubnetFromAddrs(log, hostInterfaceAddrs())
+}
+
+// pickSubnetFromAddrs is the testable core of pickSubnet — given a snapshot
+// of interface addresses, picks a non-conflicting subnet using the same
+// strategy: prefer DefaultSubnet, retry up to 10 random 10.x.0.0/16 ranges,
+// then fall back to 10.199.0.0/16. Extracted so unit tests can feed in
+// fakes without touching the host's real network configuration.
+func pickSubnetFromAddrs(log *slog.Logger, addrs []net.Addr) string {
+	if !subnetInUseAmong(DefaultSubnet, addrs) {
 		return DefaultSubnet
 	}
 	log.Info("default subnet in use, picking alternative", "subnet", DefaultSubnet)
@@ -32,7 +41,7 @@ func pickSubnet(log *slog.Logger) string {
 	for range 10 {
 		second := rand.IntN(256)
 		candidate := fmt.Sprintf("10.%d.0.0/16", second)
-		if !subnetInUse(candidate) {
+		if !subnetInUseAmong(candidate, addrs) {
 			log.Info("selected subnet", "subnet", candidate)
 			return candidate
 		}
@@ -42,31 +51,45 @@ func pickSubnet(log *slog.Logger) string {
 	return "10.199.0.0/16"
 }
 
-// subnetInUse checks if any network interface has an address in the given CIDR.
-func subnetInUse(cidr string) bool {
-	_, ipnet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return false
-	}
-
+// hostInterfaceAddrs gathers all addresses from all host interfaces.
+// Errors are swallowed (returning a partial or empty list) because the
+// caller — pickSubnet — already has a "give up and use 10.199.0.0/16"
+// fallback for the no-information case.
+func hostInterfaceAddrs() []net.Addr {
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		return false
+		return nil
 	}
-
+	var out []net.Addr
 	for _, iface := range ifaces {
 		addrs, err := iface.Addrs()
 		if err != nil {
 			continue
 		}
-		for _, addr := range addrs {
-			ip, _, err := net.ParseCIDR(addr.String())
-			if err != nil {
-				continue
-			}
-			if ipnet.Contains(ip) {
-				return true
-			}
+		out = append(out, addrs...)
+	}
+	return out
+}
+
+// subnetInUse checks if any network interface has an address in the given CIDR.
+func subnetInUse(cidr string) bool {
+	return subnetInUseAmong(cidr, hostInterfaceAddrs())
+}
+
+// subnetInUseAmong reports whether any of the given addresses fall inside cidr.
+// Returns false for malformed CIDRs and for addresses that fail to parse.
+func subnetInUseAmong(cidr string, addrs []net.Addr) bool {
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return false
+	}
+	for _, addr := range addrs {
+		ip, _, err := net.ParseCIDR(addr.String())
+		if err != nil {
+			continue
+		}
+		if ipnet.Contains(ip) {
+			return true
 		}
 	}
 	return false

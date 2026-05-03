@@ -8,6 +8,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	gh "github.com/google/go-github/v72/github"
@@ -268,6 +271,238 @@ func TestRegisterWebhooks_APIError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for 422 response")
 	}
+}
+
+// TestRegisterWebhooks_RollbackOnPartialFailure asserts that when webhook
+// creation fails partway through a multi-repo registration, every webhook
+// already created (in earlier repos) is deleted before the function returns
+// the error. Without rollback, ephemerd would leak hooks toward GitHub's
+// per-org/repo cap on every crashed start-up attempt.
+func TestRegisterWebhooks_RollbackOnPartialFailure(t *testing.T) {
+	var (
+		mu              sync.Mutex
+		createdHookIDs  = map[string]int64{} // repo -> assigned hook id
+		deleted         = map[string]bool{}  // repo:hookID -> true
+		nextHookID      int64                = 100
+		failOnRepo                           = "repo3" // 3rd repo fails
+		gotCreateOrder  []string
+		gotDeletedOrder []string
+	)
+
+	mux := http.NewServeMux()
+	for _, repo := range []string{"repo1", "repo2", "repo3", "repo4"} {
+		repo := repo
+		mux.HandleFunc("/repos/testorg/"+repo+"/hooks", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost {
+				mu.Lock()
+				gotCreateOrder = append(gotCreateOrder, repo)
+				mu.Unlock()
+
+				if repo == failOnRepo {
+					w.WriteHeader(http.StatusUnprocessableEntity)
+					if _, err := w.Write([]byte(`{"message":"Validation Failed"}`)); err != nil {
+						t.Logf("writing: %v", err)
+					}
+					return
+				}
+
+				mu.Lock()
+				nextHookID++
+				id := nextHookID
+				createdHookIDs[repo] = id
+				mu.Unlock()
+				w.WriteHeader(201)
+				if err := json.NewEncoder(w).Encode(map[string]any{"id": id}); err != nil {
+					t.Logf("encoding: %v", err)
+				}
+				return
+			}
+			http.NotFound(w, r)
+		})
+	}
+
+	// Each created hook is deleted via DELETE /repos/<owner>/<repo>/hooks/<id>.
+	// Use a wildcard catch-all and parse the URL to track which were deleted.
+	mux.HandleFunc("/repos/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.NotFound(w, r)
+			return
+		}
+		// /repos/testorg/<repo>/hooks/<id>
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) < 5 || parts[3] != "hooks" {
+			http.NotFound(w, r)
+			return
+		}
+		repo := parts[2]
+		hookID := parts[4]
+		mu.Lock()
+		deleted[repo+":"+hookID] = true
+		gotDeletedOrder = append(gotDeletedOrder, repo)
+		mu.Unlock()
+		w.WriteHeader(204)
+	})
+
+	c, srv := newTestClientWithServer(t, mux)
+	defer srv.Close()
+	c.cfg.Repos = []string{"repo1", "repo2", "repo3", "repo4"}
+
+	hooks, err := c.RegisterWebhooks(context.Background(), "https://tunnel.example.com/webhook", "secret")
+	if err == nil {
+		t.Fatal("expected error from partial-failure registration")
+	}
+	if hooks != nil {
+		t.Errorf("hooks = %v, want nil on rollback error", hooks)
+	}
+
+	// Creation should have stopped at repo3 — repo4 must NOT have been
+	// attempted.
+	mu.Lock()
+	defer mu.Unlock()
+	if len(gotCreateOrder) != 3 {
+		t.Fatalf("create order = %v, want exactly [repo1 repo2 repo3]", gotCreateOrder)
+	}
+	for i, repo := range []string{"repo1", "repo2", "repo3"} {
+		if gotCreateOrder[i] != repo {
+			t.Errorf("create order[%d] = %q, want %q", i, gotCreateOrder[i], repo)
+		}
+	}
+
+	// Both successful hooks (repo1, repo2) must have been deleted.
+	if !deleted["repo1:"+itoa(createdHookIDs["repo1"])] {
+		t.Errorf("repo1 hook was not deleted on rollback")
+	}
+	if !deleted["repo2:"+itoa(createdHookIDs["repo2"])] {
+		t.Errorf("repo2 hook was not deleted on rollback")
+	}
+	// repo3 itself never returned a hook (the create failed) so nothing to delete.
+	if got := len(gotDeletedOrder); got != 2 {
+		t.Errorf("got %d delete calls, want 2 (repo1 + repo2)", got)
+	}
+}
+
+// TestRegisterWebhooks_RollbackContinuesOnDeleteFailure asserts that even
+// if cleaning up an already-created webhook fails (network blip, GitHub 5xx),
+// the loop keeps trying to clean up the rest. We don't want a single failed
+// delete to abort the rollback and leak the remaining hooks.
+func TestRegisterWebhooks_RollbackContinuesOnDeleteFailure(t *testing.T) {
+	var (
+		mu             sync.Mutex
+		deleteAttempts atomic.Int32
+		createdRepos   []string
+		deletedRepos   []string
+	)
+
+	mux := http.NewServeMux()
+	repos := []string{"alpha", "beta", "gamma"}
+	for _, repo := range repos {
+		repo := repo
+		mux.HandleFunc("/repos/testorg/"+repo+"/hooks", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.NotFound(w, r)
+				return
+			}
+			mu.Lock()
+			createdRepos = append(createdRepos, repo)
+			mu.Unlock()
+
+			if repo == "gamma" {
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				if _, err := w.Write([]byte(`{"message":"Validation Failed"}`)); err != nil {
+					t.Logf("writing: %v", err)
+				}
+				return
+			}
+
+			// alpha → hook id 1, beta → hook id 2
+			id := int64(1)
+			if repo == "beta" {
+				id = 2
+			}
+			w.WriteHeader(201)
+			if err := json.NewEncoder(w).Encode(map[string]any{"id": id}); err != nil {
+				t.Logf("encoding: %v", err)
+			}
+		})
+	}
+
+	mux.HandleFunc("/repos/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.NotFound(w, r)
+			return
+		}
+		deleteAttempts.Add(1)
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) < 5 || parts[3] != "hooks" {
+			http.NotFound(w, r)
+			return
+		}
+		repo := parts[2]
+
+		// First delete (alpha) fails — second delete (beta) must still happen.
+		if repo == "alpha" {
+			w.WriteHeader(500)
+			return
+		}
+
+		mu.Lock()
+		deletedRepos = append(deletedRepos, repo)
+		mu.Unlock()
+		w.WriteHeader(204)
+	})
+
+	c, srv := newTestClientWithServer(t, mux)
+	defer srv.Close()
+	c.cfg.Repos = repos
+
+	if _, err := c.RegisterWebhooks(context.Background(), "https://tunnel.example.com/webhook", "secret"); err == nil {
+		t.Fatal("expected error from partial-failure registration")
+	}
+
+	// Both successful creates must have triggered delete attempts (2 attempts).
+	if got := deleteAttempts.Load(); got != 2 {
+		t.Errorf("delete attempts = %d, want 2", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	// beta should be in the deleted list (alpha's delete failed).
+	found := false
+	for _, r := range deletedRepos {
+		if r == "beta" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("beta should have been deleted even after alpha's delete failed; deleted=%v", deletedRepos)
+	}
+	if len(createdRepos) != 3 {
+		t.Errorf("create attempts = %v, want all three repos attempted", createdRepos)
+	}
+}
+
+// itoa is a tiny helper to avoid importing strconv just for one integer
+// formatting call in the rollback test.
+func itoa(n int64) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
 }
 
 // --- DeregisterWebhooks tests ---

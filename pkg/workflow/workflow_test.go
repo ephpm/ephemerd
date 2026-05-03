@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // --- Parse tests ---
@@ -298,6 +300,155 @@ func TestTargetPlatform_String(t *testing.T) {
 				t.Errorf("String() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// --- Container.UnmarshalYAML tests ---
+
+func TestContainer_UnmarshalYAML_StringForm(t *testing.T) {
+	// Bare string ("image:tag") shorthand.
+	data := []byte(`ghcr.io/myorg/runner:v1`)
+	var c Container
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+	if c.Image != "ghcr.io/myorg/runner:v1" {
+		t.Errorf("Image = %q, want %q", c.Image, "ghcr.io/myorg/runner:v1")
+	}
+}
+
+func TestContainer_UnmarshalYAML_StringForm_QuotedTag(t *testing.T) {
+	// Quoted string preserves colon-bearing image refs.
+	data := []byte(`"my/image:1.2.3"`)
+	var c Container
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+	if c.Image != "my/image:1.2.3" {
+		t.Errorf("Image = %q, want %q", c.Image, "my/image:1.2.3")
+	}
+}
+
+func TestContainer_UnmarshalYAML_MappingForm(t *testing.T) {
+	// Full mapping form with image key.
+	data := []byte("image: ghcr.io/myorg/runner:latest\n")
+	var c Container
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+	if c.Image != "ghcr.io/myorg/runner:latest" {
+		t.Errorf("Image = %q, want %q", c.Image, "ghcr.io/myorg/runner:latest")
+	}
+}
+
+func TestContainer_UnmarshalYAML_MappingForm_WithExtraFields(t *testing.T) {
+	// Mapping with unknown fields — should still parse the image.
+	// yaml.v3 ignores unknown fields by default.
+	data := []byte(`
+image: my-image:tag
+options: --cpus 1
+ports:
+  - 8080:80
+`)
+	var c Container
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+	if c.Image != "my-image:tag" {
+		t.Errorf("Image = %q, want %q", c.Image, "my-image:tag")
+	}
+}
+
+func TestContainer_UnmarshalYAML_MappingForm_NoImage(t *testing.T) {
+	// Mapping form with no image key — Image should be zero value.
+	data := []byte("options: --rm\n")
+	var c Container
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+	if c.Image != "" {
+		t.Errorf("Image = %q, want empty", c.Image)
+	}
+}
+
+func TestContainer_UnmarshalYAML_Null(t *testing.T) {
+	// Explicit null — yaml.v3 represents this as a ScalarNode with empty value.
+	data := []byte("~\n")
+	var c Container
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+	// Null ScalarNode produces empty string image (current behavior).
+	if c.Image != "" {
+		t.Errorf("Image = %q, want empty for null", c.Image)
+	}
+}
+
+func TestContainer_UnmarshalYAML_EmptyString(t *testing.T) {
+	// Empty quoted string.
+	data := []byte(`""`)
+	var c Container
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+	if c.Image != "" {
+		t.Errorf("Image = %q, want empty", c.Image)
+	}
+}
+
+func TestContainer_UnmarshalYAML_InvalidType_Sequence(t *testing.T) {
+	// A sequence (list) is neither a scalar nor mapping — should error.
+	data := []byte("[a, b, c]\n")
+	var c Container
+	err := yaml.Unmarshal(data, &c)
+	if err == nil {
+		t.Fatal("expected error for sequence-typed container")
+	}
+}
+
+func TestContainer_UnmarshalYAML_NestedJob(t *testing.T) {
+	// Container nested inside a Job (real workflow shape).
+	data := []byte(`
+runs-on: ubuntu-latest
+container:
+  image: nested/image:v1
+steps:
+  - run: echo hi
+`)
+	var j Job
+	if err := yaml.Unmarshal(data, &j); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+	if j.Container.Image != "nested/image:v1" {
+		t.Errorf("nested Container.Image = %q, want %q", j.Container.Image, "nested/image:v1")
+	}
+}
+
+func TestContainer_UnmarshalYAML_NestedJobShorthand(t *testing.T) {
+	// Container as shorthand string nested in a Job.
+	data := []byte(`
+runs-on: ubuntu-latest
+container: shorthand/image:tag
+`)
+	var j Job
+	if err := yaml.Unmarshal(data, &j); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+	if j.Container.Image != "shorthand/image:tag" {
+		t.Errorf("Container.Image = %q, want %q", j.Container.Image, "shorthand/image:tag")
+	}
+}
+
+func TestContainer_UnmarshalYAML_DoesNotInfiniteLoop(t *testing.T) {
+	// Regression: the implementation uses a `type raw Container` alias to
+	// avoid recursing into its own UnmarshalYAML. Without it, this test
+	// would stack-overflow.
+	data := []byte("image: a\n")
+	for i := 0; i < 1000; i++ {
+		var c Container
+		if err := yaml.Unmarshal(data, &c); err != nil {
+			t.Fatalf("iter %d: %v", i, err)
+		}
 	}
 }
 
