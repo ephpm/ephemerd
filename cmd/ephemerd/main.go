@@ -674,21 +674,6 @@ func pollInterval(cfg *config.Config) time.Duration {
 	}
 }
 
-// ctrctlCmd provides direct access to the embedded containerd for debugging.
-// Similar to rke2's "rke2 crictl" passthrough.
-func ctrctlCmd() *cli.Command {
-	return &cli.Command{
-		Name:            "ctrctl",
-		Usage:           "Access the embedded containerd (passthrough to ctr)",
-		Description:     "Runs ctr commands against ephemerd's embedded containerd instance.\nAll arguments after 'ctrctl' are passed directly to ctr.",
-		SkipFlagParsing: true,
-		Action: func(ctx context.Context, cmd *cli.Command) error {
-			socketPath := containerd.SocketPath(configDir)
-			return containerd.ExecCtr(socketPath, cmd.Args().Slice())
-		},
-	}
-}
-
 // crictlCmd exposes the upstream crictl CLI against ephemerd's embedded
 // containerd CRI socket. The crictl library is linked in-process; no external
 // binary is required. See docs/arch/crictl.md.
