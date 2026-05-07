@@ -1,43 +1,83 @@
-# ephemerd serve
+---
+title: serve
+weight: 1
+---
 
-Start the ephemerd daemon. This is the main command — it starts containerd, connects to GitHub, and begins provisioning runners for queued jobs.
-
-## Usage
+Start the ephemerd daemon. This is the default command -- running `ephemerd` without a subcommand is equivalent to `ephemerd serve`.
 
 ```
-ephemerd serve [--data-dir <path>]
+ephemerd serve [flags]
 ```
-
-## What it does
-
-1. Loads config from `<data-dir>/config.toml`
-2. Starts the embedded containerd server (in-process, no external binary)
-3. Extracts embedded runner, CNI, and shim binaries into the data directory
-4. Sets up container networking (CNI bridge on Linux, HCN on Windows)
-5. Installs firewall rules blocking containers from private networks
-6. Starts the health endpoint on the configured webhook port (default 8080)
-7. Connects to GitHub via polling or webhook tunnel
-8. For each queued job: creates an isolated container, starts the runner, destroys on completion
-9. On SIGTERM: drains running jobs (waits up to `shutdown_timeout`), deregisters webhooks, cleans up
-
-## Environment variables
-
-- `GITHUB_TOKEN` — GitHub personal access token (if not set in config)
 
 ## Flags
 
-- `--data-dir` — data directory for ephemerd state (default: `/var/lib/ephemerd` on Linux, `C:\ProgramData\ephemerd` on Windows)
-- `--config`, `-c` — path to config file (default: `<data-dir>/config.toml`)
-- `--containerd-tcp-port` — also expose containerd on a TCP port (used by WSL host integration)
-- `--containerd-tcp-addr` — bind address for the containerd TCP listener (default: `127.0.0.1`, use `0.0.0.0` when host lives outside the network namespace)
-- `--containerd-only` — only run containerd + dispatch worker (no scheduler, GitHub polling, or runner extraction). Used by the WSL Linux VM.
-- `--dind` — mount a fake Docker socket into each container (overrides `dind.enabled` in config)
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config`, `-c` | `<data-dir>/config.toml` | Path to config file |
+| `--containerd-tcp-port` | (none) | Also expose containerd on a TCP port (used by WSL host integration) |
+| `--containerd-tcp-addr` | `127.0.0.1` | Bind address for the containerd TCP listener (use `0.0.0.0` when host lives outside the network namespace) |
+| `--containerd-only` | `false` | Only run containerd and the dispatch worker (no scheduler, no GitHub polling, no runner extraction) |
+| `--dind` | `false` | Mount a fake Docker socket into each container (overrides config file setting) |
+
+## Startup sequence
+
+When `serve` starts, it performs these steps in order:
+
+1. **Check for existing instance** -- connects to the gRPC control socket to verify no other ephemerd is already running.
+2. **Load configuration** -- reads the TOML config file from `--config` or `<data-dir>/config.toml`.
+3. **Write PID file** -- writes `ephemerd.pid` to the data directory (used by the `drain` command).
+4. **Start container runtime** -- launches the embedded containerd server in-process. On macOS, this boots a Linux VM via Virtualization.framework instead.
+5. **Extract embedded runner** -- unpacks the GitHub Actions runner binary (`.tar.gz` on Linux, `.zip` on Windows).
+6. **Extract CNI plugins** -- unpacks the embedded CNI plugin binaries.
+7. **Initialize networking** -- sets up the container network (CNI bridge on Linux, HCN NAT on Windows).
+8. **Install firewall rules** -- blocks container access to RFC1918 and link-local ranges.
+9. **Create GitHub client** -- authenticates using `GITHUB_TOKEN` or GitHub App credentials from the config.
+10. **Wait for Linux dispatcher** -- if a WSL2 VM is booting in the background (Windows only), waits for the gRPC dispatch client to become ready.
+11. **Configure webhook tunnel** -- sets up localtunnel or ngrok for webhook delivery, or falls back to polling mode.
+12. **Start scheduler** -- begins discovering and processing GitHub Actions jobs.
+13. **Start metrics server** -- if metrics are enabled in the config, starts the Prometheus metrics endpoint.
+
+## Containerd-only mode
+
+When `--containerd-only` is set, the daemon runs a stripped-down mode intended for the WSL2 Linux worker:
+
+- Starts containerd with the TCP listener.
+- Extracts the runner and CNI plugins.
+- Cleans stale CNI bridges from previous WSL boots.
+- Sets up networking and firewall rules.
+- Starts the gRPC dispatch server on `containerd-tcp-port + 1`.
+- Does **not** start the scheduler, poll GitHub, or require GitHub credentials.
+
+The Windows host dispatches Linux jobs to this worker via gRPC.
+
+## Signal handling
+
+The daemon listens for `SIGINT` and `SIGTERM`. On receipt, it stops accepting new jobs and waits for running jobs to finish before exiting. The PID file is cleaned up on exit.
+
+## Environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `GITHUB_TOKEN` | GitHub personal access token (alternative to setting `github.token` in config) |
+| `EPHEMERD_DATA_DIR` | Override the default data directory |
 
 ## Ports
 
-- Webhook/health port (default 8080) — serves `/healthz` and `/webhook`
-- Metrics port (default 9090, disabled unless `[metrics] enabled = true`) — serves `/metrics`
+- **Webhook / health endpoint**: configured via `webhook.port` in config (default varies by setup)
+- **Metrics**: configured via `metrics.port` in config, only active when `metrics.enabled = true`
 
-## Signals
+## Examples
 
-- `SIGTERM` / `SIGINT` — graceful shutdown (drain running jobs, then exit)
+```bash
+# Start with default config
+sudo ephemerd serve
+
+# Start with a custom config file
+sudo ephemerd serve --config /etc/ephemerd/config.toml
+
+# Start in WSL worker mode (used by Windows host integration)
+ephemerd serve --containerd-tcp-port 10000 --containerd-tcp-addr 0.0.0.0 --containerd-only
+
+# Start with Docker-in-Docker support
+sudo ephemerd serve --dind
+```

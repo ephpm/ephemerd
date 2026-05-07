@@ -16,7 +16,7 @@ var version = "dev"
 
 func main() {
 	app := &cli.Command{
-		Name:    "forge-runner",
+		Name:    "ephemerd-runner-forgejo",
 		Usage:   "Ephemeral Forgejo Actions runner — direct process execution, no Docker",
 		Version: version,
 		Flags: []cli.Flag{

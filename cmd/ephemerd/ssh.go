@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build darwin
 
 package main
 
@@ -19,6 +19,14 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
 )
+
+func jobSubcommands() []*cli.Command {
+	return []*cli.Command{
+		jobKillCmd(),
+		jobLogsCmd(),
+		jobSSHCmd(),
+	}
+}
 
 func jobSSHCmd() *cli.Command {
 	return &cli.Command{

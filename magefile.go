@@ -115,6 +115,26 @@ func E2erun() error {
 	return sh.RunV("go", "test", "-tags", "e2e,privileged", "-v", "-timeout", "10m", "-run", "TestE2E_RunCLI", "./test/e2e/")
 }
 
+// Docs builds the docs site (downloads Hugo first if needed).
+func Docs() error {
+	mg.Deps(download.Hugo)
+	hugo := filepath.Join("bin", "hugo")
+	if runtime.GOOS == "windows" {
+		hugo += ".exe"
+	}
+	return sh.RunV(hugo, "--source", "website")
+}
+
+// DocsServe starts the Hugo dev server for local docs preview.
+func DocsServe() error {
+	mg.Deps(download.Hugo)
+	hugo := filepath.Join("bin", "hugo")
+	if runtime.GOOS == "windows" {
+		hugo += ".exe"
+	}
+	return sh.RunV(hugo, "server", "--source", "website")
+}
+
 // CI runs download, lint, test, and build.
 func CI() {
 	mg.SerialDeps(Lint, Test, build.Build)

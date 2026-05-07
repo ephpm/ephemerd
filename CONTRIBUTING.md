@@ -48,7 +48,7 @@ pkg/                library packages
   runtime/          container lifecycle (create/wait/destroy)
   scheduler/        job discovery, routing, dispatch
   tunnel/           webhook tunnel providers (localtunnel, ngrok)
-  providers/        multi-forge provider interface (GitHub, Forgejo, Gitea, GitLab, Woodpecker)
+  providers/        provider interface (GitHub, Forgejo, Gitea, GitLab, Woodpecker)
   metrics/          Prometheus metrics endpoint
   artifacts/        OCI artifact extraction for macOS VM jobs
   workflow/         local workflow parser and runner (ephemerd run)
@@ -93,6 +93,61 @@ Platform code uses build tags:
 - `*_darwin.go` — macOS-only (Virtualization.framework)
 - `*_stub.go` / `*_other.go` — fallback stubs for other platforms
 
+## Docs site
+
+The docs site lives in `website/` and uses [Hugo](https://gohugo.io/) with the [Hextra](https://imfing.github.io/hextra/) theme.
+
+```bash
+# Install Hugo extended (v0.156+)
+# https://gohugo.io/installation/
+
+# Preview locally
+cd website
+hugo server
+
+# Build static site (output in website/public/)
+hugo
+```
+
+Content is organized under `website/content/`:
+
+- `docs/` — user-facing guides (getting started, configuration, providers, etc.)
+- `architecture/` — design docs (adapted from `docs/arch/`)
+- `cli/` — CLI command reference (adapted from `docs/cli/`)
+
+When adding new architecture or CLI docs, add the markdown to both `docs/` (the canonical source) and `website/content/` (the Hugo site). The Hugo pages just need front matter added:
+
+```yaml
+---
+title: "Your Page Title"
+weight: 5  # optional, controls sidebar order
+---
+```
+
+## Docs site
+
+The docs site lives in `website/` and uses [Hugo](https://gohugo.io/) with the [Hextra](https://imfing.github.io/hextra/) theme.
+
+```bash
+mage docsServe    # download Hugo + start dev server at http://localhost:1313
+mage docs         # build static site (output in website/public/)
+```
+
+Content is organized under `website/content/`:
+
+- `docs/` — user-facing guides (getting started, configuration, providers, etc.)
+- `architecture/` — design docs (adapted from `docs/arch/`)
+- `cli/` — CLI command reference (adapted from `docs/cli/`)
+
+When adding new architecture or CLI docs, add the markdown to both `docs/` (the canonical source) and `website/content/` (the Hugo site). The Hugo pages just need front matter added:
+
+```yaml
+---
+title: "Your Page Title"
+weight: 5  # optional, controls sidebar order
+---
+```
+
 ## Architecture docs
 
 Design decisions and future plans are documented in `docs/arch/`:
@@ -104,6 +159,6 @@ Design decisions and future plans are documented in `docs/arch/`:
 - `gitlab.md` — GitLab integration design (superseded by providers.md)
 - `webhooks.md` — webhook tunnel architecture
 - `rootfs.md` — pre-baked Alpine rootfs for Linux VMs
-- `providers.md` — multi-forge provider interface
+- `providers.md` — provider interface
 - `forgejo-gitea.md` — Forgejo/Gitea Actions integration
-- `forge-runner.md` — forge-runner design spec (future)
+- `forge-runner.md` — ephemerd-runner-forgejo / ephemerd-runner-gitea architecture

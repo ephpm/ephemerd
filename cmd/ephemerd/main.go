@@ -79,9 +79,7 @@ func main() {
 			statusCmd(),
 			drainCmd(),
 			jobsCmd(),
-			imagesCmd(),
 			configCheckCmd(),
-			ctrctlCmd(),
 			crictlCmd(),
 			doctorCmd(),
 			installCmd(),
@@ -673,21 +671,6 @@ func pollInterval(cfg *config.Config) time.Duration {
 		return cfg.GitHub.ParsedPollInterval()
 	default:
 		return 30 * time.Second
-	}
-}
-
-// ctrctlCmd provides direct access to the embedded containerd for debugging.
-// Similar to rke2's "rke2 crictl" passthrough.
-func ctrctlCmd() *cli.Command {
-	return &cli.Command{
-		Name:            "ctrctl",
-		Usage:           "Access the embedded containerd (passthrough to ctr)",
-		Description:     "Runs ctr commands against ephemerd's embedded containerd instance.\nAll arguments after 'ctrctl' are passed directly to ctr.",
-		SkipFlagParsing: true,
-		Action: func(ctx context.Context, cmd *cli.Command) error {
-			socketPath := containerd.SocketPath(configDir)
-			return containerd.ExecCtr(socketPath, cmd.Args().Slice())
-		},
 	}
 }
 
