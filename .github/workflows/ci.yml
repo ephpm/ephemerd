@@ -84,12 +84,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Install mage
-        run: go install github.com/magefile/mage@latest
+      - name: Restore cached build deps
+        run: |
+          C:\ephemerd-ci\entrypoint-cache.ps1
+          if (Test-Path "C:\go\bin") { Add-Content -Path $env:GITHUB_PATH -Value "C:\go\bin" }
+        continue-on-error: true
 
       - name: Build Windows binary
         run: mage build:build
