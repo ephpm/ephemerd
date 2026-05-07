@@ -28,9 +28,11 @@ RUN Invoke-WebRequest -Uri "https://go.dev/dl/go${env:GO_VERSION}.windows-amd64.
 # unreliable across SHELL changes; the GitHub Actions runner spawns
 # powershell.exe by bare name, so we have to pin the standard System32
 # dirs (Wbem, WindowsPowerShell\v1.0) ourselves.
-ENV PATH="C:\go\bin;C:\Users\ContainerUser\go\bin;C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0;C:\Windows\System32\OpenSSH"
+ENV PATH="C:\go\bin;C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0;C:\Windows\System32\OpenSSH"
 
-RUN go install github.com/magefile/mage@latest
+# GOBIN=C:\go\bin so mage lands on PATH regardless of which user the runner
+# spawns the job as (avoids the per-profile C:\Users\<X>\go\bin trap).
+RUN $env:GOBIN='C:\go\bin'; go install github.com/magefile/mage@latest
 
 RUN New-Item -ItemType Directory -Force -Path C:\ephemerd-ci\pkg\runner\embed | Out-Null; `
     Invoke-WebRequest -Uri "https://github.com/actions/runner/releases/download/v${env:RUNNER_VERSION}/actions-runner-win-x64-${env:RUNNER_VERSION}.zip" `

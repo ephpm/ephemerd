@@ -317,10 +317,10 @@ func TestNotImplemented(t *testing.T) {
 	s := newTestServer(t)
 	client := dialServer(s)
 
-	// networks endpoint is not implemented
-	resp, err := client.Get("http://docker/networks")
+	// volumes endpoint is not implemented
+	resp, err := client.Get("http://docker/volumes")
 	if err != nil {
-		t.Fatalf("GET /networks: %v", err)
+		t.Fatalf("GET /volumes: %v", err)
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
@@ -659,6 +659,63 @@ func TestIndexOf(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("indexOf(%q, %q) = %d, want %d", tt.s, tt.b, got, tt.want)
 		}
+	}
+}
+
+func TestContainerLogsFollow(t *testing.T) {
+	s := newTestServer(t)
+
+	logDir := filepath.Join(t.TempDir(), "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(logDir, "output.log")
+	if err := os.WriteFile(logPath, []byte("line1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s.mu.Lock()
+	s.containers["follow-test"] = &containerEntry{
+		ID:      "follow-test",
+		Name:    "follow-test",
+		LogPath: logPath,
+		Status:  "running",
+	}
+	s.mu.Unlock()
+
+	client := dialServer(s)
+
+	// Non-follow: returns current content immediately.
+	resp, err := client.Get("http://docker/containers/follow-test/logs?stdout=true")
+	if err != nil {
+		t.Fatalf("GET logs: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if err := resp.Body.Close(); err != nil {
+		t.Logf("closing response body: %v", err)
+	}
+	if string(body) != "line1\n" {
+		t.Errorf("non-follow body = %q, want %q", body, "line1\n")
+	}
+
+	// Follow mode: append more data, mark exited, then read all.
+	if err := os.WriteFile(logPath, []byte("line1\nline2\nline3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.containers["follow-test"].Status = "exited"
+	s.mu.Unlock()
+
+	resp, err = client.Get("http://docker/containers/follow-test/logs?follow=true&stdout=true")
+	if err != nil {
+		t.Fatalf("GET logs follow: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	if err := resp.Body.Close(); err != nil {
+		t.Logf("closing response body: %v", err)
+	}
+	if !strings.Contains(string(body), "line1") {
+		t.Errorf("follow body = %q, expected to contain 'line1'", body)
 	}
 }
 

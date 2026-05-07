@@ -91,7 +91,7 @@ func Windows() error {
 		output = env
 	}
 	return sh.RunWith(
-		map[string]string{"GOOS": "windows", "GOARCH": "amd64"},
+		map[string]string{"CGO_ENABLED": "0", "GOOS": "windows", "GOARCH": "amd64"},
 		"go", "build", "-tags", "containers_image_openpgp", "-ldflags", ldflags(), "-o", output, "./cmd/ephemerd/",
 	)
 }
