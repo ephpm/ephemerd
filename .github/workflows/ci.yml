@@ -84,13 +84,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # Go and mage come from the runner-ci-windows image (see images/runner-ci-windows/Dockerfile),
-      # so setup-go and `go install mage` are unnecessary here.
-      # - uses: actions/setup-go@v6
-      #   with:
-      #     go-version: ${{ env.GO_VERSION }}
-      # - name: Install mage
-      #   run: go install github.com/magefile/mage@latest
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install mage
+        run: go install github.com/magefile/mage@latest
 
       - name: Build Windows binary
         run: mage build:build
