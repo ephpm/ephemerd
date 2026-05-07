@@ -83,6 +83,8 @@ type containerEntry struct {
 	PortBindings map[string][]portBinding        // container port → host bindings
 	Labels       map[string]string
 	Tty          bool
+	HostsPath    string   // host-side /etc/hosts file bind-mounted into the container
+	ExtraHosts   []string // user-provided "host:ip" entries (--add-host)
 }
 
 // createRequest is the subset of Docker's container create body we support.
@@ -112,6 +114,7 @@ type hostConfig struct {
 	RestartPolicy *restartPolicy                 `json:"RestartPolicy"`
 	Init          *bool                          `json:"Init"`
 	CgroupnsMode  string                         `json:"CgroupnsMode"`
+	ExtraHosts    []string                       `json:"ExtraHosts"`
 }
 
 type portBinding struct {
@@ -364,6 +367,28 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Provision a per-container /etc/hosts file and bind-mount it. The file
+	// is filled in at start time once CNI assigns the IP. Without this, the
+	// container's hostname doesn't resolve to its own IP — kindest/node's
+	// entrypoint, for example, runs `getent ahostsv4 $(hostname)` to detect
+	// its IPv4 address and then writes empty values to its kubelet config,
+	// causing kubeadm to fail with "unable to select an IP from lo".
+	hostsPath := filepath.Join(filepath.Dir(s.sockPath), "containers", id, "hosts")
+	if err := os.MkdirAll(filepath.Dir(hostsPath), 0o755); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"message": fmt.Sprintf("creating hosts dir: %v", err),
+		})
+		return
+	}
+	// Write a placeholder so the bind mount target exists; rewritten at start.
+	if err := os.WriteFile(hostsPath, []byte(defaultHostsContent()), 0o644); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"message": fmt.Sprintf("writing initial hosts file: %v", err),
+		})
+		return
+	}
+	opts = append(opts, withBindMount(hostsPath, "/etc/hosts", []string{"rbind", "rw"}))
+
 	// For kindest/node containers, wrap the process to pre-register
 	// iptables alternatives that may be missing from the overlay. The
 	// Debian alternatives database lives in a lower image layer and is
@@ -410,6 +435,11 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 		labels = map[string]string{}
 	}
 
+	var extraHosts []string
+	if req.HostConfig != nil {
+		extraHosts = req.HostConfig.ExtraHosts
+	}
+
 	entry := &containerEntry{
 		ID:           id,
 		Name:         name,
@@ -424,6 +454,8 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 		PortBindings: ports,
 		Labels:       labels,
 		Tty:          req.Tty,
+		HostsPath:    hostsPath,
+		ExtraHosts:   extraHosts,
 	}
 
 	s.mu.Lock()
@@ -510,6 +542,16 @@ func (s *Server) handleContainerStart(w http.ResponseWriter, r *http.Request, id
 				br.Containers[id] = result.IP
 			}
 			s.mu.Unlock()
+		}
+	}
+
+	// Now that we have an IP, rewrite the bind-mounted /etc/hosts so the
+	// container's hostname resolves to its own primary IP (matching real
+	// Docker's behavior). Must happen before task.Start so the container's
+	// init process sees the populated file from the very first read.
+	if entry.HostsPath != "" {
+		if err := writeContainerHosts(entry); err != nil {
+			s.log.Warn("writing container /etc/hosts", "id", id, "error", err)
 		}
 	}
 
@@ -1220,5 +1262,57 @@ func withTmpfsMount(dst string, options []string) oci.SpecOpts {
 		})
 		return nil
 	}
+}
+
+// defaultHostsContent returns the boilerplate /etc/hosts entries that Docker
+// writes for every container. Used before CNI assigns an IP — overwritten
+// once the container's primary IP is known.
+func defaultHostsContent() string {
+	return "127.0.0.1\tlocalhost\n" +
+		"::1\tlocalhost ip6-localhost ip6-loopback\n" +
+		"fe00::0\tip6-localnet\n" +
+		"ff00::0\tip6-mcastprefix\n" +
+		"ff02::1\tip6-allnodes\n" +
+		"ff02::2\tip6-allrouters\n"
+}
+
+// writeContainerHosts rewrites the bind-mounted /etc/hosts with the
+// container's primary IP and hostname. Mirrors Docker's standard layout
+// so tools like `getent ahostsv4 $(hostname)` and kubelet/kubeadm IP
+// detection work the same way they do under real Docker.
+func writeContainerHosts(entry *containerEntry) error {
+	if entry.HostsPath == "" {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString(defaultHostsContent())
+
+	// Extra hosts come first so they take precedence in tools that read
+	// the file top-down (matches Docker's --add-host semantics).
+	for _, h := range entry.ExtraHosts {
+		// Format is "host:ip" or "host:host-gateway".
+		host, addr, ok := strings.Cut(h, ":")
+		if !ok || host == "" || addr == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "%s\t%s\n", addr, host)
+	}
+
+	if entry.IP != "" {
+		hostname := entry.Hostname
+		if hostname == "" && len(entry.ID) >= 12 {
+			hostname = entry.ID[:12]
+		}
+		if hostname != "" {
+			fmt.Fprintf(&b, "%s\t%s\n", entry.IP, hostname)
+			// Also write the short ID so `docker exec <short-id>`-style
+			// hostname lookups inside the container resolve.
+			if len(entry.ID) >= 12 && hostname != entry.ID[:12] {
+				fmt.Fprintf(&b, "%s\t%s\n", entry.IP, entry.ID[:12])
+			}
+		}
+	}
+
+	return os.WriteFile(entry.HostsPath, []byte(b.String()), 0o644)
 }
 
