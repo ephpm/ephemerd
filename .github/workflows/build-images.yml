@@ -150,7 +150,7 @@ jobs:
             return
           }
           $v = "27.3.1"
-          Write-Host "docker CLI not found — downloading v$v..."
+          Write-Host "docker CLI not found - downloading v$v..."
           $ProgressPreference = 'SilentlyContinue'
           Invoke-WebRequest -Uri "https://download.docker.com/win/static/stable/x86_64/docker-$v.zip" -OutFile docker.zip
           Expand-Archive docker.zip -DestinationPath C:\temp-docker

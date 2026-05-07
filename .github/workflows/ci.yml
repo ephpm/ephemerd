@@ -91,7 +91,7 @@ jobs:
       - name: Ensure mage is available
         run: |
           if (Get-Command mage -ErrorAction SilentlyContinue) { return }
-          Write-Host "mage not found — installing via go install..."
+          Write-Host "mage not found - installing via go install..."
           $env:GOBIN = 'C:\go\bin'
           go install github.com/magefile/mage@latest
 
