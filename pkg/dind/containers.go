@@ -1125,6 +1125,16 @@ func withKindNodeInit(log *slog.Logger) oci.SpecOpts {
 		}
 
 		script := `set -e
+# Move /var/lib/containerd onto a tmpfs so nested containerd can use
+# overlayfs. The kindest/node rootfs sits on overlayfs (our snapshotter),
+# and Linux rejects overlayfs-on-overlayfs as upperdir. A tmpfs-backed
+# containerd store fixes this while preserving the pre-loaded images.
+if [ -d /var/lib/containerd ]; then
+  mkdir -p /tmp/containerd-vol
+  mount -t tmpfs tmpfs /tmp/containerd-vol
+  cp -a /var/lib/containerd/. /tmp/containerd-vol/
+  mount --bind /tmp/containerd-vol /var/lib/containerd
+fi
 # Pre-register iptables alternatives if the database is missing.
 # The Debian alternatives DB lives in a lower overlay layer and may
 # not be visible; re-create it so select_iptables() in the entrypoint
