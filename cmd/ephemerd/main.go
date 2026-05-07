@@ -195,7 +195,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	// Start container runtime.
 	// On Linux/Windows: embedded containerd runs in-process.
 	// On macOS: boot a Linux VM via Virtualization.framework, containerd runs inside it.
-	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, containerdTCPAddr, cfg.Dind.Enabled)
+	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, containerdTCPAddr, cfg.Dind.Enabled, cfg.VM.Linux.CPUs, cfg.VM.Linux.MemoryMB)
 	if err != nil {
 		return fmt.Errorf("starting container runtime: %w", err)
 	}
