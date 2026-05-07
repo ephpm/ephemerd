@@ -87,7 +87,7 @@ jobs:
       - name: Restore cached build deps
         run: |
           C:\ephemerd-ci\entrypoint-cache.ps1
-          if (Test-Path "C:\go\bin") { Add-Content -Path $env:GITHUB_PATH -Value "C:\go\bin" }
+          foreach ($d in @("C:\go\bin", "C:\Users\ContainerUser\go\bin")) { if (Test-Path $d) { Add-Content -Path $env:GITHUB_PATH -Value $d } }
         continue-on-error: true
 
       - name: Build Windows binary

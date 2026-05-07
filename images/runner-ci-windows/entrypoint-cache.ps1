@@ -20,7 +20,7 @@ if (-not (Test-Path "$Work\pkg\vm\embed\ephemerd-linux")) {
 # through containerd → cmd.exe → runner → PowerShell, so we write to
 # GITHUB_PATH which the runner reads for every step.
 if ($env:GITHUB_PATH) {
-    foreach ($dir in @("C:\go\bin")) {
+    foreach ($dir in @("C:\go\bin", "C:\Users\ContainerUser\go\bin")) {
         if (Test-Path $dir) {
             Add-Content -Path $env:GITHUB_PATH -Value $dir
             Write-Host "Added $dir to GITHUB_PATH"
