@@ -306,13 +306,17 @@ func (s *Server) handleExecStartHijack(w http.ResponseWriter, r *http.Request, e
 	// writes stdin data immediately after receiving the 101 and calls CloseWrite.
 	// Using a deadline avoids hanging forever if the client never sends EOF.
 	var stdinBuf bytes.Buffer
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		s.log.Debug("setting read deadline", "exec_id", exec.ID, "error", err)
+	}
 	if _, err := io.Copy(&stdinBuf, brw.Reader); err != nil {
 		if !os.IsTimeout(err) {
 			s.log.Debug("reading exec stdin", "exec_id", exec.ID, "error", err)
 		}
 	}
-	conn.SetReadDeadline(time.Time{})
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		s.log.Debug("clearing read deadline", "exec_id", exec.ID, "error", err)
+	}
 	s.log.Info("exec stdin buffered", "exec_id", exec.ID, "bytes", stdinBuf.Len())
 
 	// Fast path: "cp /dev/stdin <path>" is used by KIND to write config files

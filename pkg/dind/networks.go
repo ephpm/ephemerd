@@ -239,7 +239,7 @@ func (s *Server) handleNetworkCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	subnet := "172.18.0.0/16"
-	gateway := "172.18.0.1"
+	var gateway string
 	if req.IPAM != nil && len(req.IPAM.Config) > 0 {
 		if req.IPAM.Config[0].Subnet != "" {
 			subnet = req.IPAM.Config[0].Subnet

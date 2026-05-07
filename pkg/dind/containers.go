@@ -846,23 +846,31 @@ func (s *Server) handleContainerLogs(w http.ResponseWriter, r *http.Request, id 
 			}
 			fi, err := f.Stat()
 			if err != nil {
-				f.Close()
+				if cerr := f.Close(); cerr != nil {
+					s.log.Debug("closing log file after stat error", "error", cerr)
+				}
 				continue
 			}
 			if fi.Size() <= offset {
-				f.Close()
+				if cerr := f.Close(); cerr != nil {
+					s.log.Debug("closing log file", "error", cerr)
+				}
 				if entry.Status == "exited" {
 					return
 				}
 				continue
 			}
 			if _, err := f.Seek(offset, 0); err != nil {
-				f.Close()
+				if cerr := f.Close(); cerr != nil {
+					s.log.Debug("closing log file after seek error", "error", cerr)
+				}
 				continue
 			}
 			buf := make([]byte, fi.Size()-offset)
 			n, readErr := f.Read(buf)
-			f.Close()
+			if cerr := f.Close(); cerr != nil {
+				s.log.Debug("closing log file after read", "error", cerr)
+			}
 			if n > 0 {
 				if _, werr := w.Write(buf[:n]); werr != nil {
 					return
