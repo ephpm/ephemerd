@@ -12,6 +12,7 @@ FROM mcr.microsoft.com/windows/servercore:ltsc2025
 ARG RUNNER_VERSION=2.333.1
 ARG GOLANGCI_LINT_VERSION=2.11.4
 ARG GO_VERSION=1.26.1
+ARG DOCKER_CLI_VERSION=27.3.1
 
 # $ProgressPreference = 'SilentlyContinue' is required for Invoke-WebRequest
 # in non-interactive PowerShell. Without it the cmdlet tries to render its
@@ -33,6 +34,11 @@ ENV PATH="C:\go\bin;C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem;C:\W
 # GOBIN=C:\go\bin so mage lands on PATH regardless of which user the runner
 # spawns the job as (avoids the per-profile C:\Users\<X>\go\bin trap).
 RUN $env:GOBIN='C:\go\bin'; go install github.com/magefile/mage@latest
+
+RUN Invoke-WebRequest -Uri "https://download.docker.com/win/static/stable/x86_64/docker-${env:DOCKER_CLI_VERSION}.zip" -OutFile docker.zip; `
+    Expand-Archive docker.zip -DestinationPath C:\temp-docker; `
+    Copy-Item C:\temp-docker\docker\docker.exe C:\go\bin\docker.exe; `
+    Remove-Item -Recurse docker.zip, C:\temp-docker
 
 RUN New-Item -ItemType Directory -Force -Path C:\ephemerd-ci\pkg\runner\embed | Out-Null; `
     Invoke-WebRequest -Uri "https://github.com/actions/runner/releases/download/v${env:RUNNER_VERSION}/actions-runner-win-x64-${env:RUNNER_VERSION}.zip" `

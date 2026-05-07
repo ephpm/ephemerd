@@ -85,22 +85,15 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Restore cached build deps
-        run: |
-          C:\ephemerd-ci\entrypoint-cache.ps1
-          Write-Host "=== DEBUG PATH ==="
-          Write-Host "env:PATH = $env:PATH"
-          Write-Host "=== C:\go ==="
-          if (Test-Path "C:\go") { Get-ChildItem "C:\go" } else { Write-Host "C:\go does not exist" }
-          Write-Host "=== C:\go\bin ==="
-          if (Test-Path "C:\go\bin") { Get-ChildItem "C:\go\bin" | Select-Object Name } else { Write-Host "C:\go\bin does not exist" }
-          Write-Host "=== ContainerUser ==="
-          if (Test-Path "C:\Users\ContainerUser\go\bin") { Get-ChildItem "C:\Users\ContainerUser\go\bin" | Select-Object Name } else { Write-Host "C:\Users\ContainerUser\go\bin does not exist" }
-          Write-Host "=== where.exe mage ==="
-          where.exe mage 2>&1
-          Write-Host "=== where.exe go ==="
-          where.exe go 2>&1
-          foreach ($d in @("C:\go\bin", "C:\Users\ContainerUser\go\bin")) { if (Test-Path $d) { Add-Content -Path $env:GITHUB_PATH -Value $d } }
+        run: C:\ephemerd-ci\entrypoint-cache.ps1
         continue-on-error: true
+
+      - name: Ensure mage is available
+        run: |
+          if (Get-Command mage -ErrorAction SilentlyContinue) { return }
+          Write-Host "mage not found — installing via go install..."
+          $env:GOBIN = 'C:\go\bin'
+          go install github.com/magefile/mage@latest
 
       - name: Build Windows binary
         run: mage build:build
