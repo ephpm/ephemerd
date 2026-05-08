@@ -306,18 +306,21 @@ func (s *Server) handleExecStartHijack(w http.ResponseWriter, r *http.Request, e
 	// writes stdin data immediately after receiving the 101 and calls CloseWrite.
 	// Using a deadline avoids hanging forever if the client never sends EOF.
 	var stdinBuf bytes.Buffer
+	var stdinStreaming bool
 	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		s.log.Debug("setting read deadline", "exec_id", exec.ID, "error", err)
 	}
 	if _, err := io.Copy(&stdinBuf, brw.Reader); err != nil {
-		if !os.IsTimeout(err) {
+		if os.IsTimeout(err) {
+			stdinStreaming = true
+		} else {
 			s.log.Debug("reading exec stdin", "exec_id", exec.ID, "error", err)
 		}
 	}
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
 		s.log.Debug("clearing read deadline", "exec_id", exec.ID, "error", err)
 	}
-	s.log.Info("exec stdin buffered", "exec_id", exec.ID, "bytes", stdinBuf.Len())
+	s.log.Info("exec stdin buffered", "exec_id", exec.ID, "bytes", stdinBuf.Len(), "streaming", stdinStreaming)
 
 	// Fast path: "cp /dev/stdin <path>" is used by KIND to write config files
 	// into containers. Containerd's exec FIFO mechanism has a race condition
@@ -330,10 +333,10 @@ func (s *Server) handleExecStartHijack(w http.ResponseWriter, r *http.Request, e
 		}
 	}
 
-	// General stdin-via-file: write stdin data to the container's overlayfs
-	// and wrap the command with shell redirection. This completely bypasses
-	// containerd's exec FIFO mechanism which is unreliable for stdin delivery.
-	if stdinBuf.Len() > 0 {
+	// For one-shot stdin (client sent data then closed), write to a file in
+	// the container's overlayfs and use shell redirection. Skip for streaming
+	// execs (e.g. buildctl dial-stdio) where stdin remains open.
+	if stdinBuf.Len() > 0 && !stdinStreaming {
 		if containerPath, ok := s.writeStdinFile(exec, entry, stdinBuf.Bytes()); ok {
 			s.log.Info("exec stdin redirected via file", "exec_id", exec.ID, "path", containerPath, "bytes", stdinBuf.Len())
 			origCmd := exec.Cmd
@@ -366,14 +369,17 @@ func (s *Server) handleExecStartHijack(w http.ResponseWriter, r *http.Request, e
 		Terminal: exec.Tty,
 	}
 
-	// Use io.Pipe instead of bytes.NewReader to avoid the containerd exec
-	// FIFO race: with a bytes.NewReader the cio goroutine drains the reader
-	// and closes the FIFO write-end before the shim attaches it to the
-	// process, so the process sees immediate EOF. With a pipe we hold the
-	// data until after Start(), when the shim's FIFO plumbing is connected.
 	var stdinR io.Reader
 	var stdinPW *io.PipeWriter
-	if stdinBuf.Len() > 0 {
+	if stdinStreaming {
+		// Streaming exec (e.g. buildctl dial-stdio): the hijacked conn IS the
+		// ongoing stdin source. Prepend any initial buffered bytes, then read
+		// from the live connection. The FIFO race doesn't apply here because
+		// the reader never returns EOF until the client disconnects.
+		stdinR = io.MultiReader(bytes.NewReader(stdinBuf.Bytes()), conn)
+	} else if stdinBuf.Len() > 0 {
+		// One-shot stdin that wasn't handled by the file-redirect path.
+		// Use io.Pipe to delay delivery until after Start().
 		pr, pw := io.Pipe()
 		stdinR = pr
 		stdinPW = pw
