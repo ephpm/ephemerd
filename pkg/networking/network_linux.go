@@ -70,9 +70,21 @@ func (l *linuxNetworking) setup(ctx context.Context, id string, netns string) (*
 	}
 
 	// Extract container IP from the CNI result.
+	//
+	// result.Interfaces is a map keyed by interface name and includes the
+	// loopback interface ("lo") added by cni.WithLoNetwork. Map iteration order
+	// is randomized in Go, so a naive "first IP wins" loop will sometimes
+	// return 127.0.0.1 — that gets reported up to docker inspect and confuses
+	// any caller (e.g. kind) that picks the node IP from there.
+	//
+	// Skip loopback addresses explicitly: keep only routable IPs from the
+	// CNI bridge.
 	var ip string
 	for _, iface := range result.Interfaces {
 		for _, ipCfg := range iface.IPConfigs {
+			if ipCfg.IP == nil || ipCfg.IP.IsLoopback() {
+				continue
+			}
 			ip = ipCfg.IP.String()
 			break
 		}

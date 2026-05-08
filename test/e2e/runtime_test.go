@@ -171,7 +171,10 @@ func TestE2E_Runtime_CreateWaitDestroy(t *testing.T) {
 	// because "fake-jit-config" isn't valid base64, and the task will exit.
 	containerID := fmt.Sprintf("e2e-rt-%d", time.Now().UnixNano())
 
-	env, err := rt.Create(ctx, containerID, "", "fake-jit-config")
+	env, err := rt.Create(ctx, runtime.CreateConfig{
+		ID:        containerID,
+		JITConfig: "fake-jit-config",
+	})
 	if err != nil {
 		t.Fatalf("Runtime.Create: %v", err)
 	}

@@ -48,6 +48,7 @@ type Server struct {
 	images     map[string]*imageEntry    // in-memory image store scoped to this job
 	containers map[string]*containerEntry // containers created through this socket
 	execs      map[string]*execEntry      // exec processes inside containers
+	networks   map[string]*networkEntry   // Docker networks (logical, in-memory)
 	auth       authCache                  // per-job docker login cache (registry host → creds)
 }
 
@@ -96,7 +97,7 @@ func New(cfg Config) (*Server, error) {
 		cfg.Log.Debug("removing stale socket", "path", sockPath, "error", err)
 	}
 
-	return &Server{
+	s := &Server{
 		jobID: cfg.JobID,
 		// containerd namespace name regex (^[A-Za-z0-9]+(?:[._-](?:[A-Za-z0-9]+))*$)
 		// rejects slashes. Use hyphens to namespace per-job dind state.
@@ -109,7 +110,10 @@ func New(cfg Config) (*Server, error) {
 		images:       make(map[string]*imageEntry),
 		containers:   make(map[string]*containerEntry),
 		execs:        make(map[string]*execEntry),
-	}, nil
+		networks:     make(map[string]*networkEntry),
+	}
+	s.initDefaultBridgeNetwork()
+	return s, nil
 }
 
 // SocketPath returns the host-side Unix socket path (Linux/macOS).
@@ -244,6 +248,14 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.routeContainer(w, r, path)
 	case strings.HasPrefix(path, "/exec/"):
 		s.routeExec(w, r, path)
+	case (path == "/networks" || path == "/networks/json") && r.Method == http.MethodGet:
+		s.handleNetworkList(w, r)
+	case path == "/networks/create" && r.Method == http.MethodPost:
+		s.handleNetworkCreate(w, r)
+	case path == "/networks/prune" && r.Method == http.MethodPost:
+		s.handleNetworkPrune(w, r)
+	case strings.HasPrefix(path, "/networks/"):
+		s.routeNetwork(w, r, path)
 	default:
 		s.handleNotImplemented(w, r)
 	}

@@ -20,12 +20,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Install mage
-        run: go install github.com/magefile/mage@latest
+      # Go and mage come from the runner-ci-linux image (see images/runner-ci-linux/Dockerfile),
+      # so setup-go and `go install mage` are unnecessary here.
+      # - uses: actions/setup-go@v6
+      #   with:
+      #     go-version: ${{ env.GO_VERSION }}
+      # - name: Install mage
+      #   run: go install github.com/magefile/mage@latest
 
       - name: Download embedded dependencies
         run: |
