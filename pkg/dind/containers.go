@@ -399,7 +399,7 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	opts = append(opts, withBindMount(resolvPath, "/etc/resolv.conf", []string{"rbind", "ro"}))
+	opts = append(opts, withBindMount(resolvPath, "/etc/resolv.conf", []string{"rbind", "rw"}))
 
 	// For kindest/node containers, wrap the process to pre-register
 	// iptables alternatives that may be missing from the overlay. The
