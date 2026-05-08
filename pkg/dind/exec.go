@@ -330,6 +330,19 @@ func (s *Server) handleExecStartHijack(w http.ResponseWriter, r *http.Request, e
 		}
 	}
 
+	// General stdin-via-file: write stdin data to the container's overlayfs
+	// and wrap the command with shell redirection. This completely bypasses
+	// containerd's exec FIFO mechanism which is unreliable for stdin delivery.
+	if stdinBuf.Len() > 0 {
+		if containerPath, ok := s.writeStdinFile(exec, entry, stdinBuf.Bytes()); ok {
+			s.log.Info("exec stdin redirected via file", "exec_id", exec.ID, "path", containerPath, "bytes", stdinBuf.Len())
+			origCmd := exec.Cmd
+			shScript := fmt.Sprintf(`"$@" < %s; s=$?; rm -f %s; exit $s`, containerPath, containerPath)
+			exec.Cmd = append([]string{"sh", "-c", shScript, "_"}, origCmd...)
+			stdinBuf.Reset()
+		}
+	}
+
 	// Wire stdout/stderr writers. Multiplex with stdcopy framing when Tty=false.
 	var stdoutW, stderrW io.Writer
 	if exec.Tty {
@@ -879,6 +892,48 @@ func (s *Server) handleCpStdinDirect(conn io.Writer, exec *execEntry, entry *con
 
 	s.log.Info("cp-stdin: wrote directly to overlayfs", "exec_id", exec.ID, "path", dstPath, "bytes", len(data))
 	return true
+}
+
+// writeStdinFile writes stdin data to a temporary file inside the container's
+// overlayfs upperdir. Returns the in-container path on success. The caller
+// wraps the original command with shell redirection so the process reads from
+// this file instead of relying on containerd's FIFO stdin delivery.
+func (s *Server) writeStdinFile(exec *execEntry, entry *containerEntry, data []byte) (string, bool) {
+	ctx := namespaces.WithNamespace(context.Background(), s.jobNamespace)
+
+	snapshotID := entry.ID + "-snapshot"
+	snapshotter := s.client.SnapshotService("overlayfs")
+	if snapshotter == nil {
+		return "", false
+	}
+
+	mounts, err := snapshotter.Mounts(ctx, snapshotID)
+	if err != nil {
+		s.log.Debug("stdin-file: getting mounts", "exec_id", exec.ID, "error", err)
+		return "", false
+	}
+
+	var upperDir string
+	for _, m := range mounts {
+		for _, opt := range m.Options {
+			for _, part := range strings.Split(opt, ",") {
+				if strings.HasPrefix(part, "upperdir=") {
+					upperDir = strings.TrimPrefix(part, "upperdir=")
+				}
+			}
+		}
+	}
+	if upperDir == "" {
+		return "", false
+	}
+
+	containerPath := fmt.Sprintf("/.ephemerd-stdin-%s", exec.ID)
+	hostPath := filepath.Join(upperDir, containerPath)
+	if err := os.WriteFile(hostPath, data, 0o644); err != nil {
+		s.log.Debug("stdin-file: writing file", "exec_id", exec.ID, "error", err)
+		return "", false
+	}
+	return containerPath, true
 }
 
 // cleanupExec deletes an exec process and its log.
