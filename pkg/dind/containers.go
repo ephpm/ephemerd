@@ -389,6 +389,18 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	opts = append(opts, withBindMount(hostsPath, "/etc/hosts", []string{"rbind", "rw"}))
 
+	// Provision /etc/resolv.conf with public DNS so containers can resolve
+	// external hostnames. The default resolv.conf inside a fresh mount
+	// namespace often points to localhost (::1) which has no DNS server.
+	resolvPath := filepath.Join(filepath.Dir(s.sockPath), "containers", id, "resolv.conf")
+	if err := os.WriteFile(resolvPath, []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"), 0o644); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"message": fmt.Sprintf("writing resolv.conf: %v", err),
+		})
+		return
+	}
+	opts = append(opts, withBindMount(resolvPath, "/etc/resolv.conf", []string{"rbind", "ro"}))
+
 	// For kindest/node containers, wrap the process to pre-register
 	// iptables alternatives that may be missing from the overlay. The
 	// Debian alternatives database lives in a lower image layer and is
