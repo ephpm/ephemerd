@@ -1455,6 +1455,11 @@ if ! mount -t ext4 -o noatime "$ROOT_DISK" /newroot; then
     exec /bin/sh
 fi
 
+# Grow the filesystem to fill the disk (no-op if already full size).
+# Handles VHDX resize between boots without a schema bump.
+/sbin/resize2fs "$ROOT_DISK" 2>/dev/null && \
+    echo "ephemerd-init: filesystem resized to fill disk" || true
+
 # If the disk had a filesystem but the ephemerd rootfs was never populated
 # (e.g. leftover from an older schema that only stored containerd data),
 # treat it as first-boot and repopulate. The ephemerd-linux binary's presence

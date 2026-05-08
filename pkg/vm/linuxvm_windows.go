@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -320,7 +321,9 @@ func (l *hypervLinuxVM) ensureRootVHDX() error {
 
 	if _, err := os.Stat(vhdxPath); err == nil {
 		if l.schemaMatches() {
-			l.cfg.Log.Info("root VHDX already exists", "path", vhdxPath)
+			if err := l.growVHDXIfNeeded(vhdxPath); err != nil {
+				l.cfg.Log.Warn("failed to resize VHDX", "error", err)
+			}
 			return grantVmFileAccess(vhdxPath)
 		}
 		l.cfg.Log.Info("root VHDX has stale schema, recreating", "path", vhdxPath, "expected_version", rootVHDXSchemaVersion)
@@ -357,6 +360,48 @@ func (l *hypervLinuxVM) ensureRootVHDX() error {
 	}
 
 	return grantVmFileAccess(vhdxPath)
+}
+
+// growVHDXIfNeeded expands an existing VHDX if the configured DiskSizeGB
+// exceeds the current maximum size. The guest filesystem is grown by the
+// init script on the next boot.
+func (l *hypervLinuxVM) growVHDXIfNeeded(vhdxPath string) error {
+	wantGB := l.cfg.DiskSizeGB
+	if wantGB == 0 {
+		wantGB = 50
+	}
+	wantBytes := uint64(wantGB) * 1024 * 1024 * 1024
+
+	fi, err := os.Stat(vhdxPath)
+	if err != nil {
+		return fmt.Errorf("stat VHDX: %w", err)
+	}
+
+	// Get-VHD returns the maximum virtual size, not the file size.
+	out, err := exec.Command("powershell", "-NoProfile", "-Command",
+		fmt.Sprintf("(Get-VHD -Path '%s').Size", vhdxPath)).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("Get-VHD failed: %w\noutput: %s", err, string(out))
+	}
+
+	currentBytes, err := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil {
+		return fmt.Errorf("parsing VHDX size %q: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	if currentBytes >= wantBytes {
+		l.cfg.Log.Info("root VHDX already exists", "path", vhdxPath, "size_gb", currentBytes/(1024*1024*1024), "file_size", fi.Size())
+		return nil
+	}
+
+	l.cfg.Log.Info("resizing root VHDX", "path", vhdxPath, "from_gb", currentBytes/(1024*1024*1024), "to_gb", wantGB)
+	cmd := exec.Command("powershell", "-NoProfile", "-Command",
+		fmt.Sprintf("Resize-VHD -Path '%s' -SizeBytes %d", vhdxPath, wantBytes))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("Resize-VHD failed: %w\noutput: %s", err, string(out))
+	}
+
+	return nil
 }
 
 // schemaMatches reports whether the sidecar schema marker equals the current
