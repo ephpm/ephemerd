@@ -410,6 +410,21 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 		opts = append(opts, withKindNodeInit(s.log))
 	}
 
+	// Buildkit containers need a host ext4 directory for /var/lib/buildkit so
+	// they can use overlayfs instead of the native snapshotter.  The native
+	// snapshotter does full file copies per layer and quickly exhausts disk.
+	if strings.Contains(req.Image, "buildkit") {
+		buildkitDir := filepath.Join(filepath.Dir(s.sockPath), "buildkit", id)
+		if err := os.MkdirAll(buildkitDir, 0o755); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"message": fmt.Sprintf("creating buildkit dir: %v", err),
+			})
+			return
+		}
+		opts = append(opts, withBindMount(buildkitDir, "/var/lib/buildkit", []string{"rbind", "rw"}))
+		s.log.Info("bind-mounted host ext4 for buildkit", "container", id, "host_path", buildkitDir)
+	}
+
 	// Anonymous volumes (e.g. VOLUME /var in Dockerfile or --volume /var).
 	// Real Docker creates a named volume, copies image content into it, then
 	// bind-mounts it. We skip them: the overlay upperdir is already writable
@@ -1052,6 +1067,11 @@ func (s *Server) cleanupContainer(ctx context.Context, id string, entry *contain
 		if err := os.RemoveAll(filepath.Dir(entry.LogPath)); err != nil {
 			s.log.Debug("log cleanup", "id", id, "error", err)
 		}
+	}
+
+	buildkitDir := filepath.Join(filepath.Dir(s.sockPath), "buildkit", id)
+	if err := os.RemoveAll(buildkitDir); err != nil {
+		s.log.Debug("buildkit dir cleanup", "id", id, "error", err)
 	}
 }
 
