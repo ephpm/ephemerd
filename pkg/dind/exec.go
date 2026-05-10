@@ -388,7 +388,9 @@ func (s *Server) handleExecStartHijack(w http.ResponseWriter, r *http.Request, e
 	proc, err := entry.Task.Exec(ctx, exec.ID, pspec, cio.NewCreator(cio.WithStreams(stdinR, stdoutW, stderrW)))
 	if err != nil {
 		if stdinPW != nil {
-			stdinPW.Close()
+			if cerr := stdinPW.Close(); cerr != nil {
+				s.log.Debug("closing exec stdin pipe", "exec_id", exec.ID, "error", cerr)
+			}
 		}
 		s.log.Warn("creating hijacked exec", "exec_id", exec.ID, "error", err)
 		return
@@ -403,7 +405,9 @@ func (s *Server) handleExecStartHijack(w http.ResponseWriter, r *http.Request, e
 	statusCh, err := proc.Wait(ctx)
 	if err != nil {
 		if stdinPW != nil {
-			stdinPW.Close()
+			if cerr := stdinPW.Close(); cerr != nil {
+				s.log.Debug("closing exec stdin pipe", "exec_id", exec.ID, "error", cerr)
+			}
 		}
 		s.log.Warn("waiting for hijacked exec", "exec_id", exec.ID, "error", err)
 		return
@@ -411,7 +415,9 @@ func (s *Server) handleExecStartHijack(w http.ResponseWriter, r *http.Request, e
 
 	if err := proc.Start(ctx); err != nil {
 		if stdinPW != nil {
-			stdinPW.Close()
+			if cerr := stdinPW.Close(); cerr != nil {
+				s.log.Debug("closing exec stdin pipe", "exec_id", exec.ID, "error", cerr)
+			}
 		}
 		s.log.Warn("starting hijacked exec", "exec_id", exec.ID, "error", err)
 		return
@@ -422,7 +428,9 @@ func (s *Server) handleExecStartHijack(w http.ResponseWriter, r *http.Request, e
 			if _, err := stdinPW.Write(stdinBuf.Bytes()); err != nil {
 				s.log.Debug("writing exec stdin pipe", "exec_id", exec.ID, "error", err)
 			}
-			stdinPW.Close()
+			if cerr := stdinPW.Close(); cerr != nil {
+				s.log.Debug("closing exec stdin pipe", "exec_id", exec.ID, "error", cerr)
+			}
 		}()
 	}
 
