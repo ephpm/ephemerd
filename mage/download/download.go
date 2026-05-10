@@ -397,6 +397,12 @@ var initrdKernelModules = []string{
 	"kernel/net/netfilter/nft_chain_nat.ko.gz",
 	"kernel/net/netfilter/nft_compat.ko.gz",
 	"kernel/net/netfilter/nft_masq.ko.gz",
+	// nft_nat provides DNAT/SNAT/REDIRECT nft expressions. Needed when the
+	// runner runs `iptables-nft -j DNAT ...` — without it, nft_compat fails
+	// with "Extension DNAT revision 0 not supported, missing kernel module?".
+	"kernel/net/netfilter/nft_nat.ko.gz",
+	// xt_tcpudp backs --dport/--sport in iptables (both legacy and nft compat).
+	"kernel/net/netfilter/xt_tcpudp.ko.gz",
 	"kernel/net/ipv4/netfilter/ip_tables.ko.gz",
 	"kernel/net/ipv4/netfilter/iptable_nat.ko.gz",
 	"kernel/net/netfilter/xt_MASQUERADE.ko.gz",
@@ -528,6 +534,12 @@ var initrdKernelModulesX86 = []string{
 	"kernel/net/netfilter/nft_chain_nat.ko.gz",
 	"kernel/net/netfilter/nft_compat.ko.gz",
 	"kernel/net/netfilter/nft_masq.ko.gz",
+	// nft_nat provides DNAT/SNAT/REDIRECT nft expressions. Needed when the
+	// runner runs `iptables-nft -j DNAT ...` — without it, nft_compat fails
+	// with "Extension DNAT revision 0 not supported, missing kernel module?".
+	"kernel/net/netfilter/nft_nat.ko.gz",
+	// xt_tcpudp backs --dport/--sport in iptables (both legacy and nft compat).
+	"kernel/net/netfilter/xt_tcpudp.ko.gz",
 	"kernel/net/ipv4/netfilter/ip_tables.ko.gz",
 	"kernel/net/ipv4/netfilter/iptable_nat.ko.gz",
 	"kernel/net/netfilter/xt_MASQUERADE.ko.gz",
@@ -641,12 +653,12 @@ func extractVmlinuxFromBzImage(bzImagePath, dest string) error {
 // exec's ephemerd-linux as PID 1.
 func Initrdx86() error {
 	dest := filepath.Join(vmEmbedDir, "initrd")
-	// Initrd embeds ephemerd-linux, the rootfs tarball, and the kernel
-	// modules from linux-virt. If any of those is newer than the existing
-	// initrd, the embedded copy is stale and we must rebuild — otherwise a
-	// fresh ephemerd-linux silently runs an old initrd's binary copy.
+	// Initrd embeds the rootfs tarball and kernel modules from linux-virt.
+	// ephemerd-linux is appended to the boot initrd at runtime by
+	// pkg/vm.buildBootInitrd, so changes to Linux code do not require an
+	// initrd rebuild — only changes to busybox, the rootfs, or kernel
+	// modules invalidate this output.
 	inputs := []string{
-		filepath.Join(vmEmbedDir, "ephemerd-linux"),
 		filepath.Join(vmEmbedDir, "ephemerd-rootfs-"+AlpineVersion+"-x86_64.tar.gz"),
 	}
 	if !outOfDate(dest, inputs...) {
@@ -1301,12 +1313,13 @@ func buildInitrdX86(dest string, pkgData [][]byte, moduleFiles map[string][]byte
 		data: []byte(udhcpcScript),
 	})
 
-	// Bundle rootfs tarball and ephemerd-linux binary into the initrd at /assets/.
-	// The init script extracts these to tmpfs at boot — no disk attachment needed.
+	// Bundle the rootfs tarball into the initrd at /assets/. ephemerd-linux
+	// is appended at runtime by pkg/vm.buildBootInitrd as a separate cpio,
+	// so it is not part of the build-time initrd anymore.
 	files = append(files, cpioFile{name: "assets", mode: 0o40755})
 
-	// Read rootfs and ephemerd-linux from the embed directory on disk.
-	// These files are placed there by download.Rootfs and build.Linuxembed.
+	// Read the rootfs from the embed directory on disk. Placed there by
+	// download.Rootfs.
 	rootfsMatches, _ := filepath.Glob(filepath.Join(vmEmbedDir, "ephemerd-rootfs-*.tar.gz"))
 	if len(rootfsMatches) == 0 {
 		return fmt.Errorf("no rootfs tarball found in %s (run 'mage download:rootfs' first)", vmEmbedDir)
@@ -1323,18 +1336,11 @@ func buildInitrdX86(dest string, pkgData [][]byte, moduleFiles map[string][]byte
 	})
 	fmt.Printf("  Bundling rootfs in initrd (%d bytes)\n", len(rootfsData))
 
-	ephemerdPath := filepath.Join(vmEmbedDir, "ephemerd-linux")
-	ephemerdData, err := os.ReadFile(ephemerdPath)
-	if err != nil {
-		return fmt.Errorf("reading ephemerd-linux for initrd bundle: %w", err)
-	}
-	files = append(files, cpioFile{
-		name: "assets/ephemerd-linux",
-		mode: 0o100755,
-		size: int64(len(ephemerdData)),
-		data: ephemerdData,
-	})
-	fmt.Printf("  Bundling ephemerd-linux in initrd (%d bytes)\n", len(ephemerdData))
+	// ephemerd-linux is no longer bundled into the build-time initrd. It is
+	// embedded separately in the Windows binary and appended as a tiny cpio
+	// to the boot initrd at runtime by pkg/vm.buildBootInitrd. This avoids
+	// a 240MB rebuild of the initrd every time Linux code changes — plain
+	// `go build -o ephemerd.exe` produces a working binary.
 
 	// Hyper-V init script. On first boot, mkfs.ext4 on the single SCSI disk,
 	// extract the bundled Alpine rootfs + ephemerd-linux onto it, and create a

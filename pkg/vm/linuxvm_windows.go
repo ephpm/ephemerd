@@ -228,11 +228,15 @@ func (l *hypervLinuxVM) extractAssets() error {
 		findPrefix string      // if non-empty, use findEmbedded(prefix) for src
 	}
 
+	// "initrd-base" is the boot scaffolding — busybox, kernel modules, init
+	// script. The actual /assets/ephemerd-linux entry the init script reads
+	// is appended at runtime by buildBootInitrd into "initrd" (next step) so
+	// a fresh `go build` of ephemerd.exe delivers a new Linux binary without
+	// any mage-side initrd rebuild.
 	assets := []asset{
 		{src: "embed/vmlinuz", dest: filepath.Join(l.vmDir, "vmlinuz"), mode: 0o644},
-		{src: "embed/initrd", dest: filepath.Join(l.vmDir, "initrd"), mode: 0o644},
-		// ephemerd-linux is NOT embedded separately — it's bundled inside the
-		// fat initrd. The VM's init script extracts it at boot time.
+		{src: "embed/initrd", dest: filepath.Join(l.vmDir, "initrd-base"), mode: 0o644},
+		{src: "embed/ephemerd-linux", dest: filepath.Join(l.vmDir, "ephemerd-linux"), mode: 0o755},
 		{findPrefix: "ephemerd-rootfs-", dest: filepath.Join(l.vmDir, "rootfs.tar.gz"), mode: 0o644, gzip: true},
 	}
 
@@ -280,6 +284,20 @@ func (l *hypervLinuxVM) extractAssets() error {
 		if err := grantVmFileAccess(a.dest); err != nil {
 			return fmt.Errorf("granting VM access to %s: %w", a.dest, err)
 		}
+	}
+
+	// Build the final initrd by appending a cpio with /assets/ephemerd-linux
+	// to the base initrd. Cheap (a few file ops + gzip on a single 240MB blob)
+	// and idempotent, so we run it on every start. HCS reads InitRdPath only
+	// when the VM is created, so this must happen before createAndBootVM.
+	bootInitrd := filepath.Join(l.vmDir, "initrd")
+	baseInitrd := filepath.Join(l.vmDir, "initrd-base")
+	ephemerdBin := filepath.Join(l.vmDir, "ephemerd-linux")
+	if err := buildBootInitrd(baseInitrd, ephemerdBin, bootInitrd); err != nil {
+		return fmt.Errorf("building boot initrd: %w", err)
+	}
+	if err := grantVmFileAccess(bootInitrd); err != nil {
+		return fmt.Errorf("granting VM access to %s: %w", bootInitrd, err)
 	}
 
 	return nil
