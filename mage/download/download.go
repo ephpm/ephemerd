@@ -561,6 +561,14 @@ var initrdKernelModulesX86 = []string{
 	"kernel/net/netfilter/xt_statistic.ko.gz",
 	"kernel/net/netfilter/xt_recent.ko.gz",
 	"kernel/net/bridge/bridge.ko.gz",
+	// br_netfilter exposes /proc/sys/net/bridge/bridge-nf-call-iptables.
+	// kube-proxy requires this sysctl to be 1 so its iptables NAT rules fire
+	// on packets crossing the CNI bridge. Without br_netfilter the sysctl
+	// path doesn't exist, kube-proxy's sync silently misses bridge traffic,
+	// and every pod-to-ClusterIP request inside kindest/node black-holes —
+	// CoreDNS can't reach 10.96.0.1:443 to bootstrap its zones, so its
+	// readiness probe returns 503 and every test pod's DNS lookup fails.
+	"kernel/net/bridge/br_netfilter.ko.gz",
 	"kernel/drivers/net/veth.ko.gz",
 	// Hyper-V utilities for time sync (TimeSync IC)
 	"kernel/drivers/hv/hv_utils.ko.gz",
@@ -1529,6 +1537,15 @@ fi
 # Enable IP forwarding so containers can route through the VM to the internet.
 # This is a kernel-level setting that persists across switch_root.
 echo 1 > /proc/sys/net/ipv4/ip_forward
+
+# Make sure bridge traffic traverses iptables. br_netfilter (loaded above)
+# adds /proc/sys/net/bridge/bridge-nf-call-iptables, which kube-proxy
+# inside kindest/node requires so its NAT rules fire on packets crossing
+# the CNI bridge. Without this, every pod-to-ClusterIP request inside the
+# cluster (CoreDNS to apiserver, test pod to ephpm service) silently dies.
+echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null || \
+    echo "ephemerd-init: bridge-nf-call-iptables not available (br_netfilter not loaded?)"
+echo 1 > /proc/sys/net/bridge/bridge-nf-call-ip6tables 2>/dev/null || true
 
 # Ensure the mount points the switch_root target expects.
 mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/tmp \
