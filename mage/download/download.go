@@ -542,11 +542,24 @@ var initrdKernelModulesX86 = []string{
 	"kernel/net/netfilter/xt_tcpudp.ko.gz",
 	"kernel/net/ipv4/netfilter/ip_tables.ko.gz",
 	"kernel/net/ipv4/netfilter/iptable_nat.ko.gz",
+	// iptable_filter + iptable_mangle are required by kube-proxy inside
+	// kindest/node. Without them every Kubernetes Service request from a
+	// test pod silently fails — kube-proxy can't install the FORWARD/MARK
+	// chains that NAT ClusterIPs to pod IPs, so http://ephpm:8080/ from
+	// the ephpm-e2e pod hits a black hole and reqwest times out at ~20s.
+	"kernel/net/ipv4/netfilter/iptable_filter.ko.gz",
+	"kernel/net/ipv4/netfilter/iptable_mangle.ko.gz",
 	"kernel/net/netfilter/xt_MASQUERADE.ko.gz",
 	"kernel/net/netfilter/xt_conntrack.ko.gz",
 	"kernel/net/netfilter/xt_comment.ko.gz",
 	"kernel/net/netfilter/xt_addrtype.ko.gz",
 	"kernel/net/netfilter/xt_mark.ko.gz",
+	// xt_REDIRECT for kube-proxy's REDIRECT rules (NodePort handling) and
+	// xt_statistic for the random-load-balance rules kube-proxy emits when
+	// a Service has multiple backend pods.
+	"kernel/net/netfilter/xt_REDIRECT.ko.gz",
+	"kernel/net/netfilter/xt_statistic.ko.gz",
+	"kernel/net/netfilter/xt_recent.ko.gz",
 	"kernel/net/bridge/bridge.ko.gz",
 	"kernel/drivers/net/veth.ko.gz",
 	// Hyper-V utilities for time sync (TimeSync IC)
