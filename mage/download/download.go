@@ -1543,9 +1543,24 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
 # inside kindest/node requires so its NAT rules fire on packets crossing
 # the CNI bridge. Without this, every pod-to-ClusterIP request inside the
 # cluster (CoreDNS to apiserver, test pod to ephpm service) silently dies.
-echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null || \
-    echo "ephemerd-init: bridge-nf-call-iptables not available (br_netfilter not loaded?)"
-echo 1 > /proc/sys/net/bridge/bridge-nf-call-ip6tables 2>/dev/null || true
+#
+# br_netfilter isn't auto-loaded when bridge.ko is — we must modprobe it
+# explicitly. The insmod-loop above tries it once, but if its deps weren't
+# loaded yet (bridge first, then br_netfilter), retry here.
+if [ ! -f /proc/sys/net/bridge/bridge-nf-call-iptables ]; then
+    if [ -f /modules/br_netfilter.ko.gz ]; then
+        gunzip -c /modules/br_netfilter.ko.gz > /tmp/br_netfilter.ko
+        insmod /tmp/br_netfilter.ko 2>&1 | head -3
+        rm -f /tmp/br_netfilter.ko
+    fi
+fi
+if [ -f /proc/sys/net/bridge/bridge-nf-call-iptables ]; then
+    echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables
+    echo 1 > /proc/sys/net/bridge/bridge-nf-call-ip6tables 2>/dev/null || true
+    echo "ephemerd-init: bridge-nf-call-iptables enabled"
+else
+    echo "ephemerd-init: WARNING bridge-nf-call-iptables sysctl missing (br_netfilter not loaded)"
+fi
 
 # Ensure the mount points the switch_root target expects.
 mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/tmp \
