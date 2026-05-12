@@ -560,6 +560,16 @@ var initrdKernelModulesX86 = []string{
 	"kernel/net/netfilter/xt_REDIRECT.ko.gz",
 	"kernel/net/netfilter/xt_statistic.ko.gz",
 	"kernel/net/netfilter/xt_recent.ko.gz",
+	// REJECT target — kube-proxy uses it to reject traffic to Services
+	// with no endpoints (so clients see ICMP rejection rather than a hang).
+	// kube-proxy emits this as the very first rule of its iptables-restore
+	// batch, so if the module is missing the ENTIRE Service sync fails on
+	// line 15 with "Extension REJECT revision 0 not supported", no rules
+	// install, and every pod-to-ClusterIP request black-holes. nf_reject
+	// modules are the underlying infrastructure for both ipt_REJECT and
+	// ip6t_REJECT.
+	"kernel/net/ipv4/netfilter/nf_reject_ipv4.ko.gz",
+	"kernel/net/ipv4/netfilter/ipt_REJECT.ko.gz",
 	"kernel/net/bridge/bridge.ko.gz",
 	// br_netfilter exposes /proc/sys/net/bridge/bridge-nf-call-iptables.
 	// kube-proxy requires this sysctl to be 1 so its iptables NAT rules fire

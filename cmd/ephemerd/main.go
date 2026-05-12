@@ -292,6 +292,12 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		dispatchCleanup := scheduler.StartDispatchServer(dispatchPort, rt, log)
 		defer dispatchCleanup()
 
+		// Debug exec server on dispatch_port+1 — lets the Windows host poke
+		// into any container in the VM (e.g. exec'ing into kindest/node to
+		// inspect iptables / lsmod / pod logs). No-op on non-Linux.
+		debugCleanup := startWorkerDebugExec(ctx, int(containerdTCPPort)+2, rt.Client(), log)
+		defer debugCleanup()
+
 		log.Info("worker mode ready", "containerd_port", containerdTCPPort, "dispatch_port", dispatchPort, "dind", cfg.Dind.Enabled)
 		<-ctx.Done()
 		return nil

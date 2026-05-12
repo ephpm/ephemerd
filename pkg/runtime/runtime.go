@@ -91,6 +91,13 @@ type Runtime struct {
 	pullMu sync.Mutex // serializes image pulls to avoid content store contention
 }
 
+// Client returns the underlying containerd client. Used by the in-VM
+// debug-exec HTTP server so the Windows host can poke into running
+// containers (kindest/node, buildkit) without leaving the VM.
+func (r *Runtime) Client() *client.Client {
+	return r.client
+}
+
 // RunnerEnv represents a running runner environment.
 type RunnerEnv struct {
 	ID        string
