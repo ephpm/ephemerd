@@ -100,8 +100,11 @@ func TestForwardConn_TargetUnreachable(t *testing.T) {
 	if err == nil {
 		t.Error("expected error reading from client after target fails")
 	}
-	if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
-		// Either is acceptable: forwardConn closed `server`, propagating to client.
+	// Either io.EOF or io.ErrClosedPipe is acceptable: forwardConn closed
+	// `server` after the target dial failed, which propagates to client as
+	// either of those depending on timing. Any *other* error is unexpected.
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
+		t.Errorf("unexpected error from client.Read: %v", err)
 	}
 
 	select {

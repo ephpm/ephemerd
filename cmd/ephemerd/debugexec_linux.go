@@ -36,6 +36,15 @@ func startWorkerDebugExec(ctx context.Context, port int, ctrdClient *client.Clie
 //	GET /exec?ns=<containerd-ns>&cid=<container-id-or-prefix>&cmd=<base64-json-array>
 //	Returns: stdout bytes, then a trailer "\n--- exit=<code> ---\n" on stderr
 func startDebugExecServer(ctx context.Context, port int, ctrdClient *client.Client, log *slog.Logger) func() {
+	// writef wraps fmt.Fprintf for response writes — a broken HTTP connection
+	// is the only realistic source of failure here, and there's nothing
+	// useful to do beyond logging at debug level.
+	writef := func(w http.ResponseWriter, format string, args ...any) {
+		if _, err := fmt.Fprintf(w, format, args...); err != nil {
+			log.Debug("debugexec response write", "error", err)
+		}
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/namespaces", func(w http.ResponseWriter, r *http.Request) {
 		nss, err := ctrdClient.NamespaceService().List(r.Context())
@@ -45,7 +54,7 @@ func startDebugExecServer(ctx context.Context, port int, ctrdClient *client.Clie
 		}
 		w.Header().Set("Content-Type", "text/plain")
 		for _, n := range nss {
-			fmt.Fprintln(w, n)
+			writef(w, "%s\n", n)
 		}
 	})
 	mux.HandleFunc("/list", func(w http.ResponseWriter, r *http.Request) {
@@ -66,17 +75,17 @@ func startDebugExecServer(ctx context.Context, port int, ctrdClient *client.Clie
 			nsCtx := namespaces.WithNamespace(r.Context(), target)
 			all, err := ctrdClient.Containers(nsCtx)
 			if err != nil {
-				fmt.Fprintf(w, "namespace=%s error=%v\n", target, err)
+				writef(w, "namespace=%s error=%v\n", target, err)
 				continue
 			}
-			fmt.Fprintf(w, "namespace=%s count=%d\n", target, len(all))
+			writef(w, "namespace=%s count=%d\n", target, len(all))
 			for _, c := range all {
 				info, ierr := c.Info(nsCtx)
 				if ierr != nil {
-					fmt.Fprintf(w, "  %s info-error=%v\n", c.ID(), ierr)
+					writef(w, "  %s info-error=%v\n", c.ID(), ierr)
 					continue
 				}
-				fmt.Fprintf(w, "  %s image=%s\n", c.ID(), info.Image)
+				writef(w, "  %s image=%s\n", c.ID(), info.Image)
 			}
 		}
 	})
@@ -154,7 +163,7 @@ func startDebugExecServer(ctx context.Context, port int, ctrdClient *client.Clie
 		// FIFOs that the shim (also local) opens without issue.
 		proc, err := task.Exec(nsCtx, execID, &pspec, cio.NewCreator(cio.WithStreams(nil, w, w)))
 		if err != nil {
-			fmt.Fprintf(w, "\n--- exec create failed: %v ---\n", err)
+			writef(w, "\n--- exec create failed: %v ---\n", err)
 			return
 		}
 		defer func() {
@@ -164,24 +173,26 @@ func startDebugExecServer(ctx context.Context, port int, ctrdClient *client.Clie
 		}()
 		statusCh, err := proc.Wait(nsCtx)
 		if err != nil {
-			fmt.Fprintf(w, "\n--- wait failed: %v ---\n", err)
+			writef(w, "\n--- wait failed: %v ---\n", err)
 			return
 		}
 		if err := proc.Start(nsCtx); err != nil {
-			fmt.Fprintf(w, "\n--- start failed: %v ---\n", err)
+			writef(w, "\n--- start failed: %v ---\n", err)
 			return
 		}
 		st := <-statusCh
 		// Drain any in-flight IO.
 		if procIO := proc.IO(); procIO != nil {
 			procIO.Wait()
-			_ = procIO.Close()
+			if cerr := procIO.Close(); cerr != nil {
+				log.Debug("debugexec: cio close", "error", cerr)
+			}
 		}
 		if flusher != nil {
 			flusher.Flush()
 		}
 		w.Header().Set("X-Exit-Code", fmt.Sprintf("%d", st.ExitCode()))
-		fmt.Fprintf(w, "\n--- exit=%d ---\n", st.ExitCode())
+		writef(w, "\n--- exit=%d ---\n", st.ExitCode())
 	})
 
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
