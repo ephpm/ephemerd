@@ -406,6 +406,12 @@ var initrdKernelModules = []string{
 	"kernel/net/ipv4/netfilter/ip_tables.ko.gz",
 	"kernel/net/ipv4/netfilter/iptable_nat.ko.gz",
 	"kernel/net/netfilter/xt_MASQUERADE.ko.gz",
+	// xt_nat registers the DNAT/SNAT/NETMAP iptables targets. Without it,
+	// /proc/net/ip_tables_targets lacks DNAT and kube-proxy's iptables-restore
+	// aborts at the first KUBE-SVC DNAT line with "Extension DNAT revision 0
+	// not supported, missing kernel module" — iptables-restore is atomic, so
+	// the whole transaction is lost and no Service ClusterIP rules ever install.
+	"kernel/net/netfilter/xt_nat.ko.gz",
 	"kernel/net/netfilter/xt_conntrack.ko.gz", // iptables conntrack match extension
 	"kernel/net/netfilter/xt_comment.ko.gz",   // CNI uses --comment in NAT rules
 	"kernel/net/netfilter/xt_addrtype.ko.gz",  // CNI may use --addrtype matches
@@ -550,6 +556,12 @@ var initrdKernelModulesX86 = []string{
 	"kernel/net/ipv4/netfilter/iptable_filter.ko.gz",
 	"kernel/net/ipv4/netfilter/iptable_mangle.ko.gz",
 	"kernel/net/netfilter/xt_MASQUERADE.ko.gz",
+	// xt_nat registers the DNAT/SNAT/NETMAP iptables targets. Without it,
+	// /proc/net/ip_tables_targets lacks DNAT and kube-proxy's iptables-restore
+	// aborts at the first KUBE-SVC DNAT line with "Extension DNAT revision 0
+	// not supported, missing kernel module" — iptables-restore is atomic, so
+	// the whole transaction is lost and no Service ClusterIP rules ever install.
+	"kernel/net/netfilter/xt_nat.ko.gz",
 	"kernel/net/netfilter/xt_conntrack.ko.gz",
 	"kernel/net/netfilter/xt_comment.ko.gz",
 	"kernel/net/netfilter/xt_addrtype.ko.gz",
