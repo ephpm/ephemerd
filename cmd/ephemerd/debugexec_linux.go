@@ -37,6 +37,50 @@ func startWorkerDebugExec(ctx context.Context, port int, ctrdClient *client.Clie
 //	Returns: stdout bytes, then a trailer "\n--- exit=<code> ---\n" on stderr
 func startDebugExecServer(ctx context.Context, port int, ctrdClient *client.Client, log *slog.Logger) func() {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/namespaces", func(w http.ResponseWriter, r *http.Request) {
+		nss, err := ctrdClient.NamespaceService().List(r.Context())
+		if err != nil {
+			http.Error(w, "list namespaces: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		for _, n := range nss {
+			fmt.Fprintln(w, n)
+		}
+	})
+	mux.HandleFunc("/list", func(w http.ResponseWriter, r *http.Request) {
+		ns := r.URL.Query().Get("ns")
+		w.Header().Set("Content-Type", "text/plain")
+		var targets []string
+		if ns == "*" || ns == "" {
+			nss, err := ctrdClient.NamespaceService().List(r.Context())
+			if err != nil {
+				http.Error(w, "list namespaces: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			targets = nss
+		} else {
+			targets = []string{ns}
+		}
+		for _, target := range targets {
+			nsCtx := namespaces.WithNamespace(r.Context(), target)
+			all, err := ctrdClient.Containers(nsCtx)
+			if err != nil {
+				fmt.Fprintf(w, "namespace=%s error=%v\n", target, err)
+				continue
+			}
+			fmt.Fprintf(w, "namespace=%s count=%d\n", target, len(all))
+			for _, c := range all {
+				info, ierr := c.Info(nsCtx)
+				if ierr != nil {
+					fmt.Fprintf(w, "  %s info-error=%v\n", c.ID(), ierr)
+					continue
+				}
+				fmt.Fprintf(w, "  %s image=%s\n", c.ID(), info.Image)
+			}
+		}
+	})
+
 	mux.HandleFunc("/exec", func(w http.ResponseWriter, r *http.Request) {
 		ns := r.URL.Query().Get("ns")
 		cid := r.URL.Query().Get("cid")
@@ -67,7 +111,14 @@ func startDebugExecServer(ctx context.Context, port int, ctrdClient *client.Clie
 			}
 		}
 		if cnt == nil {
-			http.Error(w, "container not found in namespace "+ns, http.StatusNotFound)
+			ids := make([]string, 0, len(all))
+			for _, c := range all {
+				ids = append(ids, c.ID())
+			}
+			http.Error(w,
+				fmt.Sprintf("container with prefix %q not found in namespace %s (saw %d containers: %v)",
+					cid, ns, len(all), ids),
+				http.StatusNotFound)
 			return
 		}
 
