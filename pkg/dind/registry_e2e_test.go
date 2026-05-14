@@ -162,6 +162,20 @@ func TestPushHandlerEndToEnd(t *testing.T) {
 	}
 	t.Logf("staged image %s -> %s (%d bytes)", mockRef, imgDesc.Digest, imgDesc.Size)
 
+	// Diagnostic: confirm the three staged blobs are visible via the same
+	// content store the push handler will use, in the same namespace, right
+	// now. If any of these Info calls reports NotFound, the write didn't
+	// register the digest in the buildkit-namespace bucket — distinct from
+	// the symptom where push later fails to ReaderAt the layer.
+	cs := ctrdClient.ContentStore()
+	layerBytes := []byte("synthetic-layer-for-push-e2e")
+	layerDgst := digest.FromBytes(layerBytes)
+	for _, d := range []digest.Digest{layerDgst, imgDesc.Digest} {
+		info, infoErr := cs.Info(ctx, d)
+		t.Logf("post-stage Info(%s): err=%v size=%d labels=%v",
+			d, infoErr, info.Size, info.Labels)
+	}
+
 	// Bring up the dind server.
 	s, err := New(Config{
 		JobID:   "push-e2e",
