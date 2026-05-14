@@ -195,7 +195,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	// Start container runtime.
 	// On Linux/Windows: embedded containerd runs in-process.
 	// On macOS: boot a Linux VM via Virtualization.framework, containerd runs inside it.
-	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, containerdTCPAddr, cfg.Dind.Enabled)
+	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, containerdTCPAddr, cfg.Dind.Enabled, cfg.VM.Linux.CPUs, cfg.VM.Linux.MemoryMB, cfg.VM.Linux.DiskSizeGB)
 	if err != nil {
 		return fmt.Errorf("starting container runtime: %w", err)
 	}
@@ -291,6 +291,12 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		dispatchPort := int(containerdTCPPort) + 1
 		dispatchCleanup := scheduler.StartDispatchServer(dispatchPort, rt, log)
 		defer dispatchCleanup()
+
+		// Debug exec server on dispatch_port+1 — lets the Windows host poke
+		// into any container in the VM (e.g. exec'ing into kindest/node to
+		// inspect iptables / lsmod / pod logs). No-op on non-Linux.
+		debugCleanup := startWorkerDebugExec(ctx, int(containerdTCPPort)+2, rt.Client(), log)
+		defer debugCleanup()
 
 		log.Info("worker mode ready", "containerd_port", containerdTCPPort, "dispatch_port", dispatchPort, "dind", cfg.Dind.Enabled)
 		<-ctx.Done()

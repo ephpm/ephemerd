@@ -397,9 +397,21 @@ var initrdKernelModules = []string{
 	"kernel/net/netfilter/nft_chain_nat.ko.gz",
 	"kernel/net/netfilter/nft_compat.ko.gz",
 	"kernel/net/netfilter/nft_masq.ko.gz",
+	// nft_nat provides DNAT/SNAT/REDIRECT nft expressions. Needed when the
+	// runner runs `iptables-nft -j DNAT ...` — without it, nft_compat fails
+	// with "Extension DNAT revision 0 not supported, missing kernel module?".
+	"kernel/net/netfilter/nft_nat.ko.gz",
+	// xt_tcpudp backs --dport/--sport in iptables (both legacy and nft compat).
+	"kernel/net/netfilter/xt_tcpudp.ko.gz",
 	"kernel/net/ipv4/netfilter/ip_tables.ko.gz",
 	"kernel/net/ipv4/netfilter/iptable_nat.ko.gz",
 	"kernel/net/netfilter/xt_MASQUERADE.ko.gz",
+	// xt_nat registers the DNAT/SNAT/NETMAP iptables targets. Without it,
+	// /proc/net/ip_tables_targets lacks DNAT and kube-proxy's iptables-restore
+	// aborts at the first KUBE-SVC DNAT line with "Extension DNAT revision 0
+	// not supported, missing kernel module" — iptables-restore is atomic, so
+	// the whole transaction is lost and no Service ClusterIP rules ever install.
+	"kernel/net/netfilter/xt_nat.ko.gz",
 	"kernel/net/netfilter/xt_conntrack.ko.gz", // iptables conntrack match extension
 	"kernel/net/netfilter/xt_comment.ko.gz",   // CNI uses --comment in NAT rules
 	"kernel/net/netfilter/xt_addrtype.ko.gz",  // CNI may use --addrtype matches
@@ -528,14 +540,57 @@ var initrdKernelModulesX86 = []string{
 	"kernel/net/netfilter/nft_chain_nat.ko.gz",
 	"kernel/net/netfilter/nft_compat.ko.gz",
 	"kernel/net/netfilter/nft_masq.ko.gz",
+	// nft_nat provides DNAT/SNAT/REDIRECT nft expressions. Needed when the
+	// runner runs `iptables-nft -j DNAT ...` — without it, nft_compat fails
+	// with "Extension DNAT revision 0 not supported, missing kernel module?".
+	"kernel/net/netfilter/nft_nat.ko.gz",
+	// xt_tcpudp backs --dport/--sport in iptables (both legacy and nft compat).
+	"kernel/net/netfilter/xt_tcpudp.ko.gz",
 	"kernel/net/ipv4/netfilter/ip_tables.ko.gz",
 	"kernel/net/ipv4/netfilter/iptable_nat.ko.gz",
+	// iptable_filter + iptable_mangle are required by kube-proxy inside
+	// kindest/node. Without them every Kubernetes Service request from a
+	// test pod silently fails — kube-proxy can't install the FORWARD/MARK
+	// chains that NAT ClusterIPs to pod IPs, so http://ephpm:8080/ from
+	// the ephpm-e2e pod hits a black hole and reqwest times out at ~20s.
+	"kernel/net/ipv4/netfilter/iptable_filter.ko.gz",
+	"kernel/net/ipv4/netfilter/iptable_mangle.ko.gz",
 	"kernel/net/netfilter/xt_MASQUERADE.ko.gz",
+	// xt_nat registers the DNAT/SNAT/NETMAP iptables targets. Without it,
+	// /proc/net/ip_tables_targets lacks DNAT and kube-proxy's iptables-restore
+	// aborts at the first KUBE-SVC DNAT line with "Extension DNAT revision 0
+	// not supported, missing kernel module" — iptables-restore is atomic, so
+	// the whole transaction is lost and no Service ClusterIP rules ever install.
+	"kernel/net/netfilter/xt_nat.ko.gz",
 	"kernel/net/netfilter/xt_conntrack.ko.gz",
 	"kernel/net/netfilter/xt_comment.ko.gz",
 	"kernel/net/netfilter/xt_addrtype.ko.gz",
 	"kernel/net/netfilter/xt_mark.ko.gz",
+	// xt_REDIRECT for kube-proxy's REDIRECT rules (NodePort handling) and
+	// xt_statistic for the random-load-balance rules kube-proxy emits when
+	// a Service has multiple backend pods.
+	"kernel/net/netfilter/xt_REDIRECT.ko.gz",
+	"kernel/net/netfilter/xt_statistic.ko.gz",
+	"kernel/net/netfilter/xt_recent.ko.gz",
+	// REJECT target — kube-proxy uses it to reject traffic to Services
+	// with no endpoints (so clients see ICMP rejection rather than a hang).
+	// kube-proxy emits this as the very first rule of its iptables-restore
+	// batch, so if the module is missing the ENTIRE Service sync fails on
+	// line 15 with "Extension REJECT revision 0 not supported", no rules
+	// install, and every pod-to-ClusterIP request black-holes. nf_reject
+	// modules are the underlying infrastructure for both ipt_REJECT and
+	// ip6t_REJECT.
+	"kernel/net/ipv4/netfilter/nf_reject_ipv4.ko.gz",
+	"kernel/net/ipv4/netfilter/ipt_REJECT.ko.gz",
 	"kernel/net/bridge/bridge.ko.gz",
+	// br_netfilter exposes /proc/sys/net/bridge/bridge-nf-call-iptables.
+	// kube-proxy requires this sysctl to be 1 so its iptables NAT rules fire
+	// on packets crossing the CNI bridge. Without br_netfilter the sysctl
+	// path doesn't exist, kube-proxy's sync silently misses bridge traffic,
+	// and every pod-to-ClusterIP request inside kindest/node black-holes —
+	// CoreDNS can't reach 10.96.0.1:443 to bootstrap its zones, so its
+	// readiness probe returns 503 and every test pod's DNS lookup fails.
+	"kernel/net/bridge/br_netfilter.ko.gz",
 	"kernel/drivers/net/veth.ko.gz",
 	// Hyper-V utilities for time sync (TimeSync IC)
 	"kernel/drivers/hv/hv_utils.ko.gz",
@@ -641,12 +696,12 @@ func extractVmlinuxFromBzImage(bzImagePath, dest string) error {
 // exec's ephemerd-linux as PID 1.
 func Initrdx86() error {
 	dest := filepath.Join(vmEmbedDir, "initrd")
-	// Initrd embeds ephemerd-linux, the rootfs tarball, and the kernel
-	// modules from linux-virt. If any of those is newer than the existing
-	// initrd, the embedded copy is stale and we must rebuild — otherwise a
-	// fresh ephemerd-linux silently runs an old initrd's binary copy.
+	// Initrd embeds the rootfs tarball and kernel modules from linux-virt.
+	// ephemerd-linux is appended to the boot initrd at runtime by
+	// pkg/vm.buildBootInitrd, so changes to Linux code do not require an
+	// initrd rebuild — only changes to busybox, the rootfs, or kernel
+	// modules invalidate this output.
 	inputs := []string{
-		filepath.Join(vmEmbedDir, "ephemerd-linux"),
 		filepath.Join(vmEmbedDir, "ephemerd-rootfs-"+AlpineVersion+"-x86_64.tar.gz"),
 	}
 	if !outOfDate(dest, inputs...) {
@@ -1301,12 +1356,13 @@ func buildInitrdX86(dest string, pkgData [][]byte, moduleFiles map[string][]byte
 		data: []byte(udhcpcScript),
 	})
 
-	// Bundle rootfs tarball and ephemerd-linux binary into the initrd at /assets/.
-	// The init script extracts these to tmpfs at boot — no disk attachment needed.
+	// Bundle the rootfs tarball into the initrd at /assets/. ephemerd-linux
+	// is appended at runtime by pkg/vm.buildBootInitrd as a separate cpio,
+	// so it is not part of the build-time initrd anymore.
 	files = append(files, cpioFile{name: "assets", mode: 0o40755})
 
-	// Read rootfs and ephemerd-linux from the embed directory on disk.
-	// These files are placed there by download.Rootfs and build.Linuxembed.
+	// Read the rootfs from the embed directory on disk. Placed there by
+	// download.Rootfs.
 	rootfsMatches, _ := filepath.Glob(filepath.Join(vmEmbedDir, "ephemerd-rootfs-*.tar.gz"))
 	if len(rootfsMatches) == 0 {
 		return fmt.Errorf("no rootfs tarball found in %s (run 'mage download:rootfs' first)", vmEmbedDir)
@@ -1323,18 +1379,11 @@ func buildInitrdX86(dest string, pkgData [][]byte, moduleFiles map[string][]byte
 	})
 	fmt.Printf("  Bundling rootfs in initrd (%d bytes)\n", len(rootfsData))
 
-	ephemerdPath := filepath.Join(vmEmbedDir, "ephemerd-linux")
-	ephemerdData, err := os.ReadFile(ephemerdPath)
-	if err != nil {
-		return fmt.Errorf("reading ephemerd-linux for initrd bundle: %w", err)
-	}
-	files = append(files, cpioFile{
-		name: "assets/ephemerd-linux",
-		mode: 0o100755,
-		size: int64(len(ephemerdData)),
-		data: ephemerdData,
-	})
-	fmt.Printf("  Bundling ephemerd-linux in initrd (%d bytes)\n", len(ephemerdData))
+	// ephemerd-linux is no longer bundled into the build-time initrd. It is
+	// embedded separately in the Windows binary and appended as a tiny cpio
+	// to the boot initrd at runtime by pkg/vm.buildBootInitrd. This avoids
+	// a 240MB rebuild of the initrd every time Linux code changes — plain
+	// `go build -o ephemerd.exe` produces a working binary.
 
 	// Hyper-V init script. On first boot, mkfs.ext4 on the single SCSI disk,
 	// extract the bundled Alpine rootfs + ephemerd-linux onto it, and create a
@@ -1455,6 +1504,11 @@ if ! mount -t ext4 -o noatime "$ROOT_DISK" /newroot; then
     exec /bin/sh
 fi
 
+# Grow the filesystem to fill the disk (no-op if already full size).
+# Handles VHDX resize between boots without a schema bump.
+/sbin/resize2fs "$ROOT_DISK" 2>/dev/null && \
+    echo "ephemerd-init: filesystem resized to fill disk" || true
+
 # If the disk had a filesystem but the ephemerd rootfs was never populated
 # (e.g. leftover from an older schema that only stored containerd data),
 # treat it as first-boot and repopulate. The ephemerd-linux binary's presence
@@ -1505,6 +1559,30 @@ fi
 # Enable IP forwarding so containers can route through the VM to the internet.
 # This is a kernel-level setting that persists across switch_root.
 echo 1 > /proc/sys/net/ipv4/ip_forward
+
+# Make sure bridge traffic traverses iptables. br_netfilter (loaded above)
+# adds /proc/sys/net/bridge/bridge-nf-call-iptables, which kube-proxy
+# inside kindest/node requires so its NAT rules fire on packets crossing
+# the CNI bridge. Without this, every pod-to-ClusterIP request inside the
+# cluster (CoreDNS to apiserver, test pod to ephpm service) silently dies.
+#
+# br_netfilter isn't auto-loaded when bridge.ko is — we must modprobe it
+# explicitly. The insmod-loop above tries it once, but if its deps weren't
+# loaded yet (bridge first, then br_netfilter), retry here.
+if [ ! -f /proc/sys/net/bridge/bridge-nf-call-iptables ]; then
+    if [ -f /modules/br_netfilter.ko.gz ]; then
+        gunzip -c /modules/br_netfilter.ko.gz > /tmp/br_netfilter.ko
+        insmod /tmp/br_netfilter.ko 2>&1 | head -3
+        rm -f /tmp/br_netfilter.ko
+    fi
+fi
+if [ -f /proc/sys/net/bridge/bridge-nf-call-iptables ]; then
+    echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables
+    echo 1 > /proc/sys/net/bridge/bridge-nf-call-ip6tables 2>/dev/null || true
+    echo "ephemerd-init: bridge-nf-call-iptables enabled"
+else
+    echo "ephemerd-init: WARNING bridge-nf-call-iptables sysctl missing (br_netfilter not loaded)"
+fi
 
 # Ensure the mount points the switch_root target expects.
 mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/tmp \

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -227,11 +228,15 @@ func (l *hypervLinuxVM) extractAssets() error {
 		findPrefix string      // if non-empty, use findEmbedded(prefix) for src
 	}
 
+	// "initrd-base" is the boot scaffolding — busybox, kernel modules, init
+	// script. The actual /assets/ephemerd-linux entry the init script reads
+	// is appended at runtime by buildBootInitrd into "initrd" (next step) so
+	// a fresh `go build` of ephemerd.exe delivers a new Linux binary without
+	// any mage-side initrd rebuild.
 	assets := []asset{
 		{src: "embed/vmlinuz", dest: filepath.Join(l.vmDir, "vmlinuz"), mode: 0o644},
-		{src: "embed/initrd", dest: filepath.Join(l.vmDir, "initrd"), mode: 0o644},
-		// ephemerd-linux is NOT embedded separately — it's bundled inside the
-		// fat initrd. The VM's init script extracts it at boot time.
+		{src: "embed/initrd", dest: filepath.Join(l.vmDir, "initrd-base"), mode: 0o644},
+		{src: "embed/ephemerd-linux", dest: filepath.Join(l.vmDir, "ephemerd-linux"), mode: 0o755},
 		{findPrefix: "ephemerd-rootfs-", dest: filepath.Join(l.vmDir, "rootfs.tar.gz"), mode: 0o644, gzip: true},
 	}
 
@@ -281,6 +286,20 @@ func (l *hypervLinuxVM) extractAssets() error {
 		}
 	}
 
+	// Build the final initrd by appending a cpio with /assets/ephemerd-linux
+	// to the base initrd. Cheap (a few file ops + gzip on a single 240MB blob)
+	// and idempotent, so we run it on every start. HCS reads InitRdPath only
+	// when the VM is created, so this must happen before createAndBootVM.
+	bootInitrd := filepath.Join(l.vmDir, "initrd")
+	baseInitrd := filepath.Join(l.vmDir, "initrd-base")
+	ephemerdBin := filepath.Join(l.vmDir, "ephemerd-linux")
+	if err := buildBootInitrd(baseInitrd, ephemerdBin, bootInitrd); err != nil {
+		return fmt.Errorf("building boot initrd: %w", err)
+	}
+	if err := grantVmFileAccess(bootInitrd); err != nil {
+		return fmt.Errorf("granting VM access to %s: %w", bootInitrd, err)
+	}
+
 	return nil
 }
 
@@ -320,7 +339,9 @@ func (l *hypervLinuxVM) ensureRootVHDX() error {
 
 	if _, err := os.Stat(vhdxPath); err == nil {
 		if l.schemaMatches() {
-			l.cfg.Log.Info("root VHDX already exists", "path", vhdxPath)
+			if err := l.growVHDXIfNeeded(vhdxPath); err != nil {
+				l.cfg.Log.Warn("failed to resize VHDX", "error", err)
+			}
 			return grantVmFileAccess(vhdxPath)
 		}
 		l.cfg.Log.Info("root VHDX has stale schema, recreating", "path", vhdxPath, "expected_version", rootVHDXSchemaVersion)
@@ -357,6 +378,48 @@ func (l *hypervLinuxVM) ensureRootVHDX() error {
 	}
 
 	return grantVmFileAccess(vhdxPath)
+}
+
+// growVHDXIfNeeded expands an existing VHDX if the configured DiskSizeGB
+// exceeds the current maximum size. The guest filesystem is grown by the
+// init script on the next boot.
+func (l *hypervLinuxVM) growVHDXIfNeeded(vhdxPath string) error {
+	wantGB := l.cfg.DiskSizeGB
+	if wantGB == 0 {
+		wantGB = 50
+	}
+	wantBytes := uint64(wantGB) * 1024 * 1024 * 1024
+
+	fi, err := os.Stat(vhdxPath)
+	if err != nil {
+		return fmt.Errorf("stat VHDX: %w", err)
+	}
+
+	// Get-VHD returns the maximum virtual size, not the file size.
+	out, err := exec.Command("powershell", "-NoProfile", "-Command",
+		fmt.Sprintf("(Get-VHD -Path '%s').Size", vhdxPath)).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("Get-VHD failed: %w\noutput: %s", err, string(out))
+	}
+
+	currentBytes, err := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil {
+		return fmt.Errorf("parsing VHDX size %q: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	if currentBytes >= wantBytes {
+		l.cfg.Log.Info("root VHDX already exists", "path", vhdxPath, "size_gb", currentBytes/(1024*1024*1024), "file_size", fi.Size())
+		return nil
+	}
+
+	l.cfg.Log.Info("resizing root VHDX", "path", vhdxPath, "from_gb", currentBytes/(1024*1024*1024), "to_gb", wantGB)
+	cmd := exec.Command("powershell", "-NoProfile", "-Command",
+		fmt.Sprintf("Resize-VHD -Path '%s' -SizeBytes %d", vhdxPath, wantBytes))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("Resize-VHD failed: %w\noutput: %s", err, string(out))
+	}
+
+	return nil
 }
 
 // schemaMatches reports whether the sidecar schema marker equals the current

@@ -306,18 +306,21 @@ func (s *Server) handleExecStartHijack(w http.ResponseWriter, r *http.Request, e
 	// writes stdin data immediately after receiving the 101 and calls CloseWrite.
 	// Using a deadline avoids hanging forever if the client never sends EOF.
 	var stdinBuf bytes.Buffer
+	var stdinStreaming bool
 	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		s.log.Debug("setting read deadline", "exec_id", exec.ID, "error", err)
 	}
 	if _, err := io.Copy(&stdinBuf, brw.Reader); err != nil {
-		if !os.IsTimeout(err) {
+		if os.IsTimeout(err) {
+			stdinStreaming = true
+		} else {
 			s.log.Debug("reading exec stdin", "exec_id", exec.ID, "error", err)
 		}
 	}
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
 		s.log.Debug("clearing read deadline", "exec_id", exec.ID, "error", err)
 	}
-	s.log.Info("exec stdin buffered", "exec_id", exec.ID, "bytes", stdinBuf.Len())
+	s.log.Info("exec stdin buffered", "exec_id", exec.ID, "bytes", stdinBuf.Len(), "streaming", stdinStreaming)
 
 	// Fast path: "cp /dev/stdin <path>" is used by KIND to write config files
 	// into containers. Containerd's exec FIFO mechanism has a race condition
@@ -327,6 +330,19 @@ func (s *Server) handleExecStartHijack(w http.ResponseWriter, r *http.Request, e
 	if s.isCpStdinExec(exec.Cmd) && stdinBuf.Len() > 0 {
 		if s.handleCpStdinDirect(conn, exec, entry, stdinBuf.Bytes()) {
 			return
+		}
+	}
+
+	// For one-shot stdin (client sent data then closed), write to a file in
+	// the container's overlayfs and use shell redirection. Skip for streaming
+	// execs (e.g. buildctl dial-stdio) where stdin remains open.
+	if stdinBuf.Len() > 0 && !stdinStreaming {
+		if containerPath, ok := s.writeStdinFile(exec, entry, stdinBuf.Bytes()); ok {
+			s.log.Info("exec stdin redirected via file", "exec_id", exec.ID, "path", containerPath, "bytes", stdinBuf.Len())
+			origCmd := exec.Cmd
+			shScript := fmt.Sprintf(`"$@" < %s; s=$?; rm -f %s; exit $s`, containerPath, containerPath)
+			exec.Cmd = append([]string{"sh", "-c", shScript, "_"}, origCmd...)
+			stdinBuf.Reset()
 		}
 	}
 
@@ -354,12 +370,28 @@ func (s *Server) handleExecStartHijack(w http.ResponseWriter, r *http.Request, e
 	}
 
 	var stdinR io.Reader
-	if stdinBuf.Len() > 0 {
-		stdinR = bytes.NewReader(stdinBuf.Bytes())
+	var stdinPW *io.PipeWriter
+	if stdinStreaming {
+		// Streaming exec (e.g. buildctl dial-stdio): the hijacked conn IS the
+		// ongoing stdin source. Prepend any initial buffered bytes, then read
+		// from the live connection. The FIFO race doesn't apply here because
+		// the reader never returns EOF until the client disconnects.
+		stdinR = io.MultiReader(bytes.NewReader(stdinBuf.Bytes()), conn)
+	} else if stdinBuf.Len() > 0 {
+		// One-shot stdin that wasn't handled by the file-redirect path.
+		// Use io.Pipe to delay delivery until after Start().
+		pr, pw := io.Pipe()
+		stdinR = pr
+		stdinPW = pw
 	}
 
 	proc, err := entry.Task.Exec(ctx, exec.ID, pspec, cio.NewCreator(cio.WithStreams(stdinR, stdoutW, stderrW)))
 	if err != nil {
+		if stdinPW != nil {
+			if cerr := stdinPW.Close(); cerr != nil {
+				s.log.Debug("closing exec stdin pipe", "exec_id", exec.ID, "error", cerr)
+			}
+		}
 		s.log.Warn("creating hijacked exec", "exec_id", exec.ID, "error", err)
 		return
 	}
@@ -372,13 +404,34 @@ func (s *Server) handleExecStartHijack(w http.ResponseWriter, r *http.Request, e
 
 	statusCh, err := proc.Wait(ctx)
 	if err != nil {
+		if stdinPW != nil {
+			if cerr := stdinPW.Close(); cerr != nil {
+				s.log.Debug("closing exec stdin pipe", "exec_id", exec.ID, "error", cerr)
+			}
+		}
 		s.log.Warn("waiting for hijacked exec", "exec_id", exec.ID, "error", err)
 		return
 	}
 
 	if err := proc.Start(ctx); err != nil {
+		if stdinPW != nil {
+			if cerr := stdinPW.Close(); cerr != nil {
+				s.log.Debug("closing exec stdin pipe", "exec_id", exec.ID, "error", cerr)
+			}
+		}
 		s.log.Warn("starting hijacked exec", "exec_id", exec.ID, "error", err)
 		return
+	}
+
+	if stdinPW != nil {
+		go func() {
+			if _, err := stdinPW.Write(stdinBuf.Bytes()); err != nil {
+				s.log.Debug("writing exec stdin pipe", "exec_id", exec.ID, "error", err)
+			}
+			if cerr := stdinPW.Close(); cerr != nil {
+				s.log.Debug("closing exec stdin pipe", "exec_id", exec.ID, "error", cerr)
+			}
+		}()
 	}
 
 	exec.Running = true
@@ -853,6 +906,48 @@ func (s *Server) handleCpStdinDirect(conn io.Writer, exec *execEntry, entry *con
 
 	s.log.Info("cp-stdin: wrote directly to overlayfs", "exec_id", exec.ID, "path", dstPath, "bytes", len(data))
 	return true
+}
+
+// writeStdinFile writes stdin data to a temporary file inside the container's
+// overlayfs upperdir. Returns the in-container path on success. The caller
+// wraps the original command with shell redirection so the process reads from
+// this file instead of relying on containerd's FIFO stdin delivery.
+func (s *Server) writeStdinFile(exec *execEntry, entry *containerEntry, data []byte) (string, bool) {
+	ctx := namespaces.WithNamespace(context.Background(), s.jobNamespace)
+
+	snapshotID := entry.ID + "-snapshot"
+	snapshotter := s.client.SnapshotService("overlayfs")
+	if snapshotter == nil {
+		return "", false
+	}
+
+	mounts, err := snapshotter.Mounts(ctx, snapshotID)
+	if err != nil {
+		s.log.Debug("stdin-file: getting mounts", "exec_id", exec.ID, "error", err)
+		return "", false
+	}
+
+	var upperDir string
+	for _, m := range mounts {
+		for _, opt := range m.Options {
+			for _, part := range strings.Split(opt, ",") {
+				if strings.HasPrefix(part, "upperdir=") {
+					upperDir = strings.TrimPrefix(part, "upperdir=")
+				}
+			}
+		}
+	}
+	if upperDir == "" {
+		return "", false
+	}
+
+	containerPath := fmt.Sprintf("/.ephemerd-stdin-%s", exec.ID)
+	hostPath := filepath.Join(upperDir, containerPath)
+	if err := os.WriteFile(hostPath, data, 0o644); err != nil {
+		s.log.Debug("stdin-file: writing file", "exec_id", exec.ID, "error", err)
+		return "", false
+	}
+	return containerPath, true
 }
 
 // cleanupExec deletes an exec process and its log.

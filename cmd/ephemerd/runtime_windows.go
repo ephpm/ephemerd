@@ -18,7 +18,7 @@ import (
 // Returns the native containerd client for Windows jobs and a function that
 // blocks until the Linux dispatch client is ready (nil if Linux VM is disabled
 // or failed to start).
-func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool, _ uint32, _ string, dindEnabled bool) (*client.Client, func() (*scheduler.DispatchClient, *client.Client), func(), error) {
+func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool, _ uint32, _ string, dindEnabled bool, linuxVMCPUs uint, linuxVMMemoryMB uint64, linuxVMDiskSizeGB uint64) (*client.Client, func() (*scheduler.DispatchClient, *client.Client), func(), error) {
 	// Start native containerd for Windows container jobs
 	ctrd, err := containerd.New(containerd.Config{
 		DataDir: dataDir,
@@ -46,6 +46,9 @@ func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool
 
 		lvm, err := vm.StartLinuxVM(vm.LinuxVMConfig{
 			DataDir:     dataDir,
+			CPUs:        linuxVMCPUs,
+			MemoryMB:    linuxVMMemoryMB,
+			DiskSizeGB:  linuxVMDiskSizeGB,
 			DindEnabled: dindEnabled,
 			Log:         log,
 		})
@@ -83,7 +86,9 @@ func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool
 	cleanup = func() {
 		<-linuxVMDone
 		if dispatchClient != nil {
-			_ = dispatchClient.Close()
+			if err := dispatchClient.Close(); err != nil {
+				log.Warn("closing dispatch client", "error", err)
+			}
 		}
 		if linuxVM != nil {
 			linuxVM.Stop()

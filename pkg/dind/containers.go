@@ -85,6 +85,7 @@ type containerEntry struct {
 	Tty          bool
 	HostsPath    string   // host-side /etc/hosts file bind-mounted into the container
 	ExtraHosts   []string // user-provided "host:ip" entries (--add-host)
+	PortForwards []func() // stop functions for port-forward proxy goroutines
 }
 
 // createRequest is the subset of Docker's container create body we support.
@@ -389,6 +390,39 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	opts = append(opts, withBindMount(hostsPath, "/etc/hosts", []string{"rbind", "rw"}))
 
+	// Provision /etc/hostname so systemd (and anything that reads the file
+	// directly) sees the container's hostname rather than whatever was baked
+	// into the image. Without this, systemd resets the UTS hostname to the
+	// image default (e.g. "debuerreotype" for Debian), breaking kubeadm's
+	// certificate SAN generation inside kindest/node.
+	hostname := req.Hostname
+	if hostname == "" {
+		hostname = name
+	}
+	if hostname == "" && len(id) >= 12 {
+		hostname = id[:12]
+	}
+	hostnamePath := filepath.Join(filepath.Dir(s.sockPath), "containers", id, "hostname")
+	if err := os.WriteFile(hostnamePath, []byte(hostname+"\n"), 0o644); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"message": fmt.Sprintf("writing hostname file: %v", err),
+		})
+		return
+	}
+	opts = append(opts, withBindMount(hostnamePath, "/etc/hostname", []string{"rbind", "rw"}))
+
+	// Provision /etc/resolv.conf with public DNS so containers can resolve
+	// external hostnames. The default resolv.conf inside a fresh mount
+	// namespace often points to localhost (::1) which has no DNS server.
+	resolvPath := filepath.Join(filepath.Dir(s.sockPath), "containers", id, "resolv.conf")
+	if err := os.WriteFile(resolvPath, []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"), 0o644); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"message": fmt.Sprintf("writing resolv.conf: %v", err),
+		})
+		return
+	}
+	opts = append(opts, withBindMount(resolvPath, "/etc/resolv.conf", []string{"rbind", "rw"}))
+
 	// For kindest/node containers, wrap the process to pre-register
 	// iptables alternatives that may be missing from the overlay. The
 	// Debian alternatives database lives in a lower image layer and is
@@ -396,6 +430,21 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	// re-creates it at container start before the real entrypoint runs.
 	if strings.Contains(req.Image, "kindest/node") && req.HostConfig != nil && req.HostConfig.Privileged {
 		opts = append(opts, withKindNodeInit(s.log))
+	}
+
+	// Buildkit containers need a host ext4 directory for /var/lib/buildkit so
+	// they can use overlayfs instead of the native snapshotter.  The native
+	// snapshotter does full file copies per layer and quickly exhausts disk.
+	if strings.Contains(req.Image, "buildkit") {
+		buildkitDir := filepath.Join(filepath.Dir(s.sockPath), "buildkit", id)
+		if err := os.MkdirAll(buildkitDir, 0o755); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"message": fmt.Sprintf("creating buildkit dir: %v", err),
+			})
+			return
+		}
+		opts = append(opts, withBindMount(buildkitDir, "/var/lib/buildkit", []string{"rbind", "rw"}))
+		s.log.Info("bind-mounted host ext4 for buildkit", "container", id, "host_path", buildkitDir)
 	}
 
 	// Anonymous volumes (e.g. VOLUME /var in Dockerfile or --volume /var).
@@ -463,7 +512,7 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	s.assignContainerNetwork(entry, req)
 	s.mu.Unlock()
 
-	s.log.Info("container created", "id", id, "name", name, "image", req.Image)
+	s.log.Info("container created", "id", id, "name", name, "image", req.Image, "labels", entry.Labels)
 
 	// Ensure files from lower overlay layers are visible in the container.
 	// Containerd's overlayfs snapshotter can produce mounts where directories
@@ -576,6 +625,12 @@ func (s *Server) handleContainerStart(w http.ResponseWriter, r *http.Request, id
 
 	entry.Status = "running"
 	s.log.Info("container started", "id", id, "ip", entry.IP)
+
+	// Install DNAT rules for any port bindings. KIND's `kind create cluster`
+	// creates the kindest/node with -p 127.0.0.1:<random>:6443 and writes a
+	// kubeconfig pointing at that 127.0.0.1:<random>. Without DNAT in the
+	// runner's netns, tilt + kubectl get connection refused.
+	s.installPortForwards(entry)
 
 	// Monitor for unexpected exit so we can diagnose crashes.
 	bgCtx := namespaces.WithNamespace(context.Background(), s.jobNamespace)
@@ -911,11 +966,95 @@ func (s *Server) handleContainerRemove(w http.ResponseWriter, r *http.Request, i
 }
 
 func (s *Server) handleContainerList(w http.ResponseWriter, r *http.Request) {
+	// Parse the "filters" query parameter. Docker's filters serialize to one
+	// of two JSON shapes depending on the client SDK version:
+	//   {"label":{"k=v":true},"name":{"foo":true}}   (current Docker SDK)
+	//   {"label":["k=v"],"name":["foo"]}             (older clients / docs)
+	// Support both. KIND uses the map form via the Go SDK, so failing to
+	// parse it means kind load sees an empty container list and tries to
+	// inspect '' — exactly the symptom we keep hitting.
+	labelFilters := map[string]string{}
+	labelKeyOnly := map[string]bool{}
+	nameFilters := []string{}
+	if raw := r.URL.Query().Get("filters"); raw != "" {
+		extract := func(label, name []string) {
+			for _, lf := range label {
+				if k, v, ok := strings.Cut(lf, "="); ok {
+					labelFilters[k] = v
+				} else {
+					labelKeyOnly[lf] = true
+				}
+			}
+			nameFilters = append(nameFilters, name...)
+		}
+
+		// Try the map shape first (current Docker SDK).
+		var asMap map[string]map[string]bool
+		if err := json.Unmarshal([]byte(raw), &asMap); err == nil {
+			labels := make([]string, 0, len(asMap["label"]))
+			for k, on := range asMap["label"] {
+				if on {
+					labels = append(labels, k)
+				}
+			}
+			names := make([]string, 0, len(asMap["name"]))
+			for k, on := range asMap["name"] {
+				if on {
+					names = append(names, k)
+				}
+			}
+			extract(labels, names)
+		} else {
+			// Fall back to the older array shape.
+			var asArr map[string][]string
+			if err := json.Unmarshal([]byte(raw), &asArr); err == nil {
+				extract(asArr["label"], asArr["name"])
+			} else {
+				s.log.Warn("container list: filters JSON unparseable",
+					"raw", raw, "map_err", err.Error())
+			}
+		}
+		s.log.Debug("container list: filters parsed",
+			"raw", raw,
+			"labels", labelFilters,
+			"label_keys", labelKeyOnly,
+			"names", nameFilters)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	result := make([]map[string]any, 0, len(s.containers))
 	for _, entry := range s.containers {
+		// Apply label filters.
+		matched := true
+		for k, v := range labelFilters {
+			if entry.Labels[k] != v {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			for k := range labelKeyOnly {
+				if _, ok := entry.Labels[k]; !ok {
+					matched = false
+					break
+				}
+			}
+		}
+		if matched && len(nameFilters) > 0 {
+			matched = false
+			for _, nf := range nameFilters {
+				if strings.Contains(entry.Name, nf) {
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched {
+			continue
+		}
+
 		names := []string{}
 		if entry.Name != "" {
 			names = []string{"/" + entry.Name}
@@ -932,6 +1071,7 @@ func (s *Server) handleContainerList(w http.ResponseWriter, r *http.Request) {
 			"Image":   entry.Image,
 			"State":   entry.Status,
 			"Created": entry.Created.Unix(),
+			"Labels":  entry.Labels,
 			"NetworkSettings": map[string]any{
 				"Networks": networks,
 			},
@@ -1006,8 +1146,59 @@ func (s *Server) assignContainerNetwork(entry *containerEntry, req createRequest
 	entry.IP = ip
 }
 
+// installPortForwards starts userspace TCP proxies for every PortBindings
+// entry on the container. Each proxy listens on hostIP:hostPort inside the
+// runner's net namespace and forwards to entry.IP:containerPort. Best-effort
+// — failures log a warning and don't abort container start.
+func (s *Server) installPortForwards(entry *containerEntry) {
+	if s.runnerNetNS == "" || entry.IP == "" || len(entry.PortBindings) == 0 {
+		return
+	}
+	for containerSpec, bindings := range entry.PortBindings {
+		// containerSpec is e.g. "6443/tcp"; we only handle tcp.
+		port, proto, ok := strings.Cut(containerSpec, "/")
+		if !ok || proto != "tcp" {
+			continue
+		}
+		for _, b := range bindings {
+			if b.HostPort == "" {
+				continue
+			}
+			stop, err := startPortForwardProxy(s.runnerNetNS, b.HostIP, b.HostPort, entry.IP, port)
+			if err != nil {
+				s.log.Warn("port forward install failed",
+					"container", entry.ID[:12],
+					"host", b.HostIP+":"+b.HostPort,
+					"target", entry.IP+":"+port,
+					"error", err)
+				continue
+			}
+			entry.PortForwards = append(entry.PortForwards, stop)
+			s.log.Info("port forward installed",
+				"container", entry.ID[:12],
+				"host", b.HostIP+":"+b.HostPort,
+				"target", entry.IP+":"+port)
+		}
+	}
+}
+
+// removePortForwards stops every running port-forward proxy goroutine for
+// this container. Called from cleanupContainer.
+func (s *Server) removePortForwards(entry *containerEntry) {
+	for _, stop := range entry.PortForwards {
+		stop()
+	}
+	entry.PortForwards = nil
+}
+
 // cleanupContainer kills, deletes, and tears down networking for a container.
 func (s *Server) cleanupContainer(ctx context.Context, id string, entry *containerEntry) {
+	// Remove port forwards before killing the task — once the container's
+	// netns is gone, the DNAT target IP becomes unreachable and any
+	// in-flight kubectl call from the runner stalls. Removing rules first
+	// fails those calls fast.
+	s.removePortForwards(entry)
+
 	if entry.Task != nil {
 		taskStatus, err := entry.Task.Status(ctx)
 		if err == nil && taskStatus.Status == client.Running {
@@ -1040,6 +1231,11 @@ func (s *Server) cleanupContainer(ctx context.Context, id string, entry *contain
 		if err := os.RemoveAll(filepath.Dir(entry.LogPath)); err != nil {
 			s.log.Debug("log cleanup", "id", id, "error", err)
 		}
+	}
+
+	buildkitDir := filepath.Join(filepath.Dir(s.sockPath), "buildkit", id)
+	if err := os.RemoveAll(buildkitDir); err != nil {
+		s.log.Debug("buildkit dir cleanup", "id", id, "error", err)
 	}
 }
 
@@ -1125,6 +1321,16 @@ func withKindNodeInit(log *slog.Logger) oci.SpecOpts {
 		}
 
 		script := `set -e
+# Move /var/lib/containerd onto a tmpfs so nested containerd can use
+# overlayfs. The kindest/node rootfs sits on overlayfs (our snapshotter),
+# and Linux rejects overlayfs-on-overlayfs as upperdir. A tmpfs-backed
+# containerd store fixes this while preserving the pre-loaded images.
+if [ -d /var/lib/containerd ]; then
+  mkdir -p /tmp/containerd-vol
+  mount -t tmpfs tmpfs /tmp/containerd-vol
+  cp -a /var/lib/containerd/. /tmp/containerd-vol/
+  mount --bind /tmp/containerd-vol /var/lib/containerd
+fi
 # Pre-register iptables alternatives if the database is missing.
 # The Debian alternatives DB lives in a lower overlay layer and may
 # not be visible; re-create it so select_iptables() in the entrypoint

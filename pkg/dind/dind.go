@@ -42,6 +42,7 @@ type Server struct {
 	client       *client.Client
 	network      *networking.Manager
 	buildkit     *buildkit.Server // shared embedded BuildKit solver (nil → fall back to platform default)
+	runnerNetNS  string           // path to runner container's net namespace; used to install DNAT rules for port bindings
 	log          *slog.Logger
 
 	mu         sync.Mutex
@@ -79,6 +80,13 @@ type Config struct {
 	// platform default (buildah on Linux, 501 elsewhere) is used.
 	BuildKit *buildkit.Server
 
+	// RunnerNetNS is the path to the runner container's net namespace
+	// (e.g. /proc/<pid>/ns/net). Required for port forwarding — when a
+	// dind sibling exposes ports via -p, we install iptables DNAT rules
+	// in this namespace so the runner sees 127.0.0.1:hostPort routed to
+	// the sibling's container IP. Empty disables port forwarding.
+	RunnerNetNS string
+
 	Log *slog.Logger
 }
 
@@ -105,8 +113,9 @@ func New(cfg Config) (*Server, error) {
 		sockPath:     sockPath,
 		client:       cfg.Client,
 		network:      cfg.Network,
-		buildkit:     cfg.BuildKit,
-		log:          cfg.Log.With("component", "dind", "job_id", cfg.JobID),
+		buildkit:    cfg.BuildKit,
+		runnerNetNS: cfg.RunnerNetNS,
+		log:         cfg.Log.With("component", "dind", "job_id", cfg.JobID),
 		images:       make(map[string]*imageEntry),
 		containers:   make(map[string]*containerEntry),
 		execs:        make(map[string]*execEntry),
@@ -120,6 +129,16 @@ func New(cfg Config) (*Server, error) {
 // Empty on Windows — use Endpoint() to get the DOCKER_HOST value instead.
 func (s *Server) SocketPath() string {
 	return s.sockPath
+}
+
+// SetRunnerNetNS records the runner container's net namespace path so the
+// dind server can install iptables DNAT rules for port-bound siblings. Must
+// be called after the runner task starts (PID is known) and before any
+// docker create from inside the runner.
+func (s *Server) SetRunnerNetNS(netnsPath string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runnerNetNS = netnsPath
 }
 
 // Endpoint returns the value a container should set DOCKER_HOST to in order

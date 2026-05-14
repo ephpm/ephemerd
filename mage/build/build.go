@@ -71,12 +71,13 @@ func Build() error {
 // 1. Cross-compile static Linux binary with Linux assets embedded
 // 2. Build Windows binary embedding the Linux binary + Alpine rootfs + kernel + initrd
 func Windows() error {
-	// Phase 1: produce the inputs the initrd will bundle (ephemerd-linux binary
-	// and Alpine rootfs tarball), plus downloads that Initrdx86 doesn't touch.
+	// Phase 1: cross-compile the Linux binary that gets embedded directly in
+	// the Windows binary (extracted at runtime to <DataDir>\vm\linux\ and
+	// appended to the boot initrd by pkg/vm.buildBootInitrd), plus the rootfs
+	// the initrd bundles, plus other downloads.
 	mg.Deps(Linuxembed, download.Rootfs, download.Runnerwindows, download.Kernelx86, download.Shimwindows)
-	// Phase 2: build the initrd. Must run after Linuxembed + Rootfs — Initrdx86
-	// bundles pkg/vm/embed/ephemerd-linux and pkg/vm/embed/ephemerd-rootfs-*.tar.gz
-	// directly, and will fail on a fresh workspace if those aren't on disk yet.
+	// Phase 2: build the boot-scaffolding initrd. ephemerd-linux is no longer
+	// bundled in here — see pkg/vm/initrd_windows.go.buildBootInitrd.
 	mg.Deps(download.Initrdx86)
 
 	// Remove any Linux runner from embed dir to avoid bloating the Windows binary.
