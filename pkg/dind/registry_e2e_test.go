@@ -275,8 +275,18 @@ func stageSyntheticImage(ctx context.Context, client containerdClient, name stri
 		Digest:    manifestDigest,
 		Size:      int64(len(manifestBytes)),
 	}
+	// Attach gc.ref.content labels so containerd's GC keeps the config and
+	// layer reachable through the manifest. Without these the bare blobs are
+	// unreferenced (the image record only points at the manifest, not its
+	// children) and a GC pass between staging and push deletes the layer —
+	// the resulting "content digest <layer>: not found" error is the flake
+	// that made this test pass locally but fail intermittently in CI.
+	manifestLabels := map[string]string{
+		"containerd.io/gc.ref.content.config": configDigest.String(),
+		"containerd.io/gc.ref.content.l.0":    layerDigest.String(),
+	}
 	if err := content.WriteBlob(ctx, cs, "manifest-"+manifestDigest.String(),
-		bytes.NewReader(manifestBytes), manifestDesc); err != nil {
+		bytes.NewReader(manifestBytes), manifestDesc, content.WithLabels(manifestLabels)); err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("write manifest: %w", err)
 	}
 
