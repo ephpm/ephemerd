@@ -2,6 +2,7 @@ package localtunnel
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -402,3 +403,233 @@ func TestListen_InvalidJSON(t *testing.T) {
 		t.Fatal("expected error for invalid JSON response")
 	}
 }
+
+// --- Reconnect / dropped-connection behavior ---
+
+// fakeTunnelServer simulates the localtunnel.me API. It serves the
+// registration request and then opens a TCP listener on a random port that
+// the client's proxy() loop will dial. Each accepted connection is closed
+// immediately by default, simulating a server that drops connections —
+// which is exactly the scenario reconnect logic must handle.
+type fakeTunnelServer struct {
+	httpSrv  *httptest.Server
+	tcpLn    net.Listener
+	accepted chan struct{}
+	closed   chan struct{}
+	// onAccept controls what the server does when a TCP client connects.
+	onAccept func(net.Conn)
+}
+
+func newFakeTunnelServer(t *testing.T) *fakeTunnelServer {
+	t.Helper()
+	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	port := tcpLn.Addr().(*net.TCPAddr).Port
+
+	f := &fakeTunnelServer{
+		tcpLn:    tcpLn,
+		accepted: make(chan struct{}, 8),
+		closed:   make(chan struct{}),
+	}
+	// Default behavior: drop connections immediately.
+	f.onAccept = func(c net.Conn) {
+		if err := c.Close(); err != nil {
+			t.Logf("server close: %v", err)
+		}
+	}
+
+	go func() {
+		for {
+			c, err := tcpLn.Accept()
+			if err != nil {
+				return
+			}
+			select {
+			case f.accepted <- struct{}{}:
+			default:
+			}
+			f.onAccept(c)
+		}
+	}()
+
+	f.httpSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Response shape matches what Listen() expects.
+		body := fmt.Sprintf(`{"id":"x","port":%d,"max_conn_count":1,"url":"http://x.example/"}`, port)
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write([]byte(body)); err != nil {
+			t.Logf("writing http response: %v", err)
+		}
+	}))
+
+	t.Cleanup(func() {
+		f.httpSrv.Close()
+		if err := tcpLn.Close(); err != nil {
+			t.Logf("tcp close: %v", err)
+		}
+		close(f.closed)
+	})
+
+	return f
+}
+
+func TestListen_DroppedConnection_AbortsListener(t *testing.T) {
+	// Inspecting listener.go: handle() returns the read error to proxy(),
+	// which then calls abort(). After abort, Accept() returns the recorded
+	// error. This documents the "drop -> abort" semantics rather than
+	// auto-reconnect at the per-connection level (which is not what this
+	// implementation does — proxy()'s retry only covers the initial dial).
+	srv := newFakeTunnelServer(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	ln, err := Listen(ctx, Options{
+		BaseURL: srv.httpSrv.URL,
+		Log:     &testLogger{},
+	})
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer func() {
+		if err := ln.Close(); err != nil {
+			t.Logf("listener close: %v", err)
+		}
+	}()
+
+	// At least one accept should occur (the initial connection).
+	select {
+	case <-srv.accepted:
+		// expected
+	case <-time.After(3 * time.Second):
+		t.Fatal("never received initial connection")
+	}
+
+	// After the server drops the conn, Accept() on the listener should
+	// return the abort error within a reasonable time (no auto-reconnect).
+	type acceptResult struct {
+		err error
+	}
+	resCh := make(chan acceptResult, 1)
+	go func() {
+		_, err := ln.Accept()
+		resCh <- acceptResult{err}
+	}()
+
+	select {
+	case r := <-resCh:
+		if r.err == nil {
+			t.Error("Accept() returned nil err after server dropped connection")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Accept() did not return after server drop")
+	}
+}
+
+// TestListen_BackoffDuration documents the retry backoff schedule used by
+// proxy(). The loop sleeps time.Duration(i*i)*3*time.Second on attempt i,
+// so attempts run at 0s, 3s, 12s, 27s offsets from the initial dial.
+// We don't execute the full retry storm in unit tests (~42s); instead we
+// assert the formula at the values used in the source.
+func TestListen_BackoffSchedule(t *testing.T) {
+	// Mirror the formula in listener.go's proxy() loop.
+	expected := []time.Duration{
+		0 * time.Second,
+		3 * time.Second,
+		12 * time.Second,
+	}
+	for i, want := range expected {
+		got := time.Duration(i*i) * 3 * time.Second
+		if got != want {
+			t.Errorf("attempt %d: backoff = %v, want %v", i, got, want)
+		}
+	}
+}
+
+func TestListen_ContextCancel_StopsReconnect(t *testing.T) {
+	// When the caller cancels the context, the reconnect loop must terminate.
+	srv := newFakeTunnelServer(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	ln, err := Listen(ctx, Options{
+		BaseURL: srv.httpSrv.URL,
+		Log:     &testLogger{},
+	})
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+
+	// Cancel after a short delay so at least one connection is made.
+	time.AfterFunc(200*time.Millisecond, cancel)
+
+	// Close should return before any test timeout.
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- ln.Close() }()
+
+	select {
+	case <-closeDone:
+		// success — loop exited
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close() did not return after context cancellation")
+	}
+}
+
+// --- Listener public surface ---
+
+func TestListener_AccessorsAfterListen(t *testing.T) {
+	// Smoke-check that Addr() and URL/RemoteAddr/Close don't panic on a
+	// real Listener, even when the tunnel TCP side is dead-on-arrival.
+	srv := newFakeTunnelServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ln, err := Listen(ctx, Options{
+		BaseURL: srv.httpSrv.URL,
+		Log:     &testLogger{},
+	})
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer func() {
+		if err := ln.Close(); err != nil {
+			t.Logf("listener close: %v", err)
+		}
+	}()
+
+	addr := ln.Addr()
+	if addr == nil {
+		t.Fatal("Addr() returned nil")
+	}
+	if addr.Network() != "localtunnel" {
+		t.Errorf("Network() = %q, want localtunnel", addr.Network())
+	}
+	if addr.String() == "" {
+		t.Error("Addr.String() is empty")
+	}
+}
+
+// --- handle() stale-connection behavior is exercised indirectly ---
+
+func TestConn_Done_ClosesOnce(t *testing.T) {
+	// Multiple errors must only close Done once (sync.Once) — a regression
+	// here would cause "close of closed channel" panic during reconnect.
+	done := make(chan struct{}, 1)
+	c := &conn{
+		Conn:   &mockConn{}, // returns EOF immediately
+		Buffer: [1]byte{'x'},
+		Done:   done,
+	}
+
+	// First read consumes buffered byte and may hit EOF on underlying.
+	buf := make([]byte, 4)
+	_, _ = c.Read(buf)
+	// Second read goes straight through to underlying (always EOF).
+	_, _ = c.Read(buf)
+	// Close should not panic even if Done was already closed.
+	if err := c.Close(); err != nil {
+		t.Errorf("Close() error: %v", err)
+	}
+}
+

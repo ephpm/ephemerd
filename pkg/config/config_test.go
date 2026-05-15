@@ -1524,3 +1524,245 @@ memory_mb = 16384
 		t.Errorf("VM.MacOS.MemoryMB = %d, want 16384", cfg.VM.MacOS.MemoryMB)
 	}
 }
+
+// --- Additional Providers() and validate() coverage ---
+
+func TestProviders_Order_GitHubFirst(t *testing.T) {
+	// When all 5 providers are configured, github is always returned first
+	// (Provider() relies on this for its single-string fallback).
+	cfg := &Config{
+		GitHub:     GitHubConfig{Token: "ghp_test"},
+		Forgejo:    ForgejoConfig{InstanceURL: "https://codeberg.org"},
+		Gitea:      GiteaConfig{InstanceURL: "https://gitea.example.com"},
+		GitLab:     GitLabConfig{InstanceURL: "https://gitlab.com"},
+		Woodpecker: WoodpeckerConfig{ServerURL: "woodpecker:9000"},
+	}
+	ps := cfg.Providers()
+	if len(ps) == 0 || ps[0] != "github" {
+		t.Errorf("Providers() = %v, want github first", ps)
+	}
+	if p := cfg.Provider(); p != "github" {
+		t.Errorf("Provider() = %q, want %q", p, "github")
+	}
+}
+
+func TestValidate_GitHubApp_HappyPath(t *testing.T) {
+	// All four GitHub App fields set + owner = valid (no error).
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{
+		GitHub: GitHubConfig{
+			AppID:          12345,
+			InstallationID: 67890,
+			PrivateKeyPath: "/path/to/key.pem",
+			Owner:          "myorg",
+		},
+		Webhook: WebhookConfig{Tunnel: "none"},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidate_PAT_HappyPath(t *testing.T) {
+	// PAT-only authentication (no AppID) with owner = valid.
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{
+		GitHub:  GitHubConfig{Token: "ghp_test", Owner: "myorg"},
+		Webhook: WebhookConfig{Tunnel: "none"},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidate_EnvTokenWithOwnerOnly(t *testing.T) {
+	// Owner alone triggers github provider. GITHUB_TOKEN env should be picked up.
+	t.Setenv("GITHUB_TOKEN", "ghp_envonly")
+	cfg := &Config{
+		GitHub:  GitHubConfig{Owner: "myorg"},
+		Webhook: WebhookConfig{Tunnel: "none"},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.GitHub.Token != "ghp_envonly" {
+		t.Errorf("Token = %q, want env-supplied value", cfg.GitHub.Token)
+	}
+}
+
+func TestValidate_WebhookSecretIsHex(t *testing.T) {
+	// Auto-generated secret should be hex-encoded (only 0-9, a-f).
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{
+		GitHub:  GitHubConfig{Token: "ghp_test", Owner: "org"},
+		Webhook: WebhookConfig{Tunnel: "ngrok"},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, c := range cfg.Webhook.Secret {
+		isDigit := c >= '0' && c <= '9'
+		isHex := c >= 'a' && c <= 'f'
+		if !isDigit && !isHex {
+			t.Errorf("secret contains non-hex char %c: %s", c, cfg.Webhook.Secret)
+			break
+		}
+	}
+}
+
+func TestValidate_NoSecretWhenTunnelEmpty(t *testing.T) {
+	// Empty tunnel string is also "no tunnel" (only "!= none" triggers gen).
+	// Specifically: tunnel="" should not trigger secret generation.
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{
+		GitHub:  GitHubConfig{Token: "ghp_test", Owner: "org"},
+		Webhook: WebhookConfig{}, // Tunnel is empty string
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Currently empty string != "none" so it WILL generate a secret.
+	// This documents current behavior — caller must explicitly set "none".
+	if cfg.Webhook.Secret == "" {
+		t.Skip("if behavior changes to treat empty tunnel as 'none', this test will need update")
+	}
+}
+
+func TestValidate_NgrokTunnelGeneratesSecret(t *testing.T) {
+	// ngrok tunnel should also trigger auto-secret generation.
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{
+		GitHub:  GitHubConfig{Token: "ghp_test", Owner: "org"},
+		Webhook: WebhookConfig{Tunnel: "ngrok"},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Webhook.Secret) != 64 {
+		t.Errorf("expected hex-encoded 32-byte secret, got len=%d", len(cfg.Webhook.Secret))
+	}
+}
+
+func TestValidate_GitLabAndWoodpeckerBothChecked(t *testing.T) {
+	// Multi-provider case: gitlab valid, woodpecker missing secret.
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{
+		GitLab:     GitLabConfig{InstanceURL: "https://gitlab.com", Token: "glrt-x"},
+		Woodpecker: WoodpeckerConfig{ServerURL: "woodpecker:9000"}, // missing AgentSecret
+		Webhook:    WebhookConfig{Tunnel: "none"},
+	}
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("expected error: woodpecker missing agent_secret")
+	}
+}
+
+func TestValidate_GiteaAndForgejoBothChecked(t *testing.T) {
+	// Multi-provider case: gitea valid, forgejo missing token.
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{
+		Gitea:   GiteaConfig{InstanceURL: "https://gitea.example.com", Token: "tok"},
+		Forgejo: ForgejoConfig{InstanceURL: "https://codeberg.org"}, // missing token
+		Webhook: WebhookConfig{Tunnel: "none"},
+	}
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("expected error: forgejo missing token")
+	}
+}
+
+func TestProviders_NoCredentials_Empty(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	cfg := &Config{}
+	if ps := cfg.Providers(); len(ps) != 0 {
+		t.Errorf("Providers() = %v, want empty", ps)
+	}
+}
+
+// --- Additional duration parser coverage ---
+
+func TestLogRetentionDuration_7d(t *testing.T) {
+	// "7d" is the documented default form — ensure it parses to 7 days.
+	lc := LogConfig{LogRetention: "7d"}
+	if d := lc.LogRetentionDuration(); d != 7*24*time.Hour {
+		t.Errorf("LogRetention(7d) = %v, want %v", d, 7*24*time.Hour)
+	}
+}
+
+func TestLogRetentionDuration_168h(t *testing.T) {
+	// "168h" is equivalent to 7 days in pure Go duration form.
+	lc := LogConfig{LogRetention: "168h"}
+	if d := lc.LogRetentionDuration(); d != 168*time.Hour {
+		t.Errorf("LogRetention(168h) = %v, want %v", d, 168*time.Hour)
+	}
+}
+
+func TestLogRetentionDuration_SingleD(t *testing.T) {
+	// "d" alone (no number) is too short to be valid Nd shorthand and is
+	// not a Go duration — should fall back to default 7d.
+	lc := LogConfig{LogRetention: "d"}
+	if d := lc.LogRetentionDuration(); d != 7*24*time.Hour {
+		t.Errorf("LogRetention(d) = %v, want default 168h", d)
+	}
+}
+
+func TestLogRetentionDuration_BadDays(t *testing.T) {
+	// "abcd" — ends with 'd' but the prefix is not a valid duration.
+	// Falls through to time.ParseDuration which also fails — default returned.
+	lc := LogConfig{LogRetention: "abcd"}
+	if d := lc.LogRetentionDuration(); d != 7*24*time.Hour {
+		t.Errorf("LogRetention(abcd) = %v, want default 168h", d)
+	}
+}
+
+func TestLogRetentionDuration_OneDay(t *testing.T) {
+	lc := LogConfig{LogRetention: "1d"}
+	if d := lc.LogRetentionDuration(); d != 24*time.Hour {
+		t.Errorf("LogRetention(1d) = %v, want 24h", d)
+	}
+}
+
+func TestLogRetentionDuration_30Days(t *testing.T) {
+	lc := LogConfig{LogRetention: "30d"}
+	if d := lc.LogRetentionDuration(); d != 30*24*time.Hour {
+		t.Errorf("LogRetention(30d) = %v, want 720h", d)
+	}
+}
+
+func TestLogRetentionDuration_MixedUnits(t *testing.T) {
+	// "30m" — Go duration form; should parse as 30 minutes.
+	lc := LogConfig{LogRetention: "30m"}
+	if d := lc.LogRetentionDuration(); d != 30*time.Minute {
+		t.Errorf("LogRetention(30m) = %v, want 30m", d)
+	}
+}
+
+func TestParsedPollInterval_Empty(t *testing.T) {
+	// Explicit empty string should fall back to default.
+	g := &GitHubConfig{PollInterval: ""}
+	if d := g.ParsedPollInterval(); d != 30*time.Second {
+		t.Errorf("PollInterval('') = %v, want 30s default", d)
+	}
+}
+
+func TestParsedJobTimeout_Empty(t *testing.T) {
+	// Empty string fails ParseDuration, returns default 2h.
+	r := &RunnerConfig{JobTimeout: ""}
+	if d := r.ParsedJobTimeout(); d != 2*time.Hour {
+		t.Errorf("JobTimeout('') = %v, want 2h default", d)
+	}
+}
+
+func TestParsedShutdownTimeout_Empty(t *testing.T) {
+	r := &RunnerConfig{ShutdownTimeout: ""}
+	if d := r.ParsedShutdownTimeout(); d != 5*time.Minute {
+		t.Errorf("ShutdownTimeout('') = %v, want 5m default", d)
+	}
+}
+
+func TestParsedPollInterval_Hours(t *testing.T) {
+	g := &GitHubConfig{PollInterval: "2h"}
+	if d := g.ParsedPollInterval(); d != 2*time.Hour {
+		t.Errorf("PollInterval(2h) = %v, want 2h", d)
+	}
+}

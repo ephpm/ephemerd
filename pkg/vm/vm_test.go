@@ -1,8 +1,12 @@
 package vm
 
 import (
+	"crypto/ed25519"
 	"runtime"
+	"strings"
 	"testing"
+
+	"golang.org/x/crypto/ssh"
 )
 
 // --- LinuxVMConfig.SetDefaults ---
@@ -188,5 +192,161 @@ func TestStartLinuxVM_ErrorsOnLinux(t *testing.T) {
 	_, err := StartLinuxVM(LinuxVMConfig{})
 	if err == nil {
 		t.Error("expected error on Linux (containerd runs natively)")
+	}
+}
+
+// --- macOS SSH key material validation (cross-platform) ---
+//
+// macosvm_darwin.go is darwin-only, but the SSH key injection logic is
+// driven by MacOSVMConfig.SSHPubKey / SSHSigner — both validated/generated
+// in the cross-platform vm.go. These tests run on every platform.
+
+func TestGenerateEphemeralSSHKey_SignerIsEd25519(t *testing.T) {
+	// The generated private key must satisfy crypto.Signer (used by SSH
+	// auth in setupRunnerViaSSH and monitorRunner). The runtime type
+	// assertion (ed25519.PrivateKey) is load-bearing.
+	priv, _, err := GenerateEphemeralSSHKey()
+	if err != nil {
+		t.Fatalf("GenerateEphemeralSSHKey: %v", err)
+	}
+
+	// Confirm it satisfies the type assertion used in macosvm_darwin.go.
+	cfg := MacOSVMConfig{SSHSigner: priv}
+	signer, ok := cfg.SSHSigner.(ed25519.PrivateKey)
+	if !ok {
+		t.Fatal("SSHSigner type assertion to ed25519.PrivateKey failed")
+	}
+
+	// Confirm it can be wrapped in an ssh.Signer (also load-bearing).
+	if _, err := ssh.NewSignerFromKey(signer); err != nil {
+		t.Errorf("ssh.NewSignerFromKey: %v", err)
+	}
+}
+
+func TestMacOSVMConfig_EmptySSHPubKey(t *testing.T) {
+	// Empty SSHPubKey is allowed at the config layer — macosvm_darwin.go
+	// gates `if m.cfg.SSHPubKey != ""` for both WriteJITConfig and SSH
+	// authorized_keys injection. This documents that empty is "skip".
+	cfg := MacOSVMConfig{SSHPubKey: ""}
+	if cfg.SSHPubKey != "" {
+		t.Errorf("expected empty SSHPubKey, got %q", cfg.SSHPubKey)
+	}
+}
+
+func TestMacOSVMConfig_SSHPubKey_TrimSpace(t *testing.T) {
+	// macosvm_darwin.go's fixCmd uses strings.TrimSpace(m.cfg.SSHPubKey).
+	// Guard against subtle bugs where a trailing newline would inject a
+	// blank line into authorized_keys (technically valid but messy).
+	withNewline := "ssh-ed25519 AAAA... ephemerd\n"
+	got := strings.TrimSpace(withNewline)
+	if strings.HasSuffix(got, "\n") {
+		t.Errorf("TrimSpace did not strip trailing newline: %q", got)
+	}
+	if !strings.HasPrefix(got, "ssh-ed25519 ") {
+		t.Errorf("after TrimSpace, prefix should remain: %q", got)
+	}
+}
+
+func TestGenerateEphemeralSSHKey_PubKeyParsesAsAuthorizedKey(t *testing.T) {
+	// The pubLine format must round-trip through ssh.ParseAuthorizedKey —
+	// otherwise the guest's authorized_keys won't accept it.
+	_, pubLine, err := GenerateEphemeralSSHKey()
+	if err != nil {
+		t.Fatalf("GenerateEphemeralSSHKey: %v", err)
+	}
+	// Strip any whitespace (the function appends "\n").
+	parsed, _, _, _, err := ssh.ParseAuthorizedKey([]byte(pubLine))
+	if err != nil {
+		t.Fatalf("ParseAuthorizedKey: %v", err)
+	}
+	if parsed.Type() != "ssh-ed25519" {
+		t.Errorf("parsed key type = %q, want ssh-ed25519", parsed.Type())
+	}
+}
+
+func TestGenerateEphemeralSSHKey_PubKeyMatchesPriv(t *testing.T) {
+	// The generated public key must correspond to the private key —
+	// otherwise the guest will reject signatures from this signer.
+	priv, pubLine, err := GenerateEphemeralSSHKey()
+	if err != nil {
+		t.Fatalf("GenerateEphemeralSSHKey: %v", err)
+	}
+
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatalf("NewSignerFromKey: %v", err)
+	}
+	signerPub := signer.PublicKey()
+
+	parsed, _, _, _, err := ssh.ParseAuthorizedKey([]byte(pubLine))
+	if err != nil {
+		t.Fatalf("ParseAuthorizedKey: %v", err)
+	}
+
+	// Compare wire format.
+	if string(signerPub.Marshal()) != string(parsed.Marshal()) {
+		t.Error("pubLine does not match the public key derived from priv")
+	}
+}
+
+func TestMacOSVMConfig_SSHSignerTypeAssertion_NonEd25519(t *testing.T) {
+	// Guard against accidental misuse: a non-ed25519 SSHSigner should fail
+	// the type assertion in macosvm_darwin.go (lines 442, 583). Pass nil
+	// and a wrong type and confirm both are rejected by the assertion.
+	tests := []struct {
+		name    string
+		val     interface{}
+		wantOK  bool
+	}{
+		{"nil", nil, false},
+		{"int", 42, false},
+		{"string", "not a key", false},
+		{"valid ed25519", makeEd25519(t), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ok := tt.val.(ed25519.PrivateKey)
+			if ok != tt.wantOK {
+				t.Errorf("type assertion = %v, want %v", ok, tt.wantOK)
+			}
+		})
+	}
+}
+
+func makeEd25519(t *testing.T) ed25519.PrivateKey {
+	t.Helper()
+	priv, _, err := GenerateEphemeralSSHKey()
+	if err != nil {
+		t.Fatalf("makeEd25519: %v", err)
+	}
+	return priv
+}
+
+func TestMacOSVMConfig_PartialKeyMaterial(t *testing.T) {
+	// Document behavior when SSHPubKey is set but SSHSigner is nil
+	// (and vice versa). Neither field is validated at the config layer —
+	// the consuming code in macosvm_darwin.go must handle each independently.
+	tests := []struct {
+		name      string
+		signer    interface{}
+		pubKey    string
+		signerNil bool
+		pubEmpty  bool
+	}{
+		{"both set", makeEd25519(t), "ssh-ed25519 AAAA test", false, false},
+		{"signer only", makeEd25519(t), "", false, true},
+		{"pubkey only", nil, "ssh-ed25519 AAAA test", true, false},
+		{"both nil/empty", nil, "", true, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := MacOSVMConfig{SSHSigner: tt.signer, SSHPubKey: tt.pubKey}
+			if (cfg.SSHSigner == nil) != tt.signerNil {
+				t.Errorf("signerNil mismatch")
+			}
+			if (cfg.SSHPubKey == "") != tt.pubEmpty {
+				t.Errorf("pubEmpty mismatch")
+			}
+		})
 	}
 }

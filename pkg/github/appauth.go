@@ -27,6 +27,13 @@ type AppAuth struct {
 	key            *rsa.PrivateKey
 	log            *slog.Logger
 
+	// tokenURL overrides the GitHub API token endpoint for tests. When
+	// empty, the production https://api.github.com/... URL is used.
+	tokenURL string
+	// httpClient overrides the http client used for the token exchange.
+	// When nil, http.DefaultClient is used.
+	httpClient *http.Client
+
 	mu      sync.RWMutex
 	token   string
 	expires time.Time
@@ -192,7 +199,10 @@ func (a *AppAuth) signJWT() (string, error) {
 }
 
 func (a *AppAuth) exchangeToken(jwt string) (string, time.Time, error) {
-	url := fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", a.installationID)
+	url := a.tokenURL
+	if url == "" {
+		url = fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", a.installationID)
+	}
 	req, err := http.NewRequest("POST", url, nil)
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("creating token exchange request: %w", err)
@@ -200,7 +210,11 @@ func (a *AppAuth) exchangeToken(jwt string) (string, time.Time, error) {
 	req.Header.Set("Authorization", "Bearer "+jwt)
 	req.Header.Set("Accept", "application/vnd.github+json")
 
-	resp, err := http.DefaultClient.Do(req)
+	httpClient := a.httpClient
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("token exchange request: %w", err)
 	}
