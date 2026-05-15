@@ -79,9 +79,7 @@ func main() {
 			statusCmd(),
 			drainCmd(),
 			jobsCmd(),
-			imagesCmd(),
 			configCheckCmd(),
-			ctrctlCmd(),
 			crictlCmd(),
 			doctorCmd(),
 			installCmd(),
@@ -197,7 +195,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	// Start container runtime.
 	// On Linux/Windows: embedded containerd runs in-process.
 	// On macOS: boot a Linux VM via Virtualization.framework, containerd runs inside it.
-	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, containerdTCPAddr, cfg.Dind.Enabled)
+	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, containerdTCPAddr, cfg.Dind.Enabled, cfg.VM.Linux.CPUs, cfg.VM.Linux.MemoryMB, cfg.VM.Linux.DiskSizeGB)
 	if err != nil {
 		return fmt.Errorf("starting container runtime: %w", err)
 	}
@@ -293,6 +291,12 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		dispatchPort := int(containerdTCPPort) + 1
 		dispatchCleanup := scheduler.StartDispatchServer(dispatchPort, rt, log)
 		defer dispatchCleanup()
+
+		// Debug exec server on dispatch_port+1 — lets the Windows host poke
+		// into any container in the VM (e.g. exec'ing into kindest/node to
+		// inspect iptables / lsmod / pod logs). No-op on non-Linux.
+		debugCleanup := startWorkerDebugExec(ctx, int(containerdTCPPort)+2, rt.Client(), log)
+		defer debugCleanup()
 
 		log.Info("worker mode ready", "containerd_port", containerdTCPPort, "dispatch_port", dispatchPort, "dind", cfg.Dind.Enabled)
 		<-ctx.Done()
@@ -673,21 +677,6 @@ func pollInterval(cfg *config.Config) time.Duration {
 		return cfg.GitHub.ParsedPollInterval()
 	default:
 		return 30 * time.Second
-	}
-}
-
-// ctrctlCmd provides direct access to the embedded containerd for debugging.
-// Similar to rke2's "rke2 crictl" passthrough.
-func ctrctlCmd() *cli.Command {
-	return &cli.Command{
-		Name:            "ctrctl",
-		Usage:           "Access the embedded containerd (passthrough to ctr)",
-		Description:     "Runs ctr commands against ephemerd's embedded containerd instance.\nAll arguments after 'ctrctl' are passed directly to ctr.",
-		SkipFlagParsing: true,
-		Action: func(ctx context.Context, cmd *cli.Command) error {
-			socketPath := containerd.SocketPath(configDir)
-			return containerd.ExecCtr(socketPath, cmd.Args().Slice())
-		},
 	}
 }
 

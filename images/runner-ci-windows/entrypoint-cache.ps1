@@ -15,4 +15,13 @@ if (-not (Test-Path "$Work\pkg\vm\embed\ephemerd-linux")) {
     New-Item -ItemType File -Path "$Work\pkg\vm\embed\ephemerd-linux" | Out-Null
 }
 
+# Ensure tools baked into the image are on PATH for subsequent steps.
+# Hyper-V isolated containers don't always propagate the image's ENV PATH
+# through containerd → cmd.exe → runner → PowerShell, so we write to
+# GITHUB_PATH which the runner reads for every step.
+if ($env:GITHUB_PATH -and (Test-Path "C:\go\bin")) {
+    Add-Content -Path $env:GITHUB_PATH -Value "C:\go\bin"
+    Write-Host "Added C:\go\bin to GITHUB_PATH"
+}
+
 Write-Host "Build deps restored."

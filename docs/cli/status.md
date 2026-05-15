@@ -1,21 +1,38 @@
-# ephemerd status
+---
+title: status
+weight: 7
+---
 
-Shows the current state of the running daemon — active jobs, health, uptime, and whether the scheduler is draining.
-
-## Usage
+Show the running daemon's health and job status by querying its gRPC control socket.
 
 ```
 ephemerd status
 ```
 
-## What it shows
+## Output
 
-- **Status** — ok or error
-- **Active jobs** — number of currently running jobs
-- **Max concurrent** — configured concurrency limit
-- **Draining** — whether the daemon is shutting down and rejecting new jobs
-- **Uptime** — how long the daemon has been running
+Returns a JSON object with the following fields:
 
-## How it works
+| Field | Description |
+|-------|-------------|
+| `status` | Current daemon status |
+| `active_jobs` | Number of jobs currently running |
+| `max_concurrent` | Maximum concurrent jobs allowed |
+| `draining` | Whether the daemon is draining (shutting down gracefully) |
+| `uptime` | How long the daemon has been running |
 
-Connects to the daemon's gRPC control socket at `<data-dir>/ephemerd.sock` and calls the `Status` RPC. If the daemon isn't running, the command fails with a connection error.
+### Example output
+
+```json
+{
+  "status": "running",
+  "active_jobs": 2,
+  "max_concurrent": 4,
+  "draining": false,
+  "uptime": "3h42m15s"
+}
+```
+
+## Connection
+
+The command connects to the daemon's gRPC unix socket at `<data-dir>/ephemerd.sock`. If the daemon is not running or the socket does not exist, the command prints an error.

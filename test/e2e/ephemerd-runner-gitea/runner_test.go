@@ -1,15 +1,15 @@
 //go:build e2e && privileged
 
-// Package gitea_runner_test runs end-to-end tests for the custom gitea-runner
+// Package ephemerd_runner_gitea_test runs end-to-end tests for the custom ephemerd-runner-gitea
 // binary against a real Gitea instance.
 //
-// The test cross-compiles the gitea-runner for Linux, builds a Docker image
+// The test cross-compiles the ephemerd-runner-gitea for Linux, builds a Docker image
 // containing it, boots Gitea via docker-compose, pushes a workflow, and
 // verifies the runner executes the job to completion.
 //
 // Run with: mage e2egitearunner
 // Requires: docker (or podman) with compose support, Go toolchain for cross-compile.
-package gitea_runner_test
+package ephemerd_runner_gitea_test
 
 import (
 	"bytes"
@@ -37,33 +37,33 @@ const (
 	testOrg        = "runner-org"
 	testRepo       = "runner-repo"
 	composeProject = "ephemerd-gitearunner-e2e"
-	runnerImage    = "ephemerd-gitea-runner:e2e"
+	runnerImage    = "ephemerd-ephemerd-runner-gitea:e2e"
 	healthTimeout  = 60 * time.Second
 	runTimeout     = 4 * time.Minute
 )
 
 func baseURL() string { return "http://localhost:" + giteaPort }
 
-// TestGiteaRunner_E2E builds a Docker image with our custom gitea-runner binary,
+// TestGiteaRunner_E2E builds a Docker image with our custom ephemerd-runner-gitea binary,
 // boots Gitea, registers the runner, pushes a workflow, and verifies the job
 // completes successfully.
 func TestGiteaRunner_E2E(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping gitea-runner e2e in short mode")
+		t.Skip("skipping ephemerd-runner-gitea e2e in short mode")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 
-	// --- Step 1: Cross-compile gitea-runner for Linux ---
+	// --- Step 1: Cross-compile ephemerd-runner-gitea for Linux ---
 	buildDir := t.TempDir()
-	binaryPath := filepath.Join(buildDir, "gitea-runner")
-	t.Log("cross-compiling gitea-runner for linux/amd64")
-	buildCmd := exec.CommandContext(ctx, "go", "build", "-o", binaryPath, "./cmd/gitea-runner/")
+	binaryPath := filepath.Join(buildDir, "ephemerd-runner-gitea")
+	t.Log("cross-compiling ephemerd-runner-gitea for linux/amd64")
+	buildCmd := exec.CommandContext(ctx, "go", "build", "-o", binaryPath, "./cmd/ephemerd-runner-gitea/")
 	buildCmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
 	buildCmd.Dir = repoRoot(t)
 	if out, err := buildCmd.CombinedOutput(); err != nil {
-		t.Fatalf("cross-compile gitea-runner: %v\n%s", err, out)
+		t.Fatalf("cross-compile ephemerd-runner-gitea: %v\n%s", err, out)
 	}
 	t.Log("binary built")
 
@@ -71,8 +71,8 @@ func TestGiteaRunner_E2E(t *testing.T) {
 	dockerfile := filepath.Join(buildDir, "Dockerfile")
 	if err := os.WriteFile(dockerfile, []byte(`FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends bash ca-certificates curl git && rm -rf /var/lib/apt/lists/*
-COPY gitea-runner /usr/local/bin/gitea-runner
-RUN chmod +x /usr/local/bin/gitea-runner
+COPY ephemerd-runner-gitea /usr/local/bin/ephemerd-runner-gitea
+RUN chmod +x /usr/local/bin/ephemerd-runner-gitea
 `), 0o644); err != nil {
 		t.Fatalf("write Dockerfile: %v", err)
 	}
@@ -131,20 +131,20 @@ RUN chmod +x /usr/local/bin/gitea-runner
 		"--name", containerName,
 		"--network", network,
 		runnerImage,
-		"gitea-runner",
+		"ephemerd-runner-gitea",
 		"--instance", "http://gitea:3000",
 		"--token", regToken,
 		"--label", "ubuntu-latest",
 	}
 
-	t.Log("starting gitea-runner container")
+	t.Log("starting ephemerd-runner-gitea container")
 	if out, err := exec.CommandContext(ctx, "docker", runArgs...).CombinedOutput(); err != nil {
 		t.Fatalf("docker run: %v\n%s", err, out)
 	}
 	t.Cleanup(func() {
 		if t.Failed() {
 			if out, err := exec.Command("docker", "logs", containerName).CombinedOutput(); err == nil {
-				t.Logf("--- gitea-runner logs ---\n%s", string(out))
+				t.Logf("--- ephemerd-runner-gitea logs ---\n%s", string(out))
 			}
 		}
 		exec.Command("docker", "rm", "-f", containerName).Run()
@@ -153,14 +153,14 @@ RUN chmod +x /usr/local/bin/gitea-runner
 	time.Sleep(5 * time.Second)
 
 	// --- Step 6: Push workflow ---
-	workflow := `name: gitea-runner-e2e
+	workflow := `name: ephemerd-runner-gitea-e2e
 on: [push]
 jobs:
   hello:
     runs-on: ubuntu-latest
     steps:
       - name: Verify runner
-        run: echo "Hello from gitea-runner e2e"
+        run: echo "Hello from ephemerd-runner-gitea e2e"
       - name: Check environment
         run: |
           echo "CI=$CI"
@@ -203,11 +203,11 @@ jobs:
 
 	if finalStatus != "success" {
 		if out, err := exec.Command("docker", "logs", containerName).CombinedOutput(); err == nil {
-			t.Logf("--- gitea-runner logs ---\n%s", string(out))
+			t.Logf("--- ephemerd-runner-gitea logs ---\n%s", string(out))
 		}
 		t.Fatalf("workflow completed with status %q, expected success", finalStatus)
 	}
-	t.Log("workflow completed successfully with custom gitea-runner")
+	t.Log("workflow completed successfully with custom ephemerd-runner-gitea")
 }
 
 // --- Helpers ---

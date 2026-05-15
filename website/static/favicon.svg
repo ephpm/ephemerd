@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <path d="M14 58 C14 22 34 2 64 2 C94 2 114 22 114 58 L114 114 L94 94 L74 114 L64 104 L54 114 L34 94 L14 114 Z" fill="#5B4FD6"/>
+  <!-- Left eye (looking up-left) -->
+  <ellipse cx="48" cy="52" rx="14" ry="16" fill="white"/>
+  <ellipse cx="44" cy="49" rx="7" ry="8" fill="#2D2B55"/>
+  <!-- Right eye (slightly bigger pupil) -->
+  <ellipse cx="80" cy="52" rx="14" ry="16" fill="white"/>
+  <ellipse cx="82" cy="54" rx="8" ry="9" fill="#2D2B55"/>
+</svg>

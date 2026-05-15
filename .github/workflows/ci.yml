@@ -14,12 +14,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Install mage
-        run: go install github.com/magefile/mage@latest
+      # Go and mage come from the runner-ci-linux image (see images/runner-ci-linux/Dockerfile),
+      # so setup-go and `go install mage` are unnecessary here.
+      # - uses: actions/setup-go@v6
+      #   with:
+      #     go-version: ${{ env.GO_VERSION }}
+      # - name: Install mage
+      #   run: go install github.com/magefile/mage@latest
 
       - name: Restore cached build deps
         run: /opt/ephemerd-ci/entrypoint-cache.sh
@@ -83,12 +84,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
+      - name: Restore cached build deps
+        run: C:\ephemerd-ci\entrypoint-cache.ps1
+        continue-on-error: true
 
-      - name: Install mage
-        run: go install github.com/magefile/mage@latest
+      - name: Ensure mage is available
+        run: |
+          if (Get-Command mage -ErrorAction SilentlyContinue) { return }
+          Write-Host "mage not found - installing via go install..."
+          $env:GOBIN = 'C:\go\bin'
+          go install github.com/magefile/mage@latest
 
       - name: Build Windows binary
         run: mage build:build

@@ -2,87 +2,15 @@ package scheduler
 
 import (
 	"context"
-	"net"
 	"testing"
 	"time"
 
-	apiv1 "github.com/ephpm/ephemerd/api/v1"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-"google.golang.org/grpc/status"
+	"google.golang.org/grpc/status"
 )
 
-// fakeDispatchServer implements apiv1.DispatchServer with configurable
-// responses. Used to test DispatchClient round-trips without standing up
-// a real runtime.
-type fakeDispatchServer struct {
-	apiv1.UnimplementedDispatchServer
-
-	// Calls received.
-	createCalls   []*apiv1.CreateJobRequest
-	waitCalls     []*apiv1.WaitJobRequest
-	destroyCalls  []*apiv1.DestroyJobRequest
-
-	// Configurable responses.
-	createErr    error
-	waitErr      error
-	waitExitCode uint32
-	destroyErr   error
-}
-
-func (s *fakeDispatchServer) CreateJob(_ context.Context, req *apiv1.CreateJobRequest) (*apiv1.CreateJobResponse, error) {
-	s.createCalls = append(s.createCalls, req)
-	if s.createErr != nil {
-		return nil, s.createErr
-	}
-	return &apiv1.CreateJobResponse{}, nil
-}
-
-func (s *fakeDispatchServer) WaitJob(_ context.Context, req *apiv1.WaitJobRequest) (*apiv1.WaitJobResponse, error) {
-	s.waitCalls = append(s.waitCalls, req)
-	if s.waitErr != nil {
-		return nil, s.waitErr
-	}
-	return &apiv1.WaitJobResponse{ExitCode: s.waitExitCode}, nil
-}
-
-func (s *fakeDispatchServer) DestroyJob(_ context.Context, req *apiv1.DestroyJobRequest) (*apiv1.DestroyJobResponse, error) {
-	s.destroyCalls = append(s.destroyCalls, req)
-	if s.destroyErr != nil {
-		return nil, s.destroyErr
-	}
-	return &apiv1.DestroyJobResponse{}, nil
-}
-
-// startFakeDispatchServer spins up a gRPC server on a random local port and
-// returns the bound address and a cleanup function. Tests connect to the
-// returned address with NewDispatchClient.
-func startFakeDispatchServer(t *testing.T, impl *fakeDispatchServer) (string, func()) {
-	t.Helper()
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	srv := grpc.NewServer()
-	apiv1.RegisterDispatchServer(srv, impl)
-
-	go func() {
-		if err := srv.Serve(lis); err != nil {
-			t.Logf("fake dispatch serve: %v", err)
-		}
-	}()
-
-	cleanup := func() {
-		srv.Stop()
-		if err := lis.Close(); err != nil {
-			t.Logf("listener close: %v", err)
-		}
-	}
-	return lis.Addr().String(), cleanup
-}
-
 func TestNewDispatchClient_ValidAddr(t *testing.T) {
-	addr, cleanup := startFakeDispatchServer(t, &fakeDispatchServer{})
+	addr, _, cleanup := startFakeDispatchServer(t, &fakeDispatchServer{})
 	defer cleanup()
 
 	c, err := NewDispatchClient(addr)
@@ -109,7 +37,7 @@ func TestNewDispatchClient_InvalidAddr(t *testing.T) {
 
 func TestDispatchClient_Create(t *testing.T) {
 	impl := &fakeDispatchServer{}
-	addr, cleanup := startFakeDispatchServer(t, impl)
+	addr, _, cleanup := startFakeDispatchServer(t, impl)
 	defer cleanup()
 
 	c, err := NewDispatchClient(addr)
@@ -129,10 +57,12 @@ func TestDispatchClient_Create(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	if len(impl.createCalls) != 1 {
-		t.Fatalf("create call count = %d, want 1", len(impl.createCalls))
+	impl.mu.Lock()
+	defer impl.mu.Unlock()
+	if len(impl.createRequests) != 1 {
+		t.Fatalf("create call count = %d, want 1", len(impl.createRequests))
 	}
-	got := impl.createCalls[0]
+	got := impl.createRequests[0]
 	if got.Id != "job-1" {
 		t.Errorf("Id = %q, want job-1", got.Id)
 	}
@@ -148,7 +78,7 @@ func TestDispatchClient_Create_PropagatesError(t *testing.T) {
 	impl := &fakeDispatchServer{
 		createErr: status.Errorf(codes.Internal, "containerd unavailable"),
 	}
-	addr, cleanup := startFakeDispatchServer(t, impl)
+	addr, _, cleanup := startFakeDispatchServer(t, impl)
 	defer cleanup()
 
 	c, _ := NewDispatchClient(addr)
@@ -175,7 +105,7 @@ func TestDispatchClient_Create_PropagatesError(t *testing.T) {
 
 func TestDispatchClient_Wait_Success(t *testing.T) {
 	impl := &fakeDispatchServer{waitExitCode: 0}
-	addr, cleanup := startFakeDispatchServer(t, impl)
+	addr, _, cleanup := startFakeDispatchServer(t, impl)
 	defer cleanup()
 
 	c, _ := NewDispatchClient(addr)
@@ -198,7 +128,7 @@ func TestDispatchClient_Wait_Success(t *testing.T) {
 
 func TestDispatchClient_Wait_NonZeroExit(t *testing.T) {
 	impl := &fakeDispatchServer{waitExitCode: 137}
-	addr, cleanup := startFakeDispatchServer(t, impl)
+	addr, _, cleanup := startFakeDispatchServer(t, impl)
 	defer cleanup()
 
 	c, _ := NewDispatchClient(addr)
@@ -223,7 +153,7 @@ func TestDispatchClient_Wait_Error(t *testing.T) {
 	impl := &fakeDispatchServer{
 		waitErr: status.Errorf(codes.NotFound, "job not found"),
 	}
-	addr, cleanup := startFakeDispatchServer(t, impl)
+	addr, _, cleanup := startFakeDispatchServer(t, impl)
 	defer cleanup()
 
 	c, _ := NewDispatchClient(addr)
@@ -246,7 +176,7 @@ func TestDispatchClient_Wait_Error(t *testing.T) {
 
 func TestDispatchClient_Destroy(t *testing.T) {
 	impl := &fakeDispatchServer{}
-	addr, cleanup := startFakeDispatchServer(t, impl)
+	addr, _, cleanup := startFakeDispatchServer(t, impl)
 	defer cleanup()
 
 	c, _ := NewDispatchClient(addr)
@@ -261,11 +191,13 @@ func TestDispatchClient_Destroy(t *testing.T) {
 	if err := c.Destroy(ctx, "job-1"); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
-	if len(impl.destroyCalls) != 1 {
-		t.Fatalf("destroy call count = %d, want 1", len(impl.destroyCalls))
+	impl.mu.Lock()
+	defer impl.mu.Unlock()
+	if len(impl.destroyRequests) != 1 {
+		t.Fatalf("destroy call count = %d, want 1", len(impl.destroyRequests))
 	}
-	if impl.destroyCalls[0].Id != "job-1" {
-		t.Errorf("Id = %q, want job-1", impl.destroyCalls[0].Id)
+	if impl.destroyRequests[0].Id != "job-1" {
+		t.Errorf("Id = %q, want job-1", impl.destroyRequests[0].Id)
 	}
 }
 
@@ -273,7 +205,7 @@ func TestDispatchClient_Destroy_PropagatesError(t *testing.T) {
 	impl := &fakeDispatchServer{
 		destroyErr: status.Errorf(codes.Internal, "destroy failed"),
 	}
-	addr, cleanup := startFakeDispatchServer(t, impl)
+	addr, _, cleanup := startFakeDispatchServer(t, impl)
 	defer cleanup()
 
 	c, _ := NewDispatchClient(addr)
@@ -293,7 +225,7 @@ func TestDispatchClient_Destroy_PropagatesError(t *testing.T) {
 
 // TestDispatchClient_Close_Idempotent verifies double-close doesn't panic.
 func TestDispatchClient_Close_Idempotent(t *testing.T) {
-	addr, cleanup := startFakeDispatchServer(t, &fakeDispatchServer{})
+	addr, _, cleanup := startFakeDispatchServer(t, &fakeDispatchServer{})
 	defer cleanup()
 
 	c, _ := NewDispatchClient(addr)
@@ -305,4 +237,3 @@ func TestDispatchClient_Close_Idempotent(t *testing.T) {
 		t.Logf("second close (expected): %v", err)
 	}
 }
-

@@ -124,9 +124,12 @@ func TestCleanOldLogs_StaleSymlinkRemoved(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	// Backdate the symlink itself.
+	// Backdate the symlink itself. os.Chtimes follows symlinks on Unix and
+	// would modify the target's mtime, leaving the symlink looking fresh —
+	// use lchtimes (utimensat with AT_SYMLINK_NOFOLLOW) so the symlink's
+	// own mtime moves into the past.
 	oldTime := time.Now().Add(-30 * 24 * time.Hour)
-	if err := os.Chtimes(link, oldTime, oldTime); err != nil {
+	if err := lchtimes(link, oldTime); err != nil {
 		t.Fatal(err)
 	}
 

@@ -1,24 +1,33 @@
-# ephemerd drain
+---
+title: drain
+weight: 8
+---
 
-Tells the running daemon to stop accepting new jobs and wait for running jobs to finish. Used for graceful maintenance.
-
-## Usage
+Gracefully drain the running ephemerd daemon. The daemon stops accepting new jobs and waits for all running jobs to finish before exiting.
 
 ```
 ephemerd drain
 ```
 
-## What it does
+## Behavior
 
-1. Sends SIGTERM to the ephemerd process (found via PID file at `<data-dir>/ephemerd.pid`)
-2. The daemon sets `draining = true` — new queued jobs are rejected
-3. Running jobs continue until they complete or the shutdown timeout expires (default 5 minutes)
-4. After all jobs finish (or timeout), the daemon exits cleanly
+1. **Read PID file** -- reads `<data-dir>/ephemerd.pid` to find the running daemon's process ID.
+2. **Query status** -- if the gRPC control socket is reachable, prints the current number of active jobs.
+3. **Send SIGTERM** -- signals the daemon process. The daemon's signal handler then initiates graceful shutdown.
 
-## When to use it
+After sending the signal, the command exits immediately. The daemon continues running in the background until all active jobs complete. Use `ephemerd status` to monitor progress.
 
-- Before system maintenance or reboots
-- Before upgrading ephemerd to a new version
-- When you want to temporarily stop processing jobs without killing running ones
+## Example
 
-The daemon exits after draining. To resume, start it again with `ephemerd serve` or `systemctl start ephemerd`.
+```bash
+$ ephemerd drain
+Active jobs: 3
+Sending SIGTERM to ephemerd (pid 12345)...
+The daemon will wait for running jobs to finish before exiting.
+Use 'ephemerd status' to monitor progress.
+```
+
+## Notes
+
+- If the PID file does not exist, the command fails with an error indicating the daemon may not be running.
+- This command does not forcefully kill the daemon. To force an immediate stop, send `SIGKILL` directly or use `ephemerd stop`.

@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+
+  <!-- Ghost 5 (most faded) -->
+  <g opacity="0.06" transform="translate(-52, 0)">
+    <path d="M28 108 C28 42 68 4 128 4 C188 4 228 42 228 108 L228 232 L208 210 L188 232 L168 210 L148 232 L128 210 L108 232 L88 210 L68 232 L48 210 L28 232 Z" fill="#5B4FD6"/>
+  </g>
+
+  <!-- Ghost 4 -->
+  <g opacity="0.12" transform="translate(-39, 0)">
+    <path d="M28 108 C28 42 68 4 128 4 C188 4 228 42 228 108 L228 232 L208 210 L188 232 L168 210 L148 232 L128 210 L108 232 L88 210 L68 232 L48 210 L28 232 Z" fill="#5B4FD6"/>
+  </g>
+
+  <!-- Ghost 3 -->
+  <g opacity="0.20" transform="translate(-26, 0)">
+    <path d="M28 108 C28 42 68 4 128 4 C188 4 228 42 228 108 L228 232 L208 210 L188 232 L168 210 L148 232 L128 210 L108 232 L88 210 L68 232 L48 210 L28 232 Z" fill="#5B4FD6"/>
+  </g>
+
+  <!-- Ghost 2 -->
+  <g opacity="0.32" transform="translate(-13, 0)">
+    <path d="M28 108 C28 42 68 4 128 4 C188 4 228 42 228 108 L228 232 L208 210 L188 232 L168 210 L148 232 L128 210 L108 232 L88 210 L68 232 L48 210 L28 232 Z" fill="#5B4FD6"/>
+  </g>
+
+  <!-- Ghost 1 (primary) -->
+  <g>
+    <path d="M28 108 C28 42 68 4 128 4 C188 4 228 42 228 108 L228 232 L208 210 L188 232 L168 210 L148 232 L128 210 L108 232 L88 210 L68 232 L48 210 L28 232 Z" fill="#5B4FD6"/>
+    <!-- Left eye (looking up-left) -->
+    <ellipse cx="100" cy="96" rx="24" ry="28" fill="white"/>
+    <ellipse cx="93" cy="91" rx="12" ry="14" fill="#2D2B55"/>
+    <!-- Right eye (looking down-right, slightly bigger pupil) -->
+    <ellipse cx="160" cy="96" rx="24" ry="28" fill="white"/>
+    <ellipse cx="162" cy="99" rx="14" ry="16" fill="#2D2B55"/>
+  </g>
+
+  <!-- "EPH" centered under eyes -->
+  <!-- 8px blocks, 3 letters × 3 cols = 9 cols, 12px gaps between letters -->
+  <!-- E: 24px wide, gap 12px, P: 24px wide, gap 12px, H: 24px wide = 96px -->
+  <!-- Centered at x=128: starts at x=80 -->
+  <g fill="white" opacity="0.9">
+    <!-- E: cols 80,88,96 -->
+    <rect x="80" y="140" width="8" height="8"/>
+    <rect x="88" y="140" width="8" height="8"/>
+    <rect x="96" y="140" width="8" height="8"/>
+    <rect x="80" y="148" width="8" height="8"/>
+    <rect x="80" y="156" width="8" height="8"/>
+    <rect x="88" y="156" width="8" height="8"/>
+    <rect x="96" y="156" width="8" height="8"/>
+    <rect x="80" y="164" width="8" height="8"/>
+    <rect x="80" y="172" width="8" height="8"/>
+    <rect x="88" y="172" width="8" height="8"/>
+    <rect x="96" y="172" width="8" height="8"/>
+
+    <!-- P: cols 116,124,132 -->
+    <rect x="116" y="140" width="8" height="8"/>
+    <rect x="124" y="140" width="8" height="8"/>
+    <rect x="132" y="140" width="8" height="8"/>
+    <rect x="116" y="148" width="8" height="8"/>
+    <rect x="132" y="148" width="8" height="8"/>
+    <rect x="116" y="156" width="8" height="8"/>
+    <rect x="124" y="156" width="8" height="8"/>
+    <rect x="132" y="156" width="8" height="8"/>
+    <rect x="116" y="164" width="8" height="8"/>
+    <rect x="116" y="172" width="8" height="8"/>
+
+    <!-- H: cols 152,160,168 -->
+    <rect x="152" y="140" width="8" height="8"/>
+    <rect x="168" y="140" width="8" height="8"/>
+    <rect x="152" y="148" width="8" height="8"/>
+    <rect x="168" y="148" width="8" height="8"/>
+    <rect x="152" y="156" width="8" height="8"/>
+    <rect x="160" y="156" width="8" height="8"/>
+    <rect x="168" y="156" width="8" height="8"/>
+    <rect x="152" y="164" width="8" height="8"/>
+    <rect x="168" y="164" width="8" height="8"/>
+    <rect x="152" y="172" width="8" height="8"/>
+    <rect x="168" y="172" width="8" height="8"/>
+  </g>
+</svg>

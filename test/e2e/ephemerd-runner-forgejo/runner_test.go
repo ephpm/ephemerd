@@ -1,15 +1,15 @@
 //go:build e2e && privileged
 
-// Package forge_runner_test runs end-to-end tests for the custom forge-runner
+// Package ephemerd_runner_forgejo_test runs end-to-end tests for the custom ephemerd-runner-forgejo
 // binary against a real Forgejo instance.
 //
-// The test cross-compiles the forge-runner for Linux, builds a Docker image
+// The test cross-compiles the ephemerd-runner-forgejo for Linux, builds a Docker image
 // containing it, boots Forgejo via docker-compose, pushes a workflow, and
 // verifies the runner executes the job to completion.
 //
 // Run with: mage e2eforgerunner
 // Requires: docker (or podman) with compose support, Go toolchain for cross-compile.
-package forge_runner_test
+package ephemerd_runner_forgejo_test
 
 import (
 	"bytes"
@@ -37,33 +37,33 @@ const (
 	testOrg        = "runner-org"
 	testRepo       = "runner-repo"
 	composeProject = "ephemerd-forgerunner-e2e"
-	runnerImage    = "ephemerd-forge-runner:e2e"
+	runnerImage    = "ephemerd-ephemerd-runner-forgejo:e2e"
 	healthTimeout  = 60 * time.Second
 	runTimeout     = 4 * time.Minute
 )
 
 func baseURL() string { return "http://localhost:" + forgejoPort }
 
-// TestForgeRunner_E2E builds a Docker image with our custom forge-runner binary,
+// TestForgeRunner_E2E builds a Docker image with our custom ephemerd-runner-forgejo binary,
 // boots Forgejo, registers the runner, pushes a workflow, and verifies the job
-// completes successfully — proving the forge-runner can execute real workflows.
+// completes successfully — proving the ephemerd-runner-forgejo can execute real workflows.
 func TestForgeRunner_E2E(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping forge-runner e2e in short mode")
+		t.Skip("skipping ephemerd-runner-forgejo e2e in short mode")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 
-	// --- Step 1: Cross-compile forge-runner for Linux ---
+	// --- Step 1: Cross-compile ephemerd-runner-forgejo for Linux ---
 	buildDir := t.TempDir()
-	binaryPath := filepath.Join(buildDir, "forge-runner")
-	t.Log("cross-compiling forge-runner for linux/amd64")
-	buildCmd := exec.CommandContext(ctx, "go", "build", "-o", binaryPath, "./cmd/forge-runner/")
+	binaryPath := filepath.Join(buildDir, "ephemerd-runner-forgejo")
+	t.Log("cross-compiling ephemerd-runner-forgejo for linux/amd64")
+	buildCmd := exec.CommandContext(ctx, "go", "build", "-o", binaryPath, "./cmd/ephemerd-runner-forgejo/")
 	buildCmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
 	buildCmd.Dir = repoRoot(t)
 	if out, err := buildCmd.CombinedOutput(); err != nil {
-		t.Fatalf("cross-compile forge-runner: %v\n%s", err, out)
+		t.Fatalf("cross-compile ephemerd-runner-forgejo: %v\n%s", err, out)
 	}
 	t.Log("binary built")
 
@@ -71,8 +71,8 @@ func TestForgeRunner_E2E(t *testing.T) {
 	dockerfile := filepath.Join(buildDir, "Dockerfile")
 	if err := os.WriteFile(dockerfile, []byte(`FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends bash ca-certificates curl git && rm -rf /var/lib/apt/lists/*
-COPY forge-runner /usr/local/bin/forge-runner
-RUN chmod +x /usr/local/bin/forge-runner
+COPY ephemerd-runner-forgejo /usr/local/bin/ephemerd-runner-forgejo
+RUN chmod +x /usr/local/bin/ephemerd-runner-forgejo
 `), 0o644); err != nil {
 		t.Fatalf("write Dockerfile: %v", err)
 	}
@@ -138,13 +138,13 @@ RUN chmod +x /usr/local/bin/forge-runner
 		"-e", "FORGEJO_REG_TOKEN=" + regToken,
 		"-e", "FORGEJO_RUNNER_LABELS=ubuntu-latest",
 		runnerImage,
-		"forge-runner",
+		"ephemerd-runner-forgejo",
 		"--instance", "http://forgejo:3000",
 		"--token", regToken,
 		"--label", "ubuntu-latest",
 	}
 
-	t.Log("starting forge-runner container")
+	t.Log("starting ephemerd-runner-forgejo container")
 	if out, err := exec.CommandContext(ctx, "docker", runArgs...).CombinedOutput(); err != nil {
 		t.Fatalf("docker run: %v\n%s", err, out)
 	}
@@ -152,7 +152,7 @@ RUN chmod +x /usr/local/bin/forge-runner
 		// Dump runner logs for debugging on failure
 		if t.Failed() {
 			if out, err := exec.Command("docker", "logs", containerName).CombinedOutput(); err == nil {
-				t.Logf("--- forge-runner logs ---\n%s", string(out))
+				t.Logf("--- ephemerd-runner-forgejo logs ---\n%s", string(out))
 			}
 		}
 		exec.Command("docker", "rm", "-f", containerName).Run()
@@ -162,14 +162,14 @@ RUN chmod +x /usr/local/bin/forge-runner
 	time.Sleep(5 * time.Second)
 
 	// --- Step 6: Push workflow ---
-	workflow := `name: forge-runner-e2e
+	workflow := `name: ephemerd-runner-forgejo-e2e
 on: [push]
 jobs:
   hello:
     runs-on: ubuntu-latest
     steps:
       - name: Verify runner
-        run: echo "Hello from forge-runner e2e"
+        run: echo "Hello from ephemerd-runner-forgejo e2e"
       - name: Check environment
         run: |
           echo "CI=$CI"
@@ -213,11 +213,11 @@ jobs:
 	if finalStatus != "success" {
 		// Dump runner logs on failure
 		if out, err := exec.Command("docker", "logs", containerName).CombinedOutput(); err == nil {
-			t.Logf("--- forge-runner logs ---\n%s", string(out))
+			t.Logf("--- ephemerd-runner-forgejo logs ---\n%s", string(out))
 		}
 		t.Fatalf("workflow completed with status %q, expected success", finalStatus)
 	}
-	t.Log("workflow completed successfully with custom forge-runner")
+	t.Log("workflow completed successfully with custom ephemerd-runner-forgejo")
 }
 
 // --- Helpers ---

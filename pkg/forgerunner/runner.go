@@ -3,9 +3,7 @@
 // and executes workflow steps via direct process spawning — no Docker.
 //
 // This package contains the shared logic. Platform-specific CLI entrypoints
-// live in cmd/forge-runner (Forgejo) and cmd/gitea-runner (Gitea).
-//
-// See docs/arch/forge-runner.md for the full design.
+// live in cmd/ephemerd-runner-forgejo (Forgejo) and cmd/ephemerd-runner-gitea (Gitea).
 package forgerunner
 
 import (

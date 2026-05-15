@@ -1,22 +1,26 @@
 # ephemerd
 
-[![CI](https://img.shields.io/github/actions/workflow/status/ephpm/ephemerd/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=white&label=CI)](https://github.com/ephpm/ephemerd/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/ephpm/ephemerd?style=flat-square&logo=github&label=Release)](https://github.com/ephpm/ephemerd/releases/latest)
-[![License](https://img.shields.io/github/license/ephpm/ephemerd?style=flat-square)](https://github.com/ephpm/ephemerd/blob/main/LICENSE)
-[![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&logo=go&logoColor=white)](https://pkg.go.dev/github.com/ephpm/ephemerd)
-![Linux](https://img.shields.io/badge/Linux-FCC624?style=flat-square&logo=linux&logoColor=black)
-![Windows](https://img.shields.io/badge/Windows-0078D4?style=flat-square&logo=windows&logoColor=white)
-![macOS](https://img.shields.io/badge/macOS-000000?style=flat-square&logo=apple&logoColor=white)
-![x86_64](https://img.shields.io/badge/x86__64-grey?style=flat-square)
-![ARM64](https://img.shields.io/badge/ARM64-grey?style=flat-square)
+<p align="center">
+  <a href="https://github.com/ephpm/ephemerd/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ephpm/ephemerd/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=white&label=CI" alt="CI"></a>
+  <a href="https://github.com/ephpm/ephemerd/releases/latest"><img src="https://img.shields.io/github/v/release/ephpm/ephemerd?style=flat-square&logo=github&label=Release" alt="Release"></a>
+  <a href="https://github.com/ephpm/ephemerd/blob/main/LICENSE"><img src="https://img.shields.io/github/license/ephpm/ephemerd?style=flat-square" alt="License"></a>
+  <a href="https://pkg.go.dev/github.com/ephpm/ephemerd"><img src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go"></a>
+  <br>
+  <img src="https://img.shields.io/badge/Linux-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux">
+  <img src="https://img.shields.io/badge/Windows-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Windows">
+  <img src="https://img.shields.io/badge/macOS-000000?style=flat-square&logo=apple&logoColor=white" alt="macOS">
+  <img src="https://img.shields.io/badge/x86__64-grey?style=flat-square" alt="x86_64">
+  <img src="https://img.shields.io/badge/ARM64-grey?style=flat-square" alt="ARM64">
+</p>
 
 Ephemeral GitHub Actions runner daemon. One binary, every platform. Secure by default.
 
 ephemerd manages self-hosted GitHub Actions runners that are isolated, disposable, and automatic. Every job gets a fresh environment. When it's done, everything is destroyed. No leftover state, no security risk from untrusted PRs.
 
-Built by [@luthermonson](https://github.com/luthermonson) using [Claude Opus 4.6](https://claude.ai) · [GitHub](https://github.com/luthermonson) · [Twitter](https://x.com/luthermonson)
+Designed by [@luthermonson](https://github.com/luthermonson) in Arizona 🌵 Assembled in [Claude Opus 4.6](https://claude.ai).
 
 ## Why
+
 
 Self-hosted GitHub Actions runners on bare metal are a security problem — any PR can run arbitrary code on your machine. The existing solutions don't cover cross-platform:
 
@@ -528,16 +532,15 @@ ephemerd restart        Restart the ephemerd system service
 ephemerd logs           Tail the ephemerd system service logs
 ephemerd status         Show running jobs, health, uptime
 ephemerd drain          Stop accepting new jobs, wait for running jobs
-ephemerd jobs           List and manage running jobs (kill, logs, ssh)
-ephemerd images         List cached container images
+ephemerd jobs           List and manage running jobs (kill, logs, ssh — macOS only)
 ephemerd config         Validate configuration
 ephemerd doctor         Check system readiness and clean up stale state
 ephemerd install        Install binary and register as a system service
 ephemerd uninstall      Remove binary, service, and data
-ephemerd ctrctl         Debug the embedded containerd (passthrough to ctr)
+ephemerd crictl         Debug the embedded containerd (in-process crictl)
 ```
 
-`ctrctl` gives you direct access to the embedded containerd — list containers, inspect images, check snapshots. Same as `rke2 ctr` from the rke2 world.
+`crictl` gives you direct access to the embedded containerd — list containers, inspect images, check pods. Built into the ephemerd binary, nothing extra to install.
 
 ## Building Runner Images
 

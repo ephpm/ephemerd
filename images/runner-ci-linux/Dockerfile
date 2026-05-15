@@ -24,9 +24,10 @@ ARG TARGETARCH
 USER root
 
 RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" | tar -C /usr/local -xz
-ENV PATH="/usr/local/go/bin:/root/go/bin:${PATH}"
+ENV PATH="/usr/local/go/bin:/usr/local/bin:${PATH}"
 
-RUN go install github.com/magefile/mage@latest
+# GOBIN=/usr/local/bin so mage is on PATH for the runner user (not just root).
+RUN GOBIN=/usr/local/bin go install github.com/magefile/mage@latest
 
 # Runner archive (x64/arm64 naming)
 RUN RUNNER_ARCH=$([ "${TARGETARCH}" = "amd64" ] && echo "x64" || echo "arm64") && \

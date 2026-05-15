@@ -71,12 +71,13 @@ func Build() error {
 // 1. Cross-compile static Linux binary with Linux assets embedded
 // 2. Build Windows binary embedding the Linux binary + Alpine rootfs + kernel + initrd
 func Windows() error {
-	// Phase 1: produce the inputs the initrd will bundle (ephemerd-linux binary
-	// and Alpine rootfs tarball), plus downloads that Initrdx86 doesn't touch.
+	// Phase 1: cross-compile the Linux binary that gets embedded directly in
+	// the Windows binary (extracted at runtime to <DataDir>\vm\linux\ and
+	// appended to the boot initrd by pkg/vm.buildBootInitrd), plus the rootfs
+	// the initrd bundles, plus other downloads.
 	mg.Deps(Linuxembed, download.Rootfs, download.Runnerwindows, download.Kernelx86, download.Shimwindows)
-	// Phase 2: build the initrd. Must run after Linuxembed + Rootfs — Initrdx86
-	// bundles pkg/vm/embed/ephemerd-linux and pkg/vm/embed/ephemerd-rootfs-*.tar.gz
-	// directly, and will fail on a fresh workspace if those aren't on disk yet.
+	// Phase 2: build the boot-scaffolding initrd. ephemerd-linux is no longer
+	// bundled in here — see pkg/vm/initrd_windows.go.buildBootInitrd.
 	mg.Deps(download.Initrdx86)
 
 	// Remove any Linux runner from embed dir to avoid bloating the Windows binary.
@@ -91,7 +92,7 @@ func Windows() error {
 		output = env
 	}
 	return sh.RunWith(
-		map[string]string{"GOOS": "windows", "GOARCH": "amd64"},
+		map[string]string{"CGO_ENABLED": "0", "GOOS": "windows", "GOARCH": "amd64"},
 		"go", "build", "-tags", "containers_image_openpgp", "-ldflags", ldflags(), "-o", output, "./cmd/ephemerd/",
 	)
 }
@@ -215,20 +216,20 @@ func restoreStashed(stashed [][2]string) error {
 
 // ForgeRunner compiles the Forgejo Actions runner for the current OS/arch.
 func ForgeRunner() error {
-	return buildRunner("forge-runner")
+	return buildRunner("ephemerd-runner-forgejo")
 }
 
 // GiteaRunner compiles the Gitea Actions runner for the current OS/arch.
 func GiteaRunner() error {
-	return buildRunner("gitea-runner")
+	return buildRunner("ephemerd-runner-gitea")
 }
 
-// Runners compiles both forge-runner and gitea-runner for the current OS/arch.
+// Runners compiles both ephemerd-runner-forgejo and ephemerd-runner-gitea for the current OS/arch.
 func Runners() {
 	mg.Deps(ForgeRunner, GiteaRunner)
 }
 
-// RunnersAll cross-compiles forge-runner and gitea-runner for all release platforms.
+// RunnersAll cross-compiles ephemerd-runner-forgejo and ephemerd-runner-gitea for all release platforms.
 // Outputs go to dist/<name>-<os>-<arch>[.exe].
 func RunnersAll() error {
 	type target struct{ goos, goarch string }
@@ -239,7 +240,7 @@ func RunnersAll() error {
 		{"darwin", "arm64"},
 	}
 	for _, t := range targets {
-		for _, name := range []string{"forge-runner", "gitea-runner"} {
+		for _, name := range []string{"ephemerd-runner-forgejo", "ephemerd-runner-gitea"} {
 			if err := crossBuildRunner(name, t.goos, t.goarch); err != nil {
 				return err
 			}

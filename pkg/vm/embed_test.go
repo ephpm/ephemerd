@@ -27,12 +27,12 @@ func TestFindEmbedded_NoMatch(t *testing.T) {
 func TestFindEmbedded_SkipsPlaceholder(t *testing.T) {
 	// The embed dir contains ephemerd-rootfs-placeholder.tar.gz (0 bytes).
 	// findEmbedded should skip it and either find the real rootfs or return
-	// an error — never return the placeholder file as the matched name.
+	// an error — never return the placeholder as a match.
 	name, err := findEmbedded("ephemerd-rootfs-")
 	if err != nil {
 		// No real rootfs embedded — that's fine. The error message itself
-		// may legitimately mention "placeholder" as informational text
-		// (e.g. "only the placeholder rootfs is embedded").
+		// references "placeholder" as user-facing guidance, so we only
+		// check the returned name (below) for the actual contract.
 		return
 	}
 	if strings.Contains(name, "placeholder") {

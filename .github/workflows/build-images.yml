@@ -142,6 +142,22 @@ jobs:
       # (pkg/dind), which dispatches into the embedded BuildKit solver
       # (pkg/buildkit, see docs/arch/docker-builds.md). /auth and
       # /images/{ref}/push are handled by pkg/dind/registry.go.
+      - name: Ensure docker CLI is available
+        shell: powershell
+        run: |
+          if (Get-Command docker -ErrorAction SilentlyContinue) {
+            Write-Host "docker CLI already on PATH"
+            return
+          }
+          $v = "27.3.1"
+          Write-Host "docker CLI not found - downloading v$v..."
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri "https://download.docker.com/win/static/stable/x86_64/docker-$v.zip" -OutFile docker.zip
+          Expand-Archive docker.zip -DestinationPath C:\temp-docker
+          Copy-Item C:\temp-docker\docker\docker.exe C:\go\bin\docker.exe
+          Remove-Item -Recurse docker.zip, C:\temp-docker
+          Write-Host "Installed docker CLI to C:\go\bin\docker.exe"
+
       - name: Login to Docker Hub
         shell: powershell
         env:

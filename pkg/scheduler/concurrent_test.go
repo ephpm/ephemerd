@@ -15,21 +15,31 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// concurrentDispatchFake is a configurable in-process Dispatch gRPC server
-// used by concurrent claim/cancellation tests. Each method increments a
-// counter and may block, fail, or signal a channel as configured.
-type concurrentDispatchFake struct {
+// fakeDispatchServer is a configurable in-process Dispatch gRPC server used
+// across scheduler tests. Each RPC bumps an atomic counter (for concurrent
+// tests) and records the request (for dispatch round-trip tests).
+type fakeDispatchServer struct {
 	apiv1.UnimplementedDispatchServer
 
 	createCalls  atomic.Int32
 	waitCalls    atomic.Int32
 	destroyCalls atomic.Int32
 
+	// Recorded requests, protected by mu. Used by tests that assert on
+	// request fields rather than just call counts.
+	mu              sync.Mutex
+	createRequests  []*apiv1.CreateJobRequest
+	waitRequests    []*apiv1.WaitJobRequest
+	destroyRequests []*apiv1.DestroyJobRequest
+
 	// createErr, waitErr, destroyErr cause the corresponding RPC to fail
 	// when set.
 	createErr  error
 	waitErr    error
 	destroyErr error
+
+	// waitExitCode is the exit code returned by WaitJob on success.
+	waitExitCode uint32
 
 	// waitBlock, when non-nil, causes WaitJob to block until the channel
 	// is signalled. Used to keep dispatched jobs alive while the test
@@ -40,16 +50,22 @@ type concurrentDispatchFake struct {
 	destroyed chan string
 }
 
-func (f *concurrentDispatchFake) CreateJob(ctx context.Context, req *apiv1.CreateJobRequest) (*apiv1.CreateJobResponse, error) {
+func (f *fakeDispatchServer) CreateJob(ctx context.Context, req *apiv1.CreateJobRequest) (*apiv1.CreateJobResponse, error) {
 	f.createCalls.Add(1)
+	f.mu.Lock()
+	f.createRequests = append(f.createRequests, req)
+	f.mu.Unlock()
 	if f.createErr != nil {
 		return nil, f.createErr
 	}
 	return &apiv1.CreateJobResponse{}, nil
 }
 
-func (f *concurrentDispatchFake) WaitJob(ctx context.Context, req *apiv1.WaitJobRequest) (*apiv1.WaitJobResponse, error) {
+func (f *fakeDispatchServer) WaitJob(ctx context.Context, req *apiv1.WaitJobRequest) (*apiv1.WaitJobResponse, error) {
 	f.waitCalls.Add(1)
+	f.mu.Lock()
+	f.waitRequests = append(f.waitRequests, req)
+	f.mu.Unlock()
 	if f.waitErr != nil {
 		return &apiv1.WaitJobResponse{ExitCode: 1}, f.waitErr
 	}
@@ -60,11 +76,14 @@ func (f *concurrentDispatchFake) WaitJob(ctx context.Context, req *apiv1.WaitJob
 			return &apiv1.WaitJobResponse{ExitCode: 137}, ctx.Err()
 		}
 	}
-	return &apiv1.WaitJobResponse{ExitCode: 0}, nil
+	return &apiv1.WaitJobResponse{ExitCode: f.waitExitCode}, nil
 }
 
-func (f *concurrentDispatchFake) DestroyJob(ctx context.Context, req *apiv1.DestroyJobRequest) (*apiv1.DestroyJobResponse, error) {
+func (f *fakeDispatchServer) DestroyJob(ctx context.Context, req *apiv1.DestroyJobRequest) (*apiv1.DestroyJobResponse, error) {
 	f.destroyCalls.Add(1)
+	f.mu.Lock()
+	f.destroyRequests = append(f.destroyRequests, req)
+	f.mu.Unlock()
 	if f.destroyed != nil {
 		// Best-effort signal; never block the RPC if the test isn't reading.
 		select {
@@ -78,10 +97,10 @@ func (f *concurrentDispatchFake) DestroyJob(ctx context.Context, req *apiv1.Dest
 	return &apiv1.DestroyJobResponse{}, nil
 }
 
-// startConcurrentDispatchFake starts a gRPC server on a random port and
-// returns a connected DispatchClient plus a cleanup function. Cleanup is
-// safe to call multiple times.
-func startConcurrentDispatchFake(t *testing.T, fake *concurrentDispatchFake) (*DispatchClient, func()) {
+// startFakeDispatchServer starts a gRPC server on a random port and returns
+// the bound address, a connected DispatchClient, and a cleanup function.
+// Cleanup is safe to call multiple times.
+func startFakeDispatchServer(t *testing.T, fake *fakeDispatchServer) (string, *DispatchClient, func()) {
 	t.Helper()
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -99,7 +118,8 @@ func startConcurrentDispatchFake(t *testing.T, fake *concurrentDispatchFake) (*D
 		}
 	}()
 
-	conn, err := grpc.NewClient(lis.Addr().String(),
+	addr := lis.Addr().String()
+	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {
@@ -118,7 +138,7 @@ func startConcurrentDispatchFake(t *testing.T, fake *concurrentDispatchFake) (*D
 			srv.GracefulStop()
 		})
 	}
-	return dc, cleanup
+	return addr, dc, cleanup
 }
 
 // claimCountingProvider wraps mockProvider with atomic counters for ClaimJob
@@ -164,12 +184,12 @@ func (p *claimCountingProvider) ReleaseJob(ctx context.Context, claim *providers
 // register a runner with GitHub for the same job, leaving a ghost runner
 // behind on whichever lost the race.
 func TestConcurrentHandleQueued_DedupsToSingleClaim(t *testing.T) {
-	fake := &concurrentDispatchFake{
+	fake := &fakeDispatchServer{
 		// Block Wait so the dispatched job stays alive — we don't want
 		// the cleanup goroutine to delete the running entry mid-test.
 		waitBlock: make(chan struct{}),
 	}
-	dc, stopDispatch := startConcurrentDispatchFake(t,fake)
+	_, dc, stopDispatch := startFakeDispatchServer(t, fake)
 	defer stopDispatch()
 
 	prov := newClaimCountingProvider("test-provider")
@@ -268,8 +288,8 @@ func TestConcurrentHandleQueued_DedupsToSingleClaim(t *testing.T) {
 // cohabits with multi-provider routing: two providers emitting the same
 // numeric job id must each get their own claim.
 func TestConcurrentHandleQueued_DifferentProvidersBothRun(t *testing.T) {
-	fake := &concurrentDispatchFake{waitBlock: make(chan struct{})}
-	dc, stopDispatch := startConcurrentDispatchFake(t,fake)
+	fake := &fakeDispatchServer{waitBlock: make(chan struct{})}
+	_, dc, stopDispatch := startFakeDispatchServer(t, fake)
 	defer stopDispatch()
 
 	provA := newClaimCountingProvider("provider-a")
@@ -360,8 +380,8 @@ func TestConcurrentHandleQueued_DifferentProvidersBothRun(t *testing.T) {
 // cancelled. The cleanup must use a fresh context.Background(), otherwise a
 // shutting-down scheduler would leak containers.
 func TestHandleCompleted_DestroyRunsAfterCancel(t *testing.T) {
-	fake := &concurrentDispatchFake{destroyed: make(chan string, 4)}
-	dc, stopDispatch := startConcurrentDispatchFake(t,fake)
+	fake := &fakeDispatchServer{destroyed: make(chan string, 4)}
+	_, dc, stopDispatch := startFakeDispatchServer(t, fake)
 	defer stopDispatch()
 
 	prov := newClaimCountingProvider("dispatch-prov")
@@ -440,8 +460,8 @@ func TestHandleCompleted_DestroyRunsAfterCancel(t *testing.T) {
 // the parent context is cancelled at this point in the lifecycle. The Linux
 // dispatcher path uses context.Background() specifically to survive shutdown.
 func TestDestroyAll_DestroysEvenWhenContextCancelled(t *testing.T) {
-	fake := &concurrentDispatchFake{destroyed: make(chan string, 8)}
-	dc, stopDispatch := startConcurrentDispatchFake(t,fake)
+	fake := &fakeDispatchServer{destroyed: make(chan string, 8)}
+	_, dc, stopDispatch := startFakeDispatchServer(t, fake)
 	defer stopDispatch()
 
 	prov := newClaimCountingProvider("shutdown-prov")
@@ -506,11 +526,11 @@ func TestDestroyAll_DestroysEvenWhenContextCancelled(t *testing.T) {
 // jobCtx fires before it finishes. Wait returns an error (timeout), and the
 // cleanup goroutine still calls dispatch.Destroy.
 func TestHandleLinuxJob_TimeoutTriggersDispatchDestroy(t *testing.T) {
-	fake := &concurrentDispatchFake{
+	fake := &fakeDispatchServer{
 		destroyed: make(chan string, 1),
 		waitErr:   errors.New("simulated timeout"),
 	}
-	dc, stopDispatch := startConcurrentDispatchFake(t,fake)
+	_, dc, stopDispatch := startFakeDispatchServer(t, fake)
 	defer stopDispatch()
 
 	prov := newClaimCountingProvider("timeout-prov")
@@ -607,10 +627,11 @@ type stopRecordingMacVM struct {
 	stopCount *atomic.Int32
 }
 
-func (m *stopRecordingMacVM) WriteJITConfig(string) error                       { return nil }
-func (m *stopRecordingMacVM) Start(ctx context.Context) error                   { return nil }
-func (m *stopRecordingMacVM) WaitForRunner(ctx context.Context) (string, error) { return "10.0.0.1", nil }
-func (m *stopRecordingMacVM) RunnerAddress() string                             { return "10.0.0.1" }
-func (m *stopRecordingMacVM) Wait(ctx context.Context) (int, error)             { return 0, nil }
-func (m *stopRecordingMacVM) Stop()                                             { m.stopCount.Add(1) }
-
+func (m *stopRecordingMacVM) WriteJITConfig(string) error     { return nil }
+func (m *stopRecordingMacVM) Start(ctx context.Context) error { return nil }
+func (m *stopRecordingMacVM) WaitForRunner(ctx context.Context) (string, error) {
+	return "10.0.0.1", nil
+}
+func (m *stopRecordingMacVM) RunnerAddress() string                 { return "10.0.0.1" }
+func (m *stopRecordingMacVM) Wait(ctx context.Context) (int, error) { return 0, nil }
+func (m *stopRecordingMacVM) Stop()                                 { m.stopCount.Add(1) }

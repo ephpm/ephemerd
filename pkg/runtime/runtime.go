@@ -91,6 +91,13 @@ type Runtime struct {
 	pullMu sync.Mutex // serializes image pulls to avoid content store contention
 }
 
+// Client returns the underlying containerd client. Used by the in-VM
+// debug-exec HTTP server so the Windows host can poke into running
+// containers (kindest/node, buildkit) without leaving the VM.
+func (r *Runtime) Client() *client.Client {
+	return r.client
+}
+
 // RunnerEnv represents a running runner environment.
 type RunnerEnv struct {
 	ID        string
@@ -659,6 +666,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			containerDataDir = r.cfg.ContainerDataDir
 		}
 		opts = append(opts, withDNSMount(hostDataDir, containerDataDir, id))
+		opts = append(opts, withHostsMount(hostDataDir, containerDataDir, id))
 	}
 
 	// Start per-job fake Docker daemon. Exposure to the container differs
@@ -810,6 +818,13 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	if r.cfg.Network != nil && goruntime.GOOS != "windows" {
 		pid := task.Pid()
 		netns = fmt.Sprintf("/proc/%d/ns/net", pid)
+		// Tell the dind server which netns to install port-forwarding DNAT
+		// rules into. KIND publishes its API server on 127.0.0.1:<random> in
+		// the runner's namespace via -p, so we need to install DNAT rules
+		// here when a sibling container is created with PortBindings.
+		if dindServer != nil {
+			dindServer.SetRunnerNetNS(netns)
+		}
 		if _, err := r.cfg.Network.Setup(ctx, id, netns); err != nil {
 			stopDind()
 			if _, delErr := task.Delete(ctx, client.WithProcessKill); delErr != nil {
@@ -957,6 +972,45 @@ func (r *Runtime) Wait(ctx context.Context, env *RunnerEnv) (uint32, error) {
 		return status.ExitCode(), status.Error()
 	case <-ctx.Done():
 		return 1, ctx.Err()
+	}
+}
+
+// withHostsMount writes a per-container /etc/hosts file and bind-mounts
+// it into the container. Docker does this by default; without it, the
+// image's /etc/hosts (often empty in actions-runner-style images) leaves
+// "localhost" without a files-side entry, so Go programs that call
+// net.Listen("tcp", "localhost:10350") fall through to DNS and fail with
+// "lookup localhost on 1.1.1.1:53: no such host" — exactly what tilt ci
+// hits inside our self-hosted runner.
+func withHostsMount(hostDir, containerDir, containerID string) oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
+		content := "127.0.0.1\tlocalhost\n" +
+			"::1\tlocalhost ip6-localhost ip6-loopback\n" +
+			"fe00::0\tip6-localnet\n" +
+			"ff00::0\tip6-mcastprefix\n" +
+			"ff02::1\tip6-allnodes\n" +
+			"ff02::2\tip6-allrouters\n"
+
+		dir := filepath.Join(hostDir, "hosts")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("creating hosts dir: %w", err)
+		}
+		hostFile := filepath.Join(dir, containerID+".hosts")
+		if err := os.WriteFile(hostFile, []byte(content), 0o644); err != nil {
+			return fmt.Errorf("writing hosts: %w", err)
+		}
+
+		src := filepath.Join(containerDir, "hosts", containerID+".hosts")
+		if s.Mounts == nil {
+			s.Mounts = []ocispec.Mount{}
+		}
+		s.Mounts = append(s.Mounts, ocispec.Mount{
+			Destination: "/etc/hosts",
+			Type:        "bind",
+			Source:      src,
+			Options:     []string{"rbind", "ro"},
+		})
+		return nil
 	}
 }
 

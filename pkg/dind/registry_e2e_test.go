@@ -162,6 +162,20 @@ func TestPushHandlerEndToEnd(t *testing.T) {
 	}
 	t.Logf("staged image %s -> %s (%d bytes)", mockRef, imgDesc.Digest, imgDesc.Size)
 
+	// Diagnostic: confirm the three staged blobs are visible via the same
+	// content store the push handler will use, in the same namespace, right
+	// now. If any of these Info calls reports NotFound, the write didn't
+	// register the digest in the buildkit-namespace bucket — distinct from
+	// the symptom where push later fails to ReaderAt the layer.
+	cs := ctrdClient.ContentStore()
+	layerBytes := []byte("synthetic-layer-for-push-e2e")
+	layerDgst := digest.FromBytes(layerBytes)
+	for _, d := range []digest.Digest{layerDgst, imgDesc.Digest} {
+		info, infoErr := cs.Info(ctx, d)
+		t.Logf("post-stage Info(%s): err=%v size=%d labels=%v",
+			d, infoErr, info.Size, info.Labels)
+	}
+
 	// Bring up the dind server.
 	s, err := New(Config{
 		JobID:   "push-e2e",
@@ -275,8 +289,18 @@ func stageSyntheticImage(ctx context.Context, client containerdClient, name stri
 		Digest:    manifestDigest,
 		Size:      int64(len(manifestBytes)),
 	}
+	// Attach gc.ref.content labels so containerd's GC keeps the config and
+	// layer reachable through the manifest. Without these the bare blobs are
+	// unreferenced (the image record only points at the manifest, not its
+	// children) and a GC pass between staging and push deletes the layer —
+	// the resulting "content digest <layer>: not found" error is the flake
+	// that made this test pass locally but fail intermittently in CI.
+	manifestLabels := map[string]string{
+		"containerd.io/gc.ref.content.config": configDigest.String(),
+		"containerd.io/gc.ref.content.l.0":    layerDigest.String(),
+	}
 	if err := content.WriteBlob(ctx, cs, "manifest-"+manifestDigest.String(),
-		bytes.NewReader(manifestBytes), manifestDesc); err != nil {
+		bytes.NewReader(manifestBytes), manifestDesc, content.WithLabels(manifestLabels)); err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("write manifest: %w", err)
 	}
 
