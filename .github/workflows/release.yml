@@ -1,5 +1,16 @@
 name: Release
 
+# Per-OS build pipeline. Each platform builds on its native self-hosted
+# runner via `mage build:<target>`, packages the binary, and uploads it as
+# a workflow artifact. A final `release` job downloads all artifacts,
+# computes checksums, and creates a draft GitHub release.
+#
+# This split exists because cross-compiling Windows/Darwin binaries from
+# a Linux host leaves their go:embed sections empty — the embedded VM
+# kernel, initrd, and rootfs are platform-specific assets downloaded by
+# mage targets that only run on the matching host. Each native build
+# pulls its own assets and produces a fully working binary.
+
 on:
   push:
     tags:
@@ -12,35 +23,168 @@ env:
   GO_VERSION: "1.26.1"
 
 jobs:
+  build-linux-amd64:
+    name: Build (Linux amd64)
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # so `git describe --tags` returns the tag
+
+      # mage comes from the runner-ci-linux image, same as ci.yml.
+      - name: Restore cached build deps
+        run: /opt/ephemerd-ci/entrypoint-cache.sh
+        continue-on-error: true
+
+      - name: Build Linux amd64 binary
+        run: mage build:build
+
+      - name: Verify binary
+        run: ./ephemerd --version
+
+      - name: Package
+        run: tar -czf "ephemerd_${GITHUB_REF_NAME}_linux_amd64.tar.gz" ephemerd
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ephemerd-linux-amd64
+          path: ephemerd_*_linux_amd64.tar.gz
+          if-no-files-found: error
+
+  build-linux-arm64:
+    name: Build (Linux arm64)
+    runs-on: [self-hosted, linux, arm64]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install mage
+        run: go install github.com/magefile/mage@latest
+
+      - name: Build Linux arm64 binary
+        run: mage build:build
+
+      - name: Verify binary
+        run: ./ephemerd --version
+
+      - name: Package
+        run: tar -czf "ephemerd_${GITHUB_REF_NAME}_linux_arm64.tar.gz" ephemerd
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ephemerd-linux-arm64
+          path: ephemerd_*_linux_arm64.tar.gz
+          if-no-files-found: error
+
+  build-windows-amd64:
+    name: Build (Windows amd64)
+    runs-on: [self-hosted, windows, x64]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Restore cached build deps
+        run: C:\ephemerd-ci\entrypoint-cache.ps1
+        continue-on-error: true
+
+      - name: Ensure mage is available
+        run: |
+          if (Get-Command mage -ErrorAction SilentlyContinue) { return }
+          Write-Host "mage not found - installing via go install..."
+          $env:GOBIN = 'C:\go\bin'
+          go install github.com/magefile/mage@latest
+
+      # Full two-stage build: cross-compiles ephemerd-linux for the Hyper-V
+      # VM, downloads kernel/initrd/rootfs, then builds ephemerd.exe with
+      # all assets embedded. ~700 MB output.
+      - name: Build Windows binary
+        run: mage build:windows
+
+      - name: Verify binary
+        run: .\ephemerd.exe --version
+
+      - name: Package
+        run: Compress-Archive -Path .\ephemerd.exe -DestinationPath "ephemerd_${env:GITHUB_REF_NAME}_windows_amd64.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ephemerd-windows-amd64
+          path: ephemerd_*_windows_amd64.zip
+          if-no-files-found: error
+
+  build-darwin-arm64:
+    name: Build (macOS arm64)
+    runs-on: [self-hosted, macos, arm64]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install mage
+        run: go install github.com/magefile/mage@latest
+
+      # Full Darwin build: downloads aarch64 Linux kernel/initrd/rootfs,
+      # cross-compiles ephemerd-linux for arm64, builds ephemerd, then
+      # ad-hoc codesigns with the virtualization entitlement Vz requires.
+      - name: Build macOS binary
+        run: mage build:macos
+
+      - name: Verify binary
+        run: |
+          ./ephemerd --version
+          codesign -v ./ephemerd && echo "codesigned" || echo "NOT codesigned"
+
+      - name: Package
+        run: tar -czf "ephemerd_${GITHUB_REF_NAME}_darwin_arm64.tar.gz" ephemerd
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ephemerd-darwin-arm64
+          path: ephemerd_*_darwin_arm64.tar.gz
+          if-no-files-found: error
+
   release:
-    name: Build & Release
+    name: Publish GitHub Release
+    needs:
+      - build-linux-amd64
+      - build-linux-arm64
+      - build-windows-amd64
+      - build-darwin-arm64
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      # Go and mage come from the runner-ci-linux image (see images/runner-ci-linux/Dockerfile),
-      # so setup-go and `go install mage` are unnecessary here.
-      # - uses: actions/setup-go@v6
-      #   with:
-      #     go-version: ${{ env.GO_VERSION }}
-      # - name: Install mage
-      #   run: go install github.com/magefile/mage@latest
-
-      - name: Download embedded dependencies
-        run: |
-          mage download:all
-          mage download:runnerwindows
-          mage download:rootfs
-
-      - name: Cross-compile Linux binary for Windows embedding
-        run: mage build:linuxembed
-
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
-          version: latest
-          args: release --clean
+          path: dist
+          merge-multiple: true
+
+      - name: Compute checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Create draft release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --draft \
+            --prerelease \
+            --generate-notes \
+            --title "${GITHUB_REF_NAME}" \
+            dist/*

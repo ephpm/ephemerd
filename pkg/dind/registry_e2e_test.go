@@ -22,6 +22,7 @@ import (
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	containerdpkg "github.com/ephpm/ephemerd/pkg/containerd"
 	"github.com/opencontainers/go-digest"
@@ -154,6 +155,25 @@ func TestPushHandlerEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(namespaces.WithNamespace(context.Background(), bkNamespace), 60*time.Second)
 	defer cancel()
 
+	// Hold a lease across the entire staging→push lifecycle. Without this,
+	// content.WriteBlob registers the blob in the namespace bucket but
+	// attaches no lease (addContentLease is a no-op without leases.FromContext)
+	// and no GC-ref labels are written for plain child blobs. The buildkit
+	// namespace can then have orphan content that is racy with respect to
+	// containerd's internal flushing/visibility paths — this manifested as
+	// CI flakes where TestPushHandlerEndToEnd would fail mid-push with
+	// "content digest sha256:...layer...: not found".
+	lease, err := ctrdClient.LeasesService().Create(ctx, leases.WithExpiration(5*time.Minute))
+	if err != nil {
+		t.Fatalf("create lease: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := ctrdClient.LeasesService().Delete(context.Background(), lease); err != nil {
+			t.Logf("delete lease: %v", err)
+		}
+	})
+	ctx = leases.WithLease(ctx, lease.ID)
+
 	// Stage a synthetic OCI image: empty layer + tiny config + manifest
 	// pointing at both. Image record `mockRef` so /push GetImage finds it.
 	imgDesc, err := stageSyntheticImage(ctx, ctrdClient, mockRef)
@@ -161,20 +181,6 @@ func TestPushHandlerEndToEnd(t *testing.T) {
 		t.Fatalf("stage image: %v", err)
 	}
 	t.Logf("staged image %s -> %s (%d bytes)", mockRef, imgDesc.Digest, imgDesc.Size)
-
-	// Diagnostic: confirm the three staged blobs are visible via the same
-	// content store the push handler will use, in the same namespace, right
-	// now. If any of these Info calls reports NotFound, the write didn't
-	// register the digest in the buildkit-namespace bucket — distinct from
-	// the symptom where push later fails to ReaderAt the layer.
-	cs := ctrdClient.ContentStore()
-	layerBytes := []byte("synthetic-layer-for-push-e2e")
-	layerDgst := digest.FromBytes(layerBytes)
-	for _, d := range []digest.Digest{layerDgst, imgDesc.Digest} {
-		info, infoErr := cs.Info(ctx, d)
-		t.Logf("post-stage Info(%s): err=%v size=%d labels=%v",
-			d, infoErr, info.Size, info.Labels)
-	}
 
 	// Bring up the dind server.
 	s, err := New(Config{
