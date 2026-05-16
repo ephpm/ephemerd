@@ -30,7 +30,11 @@ func (s *dispatchServer) CreateJob(ctx context.Context, req *apiv1.CreateJobRequ
 	s.log.Info("dispatch: creating job", "id", req.Id, "image", req.Image)
 
 	env, err := s.rt.Create(ctx, runtime.CreateConfig{
-		ID: req.Id, Image: req.Image, JITConfig: req.JitConfig,
+		ID:        req.Id,
+		Image:     req.Image,
+		JITConfig: req.JitConfig,
+		Provider:  req.Provider,
+		Repo:      req.Repo,
 	})
 	if err != nil {
 		s.log.Error("dispatch: create failed", "id", req.Id, "error", err)
@@ -140,12 +144,17 @@ func NewDispatchClient(addr string) (*DispatchClient, error) {
 	}, nil
 }
 
-// Create dispatches a container create to the WSL worker.
-func (d *DispatchClient) Create(ctx context.Context, id, image, jitConfig string) error {
+// Create dispatches a container create to the WSL worker. provider + repo
+// are passed through so the VM-side dind server can scope its per-repo
+// image cache namespace to (provider, repo) and not leak private images
+// across forges or repos.
+func (d *DispatchClient) Create(ctx context.Context, id, image, jitConfig, provider, repo string) error {
 	_, err := d.client.CreateJob(ctx, &apiv1.CreateJobRequest{
 		Id:        id,
 		Image:     image,
 		JitConfig: jitConfig,
+		Provider:  provider,
+		Repo:      repo,
 	})
 	return err
 }

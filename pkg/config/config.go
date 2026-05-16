@@ -100,6 +100,37 @@ type ContainerdConfig struct {
 // DindConfig configures the fake Docker daemon mounted into job containers.
 type DindConfig struct {
 	Enabled bool `toml:"enabled"` // mount /var/run/docker.sock with a fake Docker API
+
+	// CachePruneInterval is how often the per-repo image cache pruner runs.
+	// Accepts standard Go duration strings ("24h", "30m"). Set to 0 to
+	// disable pruning entirely. Default 24h.
+	CachePruneInterval time.Duration `toml:"cache_prune_interval"`
+
+	// CacheMaxAge is the eviction threshold for cached image records:
+	// any record whose ephemerd.io/last-accessed label (or UpdatedAt as
+	// fallback) is older than this gets removed on the next prune pass.
+	// Containerd's content GC then reclaims the unreferenced blobs.
+	// Set to 0 to disable eviction (only empty-namespace cleanup runs).
+	// Default 168h (7 days).
+	CacheMaxAge time.Duration `toml:"cache_max_age"`
+}
+
+// DindCachePruneInterval returns the prune interval with the default
+// applied when unset (or set to 0).
+func (d *DindConfig) DindCachePruneInterval() time.Duration {
+	if d.CachePruneInterval == 0 {
+		return 24 * time.Hour
+	}
+	return d.CachePruneInterval
+}
+
+// DindCacheMaxAge returns the eviction threshold with the default applied
+// when unset (or set to 0).
+func (d *DindConfig) DindCacheMaxAge() time.Duration {
+	if d.CacheMaxAge == 0 {
+		return 7 * 24 * time.Hour
+	}
+	return d.CacheMaxAge
 }
 
 // ModuleProxyConfig configures the Go module caching proxy.

@@ -24,7 +24,6 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
-	containerdpkg "github.com/ephpm/ephemerd/pkg/containerd"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -124,11 +123,15 @@ func TestPushHandlerEndToEnd(t *testing.T) {
 	mockHost := mustHost(t, mock.URL)
 	mockRef := mockHost + "/" + repoName + ":" + imageTag
 
-	// Embedded containerd in a temp data dir, with a unique socket path
-	// so the test can run alongside the live daemon without clobbering its
-	// pipe / socket. Use os.MkdirTemp + best-effort RemoveAll because
-	// containerd's bbolt meta.db can still be held briefly after Stop()
-	// returns and t.TempDir's strict cleanup would mark the test failed.
+	// Reuse the process-wide shared containerd (see testcontainerd_test.go).
+	// containerd's prometheus metrics use a global registry, so spawning a
+	// second containerd in the same test binary panics. The shared instance
+	// is fine here because the test stages into the "buildkit" namespace
+	// which doesn't collide with anything else in the suite.
+	ctrdClient := sharedTestContainerd(t)
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// Per-test scratch dir for dind's socket + job dir, separate from the
+	// shared containerd's data dir.
 	dataDir, err := os.MkdirTemp("", "ephemerd-push-e2e-*")
 	if err != nil {
 		t.Fatalf("temp dir: %v", err)
@@ -138,19 +141,6 @@ func TestPushHandlerEndToEnd(t *testing.T) {
 			t.Logf("cleanup: remove %s: %v", dataDir, err)
 		}
 	})
-	socketPath := testSocketPath(t)
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	ctrd, err := containerdpkg.New(containerdpkg.Config{
-		DataDir:    dataDir,
-		SocketPath: socketPath,
-		Log:        log.With("component", "containerd"),
-	})
-	if err != nil {
-		t.Skipf("embedded containerd unavailable in this env: %v", err)
-	}
-	t.Cleanup(ctrd.Stop)
-
-	ctrdClient := ctrd.Client()
 	bkNamespace := "buildkit"
 	ctx, cancel := context.WithTimeout(namespaces.WithNamespace(context.Background(), bkNamespace), 60*time.Second)
 	defer cancel()

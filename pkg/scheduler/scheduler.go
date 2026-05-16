@@ -619,7 +619,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		jobCtx, cancel = context.WithCancel(ctx)
 	}
 
-	if err := s.cfg.LinuxDispatcher.Create(jobCtx, claim.RunnerName, image, claim.RunnerConfig); err != nil {
+	if err := s.cfg.LinuxDispatcher.Create(jobCtx, claim.RunnerName, image, claim.RunnerConfig, event.Provider.Name(), event.Repo); err != nil {
 		log.Error("dispatch create failed", "error", err)
 		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
 			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)

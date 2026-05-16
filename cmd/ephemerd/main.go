@@ -11,12 +11,14 @@ import (
 	"syscall"
 	"time"
 
+	containerdclient "github.com/containerd/containerd/v2/client"
 	apiv1 "github.com/ephpm/ephemerd/api/v1"
 	"github.com/ephpm/ephemerd/pkg/artifacts"
 	"github.com/ephpm/ephemerd/pkg/buildkit"
 	"github.com/ephpm/ephemerd/pkg/cni"
 	"github.com/ephpm/ephemerd/pkg/config"
 	"github.com/ephpm/ephemerd/pkg/containerd"
+	"github.com/ephpm/ephemerd/pkg/dind"
 	"github.com/ephpm/ephemerd/pkg/github"
 	"github.com/ephpm/ephemerd/pkg/metrics"
 	"github.com/ephpm/ephemerd/pkg/networking"
@@ -286,6 +288,27 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		}
 		if err := rt.CleanOrphans(ctx); err != nil {
 			log.Warn("failed to clean orphan containers", "error", err)
+		}
+
+		// Clean up dind per-job namespaces left by jobs that didn't shut
+		// down cleanly on the previous boot (DeadlineExceeded, SIGKILL,
+		// host reboot, etc.). Server.Stop's CleanupJobNamespace covers the
+		// graceful path; this catches everything else. Without this, every
+		// ungraceful exit accumulates ~1 GB of pinned image content and the
+		// namespace metadata bucket — we observed 73 leaked namespaces on
+		// a host that filled its 100 GB VHDX over a couple of days.
+		cleanupCtx, cancelCleanup := context.WithTimeout(ctx, 5*time.Minute)
+		dind.CleanupStaleDindNamespaces(cleanupCtx, rt.Client(), log)
+		cancelCleanup()
+
+		// Periodic per-repo image cache pruner. Each cache namespace
+		// (ephemerd-dind-cache-<provider>-<repo>) is scanned every
+		// CachePruneInterval, and any image record whose last-accessed
+		// label is older than CacheMaxAge gets dropped — containerd's
+		// content GC reclaims the unreferenced blobs. Empty cache
+		// namespaces get removed entirely.
+		if interval := cfg.Dind.DindCachePruneInterval(); interval > 0 && cfg.Dind.DindCacheMaxAge() > 0 {
+			go runDindCachePruner(ctx, rt.Client(), interval, cfg.Dind.DindCacheMaxAge(), log)
 		}
 
 		dispatchPort := int(containerdTCPPort) + 1
@@ -671,6 +694,30 @@ func initProviders(cfg *config.Config, log *slog.Logger) ([]providers.Provider, 
 }
 
 // pollInterval returns the poll interval for the configured provider.
+// runDindCachePruner runs the per-repo image cache pruner on a fixed
+// interval until ctx is canceled. Called in worker mode so each Linux VM
+// keeps its dind image cache bounded. Errors from a single pass are
+// logged and the loop continues — the next tick retries.
+func runDindCachePruner(ctx context.Context, c *containerdclient.Client, interval, maxAge time.Duration, log *slog.Logger) {
+	log = log.With("component", "dind-cache-pruner", "interval", interval, "max_age", maxAge)
+	log.Info("starting dind cache pruner")
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("dind cache pruner stopping")
+			return
+		case <-ticker.C:
+			passCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+			if err := dind.CachePrune(passCtx, c, maxAge, log); err != nil {
+				log.Warn("dind cache prune pass failed", "error", err)
+			}
+			cancel()
+		}
+	}
+}
+
 func pollInterval(cfg *config.Config) time.Duration {
 	switch cfg.Provider() {
 	case "github":

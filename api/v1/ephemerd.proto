@@ -72,6 +72,11 @@ message CreateJobRequest {
   string id = 1;
   string image = 2;
   string jit_config = 3;
+  // provider is the forge name (e.g. "github", "gitea"); together with
+  // repo it scopes dind's per-repo image cache.
+  string provider = 4;
+  // repo is the forge-native repo path (e.g. "owner/repo").
+  string repo = 5;
 }
 message CreateJobResponse {}
 

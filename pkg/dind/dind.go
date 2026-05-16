@@ -33,17 +33,18 @@ const sharedNamespace = "ephemerd"
 
 // Server is a per-job fake Docker daemon.
 type Server struct {
-	jobID        string
-	jobNamespace string // per-job containerd namespace for isolation
-	sockPath     string // host-side unix socket path (Linux/macOS only)
-	endpoint     string // what the container should set DOCKER_HOST to (e.g. "tcp://gw:port" on Windows)
-	listener     net.Listener
-	server       *http.Server
-	client       *client.Client
-	network      *networking.Manager
-	buildkit     *buildkit.Server // shared embedded BuildKit solver (nil → fall back to platform default)
-	runnerNetNS  string           // path to runner container's net namespace; used to install DNAT rules for port bindings
-	log          *slog.Logger
+	jobID          string
+	jobNamespace   string // per-job containerd namespace for isolation
+	cacheNamespace string // per-(provider,repo) shared image cache namespace; empty disables caching
+	sockPath       string // host-side unix socket path (Linux/macOS only)
+	endpoint       string // what the container should set DOCKER_HOST to (e.g. "tcp://gw:port" on Windows)
+	listener       net.Listener
+	server         *http.Server
+	client         *client.Client
+	network        *networking.Manager
+	buildkit       *buildkit.Server // shared embedded BuildKit solver (nil → fall back to platform default)
+	runnerNetNS    string           // path to runner container's net namespace; used to install DNAT rules for port bindings
+	log            *slog.Logger
 
 	mu         sync.Mutex
 	images     map[string]*imageEntry    // in-memory image store scoped to this job
@@ -63,6 +64,18 @@ type imageEntry struct {
 type Config struct {
 	// JobID is the unique job identifier.
 	JobID string
+
+	// Provider is the forge provider name ("github", "gitea", "forgejo",
+	// "gitlab", "woodpecker") for the job. Used together with Repo to
+	// build the per-repo image cache namespace; if empty, image caching
+	// across jobs is disabled and every pull is cold for this job.
+	Provider string
+
+	// Repo is the forge-native repo path (e.g. "owner/repo" on GitHub
+	// or "group/subgroup/project" on GitLab). Used together with Provider
+	// to build the per-repo image cache namespace; if empty, image
+	// caching across jobs is disabled.
+	Repo string
 
 	// DataDir is the ephemerd data directory. The socket and temp layers
 	// are stored under <DataDir>/jobs/<JobID>/docker/.
@@ -109,17 +122,18 @@ func New(cfg Config) (*Server, error) {
 		jobID: cfg.JobID,
 		// containerd namespace name regex (^[A-Za-z0-9]+(?:[._-](?:[A-Za-z0-9]+))*$)
 		// rejects slashes. Use hyphens to namespace per-job dind state.
-		jobNamespace: "ephemerd-dind-" + cfg.JobID,
-		sockPath:     sockPath,
-		client:       cfg.Client,
-		network:      cfg.Network,
-		buildkit:    cfg.BuildKit,
-		runnerNetNS: cfg.RunnerNetNS,
-		log:         cfg.Log.With("component", "dind", "job_id", cfg.JobID),
-		images:       make(map[string]*imageEntry),
-		containers:   make(map[string]*containerEntry),
-		execs:        make(map[string]*execEntry),
-		networks:     make(map[string]*networkEntry),
+		jobNamespace:   "ephemerd-dind-" + cfg.JobID,
+		cacheNamespace: CacheNamespace(cfg.Provider, cfg.Repo),
+		sockPath:       sockPath,
+		client:         cfg.Client,
+		network:        cfg.Network,
+		buildkit:       cfg.BuildKit,
+		runnerNetNS:    cfg.RunnerNetNS,
+		log:            cfg.Log.With("component", "dind", "job_id", cfg.JobID),
+		images:         make(map[string]*imageEntry),
+		containers:     make(map[string]*containerEntry),
+		execs:          make(map[string]*execEntry),
+		networks:       make(map[string]*networkEntry),
 	}
 	s.initDefaultBridgeNetwork()
 	return s, nil
@@ -191,6 +205,18 @@ func (s *Server) Stop() {
 	// Destroy all exec processes and containers created through this socket.
 	s.destroyAllExecs()
 	s.destroyAllContainers()
+
+	// Clean up the per-job containerd namespace. destroyAllContainers handles
+	// containers tracked in the in-memory map; this catches stragglers
+	// (kindest/node-side containerd creations that landed in the same
+	// namespace but never registered in s.containers), then deletes the
+	// Image and Lease records so containerd's content GC can reclaim the
+	// pinned blobs, then drops the namespace metadata bucket itself.
+	// Without this, every job leaks ~1 GB of image content + the snapshot
+	// upperdir referenced by un-deleted Image records.
+	if s.client != nil {
+		CleanupJobNamespace(context.Background(), s.client, s.jobNamespace, s.log)
+	}
 
 	if s.server != nil {
 		if err := s.server.Shutdown(context.Background()); err != nil {
@@ -489,8 +515,40 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
+	// Mirror the Image record into the per-repo cache namespace so the
+	// gc.ref labels keep the manifest+config+layer blobs alive after the
+	// per-job namespace is cleaned up. Next job in the same repo gets a
+	// content-store hit. Cross-repo / cross-provider jobs do NOT see this
+	// cache record (namespace isolation), so private images don't leak.
+	if s.cacheNamespace != "" {
+		// Mirror both the qualified ref (what containerd pulled under)
+		// and the unqualified docker-CLI form, so future cache hits via
+		// either name work.
+		for _, name := range dedup(ref, unqualifiedRef) {
+			if err := MirrorImageToCache(ctx, s.client, s.jobNamespace, s.cacheNamespace, name, s.log); err != nil {
+				s.log.Debug("dind cache: mirror failed", "image", name, "error", err)
+			}
+		}
+	}
+
 	writeProgress(fmt.Sprintf("Digest: %s", img.Target().Digest.String()))
 	writeProgress(fmt.Sprintf("Status: Downloaded newer image for %s", unqualifiedRef))
+}
+
+// dedup returns the unique non-empty strings from the input in the order
+// they first appear. Used so we don't mirror the same image twice when
+// qualified and unqualified forms match.
+func dedup(in ...string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
 }
 
 func (s *Server) handleNotImplemented(w http.ResponseWriter, r *http.Request) {
