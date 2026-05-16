@@ -114,6 +114,8 @@ max_concurrent = 4                   # max simultaneous jobs
 # --- Docker-in-Docker --------------------------------------------------------
 [dind]
 # enabled = false                    # mount fake Docker socket into containers
+# cache_prune_interval = "24h"       # how often the per-repo image cache pruner runs
+# cache_max_age        = "168h"      # evict cached image records inactive longer than this (7 days)
 
 # --- Metrics ------------------------------------------------------------------
 [metrics]
@@ -258,11 +260,29 @@ Container networking configuration.
 
 ### `[dind]`
 
-Docker-in-Docker support.
+Docker-in-Docker support. When `enabled`, every job sees `/var/run/docker.sock` and the runner's containerd serves a fake Docker Engine API on it. Image pulls from inside the job (e.g. `kind create cluster` pulling `kindest/node`) are mirrored into a long-lived per-repo namespace so the next job in the same repo gets a content-store hit instead of re-pulling.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Mount a fake Docker socket (`/var/run/docker.sock`) into job containers |
+| `cache_prune_interval` | duration | `"24h"` | How often the per-repo image cache pruner runs. Set to `"0"` to disable pruning. |
+| `cache_max_age` | duration | `"168h"` (7d) | Evict cached image records whose `ephemerd.io/last-accessed` label is older than this. Containerd's content GC reclaims the now-unreferenced blobs. |
+
+**Per-repo image cache.** Each (provider, repo) pair gets its own long-lived containerd namespace named `ephemerd-dind-cache-<provider>-<sanitized-repo>`. Examples:
+
+```
+ephemerd-dind-cache-github-ephpm_ephpm
+ephemerd-dind-cache-gitea-ephpm_ephpm        ← distinct from the github one
+ephemerd-dind-cache-gitlab-acme_platform_api ← nested GitLab groups OK
+```
+
+The cache namespace persists across jobs and across ephemerd restarts. Per-job state lives in a separate namespace (`ephemerd-dind-<runner-name>`) which is deleted when each job exits.
+
+**Privacy boundary.** Containerd namespace isolation prevents one repo's cached image blobs from being resolved by any other namespace. Two forges with identically-named repos (`github/foo` vs `gitea/foo`) do not share a cache. Two repos within the same forge do not share a cache. Auth credentials are scoped to the per-job namespace's in-memory auth cache and are never copied into the long-lived cache namespace.
+
+**Pruning.** Every `cache_prune_interval`, dind walks each `ephemerd-dind-cache-*` namespace and evicts Image records whose `ephemerd.io/last-accessed` label is older than `cache_max_age`. Cache namespaces left empty after eviction are removed entirely. Records pre-dating the label fall back to the record's `UpdatedAt` timestamp so a deploy that introduces the cache feature doesn't nuke pre-existing records on first prune.
+
+**Disabling caching.** Setting `cache_max_age = "0"` disables eviction (the cache grows unbounded — useful for debugging but not recommended in production). Setting `cache_prune_interval = "0"` disables the pruner goroutine entirely; equivalent to "keep everything forever, even empty namespaces."
 
 ### `[metrics]`
 
