@@ -53,7 +53,7 @@ func TestDispatchClient_Create(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := c.Create(ctx, "job-1", "alpine:latest", "jit-config"); err != nil {
+	if err := c.Create(ctx, "job-1", "alpine:latest", "jit-config", "github", "owner/repo"); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -71,6 +71,12 @@ func TestDispatchClient_Create(t *testing.T) {
 	}
 	if got.JitConfig != "jit-config" {
 		t.Errorf("JitConfig = %q", got.JitConfig)
+	}
+	if got.Provider != "github" {
+		t.Errorf("Provider = %q, want github", got.Provider)
+	}
+	if got.Repo != "owner/repo" {
+		t.Errorf("Repo = %q, want owner/repo", got.Repo)
 	}
 }
 
@@ -90,7 +96,7 @@ func TestDispatchClient_Create_PropagatesError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	err := c.Create(ctx, "job-1", "img", "")
+	err := c.Create(ctx, "job-1", "img", "", "github", "owner/repo")
 	if err == nil {
 		t.Fatal("expected error from server")
 	}

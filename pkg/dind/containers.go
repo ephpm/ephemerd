@@ -252,6 +252,23 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		// Mirror the just-pulled image into the per-repo cache so a future
+		// job in the same repo can hit it without a network round-trip.
+		if s.cacheNamespace != "" {
+			for _, name := range dedup(pullRef, req.Image) {
+				if merr := MirrorImageToCache(r.Context(), s.client, s.jobNamespace, s.cacheNamespace, name, s.log); merr != nil {
+					s.log.Debug("dind cache: mirror after container-create pull", "image", name, "error", merr)
+				}
+			}
+		}
+	}
+
+	// Refresh the last-accessed label on the cache record for this image
+	// (if cached). Captures the case where a job uses an image that was
+	// previously pulled by an earlier job in the same repo and is being
+	// run via `docker run` without re-pulling.
+	if s.cacheNamespace != "" {
+		RefreshLastAccessed(r.Context(), s.client, s.cacheNamespace, req.Image, s.log)
 	}
 
 	// Build OCI spec. Always target Linux — dind containers are Linux.

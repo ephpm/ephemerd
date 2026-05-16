@@ -500,6 +500,16 @@ type CreateConfig struct {
 	ID    string // unique job identifier (container name, dind socket path)
 	Image string // OCI image reference (empty = use default)
 
+	// Provider is the forge provider name (e.g. "github", "gitea") that
+	// queued the job. Together with Repo it's used to scope dind's
+	// per-repo image cache. Empty disables caching for this job.
+	Provider string
+
+	// Repo is the forge-native repo path (e.g. "owner/repo"). Together
+	// with Provider it's used to scope dind's per-repo image cache.
+	// Empty disables caching for this job.
+	Repo string
+
 	// JITConfig is the base64-encoded JIT config for GitHub runners.
 	// Passed as "--jitconfig <value>" to the runner entrypoint.
 	// Mutually exclusive with Entrypoint.
@@ -682,6 +692,8 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		var err error
 		dindServer, err = dind.New(dind.Config{
 			JobID:    id,
+			Provider: cfg.Provider,
+			Repo:     cfg.Repo,
 			DataDir:  r.cfg.DataDir,
 			Client:   r.client,
 			Network:  r.cfg.Network,
