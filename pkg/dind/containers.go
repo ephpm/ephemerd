@@ -111,17 +111,17 @@ type createRequest struct {
 }
 
 type hostConfig struct {
-	Binds         []string                       `json:"Binds"`
-	NetworkMode   string                         `json:"NetworkMode"`
-	Privileged    bool                           `json:"Privileged"`
-	SecurityOpt   []string                       `json:"SecurityOpt"`
-	CapAdd        []string                       `json:"CapAdd"`
-	Tmpfs         map[string]string              `json:"Tmpfs"`
-	PortBindings  map[string][]portBinding        `json:"PortBindings"`
-	RestartPolicy *restartPolicy                 `json:"RestartPolicy"`
-	Init          *bool                          `json:"Init"`
-	CgroupnsMode  string                         `json:"CgroupnsMode"`
-	ExtraHosts    []string                       `json:"ExtraHosts"`
+	Binds         []string                 `json:"Binds"`
+	NetworkMode   string                   `json:"NetworkMode"`
+	Privileged    bool                     `json:"Privileged"`
+	SecurityOpt   []string                 `json:"SecurityOpt"`
+	CapAdd        []string                 `json:"CapAdd"`
+	Tmpfs         map[string]string        `json:"Tmpfs"`
+	PortBindings  map[string][]portBinding `json:"PortBindings"`
+	RestartPolicy *restartPolicy           `json:"RestartPolicy"`
+	Init          *bool                    `json:"Init"`
+	CgroupnsMode  string                   `json:"CgroupnsMode"`
+	ExtraHosts    []string                 `json:"ExtraHosts"`
 }
 
 type portBinding struct {
@@ -228,6 +228,25 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 			"message": "Image is required",
 		})
 		return
+	}
+
+	// Privileged-elevation gate. Reject before any image pull so a job
+	// can't burn bandwidth probing for a configuration we'll refuse.
+	if !s.allowPrivileged && req.HostConfig != nil {
+		if req.HostConfig.Privileged {
+			s.log.Warn("rejecting privileged container request", "image", req.Image, "reason", "dind.allow_privileged is false on this host")
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"message": "privileged containers are disabled on this host (set dind.allow_privileged = true in ephemerd config to enable)",
+			})
+			return
+		}
+		if len(req.HostConfig.CapAdd) > 0 {
+			s.log.Warn("rejecting --cap-add container request", "image", req.Image, "caps", req.HostConfig.CapAdd, "reason", "dind.allow_privileged is false on this host")
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"message": fmt.Sprintf("--cap-add (%v) is disabled on this host (set dind.allow_privileged = true in ephemerd config to enable)", req.HostConfig.CapAdd),
+			})
+			return
+		}
 	}
 
 	id := generateContainerID()
@@ -1563,4 +1582,3 @@ func writeContainerHosts(entry *containerEntry) error {
 
 	return os.WriteFile(entry.HostsPath, []byte(b.String()), 0o644)
 }
-
