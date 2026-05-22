@@ -207,6 +207,24 @@ func (s *Server) resolveContainerID(nameOrID string) string {
 	return nameOrID
 }
 
+// checkPrivilegedGate returns a user-facing rejection message and blocked=true
+// when the request asks for elevation (Privileged=true or CapAdd) but the gate
+// is closed (allowPrivileged=false). Otherwise blocked=false and msg is empty.
+// Pure function so the handler stays simple and tests don't need a containerd
+// client to exercise the gate logic.
+func checkPrivilegedGate(allowPrivileged bool, hc *hostConfig) (msg string, blocked bool) {
+	if allowPrivileged || hc == nil {
+		return "", false
+	}
+	if hc.Privileged {
+		return "privileged containers are disabled on this host (set dind.allow_privileged = true in ephemerd config to enable)", true
+	}
+	if len(hc.CapAdd) > 0 {
+		return fmt.Sprintf("--cap-add (%v) is disabled on this host (set dind.allow_privileged = true in ephemerd config to enable)", hc.CapAdd), true
+	}
+	return "", false
+}
+
 func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	if s.client == nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
@@ -232,21 +250,10 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 
 	// Privileged-elevation gate. Reject before any image pull so a job
 	// can't burn bandwidth probing for a configuration we'll refuse.
-	if !s.allowPrivileged && req.HostConfig != nil {
-		if req.HostConfig.Privileged {
-			s.log.Warn("rejecting privileged container request", "image", req.Image, "reason", "dind.allow_privileged is false on this host")
-			writeJSON(w, http.StatusForbidden, map[string]string{
-				"message": "privileged containers are disabled on this host (set dind.allow_privileged = true in ephemerd config to enable)",
-			})
-			return
-		}
-		if len(req.HostConfig.CapAdd) > 0 {
-			s.log.Warn("rejecting --cap-add container request", "image", req.Image, "caps", req.HostConfig.CapAdd, "reason", "dind.allow_privileged is false on this host")
-			writeJSON(w, http.StatusForbidden, map[string]string{
-				"message": fmt.Sprintf("--cap-add (%v) is disabled on this host (set dind.allow_privileged = true in ephemerd config to enable)", req.HostConfig.CapAdd),
-			})
-			return
-		}
+	if msg, blocked := checkPrivilegedGate(s.allowPrivileged, req.HostConfig); blocked {
+		s.log.Warn("rejecting elevated container request", "image", req.Image, "reason", msg)
+		writeJSON(w, http.StatusForbidden, map[string]string{"message": msg})
+		return
 	}
 
 	id := generateContainerID()
