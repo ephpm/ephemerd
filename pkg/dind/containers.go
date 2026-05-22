@@ -226,13 +226,6 @@ func checkPrivilegedGate(allowPrivileged bool, hc *hostConfig) (msg string, bloc
 }
 
 func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
-	if s.client == nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"message": "containerd client not available",
-		})
-		return
-	}
-
 	var req createRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
@@ -248,11 +241,19 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Privileged-elevation gate. Reject before any image pull so a job
-	// can't burn bandwidth probing for a configuration we'll refuse.
+	// Privileged-elevation gate runs before the client check: it's a
+	// request-shape validation, not a runtime-state check. This also
+	// makes the unit tests trivial — they don't need a containerd client.
 	if msg, blocked := checkPrivilegedGate(s.allowPrivileged, req.HostConfig); blocked {
 		s.log.Warn("rejecting elevated container request", "image", req.Image, "reason", msg)
 		writeJSON(w, http.StatusForbidden, map[string]string{"message": msg})
+		return
+	}
+
+	if s.client == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"message": "containerd client not available",
+		})
 		return
 	}
 
