@@ -230,10 +230,12 @@ func TestContainerCreateNoImage(t *testing.T) {
 		}
 	}()
 
-	// No containerd client → 500 before image check.
-	// This validates that the request parsing works.
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Errorf("status = %d, want 500", resp.StatusCode)
+	// Missing Image field → 400 Bad Request from request validation.
+	// (Previously this asserted 500 because the nil-client check ran
+	// first; the handler now validates request shape before checking
+	// runtime state, so 400 is the user-facing result.)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
 	}
 }
 
