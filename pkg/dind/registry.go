@@ -338,20 +338,32 @@ func tailHex(s string) string {
 // qualifyDockerHubRef ensures a reference carries an explicit registry
 // host. containerd's resolver treats the first path segment of an
 // unqualified reference as the hostname (so "ephpm/ephemerd:tag" → host
-// "ephpm" → DNS lookup fails). Docker CLI conventions default unqualified
-// refs to docker.io, prepending "library/" for single-segment names like
+// "ephpm" → DNS lookup fails; "alpine:3.20" → host "alpine", port "3.20"
+// → url.Parse rejects). Docker CLI conventions default unqualified refs
+// to docker.io, prepending "library/" for single-segment names like
 // "ubuntu". This helper applies the same rule.
+//
+// The slash is the disambiguator between a "host[:port]/path" reference
+// and a "name[:tag]" reference. With a slash, the part before it is a
+// host candidate and a dot or colon there means we've got a real
+// registry host (gcr.io, localhost:5000, my-registry.com:443, etc.).
+// Without a slash, there's no path and the whole string is a single-
+// segment image name with an optional tag — always docker.io/library/.
 func qualifyDockerHubRef(ref string) string {
-	first := ref
-	if i := strings.IndexByte(ref, '/'); i >= 0 {
-		first = ref[:i]
-	}
-	if strings.ContainsAny(first, ".:") || first == "localhost" {
-		return ref
-	}
-	if !strings.Contains(ref, "/") {
+	i := strings.IndexByte(ref, '/')
+	if i < 0 {
+		// No slash → single-segment name (possibly with tag/digest).
+		// Always qualifies with docker.io/library/. This covers the
+		// `alpine`, `alpine:3.20`, `alpine@sha256:...` cases.
 		return "docker.io/library/" + ref
 	}
+	first := ref[:i]
+	if strings.ContainsAny(first, ".:") || first == "localhost" {
+		// Looks like a real host (has a dot, or has a port, or is
+		// literally "localhost") — already qualified.
+		return ref
+	}
+	// Multi-segment name without a host (e.g. "myorg/myimage[:tag]").
 	return "docker.io/" + ref
 }
 

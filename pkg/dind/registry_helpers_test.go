@@ -80,11 +80,14 @@ func TestQualifyDockerHubRef(t *testing.T) {
 	}{
 		// Single-segment unqualified names get library/ prepended.
 		{"alpine", "docker.io/library/alpine"},
-		// Single-segment with tag — qualifyDockerHubRef sees the ":" and
-		// thinks "alpine:latest" is already a host, so it passes through
-		// unchanged. This is a known limitation; passing "alpine" without
-		// a tag is the supported form when callers want library/ added.
-		{"alpine:latest", "alpine:latest"},
+		// Single-segment WITH tag: the previous implementation bailed on the
+		// tag colon and passed it through unchanged, which made containerd's
+		// resolver try to parse "alpine" as a host and "3.20" as a port
+		// number. The disambiguator is the slash — no slash means no path,
+		// so the colon must be a tag separator.
+		{"alpine:latest", "docker.io/library/alpine:latest"},
+		{"alpine:3.20", "docker.io/library/alpine:3.20"},
+		{"alpine@sha256:abc123", "docker.io/library/alpine@sha256:abc123"},
 		// Two-segment names get docker.io/ prepended.
 		{"myorg/myimage", "docker.io/myorg/myimage"},
 		{"myorg/myimage:tag", "docker.io/myorg/myimage:tag"},
