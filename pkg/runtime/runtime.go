@@ -22,6 +22,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/ephpm/ephemerd/pkg/buildkit"
+	"github.com/ephpm/ephemerd/pkg/config"
 	"github.com/ephpm/ephemerd/pkg/dind"
 	"github.com/ephpm/ephemerd/pkg/networking"
 	craneTarball "github.com/google/go-containerregistry/pkg/v1/tarball"
@@ -67,6 +68,10 @@ type Config struct {
 	ContainerDataDir string
 	DindEnabled      bool     // mount a fake Docker socket into each container
 	CacheProxyEnv    []string // extra env vars from cache proxies (e.g., GOPROXY=...)
+	// Rlimits sets POSIX resource limits on each runner container's OCI
+	// process. Zero values fall back to the containerd default (1024).
+	// Applies on Linux only; ignored on Windows (HCS uses a different model).
+	Rlimits config.RuntimeRlimits
 	Network          *networking.Manager
 	// WindowsMemoryBytes is the memory limit for Hyper-V isolated Windows
 	// runner containers. Zero leaves the OCI spec field unset, which gives
@@ -615,6 +620,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		oci.WithCapabilities(containerCapabilities),
 	}
 	opts = append(opts, seccompOpts()...)
+	opts = append(opts, rlimitsOpts(r.cfg.Rlimits)...)
 	switch {
 	case len(cfg.Entrypoint) > 0:
 		// Forge mode: custom entrypoint (e.g. act_runner register + daemon).

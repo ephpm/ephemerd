@@ -1766,3 +1766,97 @@ func TestParsedPollInterval_Hours(t *testing.T) {
 		t.Errorf("PollInterval(2h) = %v, want 2h", d)
 	}
 }
+
+func TestRuntimeRlimitsResolved_Defaults(t *testing.T) {
+	got := RuntimeRlimits{}.Resolved()
+	if got.Nofile != 1024 {
+		t.Errorf("Nofile = %d, want 1024 (containerd default)", got.Nofile)
+	}
+	if got.Nproc != 1024 {
+		t.Errorf("Nproc = %d, want 1024 default", got.Nproc)
+	}
+}
+
+func TestRuntimeRlimitsResolved_Explicit(t *testing.T) {
+	got := RuntimeRlimits{Nofile: 4096, Nproc: 8192}.Resolved()
+	if got.Nofile != 4096 {
+		t.Errorf("Nofile = %d, want 4096", got.Nofile)
+	}
+	if got.Nproc != 8192 {
+		t.Errorf("Nproc = %d, want 8192", got.Nproc)
+	}
+}
+
+func TestRuntimeRlimitsResolved_NegativeFallsBack(t *testing.T) {
+	got := RuntimeRlimits{Nofile: -1, Nproc: -100}.Resolved()
+	if got.Nofile != 1024 {
+		t.Errorf("Nofile(-1) resolved to %d, want 1024", got.Nofile)
+	}
+	if got.Nproc != 1024 {
+		t.Errorf("Nproc(-100) resolved to %d, want 1024", got.Nproc)
+	}
+}
+
+func TestRuntimeRlimitsResolved_MixedZeroAndExplicit(t *testing.T) {
+	// Only one field set: the other should fall back without disturbing
+	// the explicit one.
+	got := RuntimeRlimits{Nofile: 65536}.Resolved()
+	if got.Nofile != 65536 {
+		t.Errorf("Nofile = %d, want 65536 (preserved)", got.Nofile)
+	}
+	if got.Nproc != 1024 {
+		t.Errorf("Nproc = %d, want 1024 (default fill)", got.Nproc)
+	}
+}
+
+func TestLoad_RuntimeRlimits(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_test123")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[github]
+owner = "testorg"
+
+[runtime.rlimits]
+nofile = 4096
+nproc = 2048
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Runtime.Rlimits.Nofile != 4096 {
+		t.Errorf("Rlimits.Nofile = %d, want 4096", cfg.Runtime.Rlimits.Nofile)
+	}
+	if cfg.Runtime.Rlimits.Nproc != 2048 {
+		t.Errorf("Rlimits.Nproc = %d, want 2048", cfg.Runtime.Rlimits.Nproc)
+	}
+}
+
+func TestLoad_RuntimeRlimits_Omitted(t *testing.T) {
+	// Empty config — Resolved() must still produce 1024/1024 so callers
+	// never have to special-case "no [runtime] block in config.toml".
+	t.Setenv("GITHUB_TOKEN", "ghp_test123")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[github]
+owner = "testorg"
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Runtime.Rlimits.Nofile != 0 {
+		t.Errorf("Rlimits.Nofile (raw) = %d, want 0 before Resolved()", cfg.Runtime.Rlimits.Nofile)
+	}
+	resolved := cfg.Runtime.Rlimits.Resolved()
+	if resolved.Nofile != 1024 || resolved.Nproc != 1024 {
+		t.Errorf("Resolved() = %+v, want {1024, 1024}", resolved)
+	}
+}
