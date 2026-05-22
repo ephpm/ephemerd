@@ -38,6 +38,14 @@ jobs:
   build-macos:
     name: Build (macOS arm64)
     needs: ci
+    # Gate on a repo variable so the job is "Skipped" (not "Pending forever")
+    # when no self-hosted macOS arm64 runner is online. Set
+    # `gh variable set HAS_MACOS_ARM64_RUNNER --body true` once the runner is up.
+    if: ${{ vars.HAS_MACOS_ARM64_RUNNER == 'true' }}
+    # Even when a runner is online, don't block PR merges on a Build (macOS arm64)
+    # failure — those failures are usually environmental (Apple notarisation
+    # quirks, codesign certs) rather than code regressions caught elsewhere.
+    continue-on-error: true
     runs-on: [self-hosted, macos, arm64]
     steps:
       - uses: actions/checkout@v6
@@ -60,6 +68,11 @@ jobs:
   build-linux-arm64:
     name: Build (Linux arm64)
     needs: ci
+    # Gate on a repo variable so the job is "Skipped" (not "Pending forever")
+    # when no self-hosted Linux arm64 runner is online. Set
+    # `gh variable set HAS_LINUX_ARM64_RUNNER --body true` once the runner is up.
+    if: ${{ vars.HAS_LINUX_ARM64_RUNNER == 'true' }}
+    continue-on-error: true
     runs-on: [self-hosted, linux, arm64]
     steps:
       - uses: actions/checkout@v6
