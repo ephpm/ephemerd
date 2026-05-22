@@ -86,6 +86,12 @@ type containerEntry struct {
 	HostsPath    string   // host-side /etc/hosts file bind-mounted into the container
 	ExtraHosts   []string // user-provided "host:ip" entries (--add-host)
 	PortForwards []func() // stop functions for port-forward proxy goroutines
+
+	// started is closed by handleContainerStart once the task is created and
+	// running. handleContainerAttach blocks on it so the Docker CLI's "attach
+	// then start" sequence works correctly: attach hijacks the conn early,
+	// then waits here, and resumes once start has the task + LogPath set.
+	started chan struct{}
 }
 
 // createRequest is the subset of Docker's container create body we support.
@@ -167,6 +173,8 @@ func (s *Server) routeContainer(w http.ResponseWriter, r *http.Request, path str
 		s.handleContainerInspect(w, r, id)
 	case action == "logs" && r.Method == http.MethodGet:
 		s.handleContainerLogs(w, r, id)
+	case action == "attach" && r.Method == http.MethodPost:
+		s.handleContainerAttach(w, r, id)
 	case action == "exec" && r.Method == http.MethodPost:
 		s.handleExecCreate(w, r, id)
 	case action == "archive" && r.Method == http.MethodPut:
@@ -522,6 +530,7 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 		Tty:          req.Tty,
 		HostsPath:    hostsPath,
 		ExtraHosts:   extraHosts,
+		started:      make(chan struct{}),
 	}
 
 	s.mu.Lock()
@@ -642,6 +651,14 @@ func (s *Server) handleContainerStart(w http.ResponseWriter, r *http.Request, id
 
 	entry.Status = "running"
 	s.log.Info("container started", "id", id, "ip", entry.IP)
+
+	// Unblock any /containers/{id}/attach handlers that hijacked the conn
+	// before start (Docker CLI's normal `docker run` sequence is attach →
+	// start → wait). They block on this channel and resume by tailing
+	// entry.LogPath once it's signaled.
+	if entry.started != nil {
+		close(entry.started)
+	}
 
 	// Install DNAT rules for any port bindings. KIND's `kind create cluster`
 	// creates the kindest/node with -p 127.0.0.1:<random>:6443 and writes a
