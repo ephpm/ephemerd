@@ -3,20 +3,20 @@ title: Pre-Baked Rootfs
 weight: 7
 ---
 
-The WSL and macOS Linux VM rootfs is an Alpine minirootfs with gcompat and iptables baked in at compile time. This eliminates network-dependent package installation during boot.
+The Linux VM rootfs (Hyper-V on Windows, Vz on macOS) and the temporary WSL distro that `ephemerd run` uses are all Alpine minirootfs with gcompat and iptables baked in at compile time. This eliminates network-dependent package installation during boot.
 
 ## Context
 
-Every WSL distro boot (and Vz Linux VM boot) needs two packages that are not in the stock Alpine minirootfs:
+Every Linux VM boot (Hyper-V on Windows, Vz on macOS) and every `ephemerd run` WSL distro import needs two packages that are not in the stock Alpine minirootfs:
 
 - **gcompat** -- glibc compatibility shim required by `containerd-shim-runc-v2`, which is built against glibc.
 - **iptables** -- required by CNI plugins for container network NAT rules.
 
-Previously these were installed at runtime via `apk add --no-cache gcompat iptables` after each distro import. This had several problems:
+Previously these were installed at runtime via `apk add --no-cache gcompat iptables` after each boot/import. This had several problems:
 
 - 10-30s of boot time spent downloading and installing packages over the network.
-- DNS flakes -- WSL networking is not always ready immediately after distro import, requiring a retry loop with backoffs.
-- The only network-dependent step in the entire distro boot sequence.
+- DNS flakes -- guest networking is not always ready immediately after the VM/distro starts, requiring a retry loop with backoffs.
+- The only network-dependent step in the entire boot sequence.
 - Multiplied cost -- `ephemerd run` creates a fresh distro per invocation, paying this penalty every time.
 
 ## How It Works

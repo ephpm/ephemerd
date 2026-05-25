@@ -157,7 +157,7 @@ Only one provider should be configured at a time. Precedence when multiple secti
 The entire container infrastructure is provider-agnostic:
 
 - Container runtime (`pkg/runtime`)
-- WSL dispatch (Linux jobs on Windows)
+- Hyper-V Linux VM dispatch (Linux jobs on Windows)
 - Networking (CNI on Linux, HCN on Windows)
 - Embedded containerd
 - gRPC control plane (status, jobs, drain)

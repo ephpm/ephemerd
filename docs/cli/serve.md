@@ -14,7 +14,7 @@ ephemerd serve [flags]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--config`, `-c` | `<data-dir>/config.toml` | Path to config file |
-| `--containerd-tcp-port` | (none) | Also expose containerd on a TCP port (used by WSL host integration) |
+| `--containerd-tcp-port` | (none) | Also expose containerd on a TCP port (used by the in-VM worker so the Windows host can reach containerd over TCP) |
 | `--containerd-tcp-addr` | `127.0.0.1` | Bind address for the containerd TCP listener (use `0.0.0.0` when host lives outside the network namespace) |
 | `--containerd-only` | `false` | Only run containerd and the dispatch worker (no scheduler, no GitHub polling, no runner extraction) |
 | `--dind` | `false` | Mount a fake Docker socket into each container (overrides config file setting) |
@@ -32,23 +32,23 @@ When `serve` starts, it performs these steps in order:
 7. **Initialize networking** -- sets up the container network (CNI bridge on Linux, HCN NAT on Windows).
 8. **Install firewall rules** -- blocks container access to RFC1918 and link-local ranges.
 9. **Create GitHub client** -- authenticates using `GITHUB_TOKEN` or GitHub App credentials from the config.
-10. **Wait for Linux dispatcher** -- if a WSL2 VM is booting in the background (Windows only), waits for the gRPC dispatch client to become ready.
+10. **Wait for Linux dispatcher** -- if a Hyper-V Linux VM is booting in the background (Windows only), waits for the gRPC dispatch client to become ready.
 11. **Configure webhook tunnel** -- sets up localtunnel or ngrok for webhook delivery, or falls back to polling mode.
 12. **Start scheduler** -- begins discovering and processing GitHub Actions jobs.
 13. **Start metrics server** -- if metrics are enabled in the config, starts the Prometheus metrics endpoint.
 
 ## Containerd-only mode
 
-When `--containerd-only` is set, the daemon runs a stripped-down mode intended for the WSL2 Linux worker:
+When `--containerd-only` is set, the daemon runs a stripped-down mode intended for the in-VM Linux worker (Hyper-V Linux VM on Windows, Vz Linux VM on macOS):
 
 - Starts containerd with the TCP listener.
 - Extracts the runner and CNI plugins.
-- Cleans stale CNI bridges from previous WSL boots.
+- Cleans stale CNI bridges from previous boots.
 - Sets up networking and firewall rules.
 - Starts the gRPC dispatch server on `containerd-tcp-port + 1`.
 - Does **not** start the scheduler, poll GitHub, or require GitHub credentials.
 
-The Windows host dispatches Linux jobs to this worker via gRPC.
+The host dispatches Linux jobs to this worker via gRPC.
 
 ## Signal handling
 
@@ -75,7 +75,7 @@ sudo ephemerd serve
 # Start with a custom config file
 sudo ephemerd serve --config /etc/ephemerd/config.toml
 
-# Start in WSL worker mode (used by Windows host integration)
+# Start in in-VM worker mode (invoked automatically inside the Hyper-V or Vz Linux VM)
 ephemerd serve --containerd-tcp-port 10000 --containerd-tcp-addr 0.0.0.0 --containerd-only
 
 # Start with Docker-in-Docker support

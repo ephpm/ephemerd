@@ -78,7 +78,7 @@ Windows named-pipe URIs use forward slashes after the scheme -- the path is `//.
 
 - **Linux**: CRI is fully supported by containerd v2. All crictl commands behave as they would against a standalone containerd install.
 - **Windows**: containerd v2 ships a native Windows CRI implementation (Hyper-V isolated containers). A handful of CRI features that assume Linux semantics (cgroups, mount propagation flags) are no-ops or return errors -- this mirrors upstream containerd behavior.
-- **WSL-to-Windows**: when the Windows host routes Linux jobs to the WSL worker, `ephemerd crictl` on the host only sees the Windows containerd CRI. To inspect WSL-side Linux containers, use `wsl -- ephemerd crictl ...` inside the distro.
+- **In-VM containerd on Windows**: when the Windows host routes Linux jobs to the Hyper-V Linux VM, `ephemerd crictl` on the host only sees the Windows containerd CRI. To inspect Linux containers inside the VM, exec into the VM (via `ephemerd debugexec` or the VM's console) and run `ephemerd crictl ...` against the VM's local containerd socket.
 
 ## Typical Debugging Workflow
 

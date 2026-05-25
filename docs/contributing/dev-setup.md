@@ -32,7 +32,7 @@ mage ci
 | `mage lint` | Download golangci-lint and run it |
 | `mage test` | Download embedded deps and run all tests |
 | `mage build:build` | Compile ephemerd for the current OS |
-| `mage build:windows` | Two-stage Windows build (cross-compiles and embeds Linux binary for WSL) |
+| `mage build:windows` | Two-stage Windows build (cross-compiles and embeds the Linux binary that runs inside the Hyper-V Linux VM) |
 | `mage e2e` | Unprivileged e2e tests (requires `GITHUB_TOKEN`) |
 | `mage e2eall` | All e2e tests including privileged (requires root + containerd) |
 | `mage e2eforgejo` | Forgejo provider e2e (requires Docker with compose) |

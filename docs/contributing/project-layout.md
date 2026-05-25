@@ -22,7 +22,7 @@ pkg/                    Library packages
   metrics/              Prometheus metrics endpoint
   artifacts/            OCI artifact extraction for macOS VM jobs
   workflow/             Local workflow parser and runner (ephemerd run)
-  vm/                   Linux VM (WSL/Vz) and macOS VM (Vz)
+  vm/                   Linux VM (Hyper-V on Windows, Vz on macOS) and macOS VM (Vz)
   runner/               Embedded GitHub Actions runner binary
 api/v1/                 gRPC protobuf definitions
 mage/                   Mage build and download targets
@@ -38,7 +38,7 @@ Platform code uses Go build tags and file name suffixes:
 | Suffix | Platform | Examples |
 |---|---|---|
 | `*_linux.go` | Linux only | CNI networking, iptables, seccomp |
-| `*_windows.go` | Windows only | HCN networking, Hyper-V, WSL |
+| `*_windows.go` | Windows only | HCN networking, Hyper-V Windows containers, Hyper-V Linux VM, WSL run-mode distro |
 | `*_darwin.go` | macOS only | Virtualization.framework |
 | `*_stub.go` / `*_other.go` | Fallback stubs | No-op implementations for unsupported platforms |
 

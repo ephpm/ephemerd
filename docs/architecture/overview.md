@@ -82,7 +82,7 @@ Standard OCI containers via embedded containerd, running directly on the host ke
 
 containerd runs natively on Windows and supports Hyper-V isolation. Each container gets its own kernel in a lightweight VM -- real isolation, malicious code cannot escape to the host. Same OCI images, same containerd APIs, just compiled for Windows. Startup ~5-10s. Networking via HCN (Host Compute Network) with NAT and per-endpoint ACL policies.
 
-Linux jobs on a Windows host are dispatched to a WSL2 worker via gRPC. See [Windows WSL dispatch]({{< relref "windows-wsl-dispatch" >}}).
+Linux jobs on a Windows host are dispatched via gRPC to a Hyper-V Linux VM that ephemerd boots and manages directly. See [Windows Hyper-V dispatch]({{< relref "windows-wsl-dispatch" >}}).
 
 ### macOS: Virtualization.framework
 
@@ -98,7 +98,7 @@ Because Windows can run Hyper-V Linux VMs and macOS can run Virtualization.frame
 |------|-----------|----------------|
 | Linux x86_64 | containerd (direct) | -- |
 | Linux arm64 | containerd (direct) | -- |
-| Windows x86_64 | containerd in WSL2 Linux VM | Hyper-V Windows containers |
+| Windows x86_64 | containerd in Hyper-V Linux VM | Hyper-V Windows containers |
 | macOS arm64 | containerd in Virtualization.framework Linux VM | Ephemeral macOS VMs (clone-on-write) |
 
 A Windows box and a Mac Mini together cover every combination: linux/amd64, linux/arm64, windows/amd64.
@@ -111,7 +111,7 @@ Each OS/arch combination produces one self-contained binary with containerd comp
 |--------|--------|----------------------|
 | linux/amd64 | `ephemerd` | containerd direct |
 | linux/arm64 | `ephemerd` | containerd direct |
-| windows/amd64 | `ephemerd.exe` | containerd + Hyper-V (Windows jobs) / WSL2 (Linux jobs) |
+| windows/amd64 | `ephemerd.exe` | containerd + Hyper-V (Windows jobs) / Hyper-V Linux VM (Linux jobs) |
 | darwin/arm64 | `ephemerd` | Virtualization.framework Linux VM + containerd inside |
 
 No runtime dependencies beyond the OS kernel, Hyper-V (Windows), or Virtualization.framework (macOS).
