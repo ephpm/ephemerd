@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -731,8 +732,156 @@ func (s *Server) copyToViaExec(w http.ResponseWriter, r *http.Request, entry *co
 	w.WriteHeader(http.StatusOK)
 }
 
+// rootfsSearchDirs returns the host-filesystem directories whose union forms
+// the container's merged rootfs view — upperdir first (container-written
+// files take precedence), then each lowerdir. Used by both HEAD and GET
+// /containers/{id}/archive to look up a file inside a container's rootfs
+// without execing into a (possibly stopped) container.
+//
+// In production it reads the overlayfs mount options from containerd's
+// snapshotter. Tests can substitute s.rootfsSearchDirsFn to point at a
+// scratch tempdir.
+func (s *Server) rootfsSearchDirs(ctx context.Context, snapshotID string) ([]string, error) {
+	if s.rootfsSearchDirsFn != nil {
+		return s.rootfsSearchDirsFn(ctx, snapshotID)
+	}
+	if s.client == nil {
+		return nil, fmt.Errorf("containerd client not available")
+	}
+	snapshotter := s.client.SnapshotService("overlayfs")
+	if snapshotter == nil {
+		return nil, fmt.Errorf("snapshotter not available")
+	}
+	mounts, err := snapshotter.Mounts(ctx, snapshotID)
+	if err != nil {
+		return nil, fmt.Errorf("getting snapshot mounts: %w", err)
+	}
+	dirs := []string{}
+	for _, m := range mounts {
+		for _, opt := range m.Options {
+			for _, part := range strings.Split(opt, ",") {
+				if strings.HasPrefix(part, "upperdir=") {
+					dirs = append(dirs, strings.TrimPrefix(part, "upperdir="))
+				}
+				if strings.HasPrefix(part, "lowerdir=") {
+					dirs = append(dirs, strings.Split(strings.TrimPrefix(part, "lowerdir="), ":")...)
+				}
+			}
+		}
+	}
+	return dirs, nil
+}
+
+// resolveContainerPath walks the rootfs search dirs in upperdir-first order
+// and returns the absolute host path of the first match for srcPath, or
+// empty string if it's not present in any layer.
+func resolveContainerPath(searchDirs []string, srcPath string) string {
+	for _, dir := range searchDirs {
+		candidate := filepath.Join(dir, filepath.Clean(srcPath))
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// dockerPathStat mirrors Docker's engine-api container/file.go PathStat,
+// which is what the CLI's StatPath unmarshals from the
+// X-Docker-Container-Path-Stat response header.
+type dockerPathStat struct {
+	Name       string      `json:"name"`
+	Size       int64       `json:"size"`
+	Mode       os.FileMode `json:"mode"`
+	Mtime      time.Time   `json:"mtime"`
+	LinkTarget string      `json:"linkTarget"`
+}
+
+// writeContainerPathStatHeader serialises fi into the header Docker CLI
+// expects on HEAD/GET /containers/{id}/archive responses. Without this
+// header set, `docker cp` fails with "unable to decode container path
+// stat header: EOF" even when the GET body is well-formed.
+func writeContainerPathStatHeader(h http.Header, fullPath string, fi os.FileInfo) error {
+	stat := dockerPathStat{
+		Name:  filepath.Base(fullPath),
+		Size:  fi.Size(),
+		Mode:  fi.Mode(),
+		Mtime: fi.ModTime(),
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		if tgt, err := os.Readlink(fullPath); err == nil {
+			stat.LinkTarget = tgt
+		}
+	}
+	raw, err := json.Marshal(&stat)
+	if err != nil {
+		return err
+	}
+	h.Set("X-Docker-Container-Path-Stat", base64.StdEncoding.EncodeToString(raw))
+	return nil
+}
+
+// handleContainerStatPath handles HEAD /containers/{id}/archive. Docker CLI
+// calls this before GET to discover whether the source is a file or a
+// directory and to validate it exists, then parses the
+// X-Docker-Container-Path-Stat header out of the response. Without a HEAD
+// handler the route fell through to handleNotImplemented (501), making
+// the CLI fail on the header decode with EOF — see PR description.
+func (s *Server) handleContainerStatPath(w http.ResponseWriter, r *http.Request, id string) {
+	s.mu.Lock()
+	entry, ok := s.containers[id]
+	s.mu.Unlock()
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"message": fmt.Sprintf("container %s not found", id),
+		})
+		return
+	}
+
+	srcPath := r.URL.Query().Get("path")
+	if srcPath == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"message": "path query parameter is required",
+		})
+		return
+	}
+
+	ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
+	searchDirs, err := s.rootfsSearchDirs(ctx, entry.ID+"-snapshot")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"message": err.Error(),
+		})
+		return
+	}
+
+	fullPath := resolveContainerPath(searchDirs, srcPath)
+	if fullPath == "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"message": fmt.Sprintf("path %s not found in container", srcPath),
+		})
+		return
+	}
+	fi, err := os.Lstat(fullPath)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"message": fmt.Sprintf("statting %s: %v", srcPath, err),
+		})
+		return
+	}
+	if err := writeContainerPathStatHeader(w.Header(), fullPath, fi); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"message": fmt.Sprintf("encoding stat header: %v", err),
+		})
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
 // handleContainerCopyFrom handles GET /containers/{id}/archive.
-// Tars up files from the container's rootfs and streams them back.
+// Tars up files from the container's rootfs and streams them back. For
+// running containers the merged overlay view is read via the snapshotter;
+// for stopped containers the same view is still valid because the upper
+// and lower dirs survive the task exit until the container is removed.
 func (s *Server) handleContainerCopyFrom(w http.ResponseWriter, r *http.Request, id string) {
 	s.mu.Lock()
 	entry, ok := s.containers[id]
@@ -752,57 +901,30 @@ func (s *Server) handleContainerCopyFrom(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	// For running containers, exec tar inside to stream files out.
-	// For stopped containers, read from the overlay upperdir.
 	ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
-	snapshotID := entry.ID + "-snapshot"
-	snapshotter := s.client.SnapshotService("overlayfs")
-	if snapshotter == nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"message": "snapshotter not available",
-		})
-		return
-	}
-
-	mounts, err := snapshotter.Mounts(ctx, snapshotID)
+	searchDirs, err := s.rootfsSearchDirs(ctx, entry.ID+"-snapshot")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"message": fmt.Sprintf("getting snapshot mounts: %v", err),
+			"message": err.Error(),
 		})
 		return
 	}
 
-	// Find a directory where we can read the merged view. For overlayfs,
-	// the lowerdir+upperdir together form the container's rootfs. We look
-	// in the upperdir first (container-written files), then fall back to
-	// searching lowerdirs.
-	searchDirs := []string{}
-	for _, m := range mounts {
-		for _, opt := range m.Options {
-			for _, part := range strings.Split(opt, ",") {
-				if strings.HasPrefix(part, "upperdir=") {
-					searchDirs = append(searchDirs, strings.TrimPrefix(part, "upperdir="))
-				}
-				if strings.HasPrefix(part, "lowerdir=") {
-					searchDirs = append(searchDirs, strings.Split(strings.TrimPrefix(part, "lowerdir="), ":")...)
-				}
-			}
-		}
-	}
-
-	var fullPath string
-	for _, dir := range searchDirs {
-		candidate := filepath.Join(dir, filepath.Clean(srcPath))
-		if _, err := os.Stat(candidate); err == nil {
-			fullPath = candidate
-			break
-		}
-	}
+	fullPath := resolveContainerPath(searchDirs, srcPath)
 	if fullPath == "" {
 		writeJSON(w, http.StatusNotFound, map[string]string{
 			"message": fmt.Sprintf("path %s not found in container", srcPath),
 		})
 		return
+	}
+
+	// Set X-Docker-Container-Path-Stat on the GET response too — the
+	// Docker CLI reads it from both HEAD and GET, and some clients skip
+	// HEAD entirely and rely on the GET header.
+	if fi, err := os.Lstat(fullPath); err == nil {
+		if hdrErr := writeContainerPathStatHeader(w.Header(), fullPath, fi); hdrErr != nil {
+			s.log.Debug("encoding stat header for GET", "error", hdrErr)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/x-tar")
