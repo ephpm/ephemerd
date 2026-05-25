@@ -111,17 +111,17 @@ type createRequest struct {
 }
 
 type hostConfig struct {
-	Binds         []string                       `json:"Binds"`
-	NetworkMode   string                         `json:"NetworkMode"`
-	Privileged    bool                           `json:"Privileged"`
-	SecurityOpt   []string                       `json:"SecurityOpt"`
-	CapAdd        []string                       `json:"CapAdd"`
-	Tmpfs         map[string]string              `json:"Tmpfs"`
-	PortBindings  map[string][]portBinding        `json:"PortBindings"`
-	RestartPolicy *restartPolicy                 `json:"RestartPolicy"`
-	Init          *bool                          `json:"Init"`
-	CgroupnsMode  string                         `json:"CgroupnsMode"`
-	ExtraHosts    []string                       `json:"ExtraHosts"`
+	Binds         []string                 `json:"Binds"`
+	NetworkMode   string                   `json:"NetworkMode"`
+	Privileged    bool                     `json:"Privileged"`
+	SecurityOpt   []string                 `json:"SecurityOpt"`
+	CapAdd        []string                 `json:"CapAdd"`
+	Tmpfs         map[string]string        `json:"Tmpfs"`
+	PortBindings  map[string][]portBinding `json:"PortBindings"`
+	RestartPolicy *restartPolicy           `json:"RestartPolicy"`
+	Init          *bool                    `json:"Init"`
+	CgroupnsMode  string                   `json:"CgroupnsMode"`
+	ExtraHosts    []string                 `json:"ExtraHosts"`
 }
 
 type portBinding struct {
@@ -181,6 +181,8 @@ func (s *Server) routeContainer(w http.ResponseWriter, r *http.Request, path str
 		s.handleContainerCopyTo(w, r, id)
 	case action == "archive" && r.Method == http.MethodGet:
 		s.handleContainerCopyFrom(w, r, id)
+	case action == "archive" && r.Method == http.MethodHead:
+		s.handleContainerStatPath(w, r, id)
 	default:
 		s.handleNotImplemented(w, r)
 	}
@@ -1563,4 +1565,3 @@ func writeContainerHosts(entry *containerEntry) error {
 
 	return os.WriteFile(entry.HostsPath, []byte(b.String()), 0o644)
 }
-

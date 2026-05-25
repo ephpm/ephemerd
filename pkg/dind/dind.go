@@ -47,11 +47,18 @@ type Server struct {
 	log            *slog.Logger
 
 	mu         sync.Mutex
-	images     map[string]*imageEntry    // in-memory image store scoped to this job
+	images     map[string]*imageEntry     // in-memory image store scoped to this job
 	containers map[string]*containerEntry // containers created through this socket
 	execs      map[string]*execEntry      // exec processes inside containers
 	networks   map[string]*networkEntry   // Docker networks (logical, in-memory)
 	auth       authCache                  // per-job docker login cache (registry host → creds)
+
+	// rootfsSearchDirsFn resolves the host-filesystem directories that
+	// together form the merged rootfs view for a container snapshot.
+	// Nil in production — handleContainerStatPath / handleContainerCopyFrom
+	// fall through to the real containerd snapshotter path. Tests stub
+	// this to avoid standing up containerd.
+	rootfsSearchDirsFn func(ctx context.Context, snapshotID string) ([]string, error)
 }
 
 type imageEntry struct {
