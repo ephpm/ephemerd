@@ -205,6 +205,151 @@ GitHub Actions workflows on self-hosted runners:
 - `test-runner.yml`: E2E smoke tests — dispatches both Linux and Windows jobs (manual dispatch)
 - `test-windows.yml`: Windows smoke tests (manual dispatch, `runs-on: [self-hosted, windows, x64]`)
 
+## Operations & Debug Runbook
+
+Recipes for poking at a running ephemerd install — written for an agent that has just walked in and needs to see what's happening, fix it, redeploy, and move on. Prefer the `ephemerd` CLI subcommands over poking the underlying service manager directly; they wrap `sc.exe` / `launchctl` / `systemctl` and degrade gracefully.
+
+### Day-1 inventory
+
+```
+ephemerd status              # is the service up? PID, uptime, active jobs
+ephemerd jobs                # live job list (JOB ID / NAME / REPO / STATUS / UPTIME)
+ephemerd logs -n 200         # last N lines from the service log
+ephemerd logs -f             # follow live
+ephemerd doctor              # platform sanity (Hyper-V/WSL/launchd state, stale dirs, sockets)
+```
+
+`ephemerd doctor` is the single best first-look command after any "is something broken?" question — it prints a checklist that catches stale PID files, orphan VM dirs, missing services, etc.
+
+### Service control
+
+Use the wrappers — they exist on all three platforms:
+
+```
+ephemerd start              # start the service
+ephemerd stop               # stop (no drain)
+ephemerd restart            # stop+start one-shot
+ephemerd drain              # graceful: stop accepting new jobs, wait for in-flight
+```
+
+`ephemerd restart` runs `serviceAction("stop")` then `serviceAction("start")` — see `cmd/ephemerd/service.go`. If the wrapper can't reach the service (broken install, missing binary), fall back to:
+
+- **Windows**: `sc.exe stop ephemerd` / `sc.exe start ephemerd` / `sc.exe query ephemerd`
+- **Linux**: `systemctl stop|start|status ephemerd`
+- **macOS**: `launchctl bootout|bootstrap system /Library/LaunchDaemons/com.ephpm.ephemerd.plist`
+
+### Filesystem layout (operational)
+
+| Path                                                  | Purpose                                            |
+|-------------------------------------------------------|----------------------------------------------------|
+| `C:\Program Files\ephemerd\ephemerd.exe`              | Windows: service-installed binary (what runs)      |
+| `C:\Users\<user>\bin\ephemerd.exe`                    | Windows: convenience copy on PATH                  |
+| `C:\ProgramData\ephemerd\ephemerd.exe`                | Windows: extra copy near data dir                  |
+| `/usr/local/bin/ephemerd`                             | Linux/macOS: installed binary                      |
+| `<DataDir>/config.toml`                               | Active config (TOML)                               |
+| `<DataDir>/ephemerd.log`                              | Service log (text or JSON depending on config)     |
+| `<DataDir>/ephemerd.pid`                              | PID file (removed on clean exit)                   |
+| `<DataDir>/ephemerd.sock`                             | Control gRPC socket (used by `status`/`jobs`/etc.) |
+| `<DataDir>/logs/<job>-runner.log`                     | Per-job runner log (preserved after destroy)       |
+| `<DataDir>/jobs/<job>/docker/d.sock`                  | Per-job fake docker daemon socket                  |
+| `<DataDir>/runners/job-<id>/`                         | Per-job runner dir (xcopy from `runners/<ver>/`)   |
+| `<DataDir>/vm/linux/`                                 | Linux VM disk + console.log (Windows/macOS hosts)  |
+
+`<DataDir>` is `C:\ProgramData\ephemerd` on Windows, `/var/lib/ephemerd` on Linux, `~/Library/Application Support/ephemerd` on macOS.
+
+### Build & deploy on this host (Windows)
+
+Two-stage Windows build embeds a Linux binary for the WSL/Hyper-V VM, then compiles the Windows host binary. From a feature worktree:
+
+```
+mage build:windows           # produces ./ephemerd.exe (~700 MB, embeds Linux binary)
+ephemerd stop                # release the binary lock
+cp ephemerd.exe "/c/Program Files/ephemerd/ephemerd.exe"
+cp ephemerd.exe /c/Users/<user>/bin/ephemerd.exe
+cp ephemerd.exe /c/ProgramData/ephemerd/ephemerd.exe   # optional
+ephemerd start
+ephemerd logs -n 50          # confirm version + clean startup
+```
+
+The version string in the startup log (`starting ephemerd version=...`) confirms the running binary matches the worktree commit.
+
+### Auth: App vs PAT precedence
+
+Code in `pkg/github/client.go`:
+
+```go
+if cfg.AppAuth != nil {
+    // App: auto-refreshing installation token via custom http.RoundTripper
+} else {
+    // Static PAT fallback (cfg.Token)
+}
+```
+
+`main.go` builds `AppAuth` whenever `cfg.GitHub.AppID != 0` and assigns it to `ghCfg.AppAuth`. **If `app_id`/`installation_id`/`private_key_path` are set in `config.toml`, the App wins and `GITHUB_TOKEN` is ignored entirely** — rotating `GITHUB_TOKEN` does *not* affect ephemerd polling in that case.
+
+Auth-failure triage:
+```
+# Look for 401s in the log (all repos affected = App key/installation issue, not per-repo perms)
+grep "401\|Bad credentials" <DataDir>/ephemerd.log | tail -20
+
+# Test the App PEM + installation directly (Linux/macOS or git-bash)
+gh auth status                                  # not authoritative for App
+ls -la "<private_key_path>"                     # confirm PEM exists and mtime
+```
+
+If 401s span all repos, suspect: rotated App private key not deployed to `private_key_path`; clock skew; GitHub-side outage. If they're per-repo, suspect: the App installation lost access to that repo.
+
+### Local CI compromise (Windows hosts only)
+
+`mage ci` / `mage lint` trips a known cgo failure on Windows: `miekg/pkcs11` (transitively via `containers/ocicrypt`) can't be preprocessed by the Windows cgo toolchain. This is documented in `AGENTS.md` as a *local* problem, not a CI problem.
+
+Workaround that gives the same coverage as remote CI without leaving Windows:
+
+```
+GOOS=linux ./bin/golangci-lint.exe run ./...        # full lint, GOOS-cross
+GOOS=linux go test -count=1 -run xxx ./pkg/...      # compile-only check
+                                                    # (exit "fork/exec: not a valid Win32 app" = compile OK)
+go test -count=1 ./pkg/config/... ./pkg/runtime/... # natively-runnable packages
+```
+
+The compile-only `-run xxx` trick is what AGENTS.md endorses for the cgo-affected packages (`pkg/containerd`, `pkg/dind`, `pkg/workflow`, `cmd/ephemerd`).
+
+### Job lifecycle in the log
+
+A successful job leaves this trail (Linux dispatched via WSL):
+```
+"provisioning Linux runner via dispatch" job_id=<X> dispatch=linux
+"using image for job"                    job_id=<X> image=<I>
+"registered repo-level JIT runner"       name=<R-runner-name>
+"Linux runner dispatched"                job_id=<X> name=<R>
+"dispatched runner exited"               job_id=<X> exit_code=0
+```
+
+Windows native job:
+```
+"provisioning runner for job"            job_id=<X>
+"runner environment ready"               job_id=<X> name=<R>
+"runner exited"                          job_id=<X> exit_code=0
+"runner environment destroyed"           id=<R>
+```
+
+Trace one job: `awk '/<job_id>/' <DataDir>/ephemerd.log`. Per-job runner log preserved at `<DataDir>/logs/<runner-name>-runner.log` even after destroy.
+
+### Worktree + commit conventions
+
+User maintains hard rules captured in memory; the short version:
+
+- **Always work in a per-feature worktree** under `.claude/worktrees/<feature>` (`git worktree add .claude/worktrees/<feature> -b <branch> origin/main`). Never edit the main worktree for branch work.
+- **Backdate commits to the prior evening** when the user approves a commit (`GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` to ~20:00–23:00 local previous day).
+- **No `_ =` to silence errors** — wrap fallible calls in `if err := …; err != nil { log.Warn(…) }`.
+- **Use the user's `GITHUB_TOKEN`** for `git push` / `gh` — never the GitHub App bot. Don't add Claude attribution to commits.
+
+### CI matrix gotchas
+
+`Build (Linux arm64)` and `Build (macOS arm64)` jobs in `.github/workflows/ci.yml` are gated behind repo variables (`HAS_LINUX_ARM64_RUNNER`, `HAS_MACOS_ARM64_RUNNER`) and `continue-on-error: true`. With the vars unset they show **Skipped**, not Pending — see PR #75. To enable once runners are live: `gh variable set HAS_LINUX_ARM64_RUNNER --body true`.
+
+`Build (Windows amd64)` is unconditional and runs on this host. If you redeploy mid-build, the running CI job dies — re-run the failed check after the deploy.
+
 ## Current Branch: feat/windows-support
 
 PR #9: https://github.com/ephpm/ephemerd/pull/9
