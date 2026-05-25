@@ -28,6 +28,7 @@ const (
 type Runner struct {
 	DataDir    string
 	SocketPath string // optional: containerd socket override for isolation from the service
+	Image      string // container image; empty falls back to defaultImage
 	Log        *slog.Logger
 }
 
@@ -84,14 +85,19 @@ func (r *Runner) RunJob(ctx context.Context, jobName string, job Job, repoDir st
 	// Pull the runner image
 	nsCtx := namespaces.WithNamespace(ctx, namespace)
 
-	r.Log.Info("pulling image", "ref", defaultImage)
-	if _, err := ctrdClient.GetImage(nsCtx, defaultImage); err != nil {
-		if _, err := ctrdClient.Pull(nsCtx, defaultImage, client.WithPullUnpack); err != nil {
-			return fmt.Errorf("pulling image %s: %w", defaultImage, err)
+	imageRef := r.Image
+	if imageRef == "" {
+		imageRef = defaultImage
+	}
+
+	r.Log.Info("pulling image", "ref", imageRef)
+	if _, err := ctrdClient.GetImage(nsCtx, imageRef); err != nil {
+		if _, err := ctrdClient.Pull(nsCtx, imageRef, client.WithPullUnpack); err != nil {
+			return fmt.Errorf("pulling image %s: %w", imageRef, err)
 		}
 	}
 
-	img, err := ctrdClient.GetImage(nsCtx, defaultImage)
+	img, err := ctrdClient.GetImage(nsCtx, imageRef)
 	if err != nil {
 		return fmt.Errorf("getting image: %w", err)
 	}

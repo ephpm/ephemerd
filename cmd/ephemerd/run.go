@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"syscall"
 
+	"github.com/ephpm/ephemerd/pkg/config"
 	"github.com/ephpm/ephemerd/pkg/vm"
 	"github.com/ephpm/ephemerd/pkg/workflow"
 	"github.com/urfave/cli/v3"
@@ -26,14 +27,18 @@ func runCmd() *cli.Command {
 				Aliases: []string{"j"},
 				Usage:   "run a specific job by name",
 			},
+			&cli.StringFlag{
+				Name:  "image",
+				Usage: "container image to use (default: from service config or built-in)",
+			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			return runWorkflow(ctx, cmd.Args().First(), cmd.String("job"))
+			return runWorkflow(ctx, cmd.Args().First(), cmd.String("job"), cmd.String("image"))
 		},
 	}
 }
 
-func runWorkflow(ctx context.Context, workflowPath string, jobFilter string) error {
+func runWorkflow(ctx context.Context, workflowPath string, jobFilter string, imageFlag string) error {
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -152,11 +157,34 @@ func runWorkflow(ctx context.Context, workflowPath string, jobFilter string) err
 		socketPath = `\\.\pipe\ephemerd-run-` + filepath.Base(tmpDir)
 	}
 
+	image := resolveRunImage(imageFlag, platform)
+
 	runner := &workflow.Runner{
 		DataDir:    tmpDir,
 		SocketPath: socketPath,
+		Image:      image,
 		Log:        log,
 	}
 
 	return runner.RunJob(ctx, jobName, job, repoDir)
+}
+
+// resolveRunImage determines the container image for a run job.
+// Priority: --image flag → service config.toml → empty (caller applies the
+// built-in default — see workflow.Runner.RunJob, which substitutes
+// defaultImage when this returns "").
+func resolveRunImage(flagValue string, platform workflow.TargetPlatform) string {
+	if flagValue != "" {
+		return flagValue
+	}
+
+	osName := platform.String()
+	cfgPath := filepath.Join(configDir, "config.toml")
+	if cfg, err := config.Load(cfgPath); err == nil {
+		if img := cfg.GitHub.DefaultImageFor(osName); img != "" {
+			return img
+		}
+	}
+
+	return ""
 }
