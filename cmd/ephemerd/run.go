@@ -131,9 +131,27 @@ func runWorkflow(ctx context.Context, workflowPath string, jobFilter string) err
 		return nil
 	}
 
+	// Use an isolated temp directory so the run command doesn't conflict with
+	// the ephemerd service (BoltDB is single-writer and they'd share the same
+	// data directory and named pipe otherwise).
+	tmpDir, err := os.MkdirTemp("", "ephemerd-run-*")
+	if err != nil {
+		return fmt.Errorf("creating temp directory: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// On Windows, derive a unique named pipe so we don't collide with the
+	// service's \\.\pipe\ephemerd-containerd. On Unix the socket lives
+	// inside DataDir which is already unique.
+	var socketPath string
+	if runtime.GOOS == "windows" {
+		socketPath = `\\.\pipe\ephemerd-run-` + filepath.Base(tmpDir)
+	}
+
 	runner := &workflow.Runner{
-		DataDir: configDir,
-		Log:     log,
+		DataDir:    tmpDir,
+		SocketPath: socketPath,
+		Log:        log,
 	}
 
 	return runner.RunJob(ctx, jobName, job, repoDir)
