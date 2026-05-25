@@ -213,7 +213,7 @@ default_image = "ghcr.io/your-org/ci-image:latest"
 
 ## One Image, Every Host
 
-The same Linux container image runs identically on Linux, Windows (via WSL2), and macOS (via Virtualization.framework). In all three cases, containerd is the runtime that pulls and executes the image. There is no need to maintain separate images per host platform.
+The same Linux container image runs identically on Linux, Windows (via the Hyper-V Linux VM), and macOS (via Virtualization.framework). In all three cases, containerd is the runtime that pulls and executes the image. There is no need to maintain separate images per host platform.
 
 ## Reference: ephemerd CI Images
 
