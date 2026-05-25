@@ -27,7 +27,7 @@ On startup, `server.New()`:
 5. Calls `ctdserver.New(ctx, cfg)` to create the in-process server.
 6. Creates a gRPC listener on the platform-appropriate socket and serves in a background goroutine.
 7. Also creates a tTRPC listener for task/event APIs.
-8. Optionally creates a TCP listener for remote access (used by the Windows host to connect to WSL containerd).
+8. Optionally creates a TCP listener for remote access (used by the Windows or macOS host to connect to the in-VM containerd).
 9. Connects an in-process containerd client and waits for it to become ready (up to 15 seconds).
 
 The server, gRPC listeners, and client all run in the same process. On shutdown, `Server.Stop()` closes the client, stops the server, cancels the context, and waits for the background goroutines to finish.
@@ -48,7 +48,7 @@ The `SocketPath()` function in `pkg/containerd/server.go` returns the correct pa
 
 When `TCPPort` is set in the config (e.g., `--containerd-tcp-port 10000`), the server also listens on TCP. This is used for:
 
-- **Windows host to WSL**: the Windows scheduler connects to WSL's containerd via TCP since named pipes do not cross the WSL boundary.
+- **Windows host to Hyper-V Linux VM**: the Windows scheduler connects to the in-VM containerd via TCP since named pipes do not cross the VM boundary.
 - **macOS host to Linux VM**: the macOS host connects to containerd inside the Virtualization.framework Linux VM via TCP over NAT.
 
 The TCP bind address defaults to `127.0.0.1` but can be configured to `0.0.0.0` for VM environments where the host is on a different network interface.

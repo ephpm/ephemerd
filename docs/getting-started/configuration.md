@@ -223,7 +223,7 @@ Default images when `default_image` is not set:
 - **Linux:** `ghcr.io/actions/actions-runner:latest`
 - **Windows:** `mcr.microsoft.com/windows/servercore:ltsc20XX` (auto-detected from host build)
 
-**VM resource planning (Windows and macOS):** On Windows and macOS, `max_concurrent` applies to the entire ephemerd instance — Linux container jobs and native OS jobs share the same concurrency pool. All Linux jobs run inside a single VM (WSL2 on Windows, Virtualization.framework on macOS), so if `max_concurrent = 4`, that VM could be running 4 jobs simultaneously. Size the VM's CPU and memory (`[vm.linux]`) accordingly, or jobs will compete for resources and slow each other down.
+**VM resource planning (Windows and macOS):** On Windows and macOS, `max_concurrent` applies to the entire ephemerd instance — Linux container jobs and native OS jobs share the same concurrency pool. All Linux jobs run inside a single VM (Hyper-V Linux VM on Windows, Virtualization.framework on macOS), so if `max_concurrent = 4`, that VM could be running 4 jobs simultaneously. Size the VM's CPU and memory (`[vm.linux]`) accordingly, or jobs will compete for resources and slow each other down.
 
 ### `[vm.linux]`
 
@@ -236,7 +236,7 @@ Linux VM for running Linux jobs on Windows or macOS hosts.
 | `memory_mb` | integer | `2048` | Memory in MB |
 | `disk_size_gb` | integer | `50` | Sparse disk size in GB |
 
-On Windows, this creates a WSL2 distro with an embedded rootfs. On macOS, it uses Virtualization.framework.
+On Windows, this creates a Hyper-V Linux VM via the HCS (Host Compute Service) API, booted from an embedded kernel + initrd onto a persistent VHDX. On macOS, it uses Virtualization.framework.
 
 ### `[vm.macos]`
 

@@ -36,7 +36,7 @@ ephemerd exploits this by mounting its [fake Docker socket]({{< relref "fake-doc
 flowchart TB
     F["Forge Instance<br/>(Forgejo or Gitea)"]
 
-    subgraph H ["ephemerd host (Linux, Windows via WSL2, or macOS via Vz)"]
+    subgraph H ["ephemerd host (Linux, Windows via Hyper-V Linux VM, or macOS via Vz)"]
         E[ephemerd]
         CTD["containerd"]
         DSock["Fake Docker Socket<br/>pkg/dind<br/>/var/run/docker.sock"]
@@ -88,7 +88,7 @@ flowchart TB
 ### Lifecycle
 
 1. ephemerd creates the runner container from the upstream runner image, with the fake Docker socket bind-mounted at `/var/run/docker.sock`.
-2. containerd starts the runner -- on Linux directly, inside WSL2 on Windows, inside the Vz Linux VM on macOS.
+2. containerd starts the runner -- on Linux directly, inside the Hyper-V Linux VM on Windows, inside the Vz Linux VM on macOS.
 3. Runner registers with the forge as an ephemeral runner and long-polls `FetchTask`.
 4. Forge returns a task -- workflow YAML bytes, context, secrets, vars.
 5. act parses the workflow and determines the job image from `runs-on:` label mapping.
@@ -185,7 +185,7 @@ Forgejo/Gitea Actions is a Linux-jobs-only ecosystem today. On all three host OS
 | Host OS | How Linux containers run |
 |---------|-------------------------|
 | Linux | Direct containerd |
-| Windows | containerd inside WSL2 |
+| Windows | containerd inside Hyper-V Linux VM |
 | macOS | containerd inside Vz Linux VM |
 
 ## Configuration

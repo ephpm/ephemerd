@@ -26,8 +26,9 @@ const (
 
 // Runner executes workflow jobs locally using embedded containerd.
 type Runner struct {
-	DataDir string
-	Log     *slog.Logger
+	DataDir    string
+	SocketPath string // optional: containerd socket override for isolation from the service
+	Log        *slog.Logger
 }
 
 // gitInfo holds repository metadata sniffed from the local git repo.
@@ -48,8 +49,9 @@ func (r *Runner) RunJob(ctx context.Context, jobName string, job Job, repoDir st
 	// Start embedded containerd
 	r.Log.Info("starting containerd")
 	ctrd, err := ctdpkg.New(ctdpkg.Config{
-		DataDir: r.DataDir,
-		Log:     r.Log,
+		DataDir:    r.DataDir,
+		SocketPath: r.SocketPath,
+		Log:        r.Log,
 	})
 	if err != nil {
 		return fmt.Errorf("starting containerd: %w", err)

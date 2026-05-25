@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"slices"
 	"testing"
 	"time"
@@ -1858,5 +1859,85 @@ owner = "testorg"
 	resolved := cfg.Runtime.Rlimits.Resolved()
 	if resolved.Nofile != 1024 || resolved.Nproc != 1024 {
 		t.Errorf("Resolved() = %+v, want {1024, 1024}", resolved)
+	}
+}
+
+func TestResolvedAllowPrivileged_DefaultByOS(t *testing.T) {
+	d := DindConfig{}
+	got := d.ResolvedAllowPrivileged()
+	wantTrue := goruntime.GOOS != "linux"
+	if got != wantTrue {
+		t.Errorf("default ResolvedAllowPrivileged on GOOS=%s = %v, want %v", goruntime.GOOS, got, wantTrue)
+	}
+}
+
+func TestResolvedAllowPrivileged_ExplicitTrueWins(t *testing.T) {
+	yes := true
+	d := DindConfig{AllowPrivileged: &yes}
+	if !d.ResolvedAllowPrivileged() {
+		t.Error("explicit allow_privileged=true should resolve true on every OS")
+	}
+}
+
+func TestResolvedAllowPrivileged_ExplicitFalseWins(t *testing.T) {
+	no := false
+	d := DindConfig{AllowPrivileged: &no}
+	if d.ResolvedAllowPrivileged() {
+		t.Errorf("explicit allow_privileged=false should resolve false on every OS (GOOS=%s)", goruntime.GOOS)
+	}
+}
+
+func TestLoad_DindAllowPrivileged_OmittedUsesPlatformDefault(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_test123")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[github]
+owner = "testorg"
+
+[dind]
+enabled = true
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Dind.AllowPrivileged != nil {
+		t.Errorf("AllowPrivileged ptr = %v, want nil (key not set in TOML)", *cfg.Dind.AllowPrivileged)
+	}
+	want := goruntime.GOOS != "linux"
+	if got := cfg.Dind.ResolvedAllowPrivileged(); got != want {
+		t.Errorf("ResolvedAllowPrivileged on GOOS=%s = %v, want %v", goruntime.GOOS, got, want)
+	}
+}
+
+func TestLoad_DindAllowPrivileged_ExplicitFalseOnAnyOS(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_test123")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[github]
+owner = "testorg"
+
+[dind]
+enabled = true
+allow_privileged = false
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Dind.AllowPrivileged == nil {
+		t.Fatal("AllowPrivileged ptr is nil; TOML did not bind the explicit false")
+	}
+	if *cfg.Dind.AllowPrivileged {
+		t.Errorf("AllowPrivileged = true, want false")
+	}
+	if cfg.Dind.ResolvedAllowPrivileged() {
+		t.Error("ResolvedAllowPrivileged() should honor explicit false even on non-Linux hosts")
 	}
 }

@@ -148,7 +148,7 @@ agent_secret = "your-shared-secret"
 Regardless of which provider is active, the following subsystems are shared:
 
 - Container runtime (containerd, OCI images, overlayfs/windows snapshotter)
-- WSL2 dispatch for Linux jobs on Windows hosts
+- Hyper-V Linux VM dispatch for Linux jobs on Windows hosts
 - macOS VM support via Virtualization.framework
 - CNI bridge networking (Linux) and HCN NAT networking (Windows)
 - Concurrency limiting, job dedup, and graceful drain

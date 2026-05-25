@@ -111,17 +111,17 @@ type createRequest struct {
 }
 
 type hostConfig struct {
-	Binds         []string                       `json:"Binds"`
-	NetworkMode   string                         `json:"NetworkMode"`
-	Privileged    bool                           `json:"Privileged"`
-	SecurityOpt   []string                       `json:"SecurityOpt"`
-	CapAdd        []string                       `json:"CapAdd"`
-	Tmpfs         map[string]string              `json:"Tmpfs"`
-	PortBindings  map[string][]portBinding        `json:"PortBindings"`
-	RestartPolicy *restartPolicy                 `json:"RestartPolicy"`
-	Init          *bool                          `json:"Init"`
-	CgroupnsMode  string                         `json:"CgroupnsMode"`
-	ExtraHosts    []string                       `json:"ExtraHosts"`
+	Binds         []string                 `json:"Binds"`
+	NetworkMode   string                   `json:"NetworkMode"`
+	Privileged    bool                     `json:"Privileged"`
+	SecurityOpt   []string                 `json:"SecurityOpt"`
+	CapAdd        []string                 `json:"CapAdd"`
+	Tmpfs         map[string]string        `json:"Tmpfs"`
+	PortBindings  map[string][]portBinding `json:"PortBindings"`
+	RestartPolicy *restartPolicy           `json:"RestartPolicy"`
+	Init          *bool                    `json:"Init"`
+	CgroupnsMode  string                   `json:"CgroupnsMode"`
+	ExtraHosts    []string                 `json:"ExtraHosts"`
 }
 
 type portBinding struct {
@@ -181,6 +181,8 @@ func (s *Server) routeContainer(w http.ResponseWriter, r *http.Request, path str
 		s.handleContainerCopyTo(w, r, id)
 	case action == "archive" && r.Method == http.MethodGet:
 		s.handleContainerCopyFrom(w, r, id)
+	case action == "archive" && r.Method == http.MethodHead:
+		s.handleContainerStatPath(w, r, id)
 	default:
 		s.handleNotImplemented(w, r)
 	}
@@ -207,14 +209,25 @@ func (s *Server) resolveContainerID(nameOrID string) string {
 	return nameOrID
 }
 
-func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
-	if s.client == nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"message": "containerd client not available",
-		})
-		return
+// checkPrivilegedGate returns a user-facing rejection message and blocked=true
+// when the request asks for elevation (Privileged=true or CapAdd) but the gate
+// is closed (allowPrivileged=false). Otherwise blocked=false and msg is empty.
+// Pure function so the handler stays simple and tests don't need a containerd
+// client to exercise the gate logic.
+func checkPrivilegedGate(allowPrivileged bool, hc *hostConfig) (msg string, blocked bool) {
+	if allowPrivileged || hc == nil {
+		return "", false
 	}
+	if hc.Privileged {
+		return "privileged containers are disabled on this host (set dind.allow_privileged = true in ephemerd config to enable)", true
+	}
+	if len(hc.CapAdd) > 0 {
+		return fmt.Sprintf("--cap-add (%v) is disabled on this host (set dind.allow_privileged = true in ephemerd config to enable)", hc.CapAdd), true
+	}
+	return "", false
+}
 
+func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	var req createRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
@@ -226,6 +239,22 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	if req.Image == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"message": "Image is required",
+		})
+		return
+	}
+
+	// Privileged-elevation gate runs before the client check: it's a
+	// request-shape validation, not a runtime-state check. This also
+	// makes the unit tests trivial — they don't need a containerd client.
+	if msg, blocked := checkPrivilegedGate(s.allowPrivileged, req.HostConfig); blocked {
+		s.log.Warn("rejecting elevated container request", "image", req.Image, "reason", msg)
+		writeJSON(w, http.StatusForbidden, map[string]string{"message": msg})
+		return
+	}
+
+	if s.client == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"message": "containerd client not available",
 		})
 		return
 	}
@@ -1563,4 +1592,3 @@ func writeContainerHosts(entry *containerEntry) error {
 
 	return os.WriteFile(entry.HostsPath, []byte(b.String()), 0o644)
 }
-

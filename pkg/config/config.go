@@ -15,21 +15,21 @@ import (
 )
 
 type Config struct {
-	GitHub     GitHubConfig     `toml:"github"`
-	Forgejo    ForgejoConfig    `toml:"forgejo"`
-	Gitea      GiteaConfig      `toml:"gitea"`
-	GitLab     GitLabConfig     `toml:"gitlab"`
-	Woodpecker WoodpeckerConfig `toml:"woodpecker"`
-	Webhook    WebhookConfig    `toml:"webhook"`
-	Containerd ContainerdConfig `toml:"containerd"`
-	Network    NetworkConfig    `toml:"network"`
-	VM         VMConfig         `toml:"vm"`
+	GitHub      GitHubConfig      `toml:"github"`
+	Forgejo     ForgejoConfig     `toml:"forgejo"`
+	Gitea       GiteaConfig       `toml:"gitea"`
+	GitLab      GitLabConfig      `toml:"gitlab"`
+	Woodpecker  WoodpeckerConfig  `toml:"woodpecker"`
+	Webhook     WebhookConfig     `toml:"webhook"`
+	Containerd  ContainerdConfig  `toml:"containerd"`
+	Network     NetworkConfig     `toml:"network"`
+	VM          VMConfig          `toml:"vm"`
 	Dind        DindConfig        `toml:"dind"`
 	ModuleProxy ModuleProxyConfig `toml:"module_proxy"`
 	Runtime     RuntimeConfig     `toml:"runtime"`
 	Runner      RunnerConfig      `toml:"runner"`
-	Metrics    MetricsConfig    `toml:"metrics"`
-	Log        LogConfig        `toml:"log"`
+	Metrics     MetricsConfig     `toml:"metrics"`
+	Log         LogConfig         `toml:"log"`
 }
 
 // Provider returns the name of the first configured forge provider.
@@ -78,14 +78,14 @@ type MetricsConfig struct {
 // By default, ephemerd uses polling (tunnel = "none").
 // Set tunnel = "localtunnel" or "ngrok" for instant webhook delivery.
 type WebhookConfig struct {
-	Secret            string `toml:"secret"`             // webhook HMAC secret (auto-generated if empty)
-	Port              int    `toml:"port"`               // listen port for health endpoint (default 8080)
-	TLSCert           string `toml:"tls_cert"`           // TLS certificate path (direct TLS, no tunnel)
-	TLSKey            string `toml:"tls_key"`            // TLS private key path
-	Tunnel            string `toml:"tunnel"`             // "none" (default, polling), "localtunnel", or "ngrok"
-	TunnelURL         string `toml:"tunnel_url"`         // localtunnel: self-hosted server URL
-	NgrokAuthtoken    string `toml:"ngrok_authtoken"`    // ngrok auth token (or use NGROK_AUTHTOKEN env)
-	TunnelMaxRetries  int    `toml:"tunnel_max_retries"` // max consecutive reconnect failures before falling back to polling (default 5)
+	Secret           string `toml:"secret"`             // webhook HMAC secret (auto-generated if empty)
+	Port             int    `toml:"port"`               // listen port for health endpoint (default 8080)
+	TLSCert          string `toml:"tls_cert"`           // TLS certificate path (direct TLS, no tunnel)
+	TLSKey           string `toml:"tls_key"`            // TLS private key path
+	Tunnel           string `toml:"tunnel"`             // "none" (default, polling), "localtunnel", or "ngrok"
+	TunnelURL        string `toml:"tunnel_url"`         // localtunnel: self-hosted server URL
+	NgrokAuthtoken   string `toml:"ngrok_authtoken"`    // ngrok auth token (or use NGROK_AUTHTOKEN env)
+	TunnelMaxRetries int    `toml:"tunnel_max_retries"` // max consecutive reconnect failures before falling back to polling (default 5)
 }
 
 // NetworkConfig configures container networking.
@@ -155,6 +155,45 @@ type DindConfig struct {
 	// Set to 0 to disable eviction (only empty-namespace cleanup runs).
 	// Default 168h (7 days).
 	CacheMaxAge time.Duration `toml:"cache_max_age"`
+
+	// AllowPrivileged controls whether `docker run --privileged` (or
+	// HostConfig.Privileged=true / HostConfig.CapAdd) from inside a job
+	// is honored. When true, a sibling container can request the full
+	// elevation stack (all caps, all devices, seccomp/apparmor off,
+	// writable sysfs/cgroupfs) — needed for KIND clusters, nested
+	// containerd, /dev/fuse-style mounts, etc. When false, such requests
+	// are rejected with HTTP 403.
+	//
+	// SECURITY: a privileged sibling container is effectively root on
+	// whatever host runs the containerd that backs dind. On Windows and
+	// macOS hosts that backing containerd lives inside a managed Linux
+	// VM (WSL2 / Hyper-V / Vz), so an escape only reaches the VM. On a
+	// Linux host with no VM fence, an escape reaches the bare-metal host
+	// — set this to false unless every workload is trusted.
+	//
+	// Use the pointer form so an empty/missing TOML key is
+	// distinguishable from an explicit `allow_privileged = false`. See
+	// ResolvedAllowPrivileged for the default policy.
+	AllowPrivileged *bool `toml:"allow_privileged"`
+}
+
+// ResolvedAllowPrivileged returns whether privileged dind sibling
+// containers are allowed, applying the platform-aware default when the
+// operator hasn't set the key explicitly.
+//
+// Default policy:
+//   - Windows / macOS host → true. The dind containerd backing store
+//     runs inside a VM that ephemerd manages (WSL2/Hyper-V on Windows,
+//     Vz on macOS), so the worst-case escape stays inside that VM.
+//   - Linux host → false. ephemerd runs directly on the host with no
+//     VM fence, so a privileged escape is bare-metal-host compromise.
+//     Operators that trust their workloads (e.g. internal CI for KIND
+//     tests) can opt in via `allow_privileged = true`.
+func (d *DindConfig) ResolvedAllowPrivileged() bool {
+	if d.AllowPrivileged != nil {
+		return *d.AllowPrivileged
+	}
+	return goruntime.GOOS != "linux"
 }
 
 // DindCachePruneInterval returns the prune interval with the default
@@ -190,9 +229,9 @@ type VMConfig struct {
 	// CrossPlatform enables macOS and Windows VM support. Default true.
 	// Set to false for platforms like Gitea/Forgejo that only support
 	// Linux runners — this skips macOS image pulls and Windows VM setup.
-	CrossPlatform *bool        `toml:"cross_platform"`
-	Linux         LinuxVMToml  `toml:"linux"`
-	MacOS         MacOSVMToml  `toml:"macos"`
+	CrossPlatform *bool       `toml:"cross_platform"`
+	Linux         LinuxVMToml `toml:"linux"`
+	MacOS         MacOSVMToml `toml:"macos"`
 }
 
 // CrossPlatformEnabled returns whether macOS/Windows VM support is enabled.
@@ -207,9 +246,9 @@ func (v *VMConfig) CrossPlatformEnabled() bool {
 // LinuxVMToml configures the long-running Linux VM for Linux jobs
 // on Windows (Hyper-V) and macOS (Virtualization.framework) hosts.
 type LinuxVMToml struct {
-	Enabled    bool   `toml:"enabled"`     // enable Linux VM for cross-OS Linux jobs
-	CPUs       uint   `toml:"cpus"`        // virtual CPUs (default: 2)
-	MemoryMB   uint64 `toml:"memory_mb"`   // memory in MB (default: 2048)
+	Enabled    bool   `toml:"enabled"`      // enable Linux VM for cross-OS Linux jobs
+	CPUs       uint   `toml:"cpus"`         // virtual CPUs (default: 2)
+	MemoryMB   uint64 `toml:"memory_mb"`    // memory in MB (default: 2048)
 	DiskSizeGB uint64 `toml:"disk_size_gb"` // sparse disk size in GB (default: 50)
 }
 
@@ -224,10 +263,10 @@ type MacOSVMToml struct {
 	// Apple-signed IPSW on first boot and installs stock macOS into
 	// <data_dir>/vm/macos/base.img. Distinct from the OCI base image
 	// overlaid per job — that's fetched from the job's image label.
-	DiskImage    string `toml:"disk_image"`
-	CPUs         uint   `toml:"cpus"`          // CPUs per VM (default: 4)
-	MemoryMB     uint64 `toml:"memory_mb"`     // memory per VM in MB (default: 8192)
-	MaxConcurrent int   `toml:"max_concurrent"` // max simultaneous macOS VMs (default: auto-detected from host CPUs)
+	DiskImage     string `toml:"disk_image"`
+	CPUs          uint   `toml:"cpus"`           // CPUs per VM (default: 4)
+	MemoryMB      uint64 `toml:"memory_mb"`      // memory per VM in MB (default: 8192)
+	MaxConcurrent int    `toml:"max_concurrent"` // max simultaneous macOS VMs (default: auto-detected from host CPUs)
 }
 
 type GitHubConfig struct {

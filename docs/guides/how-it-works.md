@@ -32,30 +32,32 @@ graph TD
 On Windows, ephemerd manages two types of jobs from a single process:
 
 - **Windows jobs** run as Hyper-V isolated containers. Each container gets its own Windows kernel, providing strong isolation. The embedded containerd talks to the HCS (Host Compute Service) via the runhcs shim.
-- **Linux jobs** are dispatched to a WSL2 distro via gRPC. The WSL distro runs a second copy of ephemerd (cross-compiled for Linux and embedded in the Windows binary) with its own containerd instance.
+- **Linux jobs** are dispatched via gRPC to a Hyper-V Linux VM that ephemerd boots and manages directly. The VM runs a second copy of ephemerd (cross-compiled for Linux and embedded in the Windows binary) with its own containerd instance.
 
-A single scheduler on the Windows host polls GitHub for all jobs and routes them by OS label. The WSL worker has no GitHub credentials and no scheduler -- it only runs containers on demand.
+ephemerd creates the Linux VM by calling the Hyper-V Compute Service (`vmcompute.dll`) directly, with a KernelDirect boot from an embedded Linux kernel and initrd. The root filesystem lives on a persistent VHDX under the data directory, and the VM is attached to the Hyper-V Default Switch with an HCN endpoint that ephemerd allocates. This replaced an earlier WSL2-based worker so that ephemerd can run from any Windows security context -- including `LocalSystem`, which is what the Windows service uses, and which WSL2 does not support.
+
+A single scheduler on the Windows host polls GitHub for all jobs and routes them by OS label. The Linux VM has no GitHub credentials and no scheduler -- it only runs containers on demand.
 
 ```mermaid
 graph TD
     A[ephemerd.exe serve] --> B[Windows containerd]
     A --> C[Scheduler - single poller]
-    A --> D[Boot WSL2 distro]
+    A --> D[Boot Hyper-V Linux VM]
 
-    C -->|Windows job| E[Hyper-V container]
+    C -->|Windows job| E[Hyper-V Windows container]
     B --> E
     E --> F[HCN NAT network]
 
     C -->|Linux job| G[gRPC DispatchClient]
-    G -->|CreateJob| H[WSL dispatch server]
-    H --> I[Linux containerd]
+    G -->|TCP to VM IP:10001| H[Dispatch server in VM]
+    H --> I[Linux containerd in VM]
     I --> J[OCI container]
-    J --> K[CNI bridge network]
+    J --> K[CNI bridge network in VM]
 
-    D -->|imports rootfs| H
+    D -->|kernel + initrd + VHDX root| H
 ```
 
-The WSL distro is created from an embedded Alpine rootfs with gcompat and iptables pre-installed. The Linux ephemerd binary runs from `/mnt/c/` (the Windows disk mount) to avoid the slow 9P filesystem copy into WSL. On shutdown, the distro is unregistered and destroyed.
+The VM boots from an embedded Alpine-based initrd with gcompat and iptables baked in, mounts the persistent VHDX as its rootfs, and starts the embedded Linux `ephemerd` binary in `--containerd-only` mode. The Windows host reaches the VM over TCP -- containerd gRPC on `<vm-ip>:10000` and the dispatch service on `<vm-ip>:10001`. On shutdown, the VM is stopped via HCS and the HCN endpoint is released; the VHDX persists across restarts so image content survives reboots.
 
 ### macOS
 
@@ -93,14 +95,14 @@ Every supported host can run both its native jobs and Linux jobs:
 | Host OS | Linux jobs | Native jobs |
 |---------|-----------|-------------|
 | **Linux** | OCI containers (direct) | OCI containers (direct) |
-| **Windows** | OCI containers (via WSL2) | Hyper-V containers |
+| **Windows** | OCI containers (via Hyper-V Linux VM) | Hyper-V Windows containers |
 | **macOS** | OCI containers (via Vz Linux VM) | APFS clone-on-write macOS VMs |
 
 This means a single ephemerd host can serve workflows that need both Linux and native platform steps.
 
 ### Resource planning for VMs
 
-On Windows and macOS, the `max_concurrent` setting applies globally — Linux container jobs and native OS jobs share the same concurrency pool. All Linux container jobs run inside a single VM (WSL2 on Windows, Virtualization.framework on macOS), so if `max_concurrent = 4`, that one VM could be running up to 4 concurrent jobs.
+On Windows and macOS, the `max_concurrent` setting applies globally — Linux container jobs and native OS jobs share the same concurrency pool. All Linux container jobs run inside a single VM (Hyper-V Linux VM on Windows, Virtualization.framework on macOS), so if `max_concurrent = 4`, that one VM could be running up to 4 concurrent jobs.
 
 Size the Linux VM resources accordingly:
 
@@ -117,7 +119,7 @@ If the VM is undersized, jobs will compete for CPU and memory and slow each othe
 
 ## One Image, Every Host
 
-The same Dockerfile produces an image that runs on all three platforms. ephemerd always uses containerd to run Linux OCI containers -- whether that containerd is running natively (Linux), inside WSL2 (Windows), or inside a Virtualization.framework VM (macOS). The container runtime is identical in all cases.
+The same Dockerfile produces an image that runs on all three platforms. ephemerd always uses containerd to run Linux OCI containers -- whether that containerd is running natively (Linux), inside a Hyper-V Linux VM (Windows), or inside a Virtualization.framework VM (macOS). The container runtime is identical in all cases.
 
 ```yaml
 jobs:

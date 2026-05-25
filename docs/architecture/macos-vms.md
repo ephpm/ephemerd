@@ -46,7 +46,7 @@ The rootfs tarball and Linux binary are embedded in the macOS binary via `go:emb
 - **virtio-fs**: the host's data directory is shared into the VM at `/mnt/ephemerd`. The ephemerd Linux binary lives here -- no need to copy it into the disk image. It loads into memory on exec and runs at native speed.
 - **TCP over NAT**: containerd inside the VM listens on a TCP port. The host connects a gRPC containerd client to `127.0.0.1:<port>`.
 
-Unlike Windows WSL dispatch, macOS does not need a separate dispatch layer. The containerd gRPC client is platform-agnostic -- the macOS host binary can create Linux containers directly via the TCP connection. Only the container runtime code (OCI spec, snapshotter, networking) runs inside the VM.
+Unlike the Windows Hyper-V dispatch, macOS does not need a separate dispatch layer. The containerd gRPC client is platform-agnostic -- the macOS host binary can create Linux containers directly via the TCP connection. Only the container runtime code (OCI spec, snapshotter, networking) runs inside the VM.
 
 ### Two Boot Modes
 
