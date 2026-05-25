@@ -170,7 +170,9 @@ func runWorkflow(ctx context.Context, workflowPath string, jobFilter string, ima
 }
 
 // resolveRunImage determines the container image for a run job.
-// Priority: --image flag → service config.toml → built-in default.
+// Priority: --image flag → service config.toml → empty (caller applies the
+// built-in default — see workflow.Runner.RunJob, which substitutes
+// defaultImage when this returns "").
 func resolveRunImage(flagValue string, platform workflow.TargetPlatform) string {
 	if flagValue != "" {
 		return flagValue

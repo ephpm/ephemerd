@@ -18,6 +18,7 @@ The workflow file is a **positional argument**, not a flag. If omitted, ephemerd
 | Flag | Description |
 |------|-------------|
 | `--job`, `-j` | Run a specific job by name. If omitted, runs the first job in the workflow. |
+| `--image` | Container image to use for the job. Overrides any per-OS default from the service config; when omitted, falls back to `[github] default_image_linux` / `default_image_windows` in `<data-dir>/config.toml`, then to the built-in `ghcr.io/actions/actions-runner:latest`. |
 
 ## Behavior
 
@@ -25,7 +26,8 @@ The workflow file is a **positional argument**, not a flag. If omitted, ephemerd
 2. **Parse workflow** -- reads the YAML workflow file and extracts job definitions.
 3. **Select job** -- uses `--job` to pick a specific job, or defaults to the first job found.
 4. **Detect platform** -- inspects the job's `runs-on` labels to determine the target OS (linux, windows, or macos).
-5. **Execute** -- runs the job in a local container using the container runtime.
+5. **Resolve image** -- picks the container image in priority order: `--image` flag > `[github].default_image_<os>` in the service config > built-in `actions-runner:latest`.
+6. **Execute** -- runs the job in a local container using the container runtime.
 
 ## WSL delegation on Windows
 
@@ -59,4 +61,7 @@ ephemerd run .github/workflows/ci.yml --job build
 
 # Short flag form
 ephemerd run .github/workflows/ci.yml -j test
+
+# Override the container image (e.g. test a custom CI base)
+ephemerd run .github/workflows/ci.yml --image ghcr.io/your-org/ci-base:v2
 ```
