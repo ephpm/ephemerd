@@ -152,9 +152,19 @@ func runWorkflow(ctx context.Context, workflowPath string, jobFilter string) err
 		socketPath = `\\.\pipe\ephemerd-run-` + filepath.Base(tmpDir)
 	}
 
+	// Pick the container image based on the target platform.
+	var image string
+	switch platform {
+	case workflow.PlatformWindows:
+		image = "ephpm/ephemerd:runner-ci-windows"
+	default:
+		image = "ghcr.io/actions/actions-runner:latest"
+	}
+
 	runner := &workflow.Runner{
 		DataDir:    tmpDir,
 		SocketPath: socketPath,
+		Image:      image,
 		Log:        log,
 	}
 
