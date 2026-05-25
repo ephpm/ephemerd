@@ -138,7 +138,11 @@ func runWorkflow(ctx context.Context, workflowPath string, jobFilter string) err
 	if err != nil {
 		return fmt.Errorf("creating temp directory: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			log.Warn("failed to clean up temp directory", "dir", tmpDir, "error", err)
+		}
+	}()
 
 	// On Windows, derive a unique named pipe so we don't collide with the
 	// service's \\.\pipe\ephemerd-containerd. On Unix the socket lives
