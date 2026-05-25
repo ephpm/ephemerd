@@ -10,9 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
-	goruntime "runtime"
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
@@ -65,9 +65,14 @@ type Config struct {
 	// DataDir must be rewritten to that VM-side path. When empty, falls
 	// back to DataDir.
 	ContainerDataDir string
-	DindEnabled      bool     // mount a fake Docker socket into each container
-	CacheProxyEnv    []string // extra env vars from cache proxies (e.g., GOPROXY=...)
-	Network          *networking.Manager
+	DindEnabled      bool // mount a fake Docker socket into each container
+	// DindAllowPrivileged is forwarded to each per-job dind.Server.
+	// When false, requests carrying HostConfig.Privileged=true or
+	// HostConfig.CapAdd are rejected with HTTP 403. See
+	// config.DindConfig.AllowPrivileged for the threat model.
+	DindAllowPrivileged bool
+	CacheProxyEnv       []string // extra env vars from cache proxies (e.g., GOPROXY=...)
+	Network             *networking.Manager
 	// WindowsMemoryBytes is the memory limit for Hyper-V isolated Windows
 	// runner containers. Zero leaves the OCI spec field unset, which gives
 	// the HCS default (~1 GB) — too small for MSVC builds. Caller should
@@ -101,8 +106,8 @@ func (r *Runtime) Client() *client.Client {
 // RunnerEnv represents a running runner environment.
 type RunnerEnv struct {
 	ID        string
-	Netns     string // network namespace path (Linux only)
-	RunnerDir string // per-job runner copy, cleaned up on destroy
+	Netns     string       // network namespace path (Linux only)
+	RunnerDir string       // per-job runner copy, cleaned up on destroy
 	Dind      *dind.Server // per-job fake Docker daemon (nil if disabled)
 	Container client.Container
 	Task      client.Task
@@ -691,14 +696,15 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	if r.cfg.DindEnabled {
 		var err error
 		dindServer, err = dind.New(dind.Config{
-			JobID:    id,
-			Provider: cfg.Provider,
-			Repo:     cfg.Repo,
-			DataDir:  r.cfg.DataDir,
-			Client:   r.client,
-			Network:  r.cfg.Network,
-			BuildKit: r.cfg.BuildKit,
-			Log:      r.cfg.Log,
+			JobID:           id,
+			Provider:        cfg.Provider,
+			Repo:            cfg.Repo,
+			DataDir:         r.cfg.DataDir,
+			Client:          r.client,
+			Network:         r.cfg.Network,
+			BuildKit:        r.cfg.BuildKit,
+			AllowPrivileged: r.cfg.DindAllowPrivileged,
+			Log:             r.cfg.Log,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("creating dind server for %s: %w", id, err)

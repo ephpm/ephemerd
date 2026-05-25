@@ -26,8 +26,8 @@ import (
 	"github.com/ephpm/ephemerd/pkg/providers/forgejo"
 	"github.com/ephpm/ephemerd/pkg/providers/gitea"
 	githubProv "github.com/ephpm/ephemerd/pkg/providers/github"
-	goproxy "github.com/ephpm/ephemerd/pkg/proxies/go"
 	"github.com/ephpm/ephemerd/pkg/proxies"
+	goproxy "github.com/ephpm/ephemerd/pkg/proxies/go"
 	"github.com/ephpm/ephemerd/pkg/runner"
 	"github.com/ephpm/ephemerd/pkg/runtime"
 	"github.com/ephpm/ephemerd/pkg/scheduler"
@@ -271,17 +271,18 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		}
 
 		rt, err := runtime.New(runtime.Config{
-			Client:             ctrdClient,
-			RunnerDir:          rm.Dir(),
-			RunnerMount:        rm.ContainerDir(),
-			LogDir:             joinPath(configDir, "logs"),
-			DataDir:            configDir,
-			DindEnabled:        cfg.Dind.Enabled,
-			Network:            net,
-			WindowsMemoryBytes: cfg.Runner.Windows.MemoryBytes(),
-			WindowsCPUs:        cfg.Runner.Windows.CPUCount(),
-			BuildKit:           bk,
-			Log:                log,
+			Client:              ctrdClient,
+			RunnerDir:           rm.Dir(),
+			RunnerMount:         rm.ContainerDir(),
+			LogDir:              joinPath(configDir, "logs"),
+			DataDir:             configDir,
+			DindEnabled:         cfg.Dind.Enabled,
+			DindAllowPrivileged: cfg.Dind.ResolvedAllowPrivileged(),
+			Network:             net,
+			WindowsMemoryBytes:  cfg.Runner.Windows.MemoryBytes(),
+			WindowsCPUs:         cfg.Runner.Windows.CPUCount(),
+			BuildKit:            bk,
+			Log:                 log,
 		})
 		if err != nil {
 			return fmt.Errorf("creating runtime: %w", err)
@@ -443,21 +444,22 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		containerDataDir = "/mnt/ephemerd"
 	}
 	rt, err := runtime.New(runtime.Config{
-		Client:             ctrdClient,
-		RunnerDir:          rm.Dir(),
-		RunnerMount:        rm.ContainerDir(),
-		DefaultImage:       cfg.Runner.DefaultImage,
-		ImagesDir:          joinPath(configDir, "images"),
-		LogDir:             joinPath(configDir, "logs"),
-		DataDir:            configDir,
-		ContainerDataDir:   containerDataDir,
-		DindEnabled:        cfg.Dind.Enabled,
-		CacheProxyEnv:      cacheProxyEnvVars,
-		Network:            net,
-		WindowsMemoryBytes: cfg.Runner.Windows.MemoryBytes(),
-		WindowsCPUs:        cfg.Runner.Windows.CPUCount(),
-		BuildKit:           bk,
-		Log:                log,
+		Client:              ctrdClient,
+		RunnerDir:           rm.Dir(),
+		RunnerMount:         rm.ContainerDir(),
+		DefaultImage:        cfg.Runner.DefaultImage,
+		ImagesDir:           joinPath(configDir, "images"),
+		LogDir:              joinPath(configDir, "logs"),
+		DataDir:             configDir,
+		ContainerDataDir:    containerDataDir,
+		DindEnabled:         cfg.Dind.Enabled,
+		DindAllowPrivileged: cfg.Dind.ResolvedAllowPrivileged(),
+		CacheProxyEnv:       cacheProxyEnvVars,
+		Network:             net,
+		WindowsMemoryBytes:  cfg.Runner.Windows.MemoryBytes(),
+		WindowsCPUs:         cfg.Runner.Windows.CPUCount(),
+		BuildKit:            bk,
+		Log:                 log,
 	})
 	if err != nil {
 		return fmt.Errorf("creating runtime: %w", err)
@@ -524,21 +526,21 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 
 	// Start scheduler (ties CI provider jobs to container lifecycle)
 	sched := scheduler.New(scheduler.Config{
-		Runtime:          rt,
-		Providers:        activeProviders,
-		Artifacts:        artifactExtractor,
-		LinuxDispatcher:  linuxDispatcher,
-		DataDir:          configDir,
-		MaxConcurrent:    cfg.Runner.MaxConcurrent,
-		MaxMacOSVMs:      cfg.VM.MacOS.MaxConcurrent,
-		Labels:           cfg.Runner.ExtraLabels,
-		PollInterval:     pollInterval(cfg),
-		WebhookPort:      cfg.Webhook.Port,
-		WebhookSecret:    cfg.Webhook.Secret,
-		TLSCert:          cfg.Webhook.TLSCert,
-		TLSKey:           cfg.Webhook.TLSKey,
-		Tunnel:           tunnelProvider,
-		TunnelMaxRetries: cfg.Webhook.TunnelMaxRetries,
+		Runtime:            rt,
+		Providers:          activeProviders,
+		Artifacts:          artifactExtractor,
+		LinuxDispatcher:    linuxDispatcher,
+		DataDir:            configDir,
+		MaxConcurrent:      cfg.Runner.MaxConcurrent,
+		MaxMacOSVMs:        cfg.VM.MacOS.MaxConcurrent,
+		Labels:             cfg.Runner.ExtraLabels,
+		PollInterval:       pollInterval(cfg),
+		WebhookPort:        cfg.Webhook.Port,
+		WebhookSecret:      cfg.Webhook.Secret,
+		TLSCert:            cfg.Webhook.TLSCert,
+		TLSKey:             cfg.Webhook.TLSKey,
+		Tunnel:             tunnelProvider,
+		TunnelMaxRetries:   cfg.Webhook.TunnelMaxRetries,
 		JobTimeout:         cfg.Runner.ParsedJobTimeout(),
 		ShutdownTimeout:    cfg.Runner.ParsedShutdownTimeout(),
 		LogRetention:       cfg.Log.LogRetentionDuration(),

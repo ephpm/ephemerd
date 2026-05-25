@@ -3,7 +3,16 @@
 // Each job gets its own server instance listening on a Unix socket.
 // The socket is bind-mounted into the job container at /var/run/docker.sock.
 // Docker CLI calls inside the container are translated into containerd
-// operations on the host — no real Docker daemon, no privileged containers.
+// operations on the host — no real Docker daemon.
+//
+// Sibling containers created through this API can opt into the full
+// docker --privileged elevation stack (all caps, all devices, seccomp
+// and apparmor unconfined, writable sysfs/cgroupfs) when the host is
+// configured to allow it. See Server.allowPrivileged and
+// config.DindConfig.AllowPrivileged for the threat model — the short
+// version is that on Windows and macOS hosts the dind containerd lives
+// inside a managed Linux VM, so an escape stays in that VM; on a Linux
+// host with no VM fence the default is to deny privileged requests.
 package dind
 
 import (
@@ -33,18 +42,19 @@ const sharedNamespace = "ephemerd"
 
 // Server is a per-job fake Docker daemon.
 type Server struct {
-	jobID          string
-	jobNamespace   string // per-job containerd namespace for isolation
-	cacheNamespace string // per-(provider,repo) shared image cache namespace; empty disables caching
-	sockPath       string // host-side unix socket path (Linux/macOS only)
-	endpoint       string // what the container should set DOCKER_HOST to (e.g. "tcp://gw:port" on Windows)
-	listener       net.Listener
-	server         *http.Server
-	client         *client.Client
-	network        *networking.Manager
-	buildkit       *buildkit.Server // shared embedded BuildKit solver (nil → fall back to platform default)
-	runnerNetNS    string           // path to runner container's net namespace; used to install DNAT rules for port bindings
-	log            *slog.Logger
+	jobID           string
+	jobNamespace    string // per-job containerd namespace for isolation
+	cacheNamespace  string // per-(provider,repo) shared image cache namespace; empty disables caching
+	sockPath        string // host-side unix socket path (Linux/macOS only)
+	endpoint        string // what the container should set DOCKER_HOST to (e.g. "tcp://gw:port" on Windows)
+	listener        net.Listener
+	server          *http.Server
+	client          *client.Client
+	network         *networking.Manager
+	buildkit        *buildkit.Server // shared embedded BuildKit solver (nil → fall back to platform default)
+	runnerNetNS     string           // path to runner container's net namespace; used to install DNAT rules for port bindings
+	allowPrivileged bool             // gate for docker run --privileged / --cap-add; see config.DindConfig.AllowPrivileged
+	log             *slog.Logger
 
 	mu         sync.Mutex
 	images     map[string]*imageEntry     // in-memory image store scoped to this job
@@ -107,6 +117,13 @@ type Config struct {
 	// the sibling's container IP. Empty disables port forwarding.
 	RunnerNetNS string
 
+	// AllowPrivileged controls whether sibling containers may opt into
+	// the full elevation stack via HostConfig.Privileged or via
+	// HostConfig.CapAdd. When false, requests carrying either are
+	// rejected with HTTP 403. See config.DindConfig.AllowPrivileged for
+	// the threat model.
+	AllowPrivileged bool
+
 	Log *slog.Logger
 }
 
@@ -129,18 +146,19 @@ func New(cfg Config) (*Server, error) {
 		jobID: cfg.JobID,
 		// containerd namespace name regex (^[A-Za-z0-9]+(?:[._-](?:[A-Za-z0-9]+))*$)
 		// rejects slashes. Use hyphens to namespace per-job dind state.
-		jobNamespace:   "ephemerd-dind-" + cfg.JobID,
-		cacheNamespace: CacheNamespace(cfg.Provider, cfg.Repo),
-		sockPath:       sockPath,
-		client:         cfg.Client,
-		network:        cfg.Network,
-		buildkit:       cfg.BuildKit,
-		runnerNetNS:    cfg.RunnerNetNS,
-		log:            cfg.Log.With("component", "dind", "job_id", cfg.JobID),
-		images:         make(map[string]*imageEntry),
-		containers:     make(map[string]*containerEntry),
-		execs:          make(map[string]*execEntry),
-		networks:       make(map[string]*networkEntry),
+		jobNamespace:    "ephemerd-dind-" + cfg.JobID,
+		cacheNamespace:  CacheNamespace(cfg.Provider, cfg.Repo),
+		sockPath:        sockPath,
+		client:          cfg.Client,
+		network:         cfg.Network,
+		buildkit:        cfg.BuildKit,
+		runnerNetNS:     cfg.RunnerNetNS,
+		allowPrivileged: cfg.AllowPrivileged,
+		log:             cfg.Log.With("component", "dind", "job_id", cfg.JobID),
+		images:          make(map[string]*imageEntry),
+		containers:      make(map[string]*containerEntry),
+		execs:           make(map[string]*execEntry),
+		networks:        make(map[string]*networkEntry),
 	}
 	s.initDefaultBridgeNetwork()
 	return s, nil
