@@ -68,7 +68,8 @@ func TestBindTranslation_RealContainerd(t *testing.T) {
 		t.Fatalf("create lease: %v", err)
 	}
 	t.Cleanup(func() {
-		if err := ctrdClient.LeasesService().Delete(context.Background(), lease); err != nil {
+		ctx := namespaces.WithNamespace(context.Background(), sharedNamespace)
+		if err := ctrdClient.LeasesService().Delete(ctx, lease); err != nil {
 			t.Logf("delete lease: %v", err)
 		}
 	})
@@ -79,19 +80,34 @@ func TestBindTranslation_RealContainerd(t *testing.T) {
 		t.Skip("overlayfs snapshotter unavailable in this containerd build")
 	}
 
-	const snapshotKey = "bind-translate-e2e"
+	const (
+		parentPrepKey = "bind-translate-e2e-parent-prep"
+		parentKey     = "bind-translate-e2e-parent"
+		snapshotKey   = "bind-translate-e2e"
+	)
 	t.Cleanup(func() {
 		cleanup, cancelCleanup := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancelCleanup()
 		cleanup = namespaces.WithNamespace(cleanup, sharedNamespace)
-		if err := snapshotter.Remove(cleanup, snapshotKey); err != nil && !strings.Contains(err.Error(), "not found") {
-			t.Logf("snapshot cleanup: %v", err)
+		for _, k := range []string{snapshotKey, parentKey, parentPrepKey} {
+			if err := snapshotter.Remove(cleanup, k); err != nil && !strings.Contains(err.Error(), "not found") {
+				t.Logf("snapshot cleanup %s: %v", k, err)
+			}
 		}
 	})
 
-	// Empty parent → empty rootfs. We don't need image content, just the
-	// upperdir to plant the marker into.
-	mounts, err := snapshotter.Prepare(ctx, snapshotKey, "")
+	// Stage an empty committed parent so the active snapshot on top is
+	// a real overlay mount with upperdir= / lowerdir= options. A direct
+	// Prepare(..., "") returns a plain bind to the snapshot fs dir,
+	// which has no overlayfs layout for translation to find.
+	if _, err := snapshotter.Prepare(ctx, parentPrepKey, ""); err != nil {
+		t.Fatalf("prepare parent: %v", err)
+	}
+	if err := snapshotter.Commit(ctx, parentKey, parentPrepKey); err != nil {
+		t.Fatalf("commit parent: %v", err)
+	}
+
+	mounts, err := snapshotter.Prepare(ctx, snapshotKey, parentKey)
 	if err != nil {
 		t.Fatalf("snapshotter.Prepare: %v", err)
 	}
@@ -237,7 +253,8 @@ func TestBindTranslation_RejectsForeignSource(t *testing.T) {
 		t.Fatalf("create lease: %v", err)
 	}
 	t.Cleanup(func() {
-		if err := ctrdClient.LeasesService().Delete(context.Background(), lease); err != nil {
+		ctx := namespaces.WithNamespace(context.Background(), sharedNamespace)
+		if err := ctrdClient.LeasesService().Delete(ctx, lease); err != nil {
 			t.Logf("delete lease: %v", err)
 		}
 	})
@@ -247,6 +264,10 @@ func TestBindTranslation_RejectsForeignSource(t *testing.T) {
 	if snapshotter == nil {
 		t.Skip("overlayfs snapshotter unavailable in this containerd build")
 	}
+	// The rejection path doesn't need an overlay mount — buildBindMounts
+	// fails out at the bind-table / rootfs lookup before any layer walk
+	// matters. A bare snapshot is enough; we only need the key to be
+	// registered so SetRunnerRootfs takes the on-path branch.
 	const snapshotKey = "bind-translate-reject-e2e"
 	t.Cleanup(func() {
 		cleanup, cancelCleanup := context.WithTimeout(context.Background(), 10*time.Second)
