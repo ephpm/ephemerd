@@ -805,6 +805,34 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		return nil, fmt.Errorf("creating container %s: %w", id, err)
 	}
 
+	// Register the runner snapshot + the non-rootfs bind table with the
+	// dind server so it can translate sibling `-v` sources from the
+	// runner's mount namespace to real host paths. Without this, the GHA
+	// runner's `container:` flow asks dind for binds like
+	// `/home/runner/_work/_temp` that don't exist on the dind daemon's
+	// filesystem — the shim used to silently drop them and the resulting
+	// `docker exec sh -e /__w/_temp/<uuid>.sh` failed with "cannot open".
+	//
+	// The GOOS guard only skips the Windows-native job path (Hyper-V
+	// isolated Windows containers with the "windowsfilter" snapshotter —
+	// no overlay upperdir to walk, and bind semantics differ enough that
+	// translation needs a separate design). Linux jobs on Windows hosts
+	// reach this code via the in-VM ephemerd process running as Linux,
+	// so they take the registration branch normally.
+	if dindServer != nil && goruntime.GOOS != "windows" {
+		bindMappings := map[string]string{}
+		if dindServer.SocketPath() != "" {
+			bindMappings["/var/run/docker.sock"] = dindServer.SocketPath()
+		}
+		hostDataDir := filepath.Dir(r.cfg.LogDir)
+		bindMappings["/etc/hosts"] = filepath.Join(hostDataDir, "hosts", id+".hosts")
+		bindMappings["/etc/resolv.conf"] = filepath.Join(hostDataDir, "dns", id+".conf")
+		if jobRunnerDir != "" && r.cfg.RunnerMount != "" {
+			bindMappings[r.cfg.RunnerMount] = jobRunnerDir
+		}
+		dindServer.SetRunnerRootfs(snapshotName, bindMappings)
+	}
+
 	// Create and start the task with per-job log capture.
 	// On Windows, cio.LogFile uses file:// URIs which runhcs rejects
 	// (it only accepts binary:// scheme), and cio.WithStdio fails with

@@ -732,6 +732,37 @@ func (s *Server) copyToViaExec(w http.ResponseWriter, r *http.Request, entry *co
 	w.WriteHeader(http.StatusOK)
 }
 
+// runnerRootfsLayers returns the runner container's overlayfs layers split
+// into the writable upperdir and the read-only lowerdirs. Used by
+// translateBindSource to map sibling -v sources from the runner's mount
+// namespace to real host paths.
+//
+// The runner snapshot lives in the runtime's "ephemerd" namespace (it was
+// created by pkg/runtime, not by dind), so this helper switches namespaces
+// before consulting the snapshotter. Returns ("", nil, nil) when no runner
+// rootfs has been registered yet — callers treat that as "rootfs empty",
+// which makes every non-runner-bind source fail translation with a clear
+// error rather than silently dropping the mount.
+func (s *Server) runnerRootfsLayers(ctx context.Context) (upperdir string, lowerdirs []string, err error) {
+	s.mu.Lock()
+	key := s.runnerSnapshotKey
+	s.mu.Unlock()
+	if key == "" {
+		return "", nil, nil
+	}
+	runnerCtx := namespaces.WithNamespace(ctx, sharedNamespace)
+	dirs, err := s.rootfsSearchDirs(runnerCtx, key)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(dirs) == 0 {
+		return "", nil, nil
+	}
+	// rootfsSearchDirs returns upperdir first, then lowerdirs in order.
+	// In test stubs that return a single entry, treat it as upperdir-only.
+	return dirs[0], dirs[1:], nil
+}
+
 // rootfsSearchDirs returns the host-filesystem directories whose union forms
 // the container's merged rootfs view — upperdir first (container-written
 // files take precedence), then each lowerdir. Used by both HEAD and GET
