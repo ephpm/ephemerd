@@ -26,6 +26,7 @@ type Config struct {
 	VM          VMConfig          `toml:"vm"`
 	Dind        DindConfig        `toml:"dind"`
 	ModuleProxy ModuleProxyConfig `toml:"module_proxy"`
+	Runtime     RuntimeConfig     `toml:"runtime"`
 	Runner      RunnerConfig      `toml:"runner"`
 	Metrics     MetricsConfig     `toml:"metrics"`
 	Log         LogConfig         `toml:"log"`
@@ -95,6 +96,47 @@ type NetworkConfig struct {
 
 type ContainerdConfig struct {
 	// Reserved for future containerd-specific settings (e.g. snapshotter overrides)
+}
+
+// RuntimeConfig configures behavior of the per-job container runtime —
+// things that apply to the OCI spec rather than to a specific subsystem
+// like dind or networking.
+type RuntimeConfig struct {
+	Rlimits RuntimeRlimits `toml:"rlimits"`
+}
+
+// RuntimeRlimits sets POSIX resource limits (RLIMIT_*) on each runner
+// container's OCI spec. Defaults match containerd's built-in OCI spec
+// (nofile=1024, nproc=1024) so an empty config is a no-behavior-change.
+//
+// Set higher when CI workloads need more file descriptors or processes
+// than containerd's defaults allow. Common case: a build tool calling
+// `ulimit -n 2048` to raise its open-file ceiling. That fails with
+// "Operation not permitted" if the container's hard limit is 1024 —
+// raising the hard limit needs CAP_SYS_RESOURCE, which we deliberately
+// don't grant. Setting nofile higher here lets the same `ulimit` call
+// succeed without granting the capability, because lowering is always
+// allowed and the OCI hard limit is now generous.
+type RuntimeRlimits struct {
+	// Nofile is RLIMIT_NOFILE (max open file descriptors). Both soft
+	// and hard get set to this value. Default 1024 (containerd default).
+	Nofile int64 `toml:"nofile"`
+	// Nproc is RLIMIT_NPROC (max processes/threads for the container's
+	// user). Both soft and hard get set to this value. Default 1024.
+	Nproc int64 `toml:"nproc"`
+}
+
+// Resolved returns the rlimits with defaults filled in for any unset
+// (zero or negative) field. Always returns positive values so callers
+// can blindly emit OCI rlimit entries.
+func (r RuntimeRlimits) Resolved() RuntimeRlimits {
+	if r.Nofile <= 0 {
+		r.Nofile = 1024
+	}
+	if r.Nproc <= 0 {
+		r.Nproc = 1024
+	}
+	return r
 }
 
 // DindConfig configures the fake Docker daemon mounted into job containers.
