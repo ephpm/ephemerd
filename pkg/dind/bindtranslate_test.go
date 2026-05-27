@@ -17,9 +17,6 @@ import (
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-// itoa wraps strconv.Itoa so callers reading the test don't need an extra
-// import for one number-to-string conversion.
-func itoa(n int) string { return strconv.Itoa(n) }
 
 // applyOpts invokes a list of oci.SpecOpts against an empty spec so tests
 // can assert what they produced. withBindMount and friends don't touch the
@@ -262,7 +259,7 @@ func TestTranslateBindSource_TaskPIDResolvesViaProcRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("translate via /proc/self/root: %v", err)
 	}
-	wantPrefix := "/proc/" + itoa(int(pid)) + "/root"
+	wantPrefix := "/proc/" + strconv.Itoa(int(pid)) + "/root"
 	if !strings.HasPrefix(got.HostPath, wantPrefix) {
 		t.Errorf("HostPath = %q, want it to begin with %q (resolution must go through /proc/<pid>/root)", got.HostPath, wantPrefix)
 	}
