@@ -805,34 +805,6 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		return nil, fmt.Errorf("creating container %s: %w", id, err)
 	}
 
-	// Register the runner snapshot + the non-rootfs bind table with the
-	// dind server so it can translate sibling `-v` sources from the
-	// runner's mount namespace to real host paths. Without this, the GHA
-	// runner's `container:` flow asks dind for binds like
-	// `/home/runner/_work/_temp` that don't exist on the dind daemon's
-	// filesystem — the shim used to silently drop them and the resulting
-	// `docker exec sh -e /__w/_temp/<uuid>.sh` failed with "cannot open".
-	//
-	// The GOOS guard only skips the Windows-native job path (Hyper-V
-	// isolated Windows containers with the "windowsfilter" snapshotter —
-	// no overlay upperdir to walk, and bind semantics differ enough that
-	// translation needs a separate design). Linux jobs on Windows hosts
-	// reach this code via the in-VM ephemerd process running as Linux,
-	// so they take the registration branch normally.
-	if dindServer != nil && goruntime.GOOS != "windows" {
-		bindMappings := map[string]string{}
-		if dindServer.SocketPath() != "" {
-			bindMappings["/var/run/docker.sock"] = dindServer.SocketPath()
-		}
-		hostDataDir := filepath.Dir(r.cfg.LogDir)
-		bindMappings["/etc/hosts"] = filepath.Join(hostDataDir, "hosts", id+".hosts")
-		bindMappings["/etc/resolv.conf"] = filepath.Join(hostDataDir, "dns", id+".conf")
-		if jobRunnerDir != "" && r.cfg.RunnerMount != "" {
-			bindMappings[r.cfg.RunnerMount] = jobRunnerDir
-		}
-		dindServer.SetRunnerRootfs(snapshotName, bindMappings)
-	}
-
 	// Create and start the task with per-job log capture.
 	// On Windows, cio.LogFile uses file:// URIs which runhcs rejects
 	// (it only accepts binary:// scheme), and cio.WithStdio fails with
@@ -876,6 +848,24 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		// here when a sibling container is created with PortBindings.
 		if dindServer != nil {
 			dindServer.SetRunnerNetNS(netns)
+			// Register the runner snapshot + task PID + non-rootfs bind
+			// table so dind can translate sibling `-v` sources from the
+			// runner's mount namespace to real host paths. The task PID
+			// drives /proc/<pid>/root resolution — without it, paths
+			// whose contents span multiple image layers (e.g.
+			// /home/runner/externals/node20/bin/node) bind incomplete
+			// trees and downstream exec fails with "no such file".
+			bindMappings := map[string]string{}
+			if dindServer.SocketPath() != "" {
+				bindMappings["/var/run/docker.sock"] = dindServer.SocketPath()
+			}
+			hostDataDir := filepath.Dir(r.cfg.LogDir)
+			bindMappings["/etc/hosts"] = filepath.Join(hostDataDir, "hosts", id+".hosts")
+			bindMappings["/etc/resolv.conf"] = filepath.Join(hostDataDir, "dns", id+".conf")
+			if jobRunnerDir != "" && r.cfg.RunnerMount != "" {
+				bindMappings[r.cfg.RunnerMount] = jobRunnerDir
+			}
+			dindServer.SetRunnerRootfs(snapshotName, pid, bindMappings)
 		}
 		if _, err := r.cfg.Network.Setup(ctx, id, netns); err != nil {
 			stopDind()

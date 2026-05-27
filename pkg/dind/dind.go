@@ -71,6 +71,15 @@ type Server struct {
 	// the rootfs walk in translateBindSource.
 	runnerBindMappings map[string]string
 
+	// runnerTaskPID is the host-PID of the runner container's init
+	// process. translateBindSource uses it to address the runner's
+	// merged overlay view through /proc/<pid>/root, which is the only
+	// way to expose files whose contents span multiple image layers
+	// (e.g. /home/runner/externals/node20/bin/node, where the dir entry
+	// and the file live in different lowerdirs). Zero until
+	// SetRunnerRootfs is called.
+	runnerTaskPID uint32
+
 	log *slog.Logger
 
 	mu         sync.Mutex
@@ -197,26 +206,34 @@ func (s *Server) SetRunnerNetNS(netnsPath string) {
 	s.runnerNetNS = netnsPath
 }
 
-// SetRunnerRootfs registers the runner container's snapshot and the
-// non-rootfs bind table ephemerd installed into it, so that subsequent
+// SetRunnerRootfs registers the runner container's snapshot, task PID, and
+// the non-rootfs bind table ephemerd installed into it, so that subsequent
 // docker create requests from inside the runner can have their -v sources
 // translated from the runner's mount namespace to real host paths.
 //
 // snapshotKey is the containerd snapshot name (typically
-// "<runnerID>-snapshot" in the runtime's "ephemerd" namespace).
+// "<runnerID>-snapshot" in the runtime's "ephemerd" namespace). Kept for
+// the (now-fallback) layer walk used by the unit tests; production
+// resolution goes through taskPID.
+//
+// taskPID is the host-side PID of the runner's init process. Required for
+// the /proc/<pid>/root resolution path that gives the runner's merged
+// overlay view — without it, sibling binds for paths split across image
+// layers (e.g. /home/runner/externals) bind incomplete trees.
 //
 // bindMappings keys are container destination paths (what the runner sees,
 // e.g. "/var/run/docker.sock"); values are host source paths (what the dind
-// daemon hands to containerd, e.g. "<DataDir>/jobs/<id>/docker/d.sock").
-// The map is copied so the caller may continue to mutate it.
+// daemon hands to containerd). The map is copied so the caller may continue
+// to mutate it.
 //
-// Must be called after the runner container is created (so the snapshot
-// exists) and before any docker create from inside the runner. The runtime
-// pairs this call with SetRunnerNetNS at the same point in startup.
-func (s *Server) SetRunnerRootfs(snapshotKey string, bindMappings map[string]string) {
+// Must be called after the runner task starts (PID is known) and before any
+// docker create from inside the runner. Pairs with SetRunnerNetNS in the
+// runtime, called at the same point in startup.
+func (s *Server) SetRunnerRootfs(snapshotKey string, taskPID uint32, bindMappings map[string]string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.runnerSnapshotKey = snapshotKey
+	s.runnerTaskPID = taskPID
 	if len(bindMappings) == 0 {
 		s.runnerBindMappings = nil
 		return

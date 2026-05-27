@@ -162,7 +162,12 @@ func TestBindTranslation_RealContainerd(t *testing.T) {
 		"/etc/hosts":           filepath.Join(dataDir, "hosts", "fake.hosts"),
 		"/etc/resolv.conf":     filepath.Join(dataDir, "dns", "fake.conf"),
 	}
-	s.SetRunnerRootfs(snapshotKey, bindMappings)
+	// PID 0 keeps the e2e on the snapshot-layer fallback so it
+	// exercises the upperdir/lowerdir walk against a real overlayfs
+	// snapshot. Production calls pass task.Pid() and resolve via
+	// /proc/<pid>/root — covered by the in-VM workflow run, not by
+	// this hermetic e2e.
+	s.SetRunnerRootfs(snapshotKey, 0, bindMappings)
 
 	// Drive buildBindMounts with the exact bind set the upstream GHA
 	// runner emits for `container:` workflows (verbatim from the ephpm
@@ -296,7 +301,7 @@ func TestBindTranslation_RejectsForeignSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dind New: %v", err)
 	}
-	s.SetRunnerRootfs(snapshotKey, nil)
+	s.SetRunnerRootfs(snapshotKey, 0, nil)
 
 	_, err = s.buildBindMounts(ctx, []string{"/etc/shadow:/x"})
 	if err == nil {

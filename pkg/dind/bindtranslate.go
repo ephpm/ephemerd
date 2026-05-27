@@ -30,26 +30,28 @@ type bindResolution struct {
 // non-rootfs mounts ephemerd installed into the runner (/var/run/docker.sock,
 // /etc/hosts, /etc/resolv.conf, the embedded runner directory, etc.).
 //
-// upperdir / lowerdirs come from the runner snapshot's overlayfs mount
-// options. upperdir is the mutable layer where the runner's writes land;
-// lowerdirs are the shared, read-only image layers.
+// runnerTaskPID is the runner container's main process PID on the host. When
+// non-zero, rootfs sources resolve through /proc/<pid>/root, which is the
+// kernel's view of the runner's merged overlay. Without this, the previous
+// per-layer walk could pick the first lowerdir that has `/X` as a directory
+// entry while the actual contents live in deeper layers — that's how
+// `/__e/node20/bin/node` failed: layer 4 had `home/runner/externals/` as
+// an empty dir, layer 22 had `node20/bin/node`, the per-layer walk picked
+// layer 4 and bound an empty tree.
+//
+// upperdir / lowerdirs are the explicit layer paths for the test path —
+// real production calls always pass runnerTaskPID > 0.
 //
 // Resolution order:
-//  1. Longest-prefix match against runnerBinds — /var/run/docker.sock and
-//     anything under a known bind destination is translated via the bind
-//     table, never re-resolved against the rootfs.
-//  2. upperdir match → returned rw. This is the common GHA `container:`
-//     case: the runner writes /home/runner/_work/_temp/<uuid>.sh which
-//     lives in the runner's upperdir, and the sibling needs to read it
-//     (and the next step's wrapper script likewise needs to land back
-//     in the same _temp directory, so the mount has to stay rw).
-//  3. lowerdir match → returned ro. Image-layer files (e.g.
-//     /home/runner/externals) are shared across every container using the
-//     same base image, so a rw mount on top of one would corrupt the
-//     cache.
-//  4. No match → error. The pre-fix shim silently dropped these, which
-//     surfaced downstream as "cannot open /__w/_temp/<uuid>.sh".
-func translateBindSource(src string, runnerBinds map[string]string, upperdir string, lowerdirs []string) (bindResolution, error) {
+//  1. Longest-prefix match against runnerBinds.
+//  2. /proc/<runnerTaskPID>/root/<src> when PID > 0 — the merged overlay,
+//     i.e. the same filesystem view the runner sees. Returned rw; writes
+//     copy-up into the runner's upperdir, which is the runner's own
+//     writable layer (no cross-job leak, no image-cache corruption).
+//  3. Upperdir match (fallback for tests where PID == 0).
+//  4. Lowerdir match (fallback for tests; forced ro).
+//  5. No match → error. Loud failure replaces the pre-fix silent drop.
+func translateBindSource(src string, runnerBinds map[string]string, runnerTaskPID uint32, upperdir string, lowerdirs []string) (bindResolution, error) {
 	// Sources are POSIX paths from the runner's Linux mount namespace;
 	// use path (not filepath) so this evaluates consistently on Windows
 	// build hosts during testing. Host-side joins below use filepath
@@ -61,6 +63,14 @@ func translateBindSource(src string, runnerBinds map[string]string, upperdir str
 
 	if host, suffix, ok := matchBindPrefix(cleaned, runnerBinds); ok {
 		return bindResolution{HostPath: path.Join(host, suffix)}, nil
+	}
+
+	if runnerTaskPID > 0 {
+		procPath := fmt.Sprintf("/proc/%d/root%s", runnerTaskPID, cleaned)
+		if _, err := os.Stat(procPath); err == nil {
+			return bindResolution{HostPath: procPath}, nil
+		}
+		return bindResolution{}, fmt.Errorf("bind source %q is not visible in the runner's mount namespace (/proc/%d/root%s does not exist)", src, runnerTaskPID, cleaned)
 	}
 
 	if upperdir != "" {

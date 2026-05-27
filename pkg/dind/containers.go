@@ -1359,6 +1359,7 @@ func (s *Server) buildBindMounts(ctx context.Context, binds []string) ([]oci.Spe
 	}
 	s.mu.Lock()
 	runnerBinds := s.runnerBindMappings
+	runnerPID := s.runnerTaskPID
 	s.mu.Unlock()
 
 	out := make([]oci.SpecOpts, 0, len(binds))
@@ -1370,7 +1371,7 @@ func (s *Server) buildBindMounts(ctx context.Context, binds []string) ([]oci.Spe
 		src, dst := parts[0], parts[1]
 		requestedRO := len(parts) == 3 && parts[2] == "ro"
 
-		resolved, terr := translateBindSource(src, runnerBinds, upperdir, lowerdirs)
+		resolved, terr := translateBindSource(src, runnerBinds, runnerPID, upperdir, lowerdirs)
 		if terr != nil {
 			return nil, fmt.Errorf("bind mount %s -> %s rejected: %w", src, dst, terr)
 		}

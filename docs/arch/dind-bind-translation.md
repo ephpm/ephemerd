@@ -95,23 +95,38 @@ filesystem.
 1. **Longest-prefix match against A's bind table.** If `/X` is under a
    destination ephemerd installed into A (e.g. `/var/run/docker.sock`),
    use the corresponding host source. The leftover suffix is appended.
-   Longest-prefix wins so a child mount (`/etc/hosts`) is preferred over
-   a parent (`/etc`).
-2. **Upperdir match.** If `<upperdir>/X` exists, B's bind source is that
-   path. Returned `rw` — A's upperdir is writable, and the GHA `_temp`
-   case requires the sibling to read the next step's script written
-   *after* `docker create`, so the directory mount must stay live.
-3. **Lowerdir match.** If `/X` only exists in an image layer, B's bind
-   source is that lowerdir path but the mount is forced `ro`. The
-   lowerdir is shared with every other container using the same base
-   image; a rw mount on top of it would corrupt the cache for unrelated
-   jobs.
-4. **No match → error.** Surfaced as HTTP 400 from
-   `handleContainerCreate`. The pre-fix behavior was to silently drop;
-   the new behavior fails loudly so the user sees a clear "bind mount
-   /X -> /Y rejected" instead of a downstream "cannot open".
+   Longest-prefix wins so a child mount (`/etc/hosts`) is preferred
+   over a parent (`/etc`).
+2. **`/proc/<runner-task-PID>/root/X`.** When the runner's task PID is
+   registered, sources resolve through procfs's magic root link, which
+   the kernel walks in the runner's mount namespace. This is the
+   runner's *merged overlay view* — the same filesystem A sees from
+   inside. Returned `rw`; writes copy-up into A's upperdir, which is
+   A's own writable layer (no cross-job leak, no image-cache
+   corruption).
+3. **Upperdir match (fallback).** If no PID is registered (test path),
+   walk A's snapshot upperdir directly. Returned `rw`.
+4. **Lowerdir match (fallback).** Walk A's snapshot lowerdirs. Returned
+   `ro` — sibling writes through the bind would land on a shared image
+   layer.
+5. **No match → error.** Surfaced as HTTP 400 from
+   `handleContainerCreate`. Pre-fix behavior was to silently drop; the
+   new behavior fails loudly so the user sees "bind mount /X -> /Y
+   rejected" instead of a downstream "cannot open".
 
-`filepath.Clean`/`path.Clean` normalizes `..` before the join, so a
+**Why PID resolution beats per-layer walk.** The first cut of this fix
+walked the snapshot's upperdir then each lowerdir in order and returned
+the first match. That broke for paths whose contents span multiple
+image layers: in the GHA `actions/runner` image, layer 4 creates the
+empty directory entry `/home/runner/externals/`, layer 22 adds
+`node20/bin/node` deep inside it. The per-layer walk picked layer 4
+(first match — dir exists), bound an empty tree, and
+`actions/checkout` failed downstream with
+`exec: "/__e/node20/bin/node": no such file`. Resolving through
+`/proc/<pid>/root` delegates the merge to the kernel and always
+produces the same view A has.
+
+`path.Clean` normalizes `..` before the join, so a
 malicious `/home/runner/../../etc/shadow` resolves to `/etc/shadow` and
 either falls into A's rootfs (which means the sibling sees A's own
 `/etc/shadow` — exactly what A could already see) or fails to resolve at
