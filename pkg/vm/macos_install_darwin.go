@@ -825,6 +825,20 @@ if [ "$RUNNER_MOUNTED" = false ]; then
     echo "ERROR: failed to mount runner share after 60 attempts"
 fi
 
+# Mount OCI artifacts if the share exists (optional — only present when
+# the scheduler extracted per-repo artifacts for this job).
+ARTIFACTS_MOUNT="/Library/ephemerd/artifacts"
+mkdir -p "$ARTIFACTS_MOUNT"
+if mount_virtiofs artifacts "$ARTIFACTS_MOUNT" 2>/dev/null; then
+    echo "OCI artifacts mounted at $ARTIFACTS_MOUNT"
+    # Add artifacts bin dirs to PATH if they exist
+    for d in "$ARTIFACTS_MOUNT"/usr/local/bin "$ARTIFACTS_MOUNT"/usr/bin; do
+        [ -d "$d" ] && export PATH="$d:$PATH"
+    done
+else
+    echo "no artifacts share available (expected for jobs without OCI artifacts)"
+fi
+
 JIT_CONFIG="$SHARE/.jit_config"
 READY_FILE="$SHARE/.ready"
 SSH_PUBKEY="$SHARE/.ssh_pubkey"

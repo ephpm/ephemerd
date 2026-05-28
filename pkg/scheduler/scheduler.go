@@ -758,6 +758,11 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		return
 	}
 
+	// Expose extracted OCI artifacts inside the VM via virtio-fs
+	if artifactsDir != "" {
+		macVM.SetArtifactsDir(artifactsDir)
+	}
+
 	// Write JIT config to the shared directory before booting
 	if err := macVM.WriteJITConfig(claim.RunnerConfig); err != nil {
 		log.Error("failed to write JIT config", "error", err)

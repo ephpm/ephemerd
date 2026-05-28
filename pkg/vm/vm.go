@@ -138,6 +138,10 @@ type MacOSVM interface {
 	// Wait blocks until the VM exits. Returns the exit code.
 	Wait(ctx context.Context) (int, error)
 
+	// SetArtifactsDir sets the host directory containing extracted OCI artifacts.
+	// If non-empty, Start() will expose it as a "artifacts" virtio-fs share.
+	SetArtifactsDir(dir string)
+
 	// Stop forcefully stops the VM and deletes the clone.
 	Stop()
 }

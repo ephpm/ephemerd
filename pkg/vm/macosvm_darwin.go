@@ -28,9 +28,10 @@ type darwinMacOSVM struct {
 	clonePath string
 	auxPath   string // per-job copy of aux storage (Vz locks it exclusively)
 	jobDir    string // shared directory for JIT config exchange
-	macAddr   string // VM's MAC address for ARP-based IP discovery
-	cancel    context.CancelFunc
-	done      chan struct{}
+	macAddr      string // VM's MAC address for ARP-based IP discovery
+	artifactsDir string // host directory with extracted OCI artifacts (optional)
+	cancel       context.CancelFunc
+	done         chan struct{}
 }
 
 // NewMacOSVM creates a new per-job macOS VM. Call Start() to boot it.
@@ -75,6 +76,10 @@ func (m *darwinMacOSVM) WriteJITConfig(encodedJIT string) error {
 	}
 
 	return nil
+}
+
+func (m *darwinMacOSVM) SetArtifactsDir(dir string) {
+	m.artifactsDir = dir
 }
 
 func (m *darwinMacOSVM) Start(ctx context.Context) error {
@@ -233,6 +238,28 @@ func (m *darwinMacOSVM) Start(ctx context.Context) error {
 	}
 	jobFS.SetDirectoryShare(jobSingle)
 	fsConfigs = append(fsConfigs, jobFS)
+
+	// 3. "artifacts" → extracted OCI artifacts (pre-installed build deps)
+	if m.artifactsDir != "" {
+		artifactsShare, err := vz.NewSharedDirectory(m.artifactsDir, true) // read-only
+		if err != nil {
+			cancel()
+			return fmt.Errorf("creating artifacts share: %w", err)
+		}
+		artifactsSingle, err := vz.NewSingleDirectoryShare(artifactsShare)
+		if err != nil {
+			cancel()
+			return fmt.Errorf("creating artifacts directory share: %w", err)
+		}
+		artifactsFS, err := vz.NewVirtioFileSystemDeviceConfiguration("artifacts")
+		if err != nil {
+			cancel()
+			return fmt.Errorf("creating artifacts filesystem device: %w", err)
+		}
+		artifactsFS.SetDirectoryShare(artifactsSingle)
+		fsConfigs = append(fsConfigs, artifactsFS)
+		m.cfg.Log.Info("artifacts virtio-fs share configured", "id", m.id, "dir", m.artifactsDir)
+	}
 
 	vmConfig.SetDirectorySharingDevicesVirtualMachineConfiguration(fsConfigs)
 
