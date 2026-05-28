@@ -395,22 +395,21 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 			opts = append(opts, oci.WithNamespacedCgroup())
 		}
 
-		// Bind mounts. Skip sources that don't exist rather than failing.
-		for _, bind := range req.HostConfig.Binds {
-			bindParts := strings.SplitN(bind, ":", 3)
-			if len(bindParts) >= 2 {
-				src := bindParts[0]
-				if _, err := os.Stat(src); os.IsNotExist(err) {
-					s.log.Debug("skipping bind mount, source does not exist", "source", src, "dest", bindParts[1])
-					continue
-				}
-				mountOpts := []string{"rbind", "rw"}
-				if len(bindParts) == 3 && bindParts[2] == "ro" {
-					mountOpts = []string{"rbind", "ro"}
-				}
-				opts = append(opts, withBindMount(src, bindParts[1], mountOpts))
-			}
+		// Bind mounts. Sources arrive from inside the runner container's
+		// mount namespace — e.g. /home/runner/_work/_temp where the GHA
+		// runner writes its step wrapper scripts. Those paths don't exist
+		// on the dind daemon's filesystem; we have to translate them to
+		// the runner snapshot's overlayfs upperdir (or to the host source
+		// of a non-rootfs bind ephemerd installed into the runner, like
+		// /var/run/docker.sock). The pre-fix shim silently dropped any
+		// bind whose source didn't os.Stat — leaving GHA `container:` jobs
+		// failing downstream with "sh: cannot open /__w/_temp/<uuid>.sh".
+		bindOpts, berr := s.buildBindMounts(r.Context(), req.HostConfig.Binds)
+		if berr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"message": berr.Error()})
+			return
 		}
+		opts = append(opts, bindOpts...)
 
 		// tmpfs mounts (--tmpfs /tmp, --tmpfs /run).
 		for dest, options := range req.HostConfig.Tmpfs {
@@ -1345,6 +1344,43 @@ func generateContainerID() string {
 		return fmt.Sprintf("dind-%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+// buildBindMounts translates every Docker -v entry from the runner's
+// mount namespace into OCI bind mount spec options. Returns a user-facing
+// error (and no opts) on the first untranslatable source so the caller can
+// surface HTTP 400 — the pre-fix shim silently dropped these, which left
+// GHA `container:` jobs to fail downstream with confusing "cannot open"
+// errors. See translateBindSource for the resolution policy.
+func (s *Server) buildBindMounts(ctx context.Context, binds []string) ([]oci.SpecOpts, error) {
+	upperdir, lowerdirs, layerErr := s.runnerRootfsLayers(ctx)
+	if layerErr != nil {
+		s.log.Warn("could not load runner rootfs layers for bind translation", "error", layerErr)
+	}
+	s.mu.Lock()
+	runnerBinds := s.runnerBindMappings
+	s.mu.Unlock()
+
+	out := make([]oci.SpecOpts, 0, len(binds))
+	for _, bind := range binds {
+		parts := strings.SplitN(bind, ":", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		src, dst := parts[0], parts[1]
+		requestedRO := len(parts) == 3 && parts[2] == "ro"
+
+		resolved, terr := translateBindSource(src, runnerBinds, upperdir, lowerdirs)
+		if terr != nil {
+			return nil, fmt.Errorf("bind mount %s -> %s rejected: %w", src, dst, terr)
+		}
+		mountOpts := []string{"rbind", "rw"}
+		if requestedRO || resolved.ForceReadOnly {
+			mountOpts = []string{"rbind", "ro"}
+		}
+		out = append(out, withBindMount(resolved.HostPath, dst, mountOpts))
+	}
+	return out, nil
 }
 
 func withBindMount(src, dst string, options []string) oci.SpecOpts {

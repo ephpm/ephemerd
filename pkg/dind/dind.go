@@ -54,7 +54,24 @@ type Server struct {
 	buildkit        *buildkit.Server // shared embedded BuildKit solver (nil → fall back to platform default)
 	runnerNetNS     string           // path to runner container's net namespace; used to install DNAT rules for port bindings
 	allowPrivileged bool             // gate for docker run --privileged / --cap-add; see config.DindConfig.AllowPrivileged
-	log             *slog.Logger
+
+	// runnerSnapshotKey identifies the containerd snapshot backing the
+	// runner container that owns this dind socket. Used to resolve sibling
+	// -v bind sources from the runner's mount namespace (e.g.
+	// /home/runner/_work/_temp) to the real overlayfs upperdir/lowerdir
+	// paths on the dind daemon's filesystem. The snapshot lives in the
+	// runtime's "ephemerd" namespace, not in s.jobNamespace. Empty until
+	// SetRunnerRootfs is called.
+	runnerSnapshotKey string
+	// runnerBindMappings is a copy of the non-rootfs bind table ephemerd
+	// installed into the runner: /var/run/docker.sock → the per-job dind
+	// socket file, /etc/hosts and /etc/resolv.conf → per-runner files,
+	// the runner-mount directory → its job-specific copy on host. Keyed
+	// by container destination, value is host source. Consulted before
+	// the rootfs walk in translateBindSource.
+	runnerBindMappings map[string]string
+
+	log *slog.Logger
 
 	mu         sync.Mutex
 	images     map[string]*imageEntry     // in-memory image store scoped to this job
@@ -178,6 +195,37 @@ func (s *Server) SetRunnerNetNS(netnsPath string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.runnerNetNS = netnsPath
+}
+
+// SetRunnerRootfs registers the runner container's snapshot and the
+// non-rootfs bind table ephemerd installed into it, so that subsequent
+// docker create requests from inside the runner can have their -v sources
+// translated from the runner's mount namespace to real host paths.
+//
+// snapshotKey is the containerd snapshot name (typically
+// "<runnerID>-snapshot" in the runtime's "ephemerd" namespace).
+//
+// bindMappings keys are container destination paths (what the runner sees,
+// e.g. "/var/run/docker.sock"); values are host source paths (what the dind
+// daemon hands to containerd, e.g. "<DataDir>/jobs/<id>/docker/d.sock").
+// The map is copied so the caller may continue to mutate it.
+//
+// Must be called after the runner container is created (so the snapshot
+// exists) and before any docker create from inside the runner. The runtime
+// pairs this call with SetRunnerNetNS at the same point in startup.
+func (s *Server) SetRunnerRootfs(snapshotKey string, bindMappings map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runnerSnapshotKey = snapshotKey
+	if len(bindMappings) == 0 {
+		s.runnerBindMappings = nil
+		return
+	}
+	cp := make(map[string]string, len(bindMappings))
+	for k, v := range bindMappings {
+		cp[k] = v
+	}
+	s.runnerBindMappings = cp
 }
 
 // Endpoint returns the value a container should set DOCKER_HOST to in order
