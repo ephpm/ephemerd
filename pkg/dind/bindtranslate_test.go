@@ -7,6 +7,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +16,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/oci"
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
+
 
 // applyOpts invokes a list of oci.SpecOpts against an empty spec so tests
 // can assert what they produced. withBindMount and friends don't touch the
@@ -47,7 +50,7 @@ func TestTranslateBindSource_UpperdirMatch_ReturnsReadWrite(t *testing.T) {
 		t.Fatalf("planting upperdir: %v", err)
 	}
 
-	got, err := translateBindSource("/home/runner/_work/_temp", nil, upper, nil)
+	got, err := translateBindSource("/home/runner/_work/_temp", nil, 0, upper, nil)
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
@@ -71,7 +74,7 @@ func TestTranslateBindSource_LowerdirMatch_ForcesReadOnly(t *testing.T) {
 		t.Fatalf("planting lowerdir: %v", err)
 	}
 
-	got, err := translateBindSource("/home/runner/externals", nil, t.TempDir(), []string{lower})
+	got, err := translateBindSource("/home/runner/externals", nil, 0, t.TempDir(), []string{lower})
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
@@ -93,7 +96,7 @@ func TestTranslateBindSource_RunnerBind_Translates(t *testing.T) {
 	binds := map[string]string{
 		"/var/run/docker.sock": "/run/ephemerd/jobs/abc/docker/d.sock",
 	}
-	got, err := translateBindSource("/var/run/docker.sock", binds, "", nil)
+	got, err := translateBindSource("/var/run/docker.sock", binds, 0, "", nil)
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
@@ -111,7 +114,7 @@ func TestTranslateBindSource_RunnerBind_Translates(t *testing.T) {
 // source.
 func TestTranslateBindSource_RunnerBindSubpath_Translates(t *testing.T) {
 	binds := map[string]string{"/workspace": "/srv/ephemerd/scratch"}
-	got, err := translateBindSource("/workspace/foo/bar", binds, "", nil)
+	got, err := translateBindSource("/workspace/foo/bar", binds, 0, "", nil)
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
@@ -129,7 +132,7 @@ func TestTranslateBindSource_LongestPrefixWins(t *testing.T) {
 		"/etc":       "/host/etc",
 		"/etc/hosts": "/host/etc/hosts.runtime",
 	}
-	got, err := translateBindSource("/etc/hosts", binds, "", nil)
+	got, err := translateBindSource("/etc/hosts", binds, 0, "", nil)
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
@@ -144,7 +147,7 @@ func TestTranslateBindSource_LongestPrefixWins(t *testing.T) {
 // dropping the mount and leaving the workflow to fail with a confusing
 // "cannot open" downstream.
 func TestTranslateBindSource_NotInRootfs_Rejects(t *testing.T) {
-	_, err := translateBindSource("/etc/shadow", nil, t.TempDir(), []string{t.TempDir()})
+	_, err := translateBindSource("/etc/shadow", nil, 0, t.TempDir(), []string{t.TempDir()})
 	if err == nil {
 		t.Fatal("expected error rejecting unknown bind source, got nil")
 	}
@@ -155,7 +158,7 @@ func TestTranslateBindSource_NotInRootfs_Rejects(t *testing.T) {
 // absolute path by the Docker CLI, so a relative path here is a bug
 // somewhere upstream.
 func TestTranslateBindSource_RelativePath_Rejects(t *testing.T) {
-	_, err := translateBindSource("relative/path", nil, t.TempDir(), nil)
+	_, err := translateBindSource("relative/path", nil, 0, t.TempDir(), nil)
 	if err == nil {
 		t.Fatal("expected error on non-absolute source, got nil")
 	}
@@ -177,7 +180,7 @@ func TestTranslateBindSource_DotDotTraversal_StaysInsideUpperdir(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(upper, "home", "etc", "shadow"), []byte("fake"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got, err := translateBindSource("/home/runner/../etc/shadow", nil, upper, nil)
+	got, err := translateBindSource("/home/runner/../etc/shadow", nil, 0, upper, nil)
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
@@ -189,7 +192,7 @@ func TestTranslateBindSource_DotDotTraversal_StaysInsideUpperdir(t *testing.T) {
 	// A path that climbs above /: path.Clean(/../../etc/shadow) = /etc/shadow.
 	// Resolution is bounded — even a malicious `..` chain can't escape /.
 	// Since we never planted /etc/shadow in upperdir, this should reject.
-	if _, err := translateBindSource("/../../../etc/shadow", nil, upper, nil); err == nil {
+	if _, err := translateBindSource("/../../../etc/shadow", nil, 0, upper, nil); err == nil {
 		t.Error("expected rejection of climb-above-root traversal, got success")
 	}
 }
@@ -216,7 +219,7 @@ func TestTranslateBindSource_PreferUpperOverLower(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := translateBindSource("/"+filepath.ToSlash(rel), nil, upper, []string{lower})
+	got, err := translateBindSource("/"+filepath.ToSlash(rel), nil, 0, upper, []string{lower})
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
@@ -226,6 +229,67 @@ func TestTranslateBindSource_PreferUpperOverLower(t *testing.T) {
 	}
 	if got.ForceReadOnly {
 		t.Error("ForceReadOnly = true, want false — upperdir copy is writable")
+	}
+}
+
+// TestTranslateBindSource_TaskPIDResolvesViaProcRoot is the regression
+// test for the /__e/node20 failure mode. When runnerTaskPID > 0, sources
+// resolve through /proc/<pid>/root — the kernel's merged overlay view of
+// the runner's filesystem. This bypasses the per-layer walk that picked
+// the first lowerdir holding a path entry, even when the actual contents
+// lived in deeper layers.
+//
+// We test using the current process's PID. /proc/self/root is whatever
+// the test binary sees as its root (/), so a file we put in t.TempDir()
+// is reachable via the proc path. Linux-only — /proc semantics aren't
+// available elsewhere.
+func TestTranslateBindSource_TaskPIDResolvesViaProcRoot(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("/proc/<pid>/root resolution is Linux-only; goos=%s", runtime.GOOS)
+	}
+	scratch := t.TempDir()
+	const marker = "marker.sh"
+	markerPath := filepath.Join(scratch, marker)
+	if err := os.WriteFile(markerPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	pid := uint32(os.Getpid())
+	got, err := translateBindSource(filepath.ToSlash(markerPath), nil, pid, "", nil)
+	if err != nil {
+		t.Fatalf("translate via /proc/self/root: %v", err)
+	}
+	wantPrefix := "/proc/" + strconv.Itoa(int(pid)) + "/root"
+	if !strings.HasPrefix(got.HostPath, wantPrefix) {
+		t.Errorf("HostPath = %q, want it to begin with %q (resolution must go through /proc/<pid>/root)", got.HostPath, wantPrefix)
+	}
+	// Round-trip: reading through the proc-prefixed path must return the
+	// same bytes we planted in the underlying tempdir.
+	body, err := os.ReadFile(got.HostPath)
+	if err != nil {
+		t.Fatalf("read via translated path: %v", err)
+	}
+	if string(body) != "#!/bin/sh\n" {
+		t.Errorf("round-trip body = %q, want planted contents", string(body))
+	}
+}
+
+// TestTranslateBindSource_TaskPIDRejectsMissingSource is the loud-failure
+// guard for the proc-path. When PID > 0 and the source doesn't exist in
+// the runner's namespace, translation must error out — not fall through
+// to the layer-walk, which would mask the real "runner can't see this
+// either" situation.
+func TestTranslateBindSource_TaskPIDRejectsMissingSource(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("/proc/<pid>/root resolution is Linux-only; goos=%s", runtime.GOOS)
+	}
+	pid := uint32(os.Getpid())
+	_, err := translateBindSource("/this/path/does/not/exist/anywhere", nil, pid, "", nil)
+	if err == nil {
+		t.Fatal("expected rejection of missing source under PID path, got nil")
+	}
+	if !strings.Contains(err.Error(), "/proc/") {
+		t.Errorf("error should mention the proc path it tried: %v", err)
 	}
 }
 
