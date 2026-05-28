@@ -1260,8 +1260,8 @@ func isOfficialRunnerImage(image string) bool {
 		// as foreign images and bind-mounts /actions-runner over the rootfs,
 		// then runs /actions-runner/run.sh — which the image doesn't have,
 		// so the entrypoint exits 127 ("command not found").
-		"ephpm/ephemerd:runner-ci-linux-",
-		"docker.io/ephpm/ephemerd:runner-ci-linux-",
+		"ephpm/ephemerd:runner-ci-linux",
+		"docker.io/ephpm/ephemerd:runner-ci-linux",
 	} {
 		if strings.HasPrefix(image, prefix) {
 			return true
