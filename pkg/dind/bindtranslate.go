@@ -30,28 +30,34 @@ type bindResolution struct {
 // non-rootfs mounts ephemerd installed into the runner (/var/run/docker.sock,
 // /etc/hosts, /etc/resolv.conf, the embedded runner directory, etc.).
 //
-// runnerTaskPID is the runner container's main process PID on the host. When
-// non-zero, rootfs sources resolve through /proc/<pid>/root, which is the
-// kernel's view of the runner's merged overlay. Without this, the previous
-// per-layer walk could pick the first lowerdir that has `/X` as a directory
-// entry while the actual contents live in deeper layers — that's how
-// `/__e/node20/bin/node` failed: layer 4 had `home/runner/externals/` as
-// an empty dir, layer 22 had `node20/bin/node`, the per-layer walk picked
-// layer 4 and bound an empty tree.
+// runnerRootfsPath is the host-namespace path where the runner container's
+// merged overlay is mounted by runc (typically
+// "/run/containerd/io.containerd.runtime.v2.task/<ns>/<id>/rootfs"). When
+// non-empty, rootfs sources resolve via "<runnerRootfsPath>/<src>" — a
+// regular path in the host's mount namespace that points at the same
+// merged view the runner sees from inside.
+//
+// The previous draft of this fix tried "/proc/<pid>/root/<src>" as the
+// bind source. That path readlinks correctly, but the kernel refuses it
+// at mount(2) because resolving it crosses into the runner's mount
+// namespace — bind sources have to be paths in the *calling* process's
+// mount namespace. The bundle's rootfs mount is in the host namespace
+// so the kernel walks it normally.
 //
 // upperdir / lowerdirs are the explicit layer paths for the test path —
-// real production calls always pass runnerTaskPID > 0.
+// real production calls always pass runnerRootfsPath != "".
 //
 // Resolution order:
 //  1. Longest-prefix match against runnerBinds.
-//  2. /proc/<runnerTaskPID>/root/<src> when PID > 0 — the merged overlay,
-//     i.e. the same filesystem view the runner sees. Returned rw; writes
-//     copy-up into the runner's upperdir, which is the runner's own
-//     writable layer (no cross-job leak, no image-cache corruption).
-//  3. Upperdir match (fallback for tests where PID == 0).
+//  2. <runnerRootfsPath>/<src> when the rootfs path is registered. The
+//     directory at that path is the merged overlay, so files split
+//     across image layers (e.g. /home/runner/externals/node20/bin/node)
+//     are reachable. Returned rw; writes copy-up into the runner's
+//     own upperdir, which is the runner's own writable layer.
+//  3. Upperdir match (fallback for tests with no rootfs path).
 //  4. Lowerdir match (fallback for tests; forced ro).
 //  5. No match → error. Loud failure replaces the pre-fix silent drop.
-func translateBindSource(src string, runnerBinds map[string]string, runnerTaskPID uint32, upperdir string, lowerdirs []string) (bindResolution, error) {
+func translateBindSource(src string, runnerBinds map[string]string, runnerRootfsPath string, upperdir string, lowerdirs []string) (bindResolution, error) {
 	// Sources are POSIX paths from the runner's Linux mount namespace;
 	// use path (not filepath) so this evaluates consistently on Windows
 	// build hosts during testing. Host-side joins below use filepath
@@ -65,12 +71,12 @@ func translateBindSource(src string, runnerBinds map[string]string, runnerTaskPI
 		return bindResolution{HostPath: path.Join(host, suffix)}, nil
 	}
 
-	if runnerTaskPID > 0 {
-		procPath := fmt.Sprintf("/proc/%d/root%s", runnerTaskPID, cleaned)
-		if _, err := os.Stat(procPath); err == nil {
-			return bindResolution{HostPath: procPath}, nil
+	if runnerRootfsPath != "" {
+		candidate := path.Join(runnerRootfsPath, cleaned)
+		if _, err := os.Stat(candidate); err == nil {
+			return bindResolution{HostPath: candidate}, nil
 		}
-		return bindResolution{}, fmt.Errorf("bind source %q is not visible in the runner's mount namespace (/proc/%d/root%s does not exist)", src, runnerTaskPID, cleaned)
+		return bindResolution{}, fmt.Errorf("bind source %q is not visible in the runner's rootfs (%s does not exist)", src, candidate)
 	}
 
 	if upperdir != "" {
