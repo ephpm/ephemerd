@@ -71,14 +71,18 @@ type Server struct {
 	// the rootfs walk in translateBindSource.
 	runnerBindMappings map[string]string
 
-	// runnerTaskPID is the host-PID of the runner container's init
-	// process. translateBindSource uses it to address the runner's
-	// merged overlay view through /proc/<pid>/root, which is the only
-	// way to expose files whose contents span multiple image layers
-	// (e.g. /home/runner/externals/node20/bin/node, where the dir entry
-	// and the file live in different lowerdirs). Zero until
-	// SetRunnerRootfs is called.
-	runnerTaskPID uint32
+	// runnerRootfsPath is the host-namespace path where the runner
+	// container's merged overlay is mounted by runc (typically
+	// "/run/containerd/io.containerd.runtime.v2.task/<ns>/<id>/rootfs").
+	// translateBindSource uses it to address files in the runner's
+	// merged view — the only way to expose files whose contents span
+	// multiple image layers (e.g. /home/runner/externals/node20/bin/node,
+	// where the dir entry and the file live in different lowerdirs).
+	// An earlier draft of this fix used "/proc/<pid>/root/X" instead,
+	// but the kernel returns EINVAL at mount(2) because that path
+	// resolves into a different mount namespace.
+	// Empty until SetRunnerRootfs is called.
+	runnerRootfsPath string
 
 	log *slog.Logger
 
@@ -206,34 +210,38 @@ func (s *Server) SetRunnerNetNS(netnsPath string) {
 	s.runnerNetNS = netnsPath
 }
 
-// SetRunnerRootfs registers the runner container's snapshot, task PID, and
-// the non-rootfs bind table ephemerd installed into it, so that subsequent
-// docker create requests from inside the runner can have their -v sources
-// translated from the runner's mount namespace to real host paths.
+// SetRunnerRootfs registers the runner container's snapshot, rootfs mount
+// path, and the non-rootfs bind table ephemerd installed into it, so that
+// subsequent docker create requests from inside the runner can have their
+// -v sources translated from the runner's mount namespace to real host
+// paths.
 //
 // snapshotKey is the containerd snapshot name (typically
 // "<runnerID>-snapshot" in the runtime's "ephemerd" namespace). Kept for
 // the (now-fallback) layer walk used by the unit tests; production
-// resolution goes through taskPID.
+// resolution goes through runnerRootfsPath.
 //
-// taskPID is the host-side PID of the runner's init process. Required for
-// the /proc/<pid>/root resolution path that gives the runner's merged
-// overlay view — without it, sibling binds for paths split across image
-// layers (e.g. /home/runner/externals) bind incomplete trees.
+// runnerRootfsPath is the host-namespace path where runc has mounted the
+// runner's merged overlay. Caller typically obtains this by calling
+// os.Readlink("/proc/<runner-pid>/root") after the runner task starts —
+// runc sets up the overlay before exec, and the symlink reads back to
+// the bundle's rootfs in the host's namespace. Required for the merged
+// view: without it, sibling binds for paths split across image layers
+// (e.g. /home/runner/externals) bind incomplete trees.
 //
 // bindMappings keys are container destination paths (what the runner sees,
 // e.g. "/var/run/docker.sock"); values are host source paths (what the dind
 // daemon hands to containerd). The map is copied so the caller may continue
 // to mutate it.
 //
-// Must be called after the runner task starts (PID is known) and before any
-// docker create from inside the runner. Pairs with SetRunnerNetNS in the
-// runtime, called at the same point in startup.
-func (s *Server) SetRunnerRootfs(snapshotKey string, taskPID uint32, bindMappings map[string]string) {
+// Must be called after the runner task starts (rootfs is mounted) and
+// before any docker create from inside the runner. Pairs with
+// SetRunnerNetNS in the runtime, called at the same point in startup.
+func (s *Server) SetRunnerRootfs(snapshotKey string, runnerRootfsPath string, bindMappings map[string]string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.runnerSnapshotKey = snapshotKey
-	s.runnerTaskPID = taskPID
+	s.runnerRootfsPath = runnerRootfsPath
 	if len(bindMappings) == 0 {
 		s.runnerBindMappings = nil
 		return

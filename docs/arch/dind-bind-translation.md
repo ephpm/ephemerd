@@ -97,34 +97,46 @@ filesystem.
    use the corresponding host source. The leftover suffix is appended.
    Longest-prefix wins so a child mount (`/etc/hosts`) is preferred
    over a parent (`/etc`).
-2. **`/proc/<runner-task-PID>/root/X`.** When the runner's task PID is
-   registered, sources resolve through procfs's magic root link, which
-   the kernel walks in the runner's mount namespace. This is the
-   runner's *merged overlay view* — the same filesystem A sees from
-   inside. Returned `rw`; writes copy-up into A's upperdir, which is
-   A's own writable layer (no cross-job leak, no image-cache
-   corruption).
-3. **Upperdir match (fallback).** If no PID is registered (test path),
-   walk A's snapshot upperdir directly. Returned `rw`.
-4. **Lowerdir match (fallback).** Walk A's snapshot lowerdirs. Returned
-   `ro` — sibling writes through the bind would land on a shared image
-   layer.
+2. **`<runner-rootfs-path>/X`.** When the runner's rootfs mount path is
+   registered, sources resolve to a regular directory in the host's
+   mount namespace — the same place runc mounted the runner's merged
+   overlay (typically
+   `/run/containerd/io.containerd.runtime.v2.task/<ns>/<id>/rootfs`).
+   The runtime obtains the path via `os.Readlink("/proc/<pid>/root")`
+   after the runner's task starts; that readlink returns the bundle
+   rootfs as a host path. Binds from it see every layer's content
+   because they go through the kernel's active overlay mount. Returned
+   `rw`; writes copy-up into A's upperdir, which is A's own writable
+   layer (no cross-job leak, no image-cache corruption).
+3. **Upperdir match (fallback).** If no rootfs path is registered
+   (test path), walk A's snapshot upperdir directly. Returned `rw`.
+4. **Lowerdir match (fallback).** Walk A's snapshot lowerdirs.
+   Returned `ro` — sibling writes through the bind would land on a
+   shared image layer.
 5. **No match → error.** Surfaced as HTTP 400 from
    `handleContainerCreate`. Pre-fix behavior was to silently drop; the
    new behavior fails loudly so the user sees "bind mount /X -> /Y
    rejected" instead of a downstream "cannot open".
 
-**Why PID resolution beats per-layer walk.** The first cut of this fix
-walked the snapshot's upperdir then each lowerdir in order and returned
-the first match. That broke for paths whose contents span multiple
-image layers: in the GHA `actions/runner` image, layer 4 creates the
-empty directory entry `/home/runner/externals/`, layer 22 adds
-`node20/bin/node` deep inside it. The per-layer walk picked layer 4
-(first match — dir exists), bound an empty tree, and
-`actions/checkout` failed downstream with
-`exec: "/__e/node20/bin/node": no such file`. Resolving through
-`/proc/<pid>/root` delegates the merge to the kernel and always
-produces the same view A has.
+**Why the bundle rootfs path beats the alternatives.** Two earlier cuts
+of this fix didn't survive contact with production:
+
+- *Per-layer walk* (returned the first lowerdir holding the requested
+  path) broke for paths whose contents span multiple image layers. In
+  the GHA `actions/runner` image, layer 4 creates the empty directory
+  entry `/home/runner/externals/`, layer 22 adds `node20/bin/node` deep
+  inside it. The walk picked layer 4, bound an empty tree, and
+  `actions/checkout` failed downstream with `exec:
+  "/__e/node20/bin/node": no such file`.
+- *Procfs root link* (using `/proc/<pid>/root/X` directly as the bind
+  source) readlinks correctly but the kernel refuses to use it for
+  `mount(2)`: bind sources must resolve within the *calling* process's
+  mount namespace, and `/proc/<pid>/root` walks into another. The
+  kernel returns EINVAL.
+
+The bundle rootfs path threads the needle: it's a normal host path the
+kernel accepts as a bind source, AND it points at the kernel's active
+overlay mount so every layer's content is visible.
 
 `path.Clean` normalizes `..` before the join, so a
 malicious `/home/runner/../../etc/shadow` resolves to `/etc/shadow` and

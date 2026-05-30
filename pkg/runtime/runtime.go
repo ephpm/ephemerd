@@ -848,13 +848,25 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		// here when a sibling container is created with PortBindings.
 		if dindServer != nil {
 			dindServer.SetRunnerNetNS(netns)
-			// Register the runner snapshot + task PID + non-rootfs bind
+			// Register the runner's rootfs mount path + non-rootfs bind
 			// table so dind can translate sibling `-v` sources from the
-			// runner's mount namespace to real host paths. The task PID
-			// drives /proc/<pid>/root resolution — without it, paths
-			// whose contents span multiple image layers (e.g.
-			// /home/runner/externals/node20/bin/node) bind incomplete
-			// trees and downstream exec fails with "no such file".
+			// runner's mount namespace to real host paths.
+			//
+			// Resolving /proc/<pid>/root via readlink returns the bundle
+			// rootfs as a string in the host's mount namespace (typically
+			// /run/containerd/io.containerd.runtime.v2.task/<ns>/<id>/rootfs).
+			// Binds from that path read through the merged overlay so
+			// files split across image layers — e.g.
+			// /home/runner/externals/node20/bin/node — are reachable.
+			// Using /proc/<pid>/root *as the bind source* directly fails
+			// with EINVAL because the kernel won't follow a path that
+			// resolves into another mount namespace.
+			runnerRootfsPath, rlErr := os.Readlink(fmt.Sprintf("/proc/%d/root", pid))
+			if rlErr != nil {
+				r.cfg.Log.Warn("could not resolve runner rootfs path; sibling binds will fall back to snapshot layer walk",
+					"pid", pid, "error", rlErr)
+				runnerRootfsPath = ""
+			}
 			bindMappings := map[string]string{}
 			if dindServer.SocketPath() != "" {
 				bindMappings["/var/run/docker.sock"] = dindServer.SocketPath()
@@ -865,7 +877,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			if jobRunnerDir != "" && r.cfg.RunnerMount != "" {
 				bindMappings[r.cfg.RunnerMount] = jobRunnerDir
 			}
-			dindServer.SetRunnerRootfs(snapshotName, pid, bindMappings)
+			dindServer.SetRunnerRootfs(snapshotName, runnerRootfsPath, bindMappings)
 		}
 		if _, err := r.cfg.Network.Setup(ctx, id, netns); err != nil {
 			stopDind()
