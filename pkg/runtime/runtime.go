@@ -848,36 +848,6 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		// here when a sibling container is created with PortBindings.
 		if dindServer != nil {
 			dindServer.SetRunnerNetNS(netns)
-			// Register the runner's rootfs mount path + non-rootfs bind
-			// table so dind can translate sibling `-v` sources from the
-			// runner's mount namespace to real host paths.
-			//
-			// Resolving /proc/<pid>/root via readlink returns the bundle
-			// rootfs as a string in the host's mount namespace (typically
-			// /run/containerd/io.containerd.runtime.v2.task/<ns>/<id>/rootfs).
-			// Binds from that path read through the merged overlay so
-			// files split across image layers — e.g.
-			// /home/runner/externals/node20/bin/node — are reachable.
-			// Using /proc/<pid>/root *as the bind source* directly fails
-			// with EINVAL because the kernel won't follow a path that
-			// resolves into another mount namespace.
-			runnerRootfsPath, rlErr := os.Readlink(fmt.Sprintf("/proc/%d/root", pid))
-			if rlErr != nil {
-				r.cfg.Log.Warn("could not resolve runner rootfs path; sibling binds will fall back to snapshot layer walk",
-					"pid", pid, "error", rlErr)
-				runnerRootfsPath = ""
-			}
-			bindMappings := map[string]string{}
-			if dindServer.SocketPath() != "" {
-				bindMappings["/var/run/docker.sock"] = dindServer.SocketPath()
-			}
-			hostDataDir := filepath.Dir(r.cfg.LogDir)
-			bindMappings["/etc/hosts"] = filepath.Join(hostDataDir, "hosts", id+".hosts")
-			bindMappings["/etc/resolv.conf"] = filepath.Join(hostDataDir, "dns", id+".conf")
-			if jobRunnerDir != "" && r.cfg.RunnerMount != "" {
-				bindMappings[r.cfg.RunnerMount] = jobRunnerDir
-			}
-			dindServer.SetRunnerRootfs(snapshotName, runnerRootfsPath, bindMappings)
 		}
 		if _, err := r.cfg.Network.Setup(ctx, id, netns); err != nil {
 			stopDind()
@@ -909,6 +879,42 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			r.cfg.Log.Debug("container cleanup after failed start", "error", delErr)
 		}
 		return nil, fmt.Errorf("starting task for %s: %w", id, err)
+	}
+
+	// Register the runner's rootfs mount path + non-rootfs bind table
+	// with the dind server so it can translate sibling `-v` sources
+	// from the runner's mount namespace to real host paths.
+	//
+	// The bundle rootfs is the merged overlay path runc mounts at
+	// `<state-dir>/io.containerd.runtime.v2.task/<ns>/<task-id>/rootfs`
+	// — a regular host directory that contains the runner's full
+	// filesystem view (image lowerdirs + writable upperdir). Binds
+	// from it succeed at mount(2) and expose every layer's content.
+	//
+	// We construct it deterministically from r.cfg.DataDir rather than
+	// readlinking /proc/<pid>/root, which returns "/" on this kernel
+	// for reasons we haven't fully traced (no separate mount namespace
+	// visible from outside, or chroot-not-pivot_root, or shim-relative
+	// addressing) — see the earlier rounds of this fix in PR history.
+	if dindServer != nil && goruntime.GOOS != "windows" {
+		runnerRootfsPath := filepath.Join(r.cfg.DataDir, "containerd", "state",
+			"io.containerd.runtime.v2.task", namespace, id, "rootfs")
+		if _, statErr := os.Stat(runnerRootfsPath); statErr != nil {
+			r.cfg.Log.Warn("computed runner rootfs path does not exist; sibling binds will fall back to snapshot layer walk",
+				"path", runnerRootfsPath, "error", statErr)
+			runnerRootfsPath = ""
+		}
+		bindMappings := map[string]string{}
+		if dindServer.SocketPath() != "" {
+			bindMappings["/var/run/docker.sock"] = dindServer.SocketPath()
+		}
+		hostDataDir := filepath.Dir(r.cfg.LogDir)
+		bindMappings["/etc/hosts"] = filepath.Join(hostDataDir, "hosts", id+".hosts")
+		bindMappings["/etc/resolv.conf"] = filepath.Join(hostDataDir, "dns", id+".conf")
+		if jobRunnerDir != "" && r.cfg.RunnerMount != "" {
+			bindMappings[r.cfg.RunnerMount] = jobRunnerDir
+		}
+		dindServer.SetRunnerRootfs(snapshotName, runnerRootfsPath, bindMappings)
 	}
 
 	r.cfg.Log.Info("runner environment started", "id", id)

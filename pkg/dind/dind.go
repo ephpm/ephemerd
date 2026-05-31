@@ -242,6 +242,14 @@ func (s *Server) SetRunnerRootfs(snapshotKey string, runnerRootfsPath string, bi
 	defer s.mu.Unlock()
 	s.runnerSnapshotKey = snapshotKey
 	s.runnerRootfsPath = runnerRootfsPath
+	// Surface what was registered so we can correlate against future
+	// "bind X rejected" messages — without this, a misresolved rootfs
+	// path (empty, stale, or pointing at a directory dind can't see)
+	// is invisible until the first sibling create fails.
+	s.log.Info("runner rootfs registered for bind translation",
+		"snapshot_key", snapshotKey,
+		"rootfs_path", runnerRootfsPath,
+		"bind_table_entries", len(bindMappings))
 	if len(bindMappings) == 0 {
 		s.runnerBindMappings = nil
 		return

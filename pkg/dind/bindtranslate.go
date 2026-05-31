@@ -1,9 +1,11 @@
 package dind
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -73,10 +75,27 @@ func translateBindSource(src string, runnerBinds map[string]string, runnerRootfs
 
 	if runnerRootfsPath != "" {
 		candidate := path.Join(runnerRootfsPath, cleaned)
-		if _, err := os.Stat(candidate); err == nil {
+		switch info, err := os.Stat(candidate); {
+		case err == nil:
+			if info.IsDir() || info.Mode().IsRegular() {
+				return bindResolution{HostPath: candidate}, nil
+			}
+			return bindResolution{}, fmt.Errorf("bind source %q resolves to %s, which is not a regular file or directory (mode %s)", src, candidate, info.Mode())
+		case errors.Is(err, os.ErrNotExist):
+			// Mirror Docker's auto-mkdir-on-missing-source semantic. The
+			// GHA runner emits -v entries for paths the runner creates
+			// lazily inside a step (e.g. /home/runner/_work/_actions
+			// only exists once actions/checkout downloads its handler).
+			// Real Docker creates the missing dir at create time and
+			// the workflow proceeds. Our dind has to do the same or
+			// every container: job 400s on the first lazy bind source.
+			if mkErr := ensureBindSourceDir(candidate); mkErr != nil {
+				return bindResolution{}, fmt.Errorf("bind source %q could not be auto-created at %s: %w", src, candidate, mkErr)
+			}
 			return bindResolution{HostPath: candidate}, nil
+		default:
+			return bindResolution{}, fmt.Errorf("bind source %q could not be stat'd at %s: %w", src, candidate, err)
 		}
-		return bindResolution{}, fmt.Errorf("bind source %q is not visible in the runner's rootfs (%s does not exist)", src, candidate)
 	}
 
 	if upperdir != "" {
@@ -97,6 +116,49 @@ func translateBindSource(src string, runnerBinds map[string]string, runnerRootfs
 	}
 
 	return bindResolution{}, fmt.Errorf("bind source %q is not visible to ephemerd dind (not in runner rootfs or known bind table)", src)
+}
+
+// ensureBindSourceDir creates target (and any missing intermediate dirs
+// between it and the closest existing ancestor) so a bind for a path the
+// runner hasn't materialized yet can still proceed. Mirrors Docker's
+// behavior for missing -v sources.
+//
+// Newly-created directories inherit ownership from the closest existing
+// ancestor (Linux only, no-op elsewhere). This matters for the GHA
+// `container:` flow: the closest ancestor is typically /home/runner/_work
+// owned by uid 1001 (the runner user), so children we create are also
+// uid 1001 — the runner can write into them once a step downloads an
+// action or stages a file. Without the ownership flow, the new dir is
+// root-owned and the runner gets EACCES the first time it tries to
+// populate it.
+func ensureBindSourceDir(target string) error {
+	ancestor := target
+	var newDirs []string
+	for {
+		info, err := os.Stat(ancestor)
+		if err == nil {
+			if !info.IsDir() {
+				return fmt.Errorf("ancestor %s is not a directory", ancestor)
+			}
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat ancestor %s: %w", ancestor, err)
+		}
+		newDirs = append(newDirs, ancestor)
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			return fmt.Errorf("walked past root without finding existing ancestor of %s", target)
+		}
+		ancestor = parent
+	}
+	if len(newDirs) == 0 {
+		return nil
+	}
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", target, err)
+	}
+	return chownNewDirsLikeAncestor(newDirs, ancestor)
 }
 
 // matchBindPrefix returns the host source for the longest runnerBinds key
