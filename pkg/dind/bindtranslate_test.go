@@ -277,19 +277,55 @@ func TestTranslateBindSource_RootfsPathResolvesToMergedView(t *testing.T) {
 	}
 }
 
-// TestTranslateBindSource_RootfsPathRejectsMissingSource is the
-// loud-failure guard for the rootfs-path resolver. When the rootfs path
-// is set and the source isn't under it, translation must error out —
-// not fall through to the snapshot-layer walk, which would mask the
-// real "runner can't see this either" situation.
-func TestTranslateBindSource_RootfsPathRejectsMissingSource(t *testing.T) {
+// TestTranslateBindSource_RootfsPathAutoCreatesMissingSource asserts the
+// Docker-compat auto-mkdir behavior. The GHA `container:` flow asks for
+// binds like /home/runner/_work/_actions even before any step has
+// populated that directory — the runner expects Docker to create empty
+// dirs for missing bind sources. Without auto-mkdir, every `container:`
+// job 400s on the first lazy bind that the runner hasn't pre-created.
+func TestTranslateBindSource_RootfsPathAutoCreatesMissingSource(t *testing.T) {
 	rootfs := t.TempDir()
-	_, err := translateBindSource("/this/path/does/not/exist", nil, rootfs, "", nil)
-	if err == nil {
-		t.Fatal("expected rejection of missing source under rootfs path, got nil")
+	// Plant /home/runner/_work the way runc would have mounted it.
+	// /home/runner/_work/_actions does NOT exist yet — that's the lazy
+	// path we expect the resolver to materialize.
+	if err := os.MkdirAll(filepath.Join(rootfs, "home", "runner", "_work"), 0o755); err != nil {
+		t.Fatalf("plant _work: %v", err)
 	}
-	if !strings.Contains(err.Error(), "rootfs") {
-		t.Errorf("error should mention rootfs to explain why it was rejected: %v", err)
+
+	got, err := translateBindSource("/home/runner/_work/_actions", nil, rootfs, "", nil)
+	if err != nil {
+		t.Fatalf("translate: %v (auto-mkdir should have created the missing dir)", err)
+	}
+	wantPath := path.Join(rootfs, "home/runner/_work/_actions")
+	if got.HostPath != wantPath {
+		t.Errorf("HostPath = %q, want %q", got.HostPath, wantPath)
+	}
+	info, err := os.Stat(got.HostPath)
+	if err != nil {
+		t.Fatalf("stat auto-created dir: %v", err)
+	}
+	if !info.IsDir() {
+		t.Errorf("auto-created path = %v, want a directory", info.Mode())
+	}
+}
+
+// TestTranslateBindSource_RootfsPathPropagatesStatErrors keeps the
+// loud-failure guarantee for the cases auto-mkdir can't recover from —
+// permission denied on stat, walking past root, etc. The previous
+// rejection-on-missing test was replaced by AutoCreates above; this
+// covers the still-relevant rejection paths.
+func TestTranslateBindSource_RootfsPathPropagatesStatErrors(t *testing.T) {
+	rootfs := t.TempDir()
+	// A regular file (not a directory) blocks the bind: we won't
+	// auto-create over it, and a file isn't a valid bind target for
+	// the use cases the runner asks for.
+	if err := os.WriteFile(filepath.Join(rootfs, "blocker"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Asking for a path beneath the regular-file ancestor: ENOTDIR.
+	_, err := translateBindSource("/blocker/child", nil, rootfs, "", nil)
+	if err == nil {
+		t.Fatal("expected error when ancestor is not a directory, got nil")
 	}
 }
 
