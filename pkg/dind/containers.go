@@ -406,6 +406,12 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 		// failing downstream with "sh: cannot open /__w/_temp/<uuid>.sh".
 		bindOpts, berr := s.buildBindMounts(r.Context(), req.HostConfig.Binds)
 		if berr != nil {
+			// Log at WARN so operators can see WHY a sibling create was
+			// rejected — the message also goes to the 400 response, but
+			// the GHA runner client doesn't always surface that body in
+			// a useful way, and we want a server-side trail for triage.
+			s.log.Warn("rejecting container create: bind translation failed",
+				"image", req.Image, "binds", req.HostConfig.Binds, "error", berr)
 			writeJSON(w, http.StatusBadRequest, map[string]string{"message": berr.Error()})
 			return
 		}
