@@ -3,10 +3,12 @@ package scheduler
 import (
 	"context"
 	"errors"
+	goruntime "runtime"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/ephpm/ephemerd/pkg/config"
 	"github.com/ephpm/ephemerd/pkg/providers"
 )
 
@@ -95,6 +97,104 @@ func TestHandleQueued_SkipsMacOSWithoutVMConfig(t *testing.T) {
 	s.mu.Unlock()
 	if seen {
 		t.Error("macOS job without VM config should be unsed so it retries on next poll")
+	}
+}
+
+// TestHandleQueued_NativeMacOSRoutesCorrectly verifies that when native mode
+// is configured for a repo, macOS jobs go to handleNativeMacOSJob instead of
+// handleMacOSJob. We test this by checking the job is claimed (not deferred)
+// even without MacOSVMConfig set.
+func TestHandleQueued_NativeMacOSRoutesCorrectly(t *testing.T) {
+	if goruntime.GOOS != "darwin" {
+		t.Skip("native macOS routing only on darwin")
+	}
+
+	mp := newMockProvider("github")
+	s := New(Config{
+		Providers:     []providers.Provider{mp},
+		MaxConcurrent: 1,
+		MacOSRunnerCfg: config.MacOSRunnerConfig{
+			Mode: "native",
+		},
+		RunnerDir: t.TempDir(), // won't actually copy, but avoids nil
+		DataDir:   t.TempDir(),
+		Log:       testLogger(),
+	})
+
+	event := providers.JobEvent{
+		Provider: mp,
+		Action:   "queued",
+		Repo:     "myrepo",
+		JobID:    77,
+		Labels:   []string{"self-hosted", "macos", "arm64"},
+	}
+
+	s.handleQueued(context.Background(), event)
+
+	// The job should have been claimed via the native path (not deferred).
+	// Even though it'll fail to start (no actual runner), the claim should
+	// have been attempted.
+	mp.mu.Lock()
+	claimCount := len(mp.claims)
+	mp.mu.Unlock()
+
+	if claimCount == 0 {
+		// Check if it was deferred (still in seen) or removed (unseen)
+		s.mu.Lock()
+		_, seen := s.seen[keyFor(event)]
+		s.mu.Unlock()
+		if !seen {
+			t.Error("native macOS job was unseen — it was deferred like VM mode instead of routed to native handler")
+		}
+	}
+}
+
+// TestHandleQueued_PerRepoNativeOverride verifies that per-repo mode overrides
+// route correctly: a repo with mode=native goes to native handler while a repo
+// with mode=vm goes to the VM handler.
+func TestHandleQueued_PerRepoNativeOverride(t *testing.T) {
+	if goruntime.GOOS != "darwin" {
+		t.Skip("native macOS routing only on darwin")
+	}
+
+	mp := newMockProvider("github")
+	s := New(Config{
+		Providers:     []providers.Provider{mp},
+		MaxConcurrent: 1,
+		MacOSRunnerCfg: config.MacOSRunnerConfig{
+			Mode: "vm", // default is VM
+			Repos: map[string]string{
+				"native-repo": "native",
+			},
+		},
+		RunnerDir: t.TempDir(),
+		DataDir:   t.TempDir(),
+		Log:       testLogger(),
+	})
+
+	// Job for "native-repo" should be routed to native handler
+	event := providers.JobEvent{
+		Provider: mp,
+		Action:   "queued",
+		Repo:     "native-repo",
+		JobID:    88,
+		Labels:   []string{"self-hosted", "macos", "arm64"},
+	}
+
+	s.handleQueued(context.Background(), event)
+
+	// The native handler should have attempted a claim
+	mp.mu.Lock()
+	claimCount := len(mp.claims)
+	mp.mu.Unlock()
+
+	if claimCount == 0 {
+		s.mu.Lock()
+		_, seen := s.seen[keyFor(event)]
+		s.mu.Unlock()
+		if !seen {
+			t.Error("native-repo macOS job was unseen — it should have been routed to native handler")
+		}
 	}
 }
 

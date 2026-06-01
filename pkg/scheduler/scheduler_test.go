@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ephpm/ephemerd/pkg/config"
 	"github.com/ephpm/ephemerd/pkg/providers"
 	"github.com/ephpm/ephemerd/pkg/tunnel"
 	vmPkg "github.com/ephpm/ephemerd/pkg/vm"
@@ -239,6 +240,27 @@ func TestCanHandleJob(t *testing.T) {
 				t.Errorf("canHandleJob(%v) = %v, want %v", tt.labels, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCanHandleJob_MacOSNativeMode(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS native mode only available on darwin")
+	}
+
+	// Without native mode or VM config, macOS jobs are rejected
+	s := New(Config{Log: testLogger()})
+	if s.canHandleJob([]string{"self-hosted", "macos", "arm64"}) {
+		t.Error("macOS job should be rejected without VM config or native mode")
+	}
+
+	// With native mode configured, macOS jobs should be accepted
+	s2 := New(Config{
+		Log: testLogger(),
+		MacOSRunnerCfg: config.MacOSRunnerConfig{Mode: "native"},
+	})
+	if !s2.canHandleJob([]string{"self-hosted", "macos", "arm64"}) {
+		t.Error("macOS job should be accepted with native mode configured")
 	}
 }
 

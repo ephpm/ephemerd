@@ -1941,3 +1941,158 @@ allow_privileged = false
 		t.Error("ResolvedAllowPrivileged() should honor explicit false even on non-Linux hosts")
 	}
 }
+
+// --- MacOSRunnerConfig tests ---
+
+func TestModeForRepo_DefaultVM(t *testing.T) {
+	cfg := &MacOSRunnerConfig{}
+	if m := cfg.ModeForRepo("any-repo"); m != "vm" {
+		t.Errorf("ModeForRepo(any-repo) = %q, want vm", m)
+	}
+}
+
+func TestModeForRepo_TopLevelNative(t *testing.T) {
+	cfg := &MacOSRunnerConfig{Mode: "native"}
+	if m := cfg.ModeForRepo("any-repo"); m != "native" {
+		t.Errorf("ModeForRepo(any-repo) = %q, want native", m)
+	}
+}
+
+func TestModeForRepo_PerRepoOverride(t *testing.T) {
+	cfg := &MacOSRunnerConfig{
+		Mode: "vm",
+		Repos: map[string]string{
+			"trusted-repo":   "native",
+			"untrusted-repo": "vm",
+		},
+	}
+	if m := cfg.ModeForRepo("trusted-repo"); m != "native" {
+		t.Errorf("ModeForRepo(trusted-repo) = %q, want native", m)
+	}
+	if m := cfg.ModeForRepo("untrusted-repo"); m != "vm" {
+		t.Errorf("ModeForRepo(untrusted-repo) = %q, want vm", m)
+	}
+	if m := cfg.ModeForRepo("unknown-repo"); m != "vm" {
+		t.Errorf("ModeForRepo(unknown-repo) = %q, want vm (top-level fallback)", m)
+	}
+}
+
+func TestModeForRepo_PerRepoOverridesTopLevel(t *testing.T) {
+	cfg := &MacOSRunnerConfig{
+		Mode: "native",
+		Repos: map[string]string{
+			"force-vm": "vm",
+		},
+	}
+	if m := cfg.ModeForRepo("force-vm"); m != "vm" {
+		t.Errorf("ModeForRepo(force-vm) = %q, want vm (per-repo override)", m)
+	}
+	if m := cfg.ModeForRepo("other"); m != "native" {
+		t.Errorf("ModeForRepo(other) = %q, want native (top-level)", m)
+	}
+}
+
+func TestModeForRepo_InvalidRepoModeFallsThrough(t *testing.T) {
+	cfg := &MacOSRunnerConfig{
+		Mode: "native",
+		Repos: map[string]string{
+			"bad-repo": "invalid",
+		},
+	}
+	// Invalid repo mode should fall through to top-level
+	if m := cfg.ModeForRepo("bad-repo"); m != "native" {
+		t.Errorf("ModeForRepo(bad-repo) = %q, want native (invalid value falls through)", m)
+	}
+}
+
+func TestModeForRepo_NilReposMap(t *testing.T) {
+	cfg := &MacOSRunnerConfig{Mode: "native"}
+	// Should not panic with nil repos map
+	if m := cfg.ModeForRepo("any"); m != "native" {
+		t.Errorf("ModeForRepo(any) = %q, want native", m)
+	}
+}
+
+func TestResolvedMaxNative_Default(t *testing.T) {
+	cfg := &MacOSRunnerConfig{}
+	if n := cfg.ResolvedMaxNative(); n != 4 {
+		t.Errorf("ResolvedMaxNative() = %d, want 4", n)
+	}
+}
+
+func TestResolvedMaxNative_Explicit(t *testing.T) {
+	cfg := &MacOSRunnerConfig{MaxNative: 8}
+	if n := cfg.ResolvedMaxNative(); n != 8 {
+		t.Errorf("ResolvedMaxNative() = %d, want 8", n)
+	}
+}
+
+func TestResolvedMaxNative_NegativeFallsBack(t *testing.T) {
+	cfg := &MacOSRunnerConfig{MaxNative: -1}
+	if n := cfg.ResolvedMaxNative(); n != 4 {
+		t.Errorf("ResolvedMaxNative() = %d, want 4 (default for negative)", n)
+	}
+}
+
+func TestLoad_MacOSRunnerConfig(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_test123")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[github]
+owner = "testorg"
+
+[runner.macos]
+mode = "native"
+max_native = 6
+
+[runner.macos.repos]
+trusted = "native"
+untrusted = "vm"
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	if cfg.Runner.MacOS.Mode != "native" {
+		t.Errorf("MacOS.Mode = %q, want native", cfg.Runner.MacOS.Mode)
+	}
+	if cfg.Runner.MacOS.MaxNative != 6 {
+		t.Errorf("MacOS.MaxNative = %d, want 6", cfg.Runner.MacOS.MaxNative)
+	}
+	if cfg.Runner.MacOS.ModeForRepo("trusted") != "native" {
+		t.Errorf("ModeForRepo(trusted) = %q, want native", cfg.Runner.MacOS.ModeForRepo("trusted"))
+	}
+	if cfg.Runner.MacOS.ModeForRepo("untrusted") != "vm" {
+		t.Errorf("ModeForRepo(untrusted) = %q, want vm", cfg.Runner.MacOS.ModeForRepo("untrusted"))
+	}
+}
+
+func TestLoad_MacOSRunnerConfig_Omitted(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_test123")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[github]
+owner = "testorg"
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	// Defaults: mode empty → ModeForRepo returns "vm"
+	if cfg.Runner.MacOS.ModeForRepo("any") != "vm" {
+		t.Errorf("ModeForRepo(any) = %q, want vm (default)", cfg.Runner.MacOS.ModeForRepo("any"))
+	}
+	if cfg.Runner.MacOS.ResolvedMaxNative() != 4 {
+		t.Errorf("ResolvedMaxNative() = %d, want 4 (default)", cfg.Runner.MacOS.ResolvedMaxNative())
+	}
+}

@@ -432,6 +432,50 @@ type RunnerConfig struct {
 	JobTimeout      string            `toml:"job_timeout"`
 	ShutdownTimeout string            `toml:"shutdown_timeout"`
 	Windows         WindowsRunnerToml `toml:"windows"`
+	MacOS           MacOSRunnerConfig `toml:"macos"`
+}
+
+// MacOSRunnerConfig configures macOS job execution mode.
+// By default, macOS jobs run in per-job VMs via Virtualization.framework.
+// Set mode = "native" to run jobs directly on the host with sandbox-exec
+// isolation — faster startup, no VM overhead, but weaker isolation.
+type MacOSRunnerConfig struct {
+	// Mode selects how macOS jobs run: "vm" (default) or "native".
+	// VM mode boots an ephemeral macOS VM per job (strong isolation).
+	// Native mode runs the GHA runner directly on the host inside a
+	// sandbox-exec profile (faster, but shares the host kernel).
+	Mode string `toml:"mode"`
+
+	// MaxNative limits how many native macOS jobs run concurrently.
+	// Only applies when mode = "native". Default 4.
+	MaxNative int `toml:"max_native"`
+
+	// Repos maps repository names to execution modes, allowing per-repo
+	// overrides. E.g. {"trusted-repo": "native", "untrusted-repo": "vm"}.
+	Repos map[string]string `toml:"repos"`
+}
+
+// ModeForRepo returns the execution mode for a given repository.
+// Resolution: per-repo override → top-level Mode → "vm" default.
+func (m *MacOSRunnerConfig) ModeForRepo(repo string) string {
+	if m.Repos != nil {
+		if mode, ok := m.Repos[repo]; ok && (mode == "vm" || mode == "native") {
+			return mode
+		}
+	}
+	if m.Mode == "native" {
+		return "native"
+	}
+	return "vm"
+}
+
+// ResolvedMaxNative returns the maximum concurrent native macOS jobs,
+// applying the default of 4 when not set or zero.
+func (m *MacOSRunnerConfig) ResolvedMaxNative() int {
+	if m.MaxNative <= 0 {
+		return 4
+	}
+	return m.MaxNative
 }
 
 // WindowsRunnerToml configures resource limits for Hyper-V isolated Windows

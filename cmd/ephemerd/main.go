@@ -532,6 +532,8 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		Providers:          activeProviders,
 		Artifacts:          artifactExtractor,
 		LinuxDispatcher:    linuxDispatcher,
+		MacOSRunnerCfg:     cfg.Runner.MacOS,
+		RunnerDir:          rm.Dir(),
 		DataDir:            configDir,
 		MaxConcurrent:      cfg.Runner.MaxConcurrent,
 		MaxMacOSVMs:        cfg.VM.MacOS.MaxConcurrent,
