@@ -246,19 +246,86 @@ A `native_other.go` stub returns errors on non-darwin platforms.
 Pass `cfg.Runner.MacOS` to the scheduler config so it can read per-repo
 mode overrides.
 
-## Open questions
+## Decisions
 
-1. **Shared Homebrew mutations.** If a job runs `brew install foo`, it
-   modifies the shared `/opt/homebrew`. Options: (a) accept it for trusted
-   repos, (b) overlay a per-job Homebrew prefix, (c) make `/opt/homebrew`
-   read-only and provide a per-job writable prefix. Start with (a),
-   revisit if it causes problems.
+### 1. Homebrew: per-job writable prefix over shared read-only base
 
-2. **Keychain access.** macOS jobs may need the login keychain for code
-   signing. Native jobs share the host keychain. VM jobs each get their
-   own. For native mode, either create a per-job keychain or accept
-   shared access for trusted repos.
+Jobs need `brew install` for build deps, but we can't let one job's
+installs pollute another. The solution uses Homebrew's relocatable
+architecture:
 
-3. **Concurrency limit tuning.** `max_native = 4` is a guess for 8 GB
-   Mac minis. Should we auto-detect based on available memory, or is a
-   static config sufficient? Start with static config.
+**Host setup (one-time):** `/opt/homebrew` is pre-installed with common
+tools (Go, mage, etc.) and marked read-only for the runner user.
+
+**Per-job overlay:**
+
+```
+<data_dir>/native/<job-id>/
+  └── homebrew/           → HOMEBREW_PREFIX, HOMEBREW_CELLAR, HOMEBREW_TEMP
+      ├── Cellar/         → per-job installs land here
+      ├── lib/
+      ├── bin/            → symlinked from /opt/homebrew/bin at job start
+      └── Homebrew/       → lightweight Homebrew checkout (or symlink)
+```
+
+Environment for the runner process:
+
+```bash
+HOMEBREW_PREFIX=<job_dir>/homebrew
+HOMEBREW_CELLAR=<job_dir>/homebrew/Cellar
+HOMEBREW_TEMP=<job_dir>/tmp
+PATH=<job_dir>/homebrew/bin:/opt/homebrew/bin:/usr/local/bin:...
+```
+
+How it works:
+
+1. At job start, create `<job_dir>/homebrew/bin` and symlink all
+   executables from `/opt/homebrew/bin` into it. This gives the job
+   read access to pre-installed tools.
+2. Set `HOMEBREW_PREFIX` and `HOMEBREW_CELLAR` to the per-job dir.
+   Any `brew install` writes to the job's Cellar, not the host's.
+3. The job's `homebrew/bin` is first in PATH, so newly installed
+   formulas shadow the host versions if there's a conflict.
+4. At job end, `rm -rf <job_dir>` deletes everything — installs,
+   caches, temp files.
+
+**Why not a full Homebrew clone?** Cloning the Homebrew repo takes
+~10 seconds and ~500 MB. Symlinking the host's existing install is
+instant and zero-copy. The job only needs a writable prefix for new
+installs.
+
+**Why not just share `/opt/homebrew` read-write?** Jobs would step on
+each other. One job upgrading a formula mid-build could break another
+job. Per-job prefix keeps them independent.
+
+### 2. Keychain: per-job temporary keychain
+
+Each native job gets its own temporary keychain:
+
+```bash
+KEYCHAIN=<job_dir>/keychain/job.keychain-db
+security create-keychain -p "" "$KEYCHAIN"
+security default-keychain -s "$KEYCHAIN"
+security unlock-keychain -p "" "$KEYCHAIN"
+```
+
+At cleanup:
+
+```bash
+security delete-keychain "$KEYCHAIN"
+```
+
+This prevents jobs from accessing each other's signing identities and
+avoids polluting the host login keychain. Jobs that need code signing
+import their certs into the per-job keychain via `security import`
+(standard GitHub Actions pattern — `apple-actions/import-codesign-certs`
+does exactly this).
+
+### 3. Concurrency: static config, default 4
+
+`max_native = 4` is the default. Operators set it based on their
+hardware. No auto-detection — the right value depends on workload
+(CPU-heavy Xcode builds want fewer, lightweight Go tests want more).
+
+The value only caps native macOS jobs. Linux jobs (in the VM) and
+macOS VM jobs have their own separate limits.
