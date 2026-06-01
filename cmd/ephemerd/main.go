@@ -502,7 +502,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	// lets a job's `container: { image: ... }` pull OCI images and extract
 	// their layers into the shared data directory (available inside macOS
 	// VMs via virtio-fs).
-	artifactExtractor := artifacts.NewExtractor(ctrdClient, log)
+	artifactExtractor := artifacts.NewExtractor(log)
 
 	// Wait for Linux dispatch client if the VM is booting in the background.
 	linuxDispatcher, _ := waitDispatch()

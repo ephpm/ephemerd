@@ -1,6 +1,8 @@
 package artifacts
 
 import (
+	"archive/tar"
+	"bytes"
 	"io"
 	"log/slog"
 	"os"
@@ -114,11 +116,215 @@ func TestListContents_NonexistentDir(t *testing.T) {
 
 // --- NewExtractor ---
 
-func TestNewExtractor_NilClient(t *testing.T) {
-	// NewExtractor should not panic with nil client
-	// (it will fail on Extract(), but construction is fine)
-	e := NewExtractor(nil, testLogger())
+func TestNewExtractor(t *testing.T) {
+	e := NewExtractor(testLogger())
 	if e == nil {
 		t.Fatal("NewExtractor() returned nil")
+	}
+}
+
+// --- applyTar tests ---
+
+// buildTar creates an in-memory tar archive from the given entries.
+func buildTar(t *testing.T, entries []tarEntry) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, e := range entries {
+		hdr := &tar.Header{
+			Name:     e.name,
+			Mode:     e.mode,
+			Size:     int64(len(e.body)),
+			Typeflag: e.typeflag,
+			Linkname: e.linkname,
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("writing tar header for %s: %v", e.name, err)
+		}
+		if len(e.body) > 0 {
+			if _, err := tw.Write([]byte(e.body)); err != nil {
+				t.Fatalf("writing tar body for %s: %v", e.name, err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("closing tar writer: %v", err)
+	}
+	return &buf
+}
+
+type tarEntry struct {
+	name     string
+	body     string
+	mode     int64
+	typeflag byte
+	linkname string
+}
+
+func TestApplyTar_RegularFiles(t *testing.T) {
+	dest := t.TempDir()
+
+	entries := []tarEntry{
+		{name: "hello.txt", body: "hello world", mode: 0o644, typeflag: tar.TypeReg},
+		{name: "subdir/", mode: 0o755, typeflag: tar.TypeDir},
+		{name: "subdir/nested.txt", body: "nested content", mode: 0o644, typeflag: tar.TypeReg},
+	}
+
+	buf := buildTar(t, entries)
+	if err := applyTar(buf, dest); err != nil {
+		t.Fatalf("applyTar() error: %v", err)
+	}
+
+	// Verify hello.txt
+	data, err := os.ReadFile(filepath.Join(dest, "hello.txt"))
+	if err != nil {
+		t.Fatalf("reading hello.txt: %v", err)
+	}
+	if string(data) != "hello world" {
+		t.Errorf("hello.txt content = %q, want %q", string(data), "hello world")
+	}
+
+	// Verify subdir/nested.txt
+	data, err = os.ReadFile(filepath.Join(dest, "subdir", "nested.txt"))
+	if err != nil {
+		t.Fatalf("reading subdir/nested.txt: %v", err)
+	}
+	if string(data) != "nested content" {
+		t.Errorf("subdir/nested.txt content = %q, want %q", string(data), "nested content")
+	}
+}
+
+func TestApplyTar_Symlink(t *testing.T) {
+	dest := t.TempDir()
+
+	entries := []tarEntry{
+		{name: "target.txt", body: "target", mode: 0o644, typeflag: tar.TypeReg},
+		{name: "link.txt", typeflag: tar.TypeSymlink, linkname: "target.txt"},
+	}
+
+	buf := buildTar(t, entries)
+	if err := applyTar(buf, dest); err != nil {
+		t.Fatalf("applyTar() error: %v", err)
+	}
+
+	linkDest, err := os.Readlink(filepath.Join(dest, "link.txt"))
+	if err != nil {
+		t.Fatalf("reading symlink: %v", err)
+	}
+	if linkDest != "target.txt" {
+		t.Errorf("symlink target = %q, want %q", linkDest, "target.txt")
+	}
+}
+
+func TestApplyTar_HardLink(t *testing.T) {
+	dest := t.TempDir()
+
+	entries := []tarEntry{
+		{name: "original.txt", body: "shared content", mode: 0o644, typeflag: tar.TypeReg},
+		{name: "hardlink.txt", typeflag: tar.TypeLink, linkname: "original.txt"},
+	}
+
+	buf := buildTar(t, entries)
+	if err := applyTar(buf, dest); err != nil {
+		t.Fatalf("applyTar() error: %v", err)
+	}
+
+	// Both files should have the same content.
+	data1, err := os.ReadFile(filepath.Join(dest, "original.txt"))
+	if err != nil {
+		t.Fatalf("reading original.txt: %v", err)
+	}
+	data2, err := os.ReadFile(filepath.Join(dest, "hardlink.txt"))
+	if err != nil {
+		t.Fatalf("reading hardlink.txt: %v", err)
+	}
+	if string(data1) != string(data2) {
+		t.Errorf("hard link content mismatch: %q vs %q", string(data1), string(data2))
+	}
+}
+
+func TestApplyTar_Whiteout(t *testing.T) {
+	dest := t.TempDir()
+
+	// First, create a file that should be whited out.
+	if err := os.WriteFile(filepath.Join(dest, "removeme.txt"), []byte("gone"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Apply a layer with a whiteout for removeme.txt.
+	entries := []tarEntry{
+		{name: ".wh.removeme.txt", typeflag: tar.TypeReg, mode: 0o644},
+	}
+
+	buf := buildTar(t, entries)
+	if err := applyTar(buf, dest); err != nil {
+		t.Fatalf("applyTar() error: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dest, "removeme.txt")); !os.IsNotExist(err) {
+		t.Error("expected removeme.txt to be deleted by whiteout")
+	}
+}
+
+func TestApplyTar_DirectoryTraversal(t *testing.T) {
+	dest := t.TempDir()
+
+	// An entry with ../ should be skipped.
+	entries := []tarEntry{
+		{name: "../escape.txt", body: "bad", mode: 0o644, typeflag: tar.TypeReg},
+		{name: "good.txt", body: "good", mode: 0o644, typeflag: tar.TypeReg},
+	}
+
+	buf := buildTar(t, entries)
+	if err := applyTar(buf, dest); err != nil {
+		t.Fatalf("applyTar() error: %v", err)
+	}
+
+	// The escape file should NOT exist.
+	if _, err := os.Stat(filepath.Join(dest, "..", "escape.txt")); err == nil {
+		t.Error("directory traversal entry should have been skipped")
+	}
+
+	// The good file should exist.
+	if _, err := os.Stat(filepath.Join(dest, "good.txt")); err != nil {
+		t.Error("good.txt should exist")
+	}
+}
+
+func TestApplyTar_OverwriteFile(t *testing.T) {
+	dest := t.TempDir()
+
+	// Layer 1: create a file.
+	entries1 := []tarEntry{
+		{name: "file.txt", body: "version 1", mode: 0o644, typeflag: tar.TypeReg},
+	}
+	buf1 := buildTar(t, entries1)
+	if err := applyTar(buf1, dest); err != nil {
+		t.Fatalf("applyTar() layer 1 error: %v", err)
+	}
+
+	// Layer 2: overwrite the same file.
+	entries2 := []tarEntry{
+		{name: "file.txt", body: "version 2", mode: 0o644, typeflag: tar.TypeReg},
+	}
+	buf2 := buildTar(t, entries2)
+	if err := applyTar(buf2, dest); err != nil {
+		t.Fatalf("applyTar() layer 2 error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dest, "file.txt"))
+	if err != nil {
+		t.Fatalf("reading file.txt: %v", err)
+	}
+	if string(data) != "version 2" {
+		t.Errorf("file.txt content = %q, want %q", string(data), "version 2")
+	}
+}
+
+func TestApplyTar_EmptyArchive(t *testing.T) {
+	dest := t.TempDir()
+	buf := buildTar(t, nil)
+	if err := applyTar(buf, dest); err != nil {
+		t.Fatalf("applyTar() with empty archive should succeed, got: %v", err)
 	}
 }

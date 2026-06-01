@@ -1,61 +1,70 @@
 // Package artifacts handles OCI image layer extraction for macOS VM jobs.
 //
 // When a macOS VM job specifies `container: { image: ... }` in its workflow,
-// ephemerd pulls the OCI image via containerd and extracts all layers into a
-// flat directory on the host filesystem. This is NOT running a container --
-// just unpacking the filesystem layers into a regular directory that is shared
-// with the macOS VM via virtio-fs.
+// ephemerd pulls the OCI image and extracts all layers into a flat directory
+// on the host filesystem. This is NOT running a container -- just unpacking
+// the filesystem layers into a regular directory that is shared with the
+// macOS VM via virtio-fs.
+//
+// The extraction uses go-containerregistry (crane) to pull images directly
+// from the registry, avoiding any dependency on containerd's snapshotter.
+// This is essential on Darwin hosts where containerd runs inside a Linux VM
+// and its snapshotters (overlayfs, erofs) cannot operate on the host filesystem.
 package artifacts
 
 import (
+	"archive/tar"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
-	"github.com/containerd/containerd/v2/client"
-	"github.com/containerd/containerd/v2/core/content"
-	"github.com/containerd/containerd/v2/core/images"
-	"github.com/containerd/containerd/v2/pkg/archive"
-	"github.com/containerd/containerd/v2/pkg/archive/compression"
-	"github.com/containerd/containerd/v2/pkg/namespaces"
-	"github.com/containerd/platforms"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
 
-const namespace = "ephemerd"
-
 // Extractor pulls OCI images and extracts their layers into host directories.
+// It uses go-containerregistry to pull directly from the registry, avoiding
+// containerd's snapshotter which requires Linux filesystem operations.
 type Extractor struct {
-	client *client.Client
-	log    *slog.Logger
+	log *slog.Logger
 }
 
-// NewExtractor creates an artifact extractor using the given containerd client.
-func NewExtractor(c *client.Client, log *slog.Logger) *Extractor {
+// NewExtractor creates an artifact extractor. The containerd client parameter
+// is accepted for backward compatibility but is no longer used -- extraction
+// now uses go-containerregistry to pull directly from the registry.
+func NewExtractor(log *slog.Logger) *Extractor {
 	return &Extractor{
-		client: c,
-		log:    log,
+		log: log,
 	}
 }
 
-// Extract pulls the OCI image (if not already cached) and extracts all layers
+// Extract pulls the OCI image from the registry and extracts all layers
 // into destDir. The directory is created if it does not exist. Each layer is
 // applied in order on top of the previous, producing the final merged filesystem.
 func (e *Extractor) Extract(ctx context.Context, imageRef string, destDir string) error {
-	ctx = namespaces.WithNamespace(ctx, namespace)
-
 	e.log.Info("extracting OCI image artifacts", "image", imageRef, "dest", destDir)
 
-	// Pull or get cached image.
-	img, err := e.client.GetImage(ctx, imageRef)
+	// Parse the image reference.
+	ref, err := name.ParseReference(imageRef)
 	if err != nil {
-		e.log.Info("image not cached, pulling", "image", imageRef)
-		img, err = e.client.Pull(ctx, imageRef, client.WithPullUnpack)
-		if err != nil {
-			return fmt.Errorf("pulling image %s: %w", imageRef, err)
-		}
+		return fmt.Errorf("parsing image reference %s: %w", imageRef, err)
+	}
+
+	// Pull the image descriptor and manifest from the registry.
+	desc, err := remote.Get(ref, remote.WithAuthFromKeychain(authn.DefaultKeychain), remote.WithContext(ctx))
+	if err != nil {
+		return fmt.Errorf("fetching image %s: %w", imageRef, err)
+	}
+
+	img, err := desc.Image()
+	if err != nil {
+		return fmt.Errorf("resolving image %s: %w", imageRef, err)
 	}
 
 	// Ensure the destination directory exists.
@@ -63,60 +72,152 @@ func (e *Extractor) Extract(ctx context.Context, imageRef string, destDir string
 		return fmt.Errorf("creating artifacts directory %s: %w", destDir, err)
 	}
 
-	// Resolve the manifest for the current platform to get layer descriptors.
-	store := e.client.ContentStore()
-	manifest, err := images.Manifest(ctx, store, img.Target(), platforms.Default())
+	// Get the image layers.
+	layers, err := img.Layers()
 	if err != nil {
-		return fmt.Errorf("resolving image manifest: %w", err)
+		return fmt.Errorf("reading image layers: %w", err)
 	}
 
-	if len(manifest.Layers) == 0 {
+	if len(layers) == 0 {
 		e.log.Warn("image has no layers", "image", imageRef)
 		return nil
 	}
 
-	e.log.Debug("extracting layers", "image", imageRef, "count", len(manifest.Layers))
+	e.log.Debug("extracting layers", "image", imageRef, "count", len(layers))
 
-	// Extract each layer in order. Layers are typically compressed tar archives.
-	// We read the raw content from containerd's content store, decompress, and
-	// apply the tar to the destination directory.
-	for i, layer := range manifest.Layers {
-		if err := e.extractLayer(ctx, store, layer, destDir, i); err != nil {
-			return fmt.Errorf("extracting layer %d (%s): %w", i, layer.Digest, err)
+	// Extract each layer in order. go-containerregistry handles decompression
+	// automatically via the Uncompressed() method.
+	for i, layer := range layers {
+		if err := e.extractLayer(layer, destDir, i); err != nil {
+			return fmt.Errorf("extracting layer %d: %w", i, err)
 		}
 	}
 
-	e.log.Info("artifacts extracted", "image", imageRef, "dest", destDir, "layers", len(manifest.Layers))
+	e.log.Info("artifacts extracted", "image", imageRef, "dest", destDir, "layers", len(layers))
 	return nil
 }
 
-// extractLayer reads a single layer from the content store and extracts it
-// into destDir. It handles decompression (gzip, zstd, etc.) automatically.
-func (e *Extractor) extractLayer(ctx context.Context, store content.Store, layer ocispec.Descriptor, destDir string, index int) error {
-	e.log.Debug("applying layer", "index", index, "digest", layer.Digest, "size", layer.Size, "mediaType", layer.MediaType)
+// extractLayer reads a single layer and extracts its tar contents into destDir.
+func (e *Extractor) extractLayer(layer v1.Layer, destDir string, index int) error {
+	digest, err := layer.Digest()
+	if err != nil {
+		return fmt.Errorf("reading layer digest: %w", err)
+	}
 
-	ra, err := store.ReaderAt(ctx, layer)
+	size, err := layer.Size()
+	if err != nil {
+		return fmt.Errorf("reading layer size: %w", err)
+	}
+
+	e.log.Debug("applying layer", "index", index, "digest", digest, "size", size)
+
+	// Uncompressed() returns the decompressed tar stream.
+	rc, err := layer.Uncompressed()
 	if err != nil {
 		return fmt.Errorf("opening layer content: %w", err)
 	}
-	defer func() { _ = ra.Close() }()
-
-	// Convert ReaderAt to Reader for decompression.
-	reader := content.NewReader(ra)
-
-	// Decompress the layer stream (handles gzip, zstd, and uncompressed).
-	ds, err := compression.DecompressStream(reader)
-	if err != nil {
-		return fmt.Errorf("decompressing layer: %w", err)
-	}
-	defer func() { _ = ds.Close() }()
+	defer func() {
+		if closeErr := rc.Close(); closeErr != nil {
+			e.log.Warn("failed to close layer reader", "index", index, "error", closeErr)
+		}
+	}()
 
 	// Apply the tar archive to the destination directory.
-	if _, err := archive.Apply(ctx, destDir, ds); err != nil {
-		return fmt.Errorf("applying tar layer: %w", err)
+	if err := applyTar(rc, destDir); err != nil {
+		return fmt.Errorf("applying tar layer %d: %w", index, err)
 	}
 
 	return nil
+}
+
+// applyTar extracts a tar stream into destDir, creating files and directories
+// as needed. It handles whiteout files (.wh.) for layer deletion semantics.
+func applyTar(r io.Reader, destDir string) error {
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("reading tar header: %w", err)
+		}
+
+		// Sanitize the path to prevent directory traversal.
+		cleanName := filepath.Clean(hdr.Name)
+		if strings.HasPrefix(cleanName, "..") {
+			continue // skip entries that try to escape the destination
+		}
+
+		target := filepath.Join(destDir, cleanName)
+
+		// Handle OCI whiteout files: .wh.<name> means delete <name>.
+		base := filepath.Base(cleanName)
+		if strings.HasPrefix(base, ".wh.") {
+			deleteName := strings.TrimPrefix(base, ".wh.")
+			deleteTarget := filepath.Join(filepath.Dir(target), deleteName)
+			if err := os.RemoveAll(deleteTarget); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("applying whiteout for %s: %w", deleteName, err)
+			}
+			continue
+		}
+
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)); err != nil {
+				return fmt.Errorf("creating directory %s: %w", cleanName, err)
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return fmt.Errorf("creating parent directory for %s: %w", cleanName, err)
+			}
+			if err := writeFile(target, tr, os.FileMode(hdr.Mode)); err != nil {
+				return fmt.Errorf("writing file %s: %w", cleanName, err)
+			}
+		case tar.TypeSymlink:
+			// Remove existing file/symlink before creating.
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("removing existing symlink target %s: %w", cleanName, err)
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return fmt.Errorf("creating parent directory for symlink %s: %w", cleanName, err)
+			}
+			if err := os.Symlink(hdr.Linkname, target); err != nil {
+				return fmt.Errorf("creating symlink %s -> %s: %w", cleanName, hdr.Linkname, err)
+			}
+		case tar.TypeLink:
+			// Hard link — resolve relative to destDir.
+			linkTarget := filepath.Join(destDir, filepath.Clean(hdr.Linkname))
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("removing existing hard link target %s: %w", cleanName, err)
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return fmt.Errorf("creating parent directory for link %s: %w", cleanName, err)
+			}
+			if err := os.Link(linkTarget, target); err != nil {
+				return fmt.Errorf("creating hard link %s -> %s: %w", cleanName, hdr.Linkname, err)
+			}
+		default:
+			// Skip block devices, char devices, fifos, etc. that don't apply
+			// to artifact extraction on the host filesystem.
+		}
+	}
+}
+
+// writeFile creates or truncates a file and copies the content from r.
+func writeFile(path string, r io.Reader, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+
+	_, copyErr := io.Copy(f, r)
+	closeErr := f.Close()
+
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
 }
 
 // ArtifactsDir returns the artifacts directory for a given job under the data directory.
@@ -155,4 +256,3 @@ func ListContents(dir string) ([]string, error) {
 	})
 	return files, err
 }
-
