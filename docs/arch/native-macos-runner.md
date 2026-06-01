@@ -155,46 +155,96 @@ Block on `cmd.Wait()`. Return the exit code.
 
 | Layer | Native | VM |
 |-------|--------|----|
-| Filesystem | Per-job HOME, TMPDIR, workdir | Full disk clone |
+| Filesystem | Per-job HOME/TMPDIR/workdir + sandbox deny on sensitive paths | Full disk clone |
 | Processes | Process group (`setpgid`), killed on cleanup | Separate kernel |
-| Network | Shared host network, no isolation | NAT with firewall |
-| Users | Shared `admin` user | Isolated `admin` user |
-| Secrets | Environment vars only, cleared on exit | VM memory destroyed |
+| Network | Sandbox: deny RFC1918/localhost outbound + deny port binding | NAT with firewall |
+| Users | Shared macOS user | Isolated user per VM |
+| Secrets | Sandbox denies read on key paths, env cleared on exit | VM memory destroyed |
 
-### What native isolation provides
+### Sandbox profile (required for native mode)
 
-- **Directory isolation**: each job gets its own HOME, TMPDIR, and work
-  directory. Jobs cannot see each other's files.
+Every native job runs under `sandbox-exec -f <profile>`. The sandbox
+is **inherited by all child processes** and **enforced by the kernel**.
+No process can escape it without root.
+
+The profile is generated per-job (to include the job-specific directory
+paths) and written to the job workspace:
+
+```scheme
+(version 1)
+(allow default)
+
+;; === Network isolation ===
+
+;; Block outbound to private networks
+(deny network-outbound (remote ip "localhost:*"))
+(deny network-outbound (remote ip "10.0.0.0/8:*"))
+(deny network-outbound (remote ip "172.16.0.0/12:*"))
+(deny network-outbound (remote ip "192.168.0.0/16:*"))
+(deny network-outbound (remote ip "169.254.0.0/16:*"))
+
+;; Block binding to any port — prevents jobs from running servers
+;; that other jobs could connect to. This closes the inter-job
+;; localhost attack vector entirely.
+(deny network-bind (local ip "*:*"))
+
+;; Allow DNS (required for public internet access)
+(allow network-outbound (remote udp "*:53"))
+(allow network-outbound (remote tcp "*:53"))
+
+;; === Filesystem isolation ===
+
+;; Block sensitive host paths
+(deny file-read* (subpath "/Users/luthermonson/.ssh"))
+(deny file-read* (subpath "<data_dir>/config.toml"))
+(deny file-read* (literal "<data_dir>/ephemerd.sock"))
+(deny file-read* (subpath "<data_dir>/vm"))
+
+;; Block writes to shared tools (read-only access only)
+(deny file-write* (subpath "/opt/homebrew"))
+(deny file-write* (subpath "/Applications"))
+(deny file-write* (subpath "/usr/local"))
+
+;; Allow writes to the job directory only
+(allow file-write* (subpath "<job_dir>"))
+(allow file-write* (subpath "/private/tmp"))
+```
+
+In Go, the runner is launched as:
+
+```go
+cmd := exec.CommandContext(ctx, "sandbox-exec", "-f", profilePath,
+    "./run.sh", "--jitconfig", jitConfig)
+cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+```
+
+### What this provides
+
+- **Network isolation**: jobs cannot reach the LAN, other machines, or
+  the ephemerd control socket. Jobs cannot bind ports, so they cannot
+  communicate with each other via localhost.
+- **DNS allowed**: jobs can resolve public hostnames and connect to
+  public internet (GitHub, package registries, etc.).
+- **Filesystem write isolation**: jobs can only write to their own
+  workspace. Shared tools (`/opt/homebrew`, `/Applications`) are
+  read-only. Sensitive host files (SSH keys, config, VM assets) are
+  blocked entirely.
 - **Process isolation**: `setpgid` + process group kill ensures no
   orphaned processes survive between jobs.
-- **Environment isolation**: each runner process gets a controlled set of
-  environment variables. No leakage from the daemon process.
+- **Environment isolation**: each runner process gets a controlled set
+  of environment variables. No leakage from the daemon process.
 
-### What native isolation does NOT provide
+### Remaining limitations (accepted for trusted repos)
 
-- **No network isolation.** macOS has no network namespaces. A malicious
-  job can reach the host network, other jobs' ports, and the metadata
-  service. The host-level firewall (`pfctl`) can block RFC1918 ranges but
-  cannot isolate jobs from each other.
-- **No filesystem isolation beyond directories.** Jobs share the same
-  `/Applications`, `/opt/homebrew`, etc. A malicious job could modify
-  shared tools. Use `diskutil apfs addVolume` or a read-only system
-  volume for defense in depth.
-- **No user isolation.** All jobs run as the same macOS user. A job can
-  `ps aux` and see other jobs' processes.
-
-### Mitigation: Apple sandbox profiles (future)
-
-macOS has `sandbox-exec` (deprecated but functional through macOS 15+)
-and the App Sandbox entitlement system. A future enhancement could wrap
-the runner process in a sandbox profile that:
-
-- Denies network access to localhost and RFC1918.
-- Denies file writes outside the job directory.
-- Denies process inspection (`proc_info`).
-
-This is explicitly deferred -- it requires testing across macOS versions
-and may break runner functionality.
+- **No per-job user isolation.** All jobs run as the same macOS user.
+  A job can `ps aux` and see other jobs' PIDs (but not interact with
+  them — the sandbox blocks sensitive files and network).
+- **No resource limits.** macOS has no cgroups. A runaway build can
+  starve other jobs of CPU/memory. Mitigated with `nice` (CPU priority)
+  and `ulimit` (memory soft limit) on the runner process.
+- **Read access to non-denied paths.** Jobs can read world-readable
+  files outside the deny list. The sandbox profile should be kept
+  up-to-date with any new sensitive paths.
 
 ## Comparison table
 
