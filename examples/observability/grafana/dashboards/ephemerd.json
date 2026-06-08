@@ -1,0 +1,137 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Active jobs",
+      "type": "stat",
+      "gridPos": {"x": 0, "y": 0, "w": 4, "h": 4},
+      "targets": [{"expr": "ephemerd_jobs_active", "refId": "A"}],
+      "options": {"colorMode": "value", "graphMode": "area"}
+    },
+    {
+      "id": 2,
+      "title": "Concurrent capacity",
+      "type": "stat",
+      "gridPos": {"x": 4, "y": 0, "w": 4, "h": 4},
+      "targets": [{"expr": "ephemerd_concurrent_capacity", "refId": "A"}]
+    },
+    {
+      "id": 3,
+      "title": "Draining",
+      "type": "stat",
+      "gridPos": {"x": 8, "y": 0, "w": 4, "h": 4},
+      "targets": [{"expr": "ephemerd_draining", "refId": "A"}]
+    },
+    {
+      "id": 4,
+      "title": "Jobs completed (rate, 5m)",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+      "targets": [{"expr": "sum by (status) (rate(ephemerd_jobs_total[5m]))", "refId": "A", "legendFormat": "{{status}}"}]
+    },
+    {
+      "id": 5,
+      "title": "Container CPU utilization",
+      "description": "Per-container CPU usage as a fraction of the configured vCPU cap. >1.0 means the cap is unset (cpu_limit=0).",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 4, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "rate(ephemerd_container_cpu_usage_seconds_total[1m]) / on(id, repo, runtime) ephemerd_container_cpu_limit > 0",
+          "refId": "A",
+          "legendFormat": "{{id}} ({{runtime}})"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit"}}
+    },
+    {
+      "id": 6,
+      "title": "Container memory usage",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "ephemerd_container_memory_bytes", "refId": "A", "legendFormat": "{{id}} ({{runtime}})"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "bytes"}}
+    },
+    {
+      "id": 7,
+      "title": "Container memory vs limit",
+      "description": "Bytes used / configured cap. >1 means the cap is unset (memory_limit_bytes=0) and the ratio is meaningless.",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 12, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "ephemerd_container_memory_bytes / on(id, repo, runtime) ephemerd_container_memory_limit_bytes > 0",
+          "refId": "A",
+          "legendFormat": "{{id}} ({{runtime}})"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "max": 1.5}}
+    },
+    {
+      "id": 8,
+      "title": "Job duration (p95, 5m)",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum by (repo, le) (rate(ephemerd_job_duration_seconds_bucket[5m])))", "refId": "A", "legendFormat": "{{repo}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 9,
+      "title": "Job startup (p95, 5m)",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 20, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum by (repo, le) (rate(ephemerd_job_startup_seconds_bucket[5m])))", "refId": "A", "legendFormat": "{{repo}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 10,
+      "title": "Container network — download",
+      "description": "Per-container receive rate. Sibling dind containers are NOT included; this is the runner container's netns only.",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 28, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "rate(ephemerd_container_network_rx_bytes_total[1m])", "refId": "A", "legendFormat": "{{id}} ({{runtime}})"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "Bps"}}
+    },
+    {
+      "id": 11,
+      "title": "Container network — upload",
+      "description": "Per-container transmit rate. Sibling dind containers are NOT included.",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 28, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "rate(ephemerd_container_network_tx_bytes_total[1m])", "refId": "A", "legendFormat": "{{id}} ({{runtime}})"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "Bps"}}
+    },
+    {
+      "id": 12,
+      "title": "Container network — bytes transferred per job (total)",
+      "description": "Cumulative bytes sent + received over the container's lifetime. Series disappear when the job ends.",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 36, "w": 24, "h": 8},
+      "targets": [
+        {"expr": "ephemerd_container_network_rx_bytes_total + ephemerd_container_network_tx_bytes_total", "refId": "A", "legendFormat": "{{id}} ({{runtime}})"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "bytes"}}
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": ["ephemerd"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "title": "ephemerd",
+  "uid": "ephemerd-main",
+  "version": 1
+}

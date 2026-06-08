@@ -72,6 +72,27 @@ type MetricsConfig struct {
 	Path    string `toml:"path"`     // metrics path (default "/metrics")
 	TLSCert string `toml:"tls_cert"` // TLS certificate path (optional)
 	TLSKey  string `toml:"tls_key"`  // TLS private key path (optional)
+	// ContainerStatsInterval is how often per-container resource samples are
+	// taken (CPU, memory). Used both by the host's local sampler ticker and as
+	// the cadence the host requests from the in-VM Dispatch StreamContainerStats
+	// stream. Default 10s.
+	ContainerStatsInterval string `toml:"container_stats_interval"`
+}
+
+// ParsedContainerStatsInterval returns the configured per-container sampling
+// interval, applying the default (10s) when unset. Falls back to the default
+// on parse error rather than failing the daemon — the metric series simply
+// won't update if this is misconfigured, which is not worth aborting startup.
+func (m MetricsConfig) ParsedContainerStatsInterval() time.Duration {
+	const defaultInterval = 10 * time.Second
+	if m.ContainerStatsInterval == "" {
+		return defaultInterval
+	}
+	d, err := time.ParseDuration(m.ContainerStatsInterval)
+	if err != nil || d <= 0 {
+		return defaultInterval
+	}
+	return d
 }
 
 // WebhookConfig configures webhook delivery and tunnel providers.

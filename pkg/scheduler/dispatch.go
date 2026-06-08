@@ -2,12 +2,16 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	apiv1 "github.com/ephpm/ephemerd/api/v1"
+	"github.com/ephpm/ephemerd/pkg/metrics"
 	"github.com/ephpm/ephemerd/pkg/runtime"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -15,18 +19,81 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// dispatchServer implements the Dispatch gRPC service.
-// It runs inside the WSL containerd-only worker and proxies
-// Create/Wait/Destroy calls to the local Linux Runtime.
-type dispatchServer struct {
-	apiv1.UnimplementedDispatchServer
-	rt   *runtime.Runtime
-	log  *slog.Logger
-	mu   sync.Mutex
-	envs map[string]*runtime.RunnerEnv
+// samplerEntry binds a container's sampler to the labels it should be
+// reported under. Entries are accumulated by the dispatch server as
+// containers come and go and walked on every StreamContainerStats tick.
+type samplerEntry struct {
+	id      string
+	repo    string
+	sampler metrics.Sampler
 }
 
-func (s *dispatchServer) CreateJob(ctx context.Context, req *apiv1.CreateJobRequest) (*apiv1.CreateJobResponse, error) {
+// DispatchServer implements the Dispatch gRPC service.
+// It runs inside the WSL containerd-only worker and proxies
+// Create/Wait/Destroy calls to the local Linux Runtime. It also serves
+// StreamContainerStats so the host can scrape per-container resource
+// metrics on its own /metrics endpoint without exposing a second listener
+// inside the VM. See docs/arch/container-metrics.md.
+type DispatchServer struct {
+	apiv1.UnimplementedDispatchServer
+	rt              *runtime.Runtime
+	log             *slog.Logger
+	mu              sync.Mutex
+	envs            map[string]*runtime.RunnerEnv
+	samplers        map[string]samplerEntry
+	defaultInterval time.Duration
+	// linuxCPULimit / linuxMemLimitBytes are the configured per-container
+	// resource caps used to populate the static "limit" fields on each
+	// sample (the kernel reports the same value, but we surface caller
+	// intent rather than depending on the cgroup-side reporting being
+	// non-zero). Set via NewDispatchServer; zero means unlimited.
+	linuxCPULimit      uint64
+	linuxMemLimitBytes uint64
+}
+
+// NewDispatchServer constructs a Dispatch service handler. defaultInterval
+// is used when the StreamContainerStats client passes interval_seconds=0;
+// linuxCPULimit / linuxMemLimitBytes are baked into each per-container
+// sampler as the configured cap.
+func NewDispatchServer(rt *runtime.Runtime, log *slog.Logger, defaultInterval time.Duration, linuxCPULimit, linuxMemLimitBytes uint64) *DispatchServer {
+	if defaultInterval <= 0 {
+		defaultInterval = 10 * time.Second
+	}
+	return &DispatchServer{
+		rt:                 rt,
+		log:                log,
+		envs:               make(map[string]*runtime.RunnerEnv),
+		samplers:           make(map[string]samplerEntry),
+		defaultInterval:    defaultInterval,
+		linuxCPULimit:      linuxCPULimit,
+		linuxMemLimitBytes: linuxMemLimitBytes,
+	}
+}
+
+// RegisterSampler is called by the in-VM runtime's OnTaskStarted hook
+// to expose a container's sampler to StreamContainerStats subscribers.
+func (s *DispatchServer) RegisterSampler(id, repo string, sampler metrics.Sampler) {
+	if sampler == nil {
+		return
+	}
+	s.mu.Lock()
+	s.samplers[id] = samplerEntry{id: id, repo: repo, sampler: sampler}
+	count := len(s.samplers)
+	s.mu.Unlock()
+	s.log.Info("dispatch: sampler registered", "id", id, "repo", repo, "total_active", count)
+}
+
+// UnregisterSampler removes a container's sampler from the stream set,
+// called by the runtime's OnTaskDestroy hook.
+func (s *DispatchServer) UnregisterSampler(id string) {
+	s.mu.Lock()
+	delete(s.samplers, id)
+	count := len(s.samplers)
+	s.mu.Unlock()
+	s.log.Info("dispatch: sampler unregistered", "id", id, "total_active", count)
+}
+
+func (s *DispatchServer) CreateJob(ctx context.Context, req *apiv1.CreateJobRequest) (*apiv1.CreateJobResponse, error) {
 	s.log.Info("dispatch: creating job", "id", req.Id, "image", req.Image)
 
 	env, err := s.rt.Create(ctx, runtime.CreateConfig{
@@ -49,7 +116,7 @@ func (s *dispatchServer) CreateJob(ctx context.Context, req *apiv1.CreateJobRequ
 	return &apiv1.CreateJobResponse{}, nil
 }
 
-func (s *dispatchServer) WaitJob(ctx context.Context, req *apiv1.WaitJobRequest) (*apiv1.WaitJobResponse, error) {
+func (s *DispatchServer) WaitJob(ctx context.Context, req *apiv1.WaitJobRequest) (*apiv1.WaitJobResponse, error) {
 	s.mu.Lock()
 	env, ok := s.envs[req.Id]
 	s.mu.Unlock()
@@ -70,7 +137,7 @@ func (s *dispatchServer) WaitJob(ctx context.Context, req *apiv1.WaitJobRequest)
 	return &apiv1.WaitJobResponse{ExitCode: exitCode}, nil
 }
 
-func (s *dispatchServer) DestroyJob(ctx context.Context, req *apiv1.DestroyJobRequest) (*apiv1.DestroyJobResponse, error) {
+func (s *DispatchServer) DestroyJob(ctx context.Context, req *apiv1.DestroyJobRequest) (*apiv1.DestroyJobResponse, error) {
 	s.mu.Lock()
 	env, ok := s.envs[req.Id]
 	if ok {
@@ -93,35 +160,115 @@ func (s *dispatchServer) DestroyJob(ctx context.Context, req *apiv1.DestroyJobRe
 	return &apiv1.DestroyJobResponse{}, nil
 }
 
-// StartDispatchServer starts the dispatch gRPC server on the given TCP port.
-// Returns a cleanup function that gracefully stops the server.
+// StreamContainerStats serves the long-lived sampling stream that the host
+// uses to surface per-container resource series. The handler ticks at the
+// client-requested cadence and sends one batch per tick covering every
+// registered sampler. Returns when the client cancels the context, when
+// the underlying connection drops, or when Send fails for any reason.
+func (s *DispatchServer) StreamContainerStats(req *apiv1.StreamContainerStatsRequest, stream grpc.ServerStreamingServer[apiv1.ContainerStatsBatch]) error {
+	interval := s.defaultInterval
+	if req != nil && req.IntervalSeconds > 0 {
+		interval = time.Duration(req.IntervalSeconds) * time.Second
+	}
+	s.log.Info("dispatch: container stats stream opened", "interval", interval)
+	defer s.log.Info("dispatch: container stats stream closed")
+
+	ctx := stream.Context()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			if err := ctx.Err(); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
+				return err
+			}
+			return nil
+		case now := <-t.C:
+			batch := s.collectBatch(ctx, now)
+			if err := stream.Send(batch); err != nil {
+				// Network problem or client gone. Return to release the
+				// goroutine; the host will reconnect.
+				s.log.Debug("dispatch: container stats send failed", "error", err)
+				return err
+			}
+		}
+	}
+}
+
+func (s *DispatchServer) collectBatch(ctx context.Context, now time.Time) *apiv1.ContainerStatsBatch {
+	s.mu.Lock()
+	// Snapshot under the lock so a slow Sample call doesn't block
+	// Register/Unregister/CreateJob/DestroyJob.
+	snaps := make([]samplerEntry, 0, len(s.samplers))
+	for _, e := range s.samplers {
+		snaps = append(snaps, e)
+	}
+	s.mu.Unlock()
+
+	out := &apiv1.ContainerStatsBatch{
+		TimestampUnixNano: now.UnixNano(),
+		Stats:             make([]*apiv1.ContainerStats, 0, len(snaps)),
+	}
+	for _, e := range snaps {
+		stats, err := e.sampler.Sample(ctx)
+		if err != nil {
+			s.log.Debug("dispatch: sampler failed", "id", e.id, "error", err)
+			continue
+		}
+		out.Stats = append(out.Stats, &apiv1.ContainerStats{
+			Id:               e.id,
+			Repo:             e.repo,
+			CpuUsageNanos:    stats.CPUUsageNanos,
+			MemoryBytes:      stats.MemoryBytes,
+			MemoryAnonBytes:  stats.MemoryAnonBytes,
+			CpuLimit:         stats.CPULimit,
+			MemoryLimitBytes: stats.MemoryLimitBytes,
+			NetworkRxBytes:   stats.NetworkRxBytes,
+			NetworkTxBytes:   stats.NetworkTxBytes,
+		})
+	}
+	return out
+}
+
+// DispatchServerConfig configures the in-VM dispatch gRPC server.
+type DispatchServerConfig struct {
+	Port               int
+	Runtime            *runtime.Runtime
+	Log                *slog.Logger
+	StatsInterval      time.Duration // default 10s when zero
+	LinuxCPULimit      uint64        // 0 = unlimited
+	LinuxMemLimitBytes uint64        // 0 = unlimited
+}
+
+// StartDispatchServer starts the dispatch gRPC server on the given TCP port
+// and returns the running server instance plus a cleanup function that
+// gracefully stops it. The returned *DispatchServer exposes RegisterSampler
+// / UnregisterSampler so the local runtime can plumb its OnTaskStarted /
+// OnTaskDestroy hooks into the stats stream surface area.
 //
 // Binds to 0.0.0.0 so the host (outside the VM) can reach it. WSL on Windows
 // shares localhost with the host, so this used to be 127.0.0.1, but the same
 // process is now invoked from inside an Apple Vz VM where the host lives on
 // the NAT side and needs the listener exposed on the VM's external interface.
-func StartDispatchServer(port int, rt *runtime.Runtime, log *slog.Logger) func() {
-	lis, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
+func StartDispatchServer(cfg DispatchServerConfig) (*DispatchServer, func()) {
+	lis, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", cfg.Port))
 	if err != nil {
-		log.Error("dispatch: failed to listen", "port", port, "error", err)
-		return func() {}
+		cfg.Log.Error("dispatch: failed to listen", "port", cfg.Port, "error", err)
+		return nil, func() {}
 	}
 
 	srv := grpc.NewServer()
-	apiv1.RegisterDispatchServer(srv, &dispatchServer{
-		rt:   rt,
-		log:  log,
-		envs: make(map[string]*runtime.RunnerEnv),
-	})
+	ds := NewDispatchServer(cfg.Runtime, cfg.Log, cfg.StatsInterval, cfg.LinuxCPULimit, cfg.LinuxMemLimitBytes)
+	apiv1.RegisterDispatchServer(srv, ds)
 
 	go func() {
-		log.Info("dispatch server listening", "port", port)
+		cfg.Log.Info("dispatch server listening", "port", cfg.Port)
 		if err := srv.Serve(lis); err != nil {
-			log.Error("dispatch server error", "error", err)
+			cfg.Log.Error("dispatch server error", "error", err)
 		}
 	}()
 
-	return func() { srv.GracefulStop() }
+	return ds, func() { srv.GracefulStop() }
 }
 
 // DispatchClient dispatches Linux jobs to the WSL worker via gRPC.
@@ -172,6 +319,118 @@ func (d *DispatchClient) Wait(ctx context.Context, id string) (uint32, error) {
 func (d *DispatchClient) Destroy(ctx context.Context, id string) error {
 	_, err := d.client.DestroyJob(ctx, &apiv1.DestroyJobRequest{Id: id})
 	return err
+}
+
+// ConsumeContainerStats opens the StreamContainerStats stream, asks the
+// in-VM dispatch server for samples at the given interval, and feeds each
+// batch into the host metrics registry under the supplied runtime label
+// (typically metrics.RuntimeLinuxVM). The call returns when ctx is
+// cancelled. On non-fatal stream errors the consumer reconnects with
+// backoff so a transient network blip in the VM doesn't lose metrics for
+// the rest of the daemon's lifetime.
+//
+// Series are deleted via metrics.DeleteContainerSeries when the consumer
+// sees a container id stop appearing in batches (the in-VM
+// UnregisterSampler removes it from the stream).
+func (d *DispatchClient) ConsumeContainerStats(ctx context.Context, intervalSeconds uint32, runtimeLabel string, log *slog.Logger) error {
+	if log == nil {
+		log = slog.Default()
+	}
+	const minBackoff = 1 * time.Second
+	const maxBackoff = 30 * time.Second
+	backoff := minBackoff
+	// known maps id -> repo so we can construct the exact label tuple
+	// for DeleteContainerSeries when a container disappears.
+	known := make(map[string]string)
+	thisRound := make(map[string]string)
+
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		stream, err := d.client.StreamContainerStats(ctx, &apiv1.StreamContainerStatsRequest{IntervalSeconds: intervalSeconds})
+		if err != nil {
+			log.Warn("dispatch: opening container stats stream failed; retrying", "error", err, "backoff", backoff)
+			if err := waitWithCtx(ctx, backoff); err != nil {
+				return err
+			}
+			backoff = nextBackoff(backoff, maxBackoff)
+			continue
+		}
+		backoff = minBackoff
+		log.Info("dispatch: container stats stream open", "interval_seconds", intervalSeconds, "runtime_label", runtimeLabel)
+
+		streamErr := readStatsLoop(stream, runtimeLabel, known, thisRound)
+		if streamErr == nil || errors.Is(streamErr, io.EOF) {
+			log.Info("dispatch: container stats stream closed by server; reconnecting")
+		} else if ctx.Err() != nil {
+			return ctx.Err()
+		} else {
+			log.Warn("dispatch: container stats stream errored; reconnecting", "error", streamErr)
+		}
+		// Clear known set so the next stream's first batch re-establishes
+		// the delete-on-disappear bookkeeping cleanly.
+		for id, repo := range known {
+			metrics.DeleteContainerSeries(id, repo, runtimeLabel)
+			delete(known, id)
+		}
+	}
+}
+
+func readStatsLoop(stream grpc.ServerStreamingClient[apiv1.ContainerStatsBatch], runtimeLabel string, known, thisRound map[string]string) error {
+	for {
+		batch, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		// Reset thisRound, populate from batch.
+		for id := range thisRound {
+			delete(thisRound, id)
+		}
+		for _, s := range batch.GetStats() {
+			id, repo := s.GetId(), s.GetRepo()
+			thisRound[id] = repo
+			metrics.RecordContainerStats(id, repo, runtimeLabel, metrics.ContainerStats{
+				CPUUsageNanos:    s.GetCpuUsageNanos(),
+				MemoryBytes:      s.GetMemoryBytes(),
+				MemoryAnonBytes:  s.GetMemoryAnonBytes(),
+				CPULimit:         s.GetCpuLimit(),
+				MemoryLimitBytes: s.GetMemoryLimitBytes(),
+				NetworkRxBytes:   s.GetNetworkRxBytes(),
+				NetworkTxBytes:   s.GetNetworkTxBytes(),
+			})
+			known[id] = repo
+		}
+		// Anything in known but not in thisRound has been destroyed
+		// in-VM since the previous batch; drop its series so the host's
+		// cardinality stays bounded by the live container count.
+		for id, repo := range known {
+			if _, present := thisRound[id]; !present {
+				metrics.DeleteContainerSeries(id, repo, runtimeLabel)
+				delete(known, id)
+			}
+		}
+	}
+}
+
+func waitWithCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+func nextBackoff(cur, max time.Duration) time.Duration {
+	next := cur * 2
+	if next > max {
+		return max
+	}
+	return next
 }
 
 // Close closes the gRPC connection.
