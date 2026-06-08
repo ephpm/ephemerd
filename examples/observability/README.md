@@ -43,8 +43,38 @@ the host where ephemerd is running.
 - On **Linux Docker**: `host.docker.internal` is mapped to
   `host-gateway` via `extra_hosts`. Works out of the box.
 
-If your ephemerd lives on a different machine, edit `prometheus.yml`
-and change the target to that machine's address.
+If your ephemerd lives on a different machine, override `EPHEMERD_TARGET`
+in `.env` (copy `.env.example`).
+
+## Adding more nodes
+
+`EPHEMERD_TARGET` is a comma-separated `host:port` list. To scrape a fleet
+of ephemerd nodes on the same local network, list them all:
+
+```
+EPHEMERD_TARGET=windows-pc.lan:9090,macmini.lan:9090,linux-box.lan:9090
+```
+
+Then `docker compose restart prom-config prometheus` (the init container
+re-renders `prometheus.yml`).
+
+Prometheus tags every series with `instance="<host:port>"` automatically,
+so the dashboard panels split per node without further config — just add
+`{instance="..."}` to any query, or add a Grafana template variable on
+`label_values(instance)` to get a filter dropdown.
+
+**Reachability tips:**
+
+- Bind ephemerd's metrics server to all interfaces (it already does, via
+  `port = 9090` in `[metrics]`). Open port 9090 in the host firewall on
+  each node.
+- Use `.lan` / mDNS hostnames or static IPs — whatever resolves from the
+  box running the Compose rig. If the rig runs on Podman/WSL on Windows,
+  remember the resolver lives inside the Podman machine VM, not on the
+  Windows host.
+- LAN only — no TLS / auth wired here. Don't expose `/metrics` to the
+  internet without setting `metrics.tls_cert` / `tls_key` in `config.toml`
+  on the ephemerd side and switching Prom to `https://...`.
 
 ## Cardinality + retention
 

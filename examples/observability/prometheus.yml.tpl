@@ -8,9 +8,7 @@ scrape_configs:
     static_configs:
       - targets:
           # Rendered at boot by the prom-config service from the
-          # EPHEMERD_TARGET env var. Default is host.docker.internal:9090
-          # which works on Docker Desktop. Podman / rootless / Linux users
-          # may need to override — see README "Engine-specific overrides".
-          - '__EPHEMERD_TARGET__'
-        labels:
-          host: 'ephemerd'
+          # EPHEMERD_TARGET env var (comma-separated host:port list).
+          # Default is host.docker.internal:9090 — works on Docker Desktop.
+          # See README "Adding more nodes" + .env.example.
+__EPHEMERD_TARGETS__

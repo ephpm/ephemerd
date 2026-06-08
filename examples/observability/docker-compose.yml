@@ -1,7 +1,10 @@
 services:
   # Tiny init that renders prometheus.yml.tpl using the EPHEMERD_TARGET env
-  # var (default: host.docker.internal:9090, which works on Docker Desktop).
-  # Podman / rootless / Linux users override via a .env file or shell.
+  # var. EPHEMERD_TARGET is a comma-separated list of host:port pairs so a
+  # single rig can scrape multiple ephemerd nodes on the local network
+  # (e.g. "windows-pc:9090,macmini.local:9090,linux-host:9090"). Default is
+  # the single host.docker.internal:9090 — works on Docker Desktop; Podman
+  # / rootless / Linux users override via .env. See .env.example.
   prom-config:
     image: busybox:latest
     container_name: ephemerd-prom-config
@@ -15,8 +18,18 @@ services:
       - sh
       - -c
       - |
-        sed "s|__EPHEMERD_TARGET__|$$EPHEMERD_TARGET|g" /tpl/prometheus.yml.tpl > /out/prometheus.yml
-        echo "prometheus.yml rendered with target=$$EPHEMERD_TARGET"
+        awk -v list="$$EPHEMERD_TARGET" '
+          /__EPHEMERD_TARGETS__/ {
+            n = split(list, arr, ",")
+            for (i = 1; i <= n; i++) {
+              gsub(/^[ \t]+|[ \t]+$$/, "", arr[i])
+              if (arr[i] != "") printf "          - %c%s%c\n", 39, arr[i], 39
+            }
+            next
+          }
+          { print }
+        ' /tpl/prometheus.yml.tpl > /out/prometheus.yml
+        echo "prometheus.yml rendered with targets=$$EPHEMERD_TARGET"
         cat /out/prometheus.yml
 
   prometheus:
