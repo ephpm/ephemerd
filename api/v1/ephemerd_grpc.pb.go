@@ -277,22 +277,27 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	Dispatch_CreateJob_FullMethodName  = "/ephemerd.v1.Dispatch/CreateJob"
-	Dispatch_WaitJob_FullMethodName    = "/ephemerd.v1.Dispatch/WaitJob"
-	Dispatch_DestroyJob_FullMethodName = "/ephemerd.v1.Dispatch/DestroyJob"
+	Dispatch_CreateJob_FullMethodName            = "/ephemerd.v1.Dispatch/CreateJob"
+	Dispatch_WaitJob_FullMethodName              = "/ephemerd.v1.Dispatch/WaitJob"
+	Dispatch_DestroyJob_FullMethodName           = "/ephemerd.v1.Dispatch/DestroyJob"
+	Dispatch_StreamContainerStats_FullMethodName = "/ephemerd.v1.Dispatch/StreamContainerStats"
 )
 
 // DispatchClient is the client API for Dispatch service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// Dispatch is a lightweight job dispatch service used by the WSL containerd-only
-// worker. The Windows host scheduler sends Linux jobs here via gRPC; the worker
-// creates containers using its local (Linux) Runtime.
+// Dispatch is a lightweight job dispatch service used by the in-VM
+// containerd-only worker (Hyper-V Linux VM on Windows, Vz Linux VM on macOS).
+// The host scheduler sends Linux jobs here via gRPC; the worker creates
+// containers using its local (Linux) Runtime. The host also subscribes to
+// StreamContainerStats to surface per-container resource usage on its own
+// /metrics endpoint without exposing a second listener inside the VM.
 type DispatchClient interface {
 	CreateJob(ctx context.Context, in *CreateJobRequest, opts ...grpc.CallOption) (*CreateJobResponse, error)
 	WaitJob(ctx context.Context, in *WaitJobRequest, opts ...grpc.CallOption) (*WaitJobResponse, error)
 	DestroyJob(ctx context.Context, in *DestroyJobRequest, opts ...grpc.CallOption) (*DestroyJobResponse, error)
+	StreamContainerStats(ctx context.Context, in *StreamContainerStatsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ContainerStatsBatch], error)
 }
 
 type dispatchClient struct {
@@ -333,17 +338,40 @@ func (c *dispatchClient) DestroyJob(ctx context.Context, in *DestroyJobRequest, 
 	return out, nil
 }
 
+func (c *dispatchClient) StreamContainerStats(ctx context.Context, in *StreamContainerStatsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ContainerStatsBatch], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Dispatch_ServiceDesc.Streams[0], Dispatch_StreamContainerStats_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[StreamContainerStatsRequest, ContainerStatsBatch]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Dispatch_StreamContainerStatsClient = grpc.ServerStreamingClient[ContainerStatsBatch]
+
 // DispatchServer is the server API for Dispatch service.
 // All implementations must embed UnimplementedDispatchServer
 // for forward compatibility.
 //
-// Dispatch is a lightweight job dispatch service used by the WSL containerd-only
-// worker. The Windows host scheduler sends Linux jobs here via gRPC; the worker
-// creates containers using its local (Linux) Runtime.
+// Dispatch is a lightweight job dispatch service used by the in-VM
+// containerd-only worker (Hyper-V Linux VM on Windows, Vz Linux VM on macOS).
+// The host scheduler sends Linux jobs here via gRPC; the worker creates
+// containers using its local (Linux) Runtime. The host also subscribes to
+// StreamContainerStats to surface per-container resource usage on its own
+// /metrics endpoint without exposing a second listener inside the VM.
 type DispatchServer interface {
 	CreateJob(context.Context, *CreateJobRequest) (*CreateJobResponse, error)
 	WaitJob(context.Context, *WaitJobRequest) (*WaitJobResponse, error)
 	DestroyJob(context.Context, *DestroyJobRequest) (*DestroyJobResponse, error)
+	StreamContainerStats(*StreamContainerStatsRequest, grpc.ServerStreamingServer[ContainerStatsBatch]) error
 	mustEmbedUnimplementedDispatchServer()
 }
 
@@ -362,6 +390,9 @@ func (UnimplementedDispatchServer) WaitJob(context.Context, *WaitJobRequest) (*W
 }
 func (UnimplementedDispatchServer) DestroyJob(context.Context, *DestroyJobRequest) (*DestroyJobResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DestroyJob not implemented")
+}
+func (UnimplementedDispatchServer) StreamContainerStats(*StreamContainerStatsRequest, grpc.ServerStreamingServer[ContainerStatsBatch]) error {
+	return status.Error(codes.Unimplemented, "method StreamContainerStats not implemented")
 }
 func (UnimplementedDispatchServer) mustEmbedUnimplementedDispatchServer() {}
 func (UnimplementedDispatchServer) testEmbeddedByValue()                  {}
@@ -438,6 +469,17 @@ func _Dispatch_DestroyJob_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Dispatch_StreamContainerStats_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(StreamContainerStatsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(DispatchServer).StreamContainerStats(m, &grpc.GenericServerStream[StreamContainerStatsRequest, ContainerStatsBatch]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Dispatch_StreamContainerStatsServer = grpc.ServerStreamingServer[ContainerStatsBatch]
+
 // Dispatch_ServiceDesc is the grpc.ServiceDesc for Dispatch service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -458,6 +500,12 @@ var Dispatch_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Dispatch_DestroyJob_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "StreamContainerStats",
+			Handler:       _Dispatch_StreamContainerStats_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "api/v1/ephemerd.proto",
 }

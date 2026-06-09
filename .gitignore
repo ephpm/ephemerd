@@ -23,3 +23,6 @@ pkg/vm/embed/initrd
 
 # Claude Code personal overrides (per-engineer, per-project)
 .claude/settings.local.json
+
+# Per-host observability override (rendered from .env.example)
+examples/observability/.env

@@ -314,8 +314,20 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		}
 
 		dispatchPort := int(containerdTCPPort) + 1
-		dispatchCleanup := scheduler.StartDispatchServer(dispatchPort, rt, log)
+		ds, dispatchCleanup := scheduler.StartDispatchServer(scheduler.DispatchServerConfig{
+			Port:          dispatchPort,
+			Runtime:       rt,
+			Log:           log,
+			StatsInterval: cfg.Metrics.ParsedContainerStatsInterval(),
+			// No per-container caps configured for Linux today; samplers
+			// surface the kernel-reported limit when present.
+		})
 		defer dispatchCleanup()
+		// Wire the cgroup sampler hooks so every started container shows
+		// up on the dispatch stats stream the host subscribes to.
+		if onStart, onDestroy := buildDispatchSamplerHooks(ds, log.With("component", "dispatch-sampler")); onStart != nil {
+			rt.SetTaskHooks(onStart, onDestroy)
+		}
 
 		// Debug exec server on dispatch_port+1 — lets the Windows host poke
 		// into any container in the VM (e.g. exec'ing into kindest/node to
@@ -470,6 +482,20 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		log.Warn("failed to clean orphan containers", "error", err)
 	}
 
+	// Host-local per-container sampler registry. Only used for native
+	// containers on the host (Windows host or Linux host). In-VM Linux
+	// containers are sampled by the in-VM ephemerd and pushed back via
+	// the dispatch stream — see ConsumeContainerStats wiring below.
+	var hostSamplerRegistry *metrics.SamplerRegistry
+	if cfg.Metrics.Enabled {
+		hostSamplerRegistry = metrics.NewSamplerRegistry(cfg.Metrics.ParsedContainerStatsInterval(), log.With("component", "host-sampler"))
+		hostSamplerRegistry.Start(ctx)
+		defer hostSamplerRegistry.Stop()
+		if onStart, onDestroy := buildHostSamplerHooks(hostSamplerRegistry, log.With("component", "host-sampler"), cfg.Runner.Windows.CPUCount(), cfg.Runner.Windows.MemoryBytes()); onStart != nil {
+			rt.SetTaskHooks(onStart, onDestroy)
+		}
+	}
+
 	// Create CI providers (one or more of GitHub, Forgejo, Gitea, etc.)
 	activeProviders, providerCleanup, err := initProviders(cfg, log)
 	if err != nil {
@@ -560,6 +586,20 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			Log:     log,
 		})
 		defer metricsCleanup()
+
+		// When we have a Linux dispatcher (Windows host with VM, macOS
+		// host with Vz Linux VM), subscribe to the in-VM container stats
+		// stream and feed batches into the host's metrics registry under
+		// the linux-vm runtime label. Runs for the daemon's lifetime;
+		// reconnects on transient stream errors.
+		if linuxDispatcher != nil {
+			interval := cfg.Metrics.ParsedContainerStatsInterval()
+			go func() {
+				if err := linuxDispatcher.ConsumeContainerStats(ctx, uint32(interval.Seconds()), metrics.RuntimeLinuxVM, log.With("component", "container-stats-consumer")); err != nil && ctx.Err() == nil {
+					log.Warn("container stats consumer exited", "error", err)
+				}
+			}()
+		}
 	}
 
 	// Pull the macOS base image (Tart OCI) in the background so the

@@ -59,13 +59,17 @@ message LogChunk {
   bytes data = 1;
 }
 
-// Dispatch is a lightweight job dispatch service used by the WSL containerd-only
-// worker. The Windows host scheduler sends Linux jobs here via gRPC; the worker
-// creates containers using its local (Linux) Runtime.
+// Dispatch is a lightweight job dispatch service used by the in-VM
+// containerd-only worker (Hyper-V Linux VM on Windows, Vz Linux VM on macOS).
+// The host scheduler sends Linux jobs here via gRPC; the worker creates
+// containers using its local (Linux) Runtime. The host also subscribes to
+// StreamContainerStats to surface per-container resource usage on its own
+// /metrics endpoint without exposing a second listener inside the VM.
 service Dispatch {
   rpc CreateJob(CreateJobRequest) returns (CreateJobResponse);
   rpc WaitJob(WaitJobRequest) returns (WaitJobResponse);
   rpc DestroyJob(DestroyJobRequest) returns (DestroyJobResponse);
+  rpc StreamContainerStats(StreamContainerStatsRequest) returns (stream ContainerStatsBatch);
 }
 
 message CreateJobRequest {
@@ -85,3 +89,31 @@ message WaitJobResponse { uint32 exit_code = 1; }
 
 message DestroyJobRequest { string id = 1; }
 message DestroyJobResponse {}
+
+// StreamContainerStatsRequest opens a long-lived sampling stream. The host
+// dictates the cadence; the in-VM worker ticks at this interval and sends one
+// ContainerStatsBatch per tick.
+message StreamContainerStatsRequest {
+  uint32 interval_seconds = 1; // 0 -> server default (10s)
+}
+
+message ContainerStatsBatch {
+  int64 timestamp_unix_nano = 1; // server-side wall clock at sample time
+  repeated ContainerStats stats = 2;
+}
+
+message ContainerStats {
+  string id = 1;
+  string repo = 2;
+  uint64 cpu_usage_nanos = 3;       // cumulative CPU time in nanoseconds
+  uint64 memory_bytes = 4;          // current usage
+  uint64 memory_anon_bytes = 5;     // anon-only (cgroup); 0 on Windows
+  uint64 cpu_limit = 6;             // configured vCPU count; 0 = unlimited
+  uint64 memory_limit_bytes = 7;    // configured memory cap; 0 = unlimited
+  // Cumulative network bytes (the runner container only — does not include
+  // sibling containers spawned via dind). On Linux this is read via
+  // netlink against the container's netns and excludes loopback. On
+  // Windows it sums BytesReceived/BytesSent across HCS endpoints.
+  uint64 network_rx_bytes = 8;
+  uint64 network_tx_bytes = 9;
+}

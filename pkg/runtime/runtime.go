@@ -91,7 +91,15 @@ type Config struct {
 	// dind.Server for `docker build` support. Optional; nil means `docker build`
 	// falls back to the platform default (buildah on Linux, 501 elsewhere).
 	BuildKit *buildkit.Server
-	Log      *slog.Logger
+	// OnTaskStarted is invoked synchronously by Create after the container
+	// task has successfully Start()ed. Nil means no hook. Used to wire
+	// per-container resource samplers into the metrics endpoint; see
+	// docs/arch/container-metrics.md.
+	OnTaskStarted func(env *RunnerEnv)
+	// OnTaskDestroy is invoked synchronously by Destroy before the
+	// container is torn down. Symmetric with OnTaskStarted.
+	OnTaskDestroy func(env *RunnerEnv)
+	Log           *slog.Logger
 }
 
 // Runtime manages container lifecycle for runner environments.
@@ -111,6 +119,8 @@ func (r *Runtime) Client() *client.Client {
 // RunnerEnv represents a running runner environment.
 type RunnerEnv struct {
 	ID        string
+	Provider  string       // forge provider that queued the job (e.g. "github")
+	Repo      string       // forge-native repo path (e.g. "owner/repo")
 	Netns     string       // network namespace path (Linux only)
 	RunnerDir string       // per-job runner copy, cleaned up on destroy
 	Dind      *dind.Server // per-job fake Docker daemon (nil if disabled)
@@ -129,6 +139,16 @@ func New(cfg Config) (*Runtime, error) {
 // LogDir returns the configured per-job log directory (empty if logs go to stdio).
 func (r *Runtime) LogDir() string {
 	return r.cfg.LogDir
+}
+
+// SetTaskHooks installs (or replaces) the OnTaskStarted / OnTaskDestroy
+// callbacks. Used by main.go to wire metrics-sampler registration after
+// both the runtime and the dispatch server have been constructed —
+// constructor-order makes a plain Config-time hook awkward because the
+// dispatch server depends on the runtime.
+func (r *Runtime) SetTaskHooks(onStarted, onDestroy func(*RunnerEnv)) {
+	r.cfg.OnTaskStarted = onStarted
+	r.cfg.OnTaskDestroy = onDestroy
 }
 
 // CleanOrphans removes any leftover containers and snapshots from a previous
@@ -926,14 +946,20 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	}
 
 	createSucceeded = true
-	return &RunnerEnv{
+	env := &RunnerEnv{
 		ID:        id,
+		Provider:  cfg.Provider,
+		Repo:      cfg.Repo,
 		Netns:     envNetns,
 		RunnerDir: jobRunnerDir,
 		Dind:      dindServer,
 		Container: container,
 		Task:      task,
-	}, nil
+	}
+	if r.cfg.OnTaskStarted != nil {
+		r.cfg.OnTaskStarted(env)
+	}
+	return env, nil
 }
 
 // Destroy tears down a runner environment completely.
@@ -941,6 +967,10 @@ func (r *Runtime) Destroy(ctx context.Context, env *RunnerEnv) error {
 	ctx = namespaces.WithNamespace(ctx, namespace)
 
 	r.cfg.Log.Info("destroying runner environment", "id", env.ID)
+
+	if r.cfg.OnTaskDestroy != nil {
+		r.cfg.OnTaskDestroy(env)
+	}
 
 	// Kill the task if still running
 	status, err := env.Task.Status(ctx)
