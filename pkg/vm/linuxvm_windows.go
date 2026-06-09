@@ -520,6 +520,9 @@ func (l *hypervLinuxVM) createAndBootVM() error {
 	dindFlag := ""
 	if l.cfg.DindEnabled {
 		dindFlag = " ephemerd.dind=1"
+		if l.cfg.DindAllowPrivileged {
+			dindFlag += " ephemerd.dind_allow_privileged=1"
+		}
 	}
 	cmdline := fmt.Sprintf(
 		"rdinit=/init ephemerd.containerd_port=%d ephemerd.root_disk=/dev/sda%s "+

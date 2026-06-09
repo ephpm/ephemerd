@@ -11,7 +11,7 @@ import (
 )
 
 // startContainerRuntime starts an in-process containerd server on Linux.
-func startContainerRuntime(dataDir string, log *slog.Logger, _ bool, tcpPort uint32, tcpAddr string, _ bool, _ uint, _ uint64, _ uint64) (*client.Client, func() (*scheduler.DispatchClient, *client.Client), func(), error) {
+func startContainerRuntime(dataDir string, log *slog.Logger, _ bool, tcpPort uint32, tcpAddr string, _, _ bool, _ uint, _ uint64, _ uint64) (*client.Client, func() (*scheduler.DispatchClient, *client.Client), func(), error) {
 	ctrd, err := containerd.New(containerd.Config{
 		DataDir: dataDir,
 		TCPPort: tcpPort,

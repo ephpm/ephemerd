@@ -126,14 +126,18 @@ func serveCmd() *cli.Command {
 				Name:  "dind",
 				Usage: "mount a fake Docker socket into each container (passed to WSL worker)",
 			},
+			&cli.BoolFlag{
+				Name:  "dind-allow-privileged",
+				Usage: "allow privileged sibling containers (overrides config). Set on the in-VM ephemerd from the host's dind.allow_privileged.",
+			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			return serve(ctx, cmd.String("config"), cmd.String("images-dir"), uint32(cmd.Uint("containerd-tcp-port")), cmd.String("containerd-tcp-addr"), cmd.Bool("containerd-only"), cmd.Bool("dind"))
+			return serve(ctx, cmd.String("config"), cmd.String("images-dir"), uint32(cmd.Uint("containerd-tcp-port")), cmd.String("containerd-tcp-addr"), cmd.Bool("containerd-only"), cmd.Bool("dind"), cmd.Bool("dind-allow-privileged"))
 		},
 	}
 }
 
-func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPPort uint32, containerdTCPAddr string, containerdOnly bool, dindFlag bool) error {
+func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPPort uint32, containerdTCPAddr string, containerdOnly bool, dindFlag, dindAllowPrivilegedFlag bool) error {
 	// Check if another instance is already running.
 	if cc, err := dialControl(ctx); err == nil {
 		if resp, err := cc.Status(ctx, &apiv1.StatusRequest{}); err == nil {
@@ -164,6 +168,14 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	// CLI --dind flag overrides config file
 	if dindFlag {
 		cfg.Dind.Enabled = true
+	}
+	// CLI --dind-allow-privileged flag overrides config file. Used by the
+	// in-VM ephemerd: the host plumbs its own dind.allow_privileged across
+	// the VM boundary via this flag because the in-VM daemon has its own
+	// (defaulted) config file.
+	if dindAllowPrivilegedFlag {
+		t := true
+		cfg.Dind.AllowPrivileged = &t
 	}
 
 	// When running as a Windows Service, route log output to the Event Log.
@@ -197,7 +209,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	// Start container runtime.
 	// On Linux/Windows: embedded containerd runs in-process.
 	// On macOS: boot a Linux VM via Virtualization.framework, containerd runs inside it.
-	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, containerdTCPAddr, cfg.Dind.Enabled, cfg.VM.Linux.CPUs, cfg.VM.Linux.MemoryMB, cfg.VM.Linux.DiskSizeGB)
+	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, containerdTCPAddr, cfg.Dind.Enabled, cfg.Dind.ResolvedAllowPrivileged(), cfg.VM.Linux.CPUs, cfg.VM.Linux.MemoryMB, cfg.VM.Linux.DiskSizeGB)
 	if err != nil {
 		return fmt.Errorf("starting container runtime: %w", err)
 	}

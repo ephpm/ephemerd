@@ -696,13 +696,18 @@ func extractVmlinuxFromBzImage(bzImagePath, dest string) error {
 // exec's ephemerd-linux as PID 1.
 func Initrdx86() error {
 	dest := filepath.Join(vmEmbedDir, "initrd")
-	// Initrd embeds the rootfs tarball and kernel modules from linux-virt.
-	// ephemerd-linux is appended to the boot initrd at runtime by
-	// pkg/vm.buildBootInitrd, so changes to Linux code do not require an
-	// initrd rebuild — only changes to busybox, the rootfs, or kernel
-	// modules invalidate this output.
+	// Initrd embeds the rootfs tarball, kernel modules from linux-virt, and
+	// the init script which is templated in-line below from this very file.
+	// ephemerd-linux itself is appended to the boot initrd at runtime by
+	// pkg/vm.buildBootInitrd, so changes to *Linux ephemerd source* do not
+	// require an initrd rebuild — but changes to busybox, the rootfs,
+	// kernel modules, OR the init script (i.e. download.go itself)
+	// invalidate this output. The download.go input is what catches edits
+	// to the init script body; without it `mage build:windows` happily
+	// embeds a stale init script and the kernel boots with old behavior.
 	inputs := []string{
 		filepath.Join(vmEmbedDir, "ephemerd-rootfs-"+AlpineVersion+"-x86_64.tar.gz"),
+		filepath.Join("mage", "download", "download.go"),
 	}
 	if !outOfDate(dest, inputs...) {
 		fmt.Printf("  %s already up to date, skipping\n", dest)
@@ -1416,14 +1421,16 @@ sleep 1
 CONTAINERD_PORT="10000"
 ROOT_DISK=""
 DIND="0"
+DIND_ALLOW_PRIV="0"
 for param in $(cat /proc/cmdline); do
     case "$param" in
         ephemerd.containerd_port=*) CONTAINERD_PORT="${param#*=}" ;;
         ephemerd.root_disk=*) ROOT_DISK="${param#*=}" ;;
         ephemerd.dind=1) DIND="1" ;;
+        ephemerd.dind_allow_privileged=1) DIND_ALLOW_PRIV="1" ;;
     esac
 done
-echo "ephemerd-init: containerd_port=$CONTAINERD_PORT root_disk=$ROOT_DISK"
+echo "ephemerd-init: containerd_port=$CONTAINERD_PORT root_disk=$ROOT_DISK dind=$DIND dind_allow_privileged=$DIND_ALLOW_PRIV"
 
 # Network: eth0 via hv_netvsc (built-in), DHCP from Default Switch
 NET_IF=""
@@ -1607,8 +1614,11 @@ export HOME=/root
 DIND_FLAG=""
 if [ "$DIND" = "1" ]; then
     DIND_FLAG="--dind"
+    if [ "$DIND_ALLOW_PRIV" = "1" ]; then
+        DIND_FLAG="$DIND_FLAG --dind-allow-privileged"
+    fi
 fi
-echo "ephemerd-init: launching ephemerd-linux (dind=$DIND)"
+echo "ephemerd-init: launching ephemerd-linux (dind=$DIND allow_privileged=$DIND_ALLOW_PRIV)"
 exec switch_root /newroot /usr/local/bin/ephemerd-linux serve \
     --data-dir /var/lib/ephemerd \
     --containerd-tcp-port "$CONTAINERD_PORT" \
