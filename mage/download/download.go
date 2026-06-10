@@ -1422,15 +1422,17 @@ CONTAINERD_PORT="10000"
 ROOT_DISK=""
 DIND="0"
 DIND_ALLOW_PRIV="0"
+HOST_CONFIG_SHARE=""
 for param in $(cat /proc/cmdline); do
     case "$param" in
         ephemerd.containerd_port=*) CONTAINERD_PORT="${param#*=}" ;;
         ephemerd.root_disk=*) ROOT_DISK="${param#*=}" ;;
         ephemerd.dind=1) DIND="1" ;;
         ephemerd.dind_allow_privileged=1) DIND_ALLOW_PRIV="1" ;;
+        ephemerd.host_config_share=*) HOST_CONFIG_SHARE="${param#*=}" ;;
     esac
 done
-echo "ephemerd-init: containerd_port=$CONTAINERD_PORT root_disk=$ROOT_DISK dind=$DIND dind_allow_privileged=$DIND_ALLOW_PRIV"
+echo "ephemerd-init: containerd_port=$CONTAINERD_PORT root_disk=$ROOT_DISK dind=$DIND dind_allow_privileged=$DIND_ALLOW_PRIV host_config_share=$HOST_CONFIG_SHARE"
 
 # Network: eth0 via hv_netvsc (built-in), DHCP from Default Switch
 NET_IF=""
@@ -1618,8 +1620,33 @@ if [ "$DIND" = "1" ]; then
         DIND_FLAG="$DIND_FLAG --dind-allow-privileged"
     fi
 fi
-echo "ephemerd-init: launching ephemerd-linux (dind=$DIND allow_privileged=$DIND_ALLOW_PRIV)"
+
+# Mount the Plan9 host-config share (read-only) at /newroot/mnt/host-config.
+# When mount succeeds, point in-VM ephemerd at the host's config.toml so
+# every host-side setting (dind.*, runtime.rlimits, future knobs) takes
+# effect on this VM boot with no per-setting plumbing. When it fails
+# (missing 9p modules, share not exported), fall back silently — the
+# kernel-cmdline flags above keep the in-VM daemon working for legacy
+# behaviors. See docs/arch/plan9-config-share.md.
+CONFIG_FLAG=""
+if [ -n "$HOST_CONFIG_SHARE" ]; then
+    mkdir -p /newroot/mnt/host-config
+    if mount -t 9p -o trans=virtio,version=9p2000.L,ro \
+        "$HOST_CONFIG_SHARE" /newroot/mnt/host-config 2>/dev/null; then
+        if [ -f /newroot/mnt/host-config/config.toml ]; then
+            CONFIG_FLAG="--config /mnt/host-config/config.toml"
+            echo "ephemerd-init: host config share mounted: $HOST_CONFIG_SHARE -> /mnt/host-config"
+        else
+            echo "ephemerd-init: host config share mounted but config.toml not present at /mnt/host-config; falling back"
+        fi
+    else
+        echo "ephemerd-init: WARNING: 9p mount of $HOST_CONFIG_SHARE failed; falling back to default config"
+    fi
+fi
+
+echo "ephemerd-init: launching ephemerd-linux (dind=$DIND allow_privileged=$DIND_ALLOW_PRIV host_config=${CONFIG_FLAG:+yes})"
 exec switch_root /newroot /usr/local/bin/ephemerd-linux serve \
+    $CONFIG_FLAG \
     --data-dir /var/lib/ephemerd \
     --containerd-tcp-port "$CONTAINERD_PORT" \
     --containerd-tcp-addr 0.0.0.0 \
