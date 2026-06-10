@@ -14,7 +14,7 @@ import (
 
 func TestDockerBuildOptsToSolveOpt_MinimalInput(t *testing.T) {
 	req := httptest.NewRequest("POST", "/build?t=alpine:local&dockerfile=Dockerfile", nil)
-	opt, err := dockerBuildOptsToSolveOpt(req, "/tmp/ctx")
+	opt, err := dockerBuildOptsToSolveOpt(req, "/tmp/ctx", "test-job")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -30,8 +30,8 @@ func TestDockerBuildOptsToSolveOpt_MinimalInput(t *testing.T) {
 	if opt.Exports[0].Type != "image" {
 		t.Errorf("export type = %q, want image", opt.Exports[0].Type)
 	}
-	if opt.Exports[0].Attrs["name"] != "alpine:local" {
-		t.Errorf("export name = %q, want alpine:local", opt.Exports[0].Attrs["name"])
+	if got, want := opt.Exports[0].Attrs["name"], "build.ephemerd.local/test-job/alpine:local"; got != want {
+		t.Errorf("export name = %q, want %q", got, want)
 	}
 	if opt.LocalDirs["context"] != "/tmp/ctx" {
 		t.Errorf("LocalDirs[context] = %q, want /tmp/ctx", opt.LocalDirs["context"])
@@ -48,7 +48,7 @@ func TestDockerBuildOptsToSolveOpt_AllOptions(t *testing.T) {
 		`&buildargs={"VERSION":"1.0","DEBUG":"true"}` +
 		`&labels={"org.ephpm.test":"yes"}`
 	req := httptest.NewRequest("POST", "/build?"+q, nil)
-	opt, err := dockerBuildOptsToSolveOpt(req, "/ctx")
+	opt, err := dockerBuildOptsToSolveOpt(req, "/ctx", "test-job")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestDockerBuildOptsToSolveOpt_AllOptions(t *testing.T) {
 
 func TestDockerBuildOptsToSolveOpt_InvalidBuildargsJSON(t *testing.T) {
 	req := httptest.NewRequest("POST", "/build?buildargs=not-json", nil)
-	_, err := dockerBuildOptsToSolveOpt(req, "/ctx")
+	_, err := dockerBuildOptsToSolveOpt(req, "/ctx", "test-job")
 	if err == nil {
 		t.Fatal("want error for malformed buildargs JSON, got nil")
 	}
