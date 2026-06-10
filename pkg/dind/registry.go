@@ -168,24 +168,20 @@ func (s *Server) handleImagePush(w http.ResponseWriter, r *http.Request, refPath
 	cfg, _ := s.resolveAuthForRef(r, fullRef)
 
 	// Look up the image. Buildkit puts built images in its own namespace
-	// (configured via buildkit.Config.ContainerdNamespace = "buildkit").
+	// (configured via buildkit.Config.ContainerdNamespace = "buildkit"),
+	// stored under per-job scoped names (see scopedBuildRef) so concurrent
+	// jobs building the same tag don't collide.
 	const buildkitNS = "buildkit"
 	ctx := namespaces.WithNamespace(r.Context(), buildkitNS)
 
-	// Look up the image. The Linux Docker CLI canonicalizes refs with the
-	// docker.io/ registry prefix before POSTing the push, but BuildKit's
-	// containerd exporter stores the image under whatever short name the
-	// build's `-t` tag carried (e.g. "ephpm/ephemerd:..." with no prefix).
-	// Try the original first, then strip a leading docker.io/.
-	img, err := s.client.GetImage(ctx, fullRef)
-	if err != nil {
-		if alt, ok := strings.CutPrefix(fullRef, "docker.io/"); ok {
-			if alt2, err2 := s.client.GetImage(ctx, alt); err2 == nil {
-				img, err = alt2, nil
-			}
+	var img client.Image
+	var imgErr error
+	for _, name := range pushLookupCandidates(s.jobID, fullRef) {
+		if img, imgErr = s.client.GetImage(ctx, name); imgErr == nil {
+			break
 		}
 	}
-	if err != nil {
+	if err := imgErr; err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{
 			"message": fmt.Sprintf("image not found in buildkit namespace: %s: %v", fullRef, err),
 		})

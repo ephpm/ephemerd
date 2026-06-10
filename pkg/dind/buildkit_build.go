@@ -88,8 +88,10 @@ func (s *Server) handleImageBuildBuildkit(bk *buildkit.Server) http.HandlerFunc 
 			}
 		}()
 
-		// 2. Translate Docker build options → SolveOpt.
-		opt, err := dockerBuildOptsToSolveOpt(r, ctxDir)
+		// 2. Translate Docker build options → SolveOpt. Tags are scoped
+		// per job (see scopedBuildRef) because every job's build lands in
+		// the one shared buildkit containerd namespace.
+		opt, err := dockerBuildOptsToSolveOpt(r, ctxDir, s.jobID)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{
 				"message": fmt.Sprintf("build options: %v", err),
@@ -224,7 +226,10 @@ func extractBuildContextToTempDir(r io.Reader) (resultDir string, retErr error) 
 // a BuildKit SolveOpt. This is the heart of the arch doc's "option
 // translation" table. Not complete — MVP subset: -t, -f, --target,
 // --build-arg, --no-cache, --pull, --label.
-func dockerBuildOptsToSolveOpt(r *http.Request, ctxDir string) (bkclient.SolveOpt, error) {
+//
+// jobID scopes the export tags (see scopedBuildRef) so concurrent jobs
+// don't race on identical tag names in the shared buildkit namespace.
+func dockerBuildOptsToSolveOpt(r *http.Request, ctxDir, jobID string) (bkclient.SolveOpt, error) {
 	q := r.URL.Query()
 
 	dockerfile := q.Get("dockerfile")
@@ -283,14 +288,20 @@ func dockerBuildOptsToSolveOpt(r *http.Request, ctxDir string) (bkclient.SolveOp
 	}
 
 	// Image export: write the result into ephemerd's containerd image
-	// store under the requested tag(s). buildkit's image exporter accepts
-	// a comma-separated list under "name" — register all of them so a
-	// subsequent docker push <tag> finds the image regardless of which
-	// -t the user picked. Registry push happens later via the existing
-	// pkg/dind push path, not during build.
+	// store under the requested tag(s), scoped per job so two concurrent
+	// jobs building the same tag don't overwrite each other's image
+	// record. buildkit's image exporter accepts a comma-separated list
+	// under "name" — register all of them so a subsequent docker push
+	// <tag> finds the image regardless of which -t the user picked.
+	// Registry push happens later via the existing pkg/dind push path,
+	// which applies the same scoping on lookup.
 	exportAttrs := map[string]string{}
 	if len(tags) > 0 {
-		exportAttrs["name"] = strings.Join(tags, ",")
+		scoped := make([]string, len(tags))
+		for i, t := range tags {
+			scoped[i] = scopedBuildRef(jobID, t)
+		}
+		exportAttrs["name"] = strings.Join(scoped, ",")
 	}
 	exports := []bkclient.ExportEntry{{
 		Type:  "image",
