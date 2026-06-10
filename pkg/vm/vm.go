@@ -46,6 +46,13 @@ type LinuxVMConfig struct {
 	// Docker socket into each container.
 	DindEnabled bool
 
+	// DindAllowPrivileged forwards the host's dind.allow_privileged setting
+	// to the in-VM ephemerd via the kernel cmdline. Without this, the in-VM
+	// daemon reads its own (minimal) config and Linux defaults to false,
+	// rejecting `docker run --privileged` siblings even when the host
+	// operator explicitly opted in.
+	DindAllowPrivileged bool
+
 	Log *slog.Logger
 }
 
