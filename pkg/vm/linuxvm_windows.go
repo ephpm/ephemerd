@@ -287,13 +287,20 @@ func (l *hypervLinuxVM) extractAssets() error {
 	}
 
 	// Build the final initrd by appending a cpio with /assets/ephemerd-linux
-	// to the base initrd. Cheap (a few file ops + gzip on a single 240MB blob)
-	// and idempotent, so we run it on every start. HCS reads InitRdPath only
-	// when the VM is created, so this must happen before createAndBootVM.
+	// (and the host's config.toml when present) to the base initrd. Cheap
+	// (a few file ops + gzip on a single 240MB blob) and idempotent, so we
+	// run it on every start. HCS reads InitRdPath only when the VM is
+	// created, so this must happen before createAndBootVM. Re-running on
+	// every boot is what gives "edit config.toml + restart ephemerd =
+	// in-VM daemon sees the change" with no per-setting plumbing.
 	bootInitrd := filepath.Join(l.vmDir, "initrd")
 	baseInitrd := filepath.Join(l.vmDir, "initrd-base")
 	ephemerdBin := filepath.Join(l.vmDir, "ephemerd-linux")
-	if err := buildBootInitrd(baseInitrd, ephemerdBin, bootInitrd); err != nil {
+	hostConfig := ""
+	if l.cfg.HostDataDir != "" {
+		hostConfig = filepath.Join(l.cfg.HostDataDir, "config.toml")
+	}
+	if err := buildBootInitrd(baseInitrd, ephemerdBin, hostConfig, bootInitrd); err != nil {
 		return fmt.Errorf("building boot initrd: %w", err)
 	}
 	if err := grantVmFileAccess(bootInitrd); err != nil {
@@ -517,9 +524,10 @@ func (l *hypervLinuxVM) createAndBootVM() error {
 	//   /dev/sda as root and find init there, which fails on an unformatted VHDX.
 	// - 8250_core: enable serial UART for console output via named pipe
 	// - ephemerd.*: custom params parsed by our init script
-	// The dind* params are now redundant with the Plan9 host-config share
-	// (the in-VM ephemerd reads them from the shared config.toml). Kept as
-	// a fallback so the VM still works on kernels missing 9p modules.
+	// The dind* params are redundant when the host's config.toml rides in
+	// via the initrd tail (the in-VM ephemerd reads the same [dind]
+	// section the host does). Kept as a fallback for the no-config path —
+	// fresh installs where config.toml doesn't exist yet.
 	dindFlag := ""
 	if l.cfg.DindEnabled {
 		dindFlag = " ephemerd.dind=1"
@@ -527,15 +535,11 @@ func (l *hypervLinuxVM) createAndBootVM() error {
 			dindFlag += " ephemerd.dind_allow_privileged=1"
 		}
 	}
-	hostConfigFlag := ""
-	if l.cfg.HostDataDir != "" {
-		hostConfigFlag = " ephemerd.host_config_share=ephemerd-host-config"
-	}
 	cmdline := fmt.Sprintf(
-		"rdinit=/init ephemerd.containerd_port=%d ephemerd.root_disk=/dev/sda%s%s "+
+		"rdinit=/init ephemerd.containerd_port=%d ephemerd.root_disk=/dev/sda%s "+
 			"pci=off brd.rd_nr=0 pmtmr=0 nr_cpus=%d "+
 			"8250_core.nr_uarts=1 8250_core.skip_txen_test=1 console=ttyS0,115200",
-		l.cfg.ContainerdPort, dindFlag, hostConfigFlag, l.cfg.CPUs,
+		l.cfg.ContainerdPort, dindFlag, l.cfg.CPUs,
 	)
 
 	doc := &hcsComputeSystem{
@@ -596,21 +600,6 @@ func (l *hypervLinuxVM) createAndBootVM() error {
 		},
 	}
 
-	// Plan9 host-config share: read-only window onto the host's data dir
-	// so the in-VM ephemerd reads the same config.toml as the host. Flags
-	// 0x04 (LinuxMetadata) + 0x08 (CaseSensitive) make the share behave
-	// sensibly on Linux. See docs/arch/plan9-config-share.md.
-	if l.cfg.HostDataDir != "" {
-		doc.VirtualMachine.Devices.Plan9 = &hcsPlan9{
-			Shares: []hcsPlan9Share{{
-				Name:       "ephemerd-host-config",
-				AccessName: "ephemerd-host-config",
-				Path:       l.cfg.HostDataDir,
-				ReadOnly:   true,
-				Flags:      0x04 | 0x08,
-			}},
-		}
-	}
 
 	l.cfg.Log.Info("creating Hyper-V Linux VM",
 		"name", l.vmName,

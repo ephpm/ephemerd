@@ -53,13 +53,13 @@ type LinuxVMConfig struct {
 	// this by carrying the same value through the shared config.toml.
 	DindAllowPrivileged bool
 
-	// HostDataDir is the host's ephemerd data directory. When set, it's
-	// exposed read-only to the VM via a Hyper-V Plan9 share named
-	// "ephemerd-host-config" and mounted at /mnt/host-config by the init
-	// script. The in-VM ephemerd then reads its config from
-	// /mnt/host-config/config.toml, so any host-side setting takes effect
-	// on the next VM boot without per-setting kernel cmdline plumbing.
-	// See docs/arch/plan9-config-share.md.
+	// HostDataDir is the host's ephemerd data directory. When set,
+	// <HostDataDir>/config.toml is appended into the runtime-generated
+	// boot-initrd tail (next to ephemerd-linux) and staged at
+	// /etc/ephemerd/config.toml inside the VM, so any host-side setting
+	// takes effect on the next VM boot without per-setting kernel cmdline
+	// plumbing. A missing config.toml is non-fatal (fresh installs run on
+	// defaults). See docs/arch/host-config-initrd.md.
 	HostDataDir string
 
 	Log *slog.Logger

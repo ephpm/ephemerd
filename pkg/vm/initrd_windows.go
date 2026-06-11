@@ -11,14 +11,17 @@ import (
 )
 
 // buildBootInitrd produces the initrd the VM actually boots with by appending
-// a tiny cpio archive containing /assets/ephemerd-linux to the embedded base
-// initrd. The Linux kernel concatenates initrd cpios into a single initramfs,
-// so files in the appended cpio override (or add to) those in the base. This
-// lets a fresh `go build` of ephemerd.exe deliver a new ephemerd-linux to the
-// VM without any initrd rebuild — the build-time initrd contains only the
-// boot scaffolding (busybox, modules, init script), and the binary itself
-// rides in via the runtime-generated tail.
-func buildBootInitrd(basePath, ephemerdLinuxPath, destPath string) error {
+// a tiny cpio archive containing /assets/ephemerd-linux — and, when
+// hostConfigPath is non-empty and readable, /assets/config.toml — to the
+// embedded base initrd. The Linux kernel concatenates initrd cpios into a
+// single initramfs, so files in the appended cpio override (or add to) those
+// in the base. This lets a fresh `go build` of ephemerd.exe deliver a new
+// ephemerd-linux to the VM without any initrd rebuild, and lets the host's
+// config.toml reach the in-VM daemon on every boot with no per-setting
+// plumbing — the build-time initrd contains only the boot scaffolding
+// (busybox, modules, init script); the binary and config ride in via the
+// runtime-generated tail.
+func buildBootInitrd(basePath, ephemerdLinuxPath, hostConfigPath, destPath string) error {
 	baseData, err := os.ReadFile(basePath)
 	if err != nil {
 		return fmt.Errorf("reading base initrd: %w", err)
@@ -26,6 +29,16 @@ func buildBootInitrd(basePath, ephemerdLinuxPath, destPath string) error {
 	binData, err := os.ReadFile(ephemerdLinuxPath)
 	if err != nil {
 		return fmt.Errorf("reading ephemerd-linux: %w", err)
+	}
+	// Host config is best-effort: a missing config.toml (fresh install
+	// before first write, or tests) simply means the in-VM daemon runs on
+	// defaults + kernel-cmdline flags, same as before this feature.
+	var cfgData []byte
+	if hostConfigPath != "" {
+		cfgData, err = os.ReadFile(hostConfigPath)
+		if err != nil {
+			cfgData = nil
+		}
 	}
 
 	var tail bytes.Buffer
@@ -38,6 +51,14 @@ func buildBootInitrd(basePath, ephemerdLinuxPath, destPath string) error {
 	}
 	if err := writeCPIOEntry(gw, "assets/ephemerd-linux", 0o100755, binData, ""); err != nil {
 		return fmt.Errorf("cpio: ephemerd-linux: %w", err)
+	}
+	if cfgData != nil {
+		// 0600: config.toml can carry webhook secrets. Inside the VM it's
+		// only readable by root, and job containers never see the host
+		// rootfs — but no reason to be sloppy with the mode.
+		if err := writeCPIOEntry(gw, "assets/config.toml", 0o100600, cfgData, ""); err != nil {
+			return fmt.Errorf("cpio: config.toml: %w", err)
+		}
 	}
 	if err := writeCPIOEntry(gw, "TRAILER!!!", 0, nil, ""); err != nil {
 		return fmt.Errorf("cpio: trailer: %w", err)
