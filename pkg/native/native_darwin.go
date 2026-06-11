@@ -29,7 +29,20 @@ var serviceUserMu sync.Mutex
 // deletion wedges opendirectoryd on modern macOS.
 const ServiceUserName = "_ephemerd"
 
-// serviceUIDRange is scanned for a free UID when creating the service user.
+// ServiceGroupName is a dedicated primary group for the service user.
+// Using a dedicated group instead of staff (gid 20 — the default group for
+// every normal macOS account) keeps the runner process from inheriting
+// group access to the many files on a typical Mac that are staff-group
+// owned. Falls back to staff if the group can't be created.
+const ServiceGroupName = "_ephemerd"
+
+// staffGID is the macOS staff group, used as the fallback primary group
+// when a dedicated service group can't be provisioned.
+const staffGID = 20
+
+// service{UID,GID} ranges are scanned for a free id when creating the
+// service user/group. macOS reserves <500 for system accounts; 600-999
+// is the conventional band for added service accounts.
 const (
 	serviceUIDMin = 600
 	serviceUIDMax = 999
@@ -71,6 +84,11 @@ func (r *Runner) ensureServiceUser() (*syscall.Credential, error) {
 		return nil, fmt.Errorf("no free UID in range %d-%d", serviceUIDMin, serviceUIDMax)
 	}
 
+	// Resolve a dedicated primary group, falling back to staff (gid 20)
+	// if provisioning fails for any reason — that's the previously-tested
+	// behavior, so a group hiccup never blocks native jobs.
+	gid := r.ensureServiceGroup()
+
 	// NFSHomeDirectory is /var/empty (like _www and other service
 	// accounts). Registering a real directory as a user home puts it
 	// under macOS data protection — even root then can't delete it
@@ -80,7 +98,7 @@ func (r *Runner) ensureServiceUser() (*syscall.Credential, error) {
 		{"dscl", ".", "-create", "/Users/" + ServiceUserName},
 		{"dscl", ".", "-create", "/Users/" + ServiceUserName, "UserShell", "/bin/bash"},
 		{"dscl", ".", "-create", "/Users/" + ServiceUserName, "UniqueID", strconv.Itoa(uid)},
-		{"dscl", ".", "-create", "/Users/" + ServiceUserName, "PrimaryGroupID", "20"}, // staff
+		{"dscl", ".", "-create", "/Users/" + ServiceUserName, "PrimaryGroupID", strconv.Itoa(gid)},
 		{"dscl", ".", "-create", "/Users/" + ServiceUserName, "NFSHomeDirectory", "/var/empty"},
 		{"dscl", ".", "-create", "/Users/" + ServiceUserName, "IsHidden", "1"},
 	}
@@ -89,9 +107,62 @@ func (r *Runner) ensureServiceUser() (*syscall.Credential, error) {
 			return nil, fmt.Errorf("%v: %s: %w", args, strings.TrimSpace(string(out)), err)
 		}
 	}
-	r.log.Info("created ephemerd service user", "user", ServiceUserName, "uid", uid)
+	r.log.Info("created ephemerd service user", "user", ServiceUserName, "uid", uid, "gid", gid)
 
-	return &syscall.Credential{Uid: uint32(uid), Gid: 20}, nil
+	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}, nil
+}
+
+// ensureServiceGroup returns the gid of a dedicated _ephemerd primary
+// group, creating it if needed. On any failure it logs a warning and
+// returns staffGID (20) so native jobs keep working with the previously
+// tested behavior. Caller holds serviceUserMu.
+func (r *Runner) ensureServiceGroup() int {
+	if g, err := user.LookupGroup(ServiceGroupName); err == nil {
+		if gid, perr := strconv.Atoi(g.Gid); perr == nil {
+			return gid
+		}
+	}
+
+	out, err := exec.Command("dscl", ".", "-list", "/Groups", "PrimaryGroupID").Output()
+	if err != nil {
+		r.log.Warn("listing groups for service group; falling back to staff", "error", err)
+		return staffGID
+	}
+	used := make(map[int]bool)
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 {
+			if id, perr := strconv.Atoi(fields[1]); perr == nil {
+				used[id] = true
+			}
+		}
+	}
+	gid := 0
+	for id := serviceUIDMin; id <= serviceUIDMax; id++ {
+		if !used[id] {
+			gid = id
+			break
+		}
+	}
+	if gid == 0 {
+		r.log.Warn("no free GID for service group; falling back to staff", "range", fmt.Sprintf("%d-%d", serviceUIDMin, serviceUIDMax))
+		return staffGID
+	}
+
+	steps := [][]string{
+		{"dscl", ".", "-create", "/Groups/" + ServiceGroupName},
+		{"dscl", ".", "-create", "/Groups/" + ServiceGroupName, "PrimaryGroupID", strconv.Itoa(gid)},
+		{"dscl", ".", "-create", "/Groups/" + ServiceGroupName, "RealName", "ephemerd native runners"},
+	}
+	for _, args := range steps {
+		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
+			r.log.Warn("creating service group; falling back to staff",
+				"step", strings.Join(args, " "), "output", strings.TrimSpace(string(out)), "error", err)
+			return staffGID
+		}
+	}
+	r.log.Info("created ephemerd service group", "group", ServiceGroupName, "gid", gid)
+	return gid
 }
 
 // lookupCredential resolves a username to a syscall.Credential for
@@ -380,6 +451,13 @@ func GenerateSandboxProfile(jobDir, dataDir string) string {
 	absJobDir, _ := filepath.Abs(jobDir)
 	absDataDir, _ := filepath.Abs(dataDir)
 
+	// NOTE: this profile is allow-by-default with an explicit deny list.
+	// For native (no-VM) execution the stronger posture is deny-by-default
+	// with an allow list, but that requires enumerating every path the GHA
+	// runner + toolchains legitimately touch and live-testing on macOS so
+	// jobs don't break. Tracked as a follow-up (see PR discussion). The
+	// denies below close the concrete job-to-job and job-to-daemon read
+	// holes that matter most on a shared host.
 	return fmt.Sprintf(`(version 1)
 (allow default)
 
@@ -401,18 +479,35 @@ func GenerateSandboxProfile(jobDir, dataDir string) string {
 
 ;; === Filesystem isolation ===
 
-;; Block sensitive host paths
+;; Isolate this job from sibling jobs and ephemerd internal state.
+;; All native job workspaces live under <dataDir>/native/<jobID>, and
+;; every native job runs as the same _ephemerd uid, so without this a
+;; job could read a concurrent job's checkout token or source. Deny the
+;; whole native subtree (read AND write); the job's own dir is re-allowed
+;; below, and sandbox-exec applies the last matching rule.
+(deny file-read* (subpath "%[2]s/native"))
+(deny file-write* (subpath "%[2]s/native"))
+
+;; Block sensitive host paths entirely — read and write. .ssh was
+;; previously read-only-denied, leaving a writable authorized_keys hole
+;; on any host where the runner uid can reach the operator's home.
 (deny file-read* (subpath "%[1]s/.ssh"))
+(deny file-write* (subpath "%[1]s/.ssh"))
 (deny file-read* (literal "%[2]s/config.toml"))
+(deny file-write* (literal "%[2]s/config.toml"))
 (deny file-read* (literal "%[2]s/ephemerd.sock"))
+(deny file-write* (literal "%[2]s/ephemerd.sock"))
 (deny file-read* (subpath "%[2]s/vm"))
+(deny file-write* (subpath "%[2]s/vm"))
 
 ;; Block writes to shared tools (read-only access only)
 (deny file-write* (subpath "/opt/homebrew"))
 (deny file-write* (subpath "/Applications"))
 (deny file-write* (subpath "/usr/local"))
 
-;; Allow writes to the job directory
+;; Re-allow this job's own workspace (read + write). Placed AFTER the
+;; native-subtree deny above so it wins for the job's own directory.
+(allow file-read* (subpath "%[3]s"))
 (allow file-write* (subpath "%[3]s"))
 (allow file-write* (subpath "/private/tmp"))
 `, os.Getenv("HOME"), absDataDir, absJobDir)
