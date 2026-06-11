@@ -70,11 +70,12 @@ func TestHandleQueued_DrainNoClaim(t *testing.T) {
 // when MacOSVMConfig is nil but the job has macOS labels, the scheduler must
 // remove the seen entry so the next poll retries. The provider is never asked
 // to claim.
-func TestHandleQueued_SkipsMacOSWithoutVMConfig(t *testing.T) {
+func TestHandleQueued_SkipsMacOSWithoutVMOrNativeConfig(t *testing.T) {
 	mp := newMockProvider("github")
 	s := New(Config{
 		Providers: []providers.Provider{mp},
 		Log:       testLogger(),
+		// No MacOSVMConfig and no MacOSModeForRepo — macOS jobs should be deferred
 	})
 
 	event := providers.JobEvent{
@@ -88,13 +89,13 @@ func TestHandleQueued_SkipsMacOSWithoutVMConfig(t *testing.T) {
 	s.handleQueued(context.Background(), event)
 
 	if got := len(mp.claims); got != 0 {
-		t.Errorf("macOS job without VM config should not claim, got %d claims", got)
+		t.Errorf("macOS job without VM or native config should not claim, got %d claims", got)
 	}
 	s.mu.Lock()
 	_, seen := s.seen[keyFor(event)]
 	s.mu.Unlock()
 	if seen {
-		t.Error("macOS job without VM config should be unsed so it retries on next poll")
+		t.Error("macOS job without VM or native config should be unseen so it retries on next poll")
 	}
 }
 

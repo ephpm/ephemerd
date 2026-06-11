@@ -491,8 +491,11 @@ func (m *darwinMacOSVM) monitorRunner(ctx context.Context, ip string) {
 		}
 
 		if err != nil {
+			m.cfg.Log.Debug("monitor pgrep error", "id", m.id, "error", err, "output", strings.TrimSpace(string(out)))
 			continue
 		}
+
+		m.cfg.Log.Debug("monitor pgrep result", "id", m.id, "output", strings.TrimSpace(string(out)))
 
 		if strings.TrimSpace(string(out)) == "EXITED" {
 			// Give the runner a grace period to report results to GitHub

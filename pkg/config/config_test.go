@@ -1941,3 +1941,71 @@ allow_privileged = false
 		t.Error("ResolvedAllowPrivileged() should honor explicit false even on non-Linux hosts")
 	}
 }
+
+func TestMacOSRunnerConfig_ModeForRepo(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *MacOSRunnerConfig
+		repo string
+		want string
+	}{
+		{"nil config defaults to vm", nil, "myrepo", "vm"},
+		{"zero value defaults to vm", &MacOSRunnerConfig{}, "myrepo", "vm"},
+		{"top-level native", &MacOSRunnerConfig{Mode: "native"}, "myrepo", "native"},
+		{"top-level vm", &MacOSRunnerConfig{Mode: "vm"}, "myrepo", "vm"},
+		{"invalid top-level mode defaults to vm", &MacOSRunnerConfig{Mode: "bogus"}, "myrepo", "vm"},
+
+		// org/repo exact match
+		{"org/repo exact match native", &MacOSRunnerConfig{Repos: map[string]string{"ephpm/ephemerd": "native"}}, "ephpm/ephemerd", "native"},
+		{"org/repo exact match vm", &MacOSRunnerConfig{Mode: "native", Repos: map[string]string{"ephpm/ephemerd": "vm"}}, "ephpm/ephemerd", "vm"},
+		{"org/repo miss falls back to top-level", &MacOSRunnerConfig{Mode: "native", Repos: map[string]string{"ephpm/other": "vm"}}, "ephpm/ephemerd", "native"},
+
+		// short-name fallback (event.Repo = "ephemerd", config key = "ephpm/ephemerd")
+		{"short name matches org/repo key", &MacOSRunnerConfig{Repos: map[string]string{"ephpm/ephemerd": "native"}}, "ephemerd", "native"},
+		{"short name no match falls to top-level", &MacOSRunnerConfig{Mode: "native", Repos: map[string]string{"ephpm/other": "vm"}}, "ephemerd", "native"},
+
+		// disambiguation: fork vs original
+		{"fork stays vm while original is native", &MacOSRunnerConfig{Repos: map[string]string{"ephpm/ephemerd": "native", "fork/ephemerd": "vm"}}, "ephpm/ephemerd", "native"},
+		{"fork explicit vm", &MacOSRunnerConfig{Repos: map[string]string{"ephpm/ephemerd": "native", "fork/ephemerd": "vm"}}, "fork/ephemerd", "vm"},
+
+		// wildcard: "org/*" matches all repos in org
+		{"wildcard matches repo in org", &MacOSRunnerConfig{Repos: map[string]string{"ephpm/*": "native"}}, "ephpm/ephemerd", "native"},
+		{"wildcard matches another repo in org", &MacOSRunnerConfig{Repos: map[string]string{"ephpm/*": "native"}}, "ephpm/php-sdk", "native"},
+		{"wildcard does not match different org", &MacOSRunnerConfig{Repos: map[string]string{"ephpm/*": "native"}}, "other/ephemerd", "vm"},
+		{"exact match wins over wildcard", &MacOSRunnerConfig{Repos: map[string]string{"ephpm/*": "native", "ephpm/secret": "vm"}}, "ephpm/secret", "vm"},
+		{"wildcard still applies to non-overridden repo", &MacOSRunnerConfig{Repos: map[string]string{"ephpm/*": "native", "ephpm/secret": "vm"}}, "ephpm/ephemerd", "native"},
+
+		// invalid per-repo mode falls through
+		{"invalid per-repo mode falls back to top-level", &MacOSRunnerConfig{Mode: "native", Repos: map[string]string{"ephpm/myrepo": "bogus"}}, "ephpm/myrepo", "native"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.ModeForRepo(tt.repo)
+			if got != tt.want {
+				t.Errorf("ModeForRepo(%q) = %q, want %q", tt.repo, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMacOSRunnerConfig_ResolvedMaxNative(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *MacOSRunnerConfig
+		want int
+	}{
+		{"nil config defaults to 4", nil, 4},
+		{"zero value defaults to 4", &MacOSRunnerConfig{}, 4},
+		{"negative defaults to 4", &MacOSRunnerConfig{MaxNative: -1}, 4},
+		{"positive value used", &MacOSRunnerConfig{MaxNative: 8}, 8},
+		{"one is valid", &MacOSRunnerConfig{MaxNative: 1}, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.ResolvedMaxNative()
+			if got != tt.want {
+				t.Errorf("ResolvedMaxNative() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}

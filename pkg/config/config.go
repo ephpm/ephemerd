@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	goruntime "runtime"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -432,6 +433,85 @@ type RunnerConfig struct {
 	JobTimeout      string            `toml:"job_timeout"`
 	ShutdownTimeout string            `toml:"shutdown_timeout"`
 	Windows         WindowsRunnerToml `toml:"windows"`
+	MacOS           MacOSRunnerConfig `toml:"macos"`
+}
+
+// MacOSRunnerConfig controls macOS job routing. It lives under [runner]
+// (not [vm.macos]) because native jobs don't involve VMs.
+//
+// TOML shape:
+//
+//	[runner.macos]
+//	mode = "vm"         # default mode: "vm" or "native"
+//	max_native = 4      # max concurrent native jobs
+//	# user = "ciuser"   # optional: existing user for native runners.
+//	#                   # Default (unset): an ephemeral hidden user is
+//	#                   # created per job and deleted on cleanup.
+//
+//	[runner.macos.repos]
+//	"ephpm/*"           = "native"  # all repos in org
+//	"ephpm/secret-repo" = "vm"     # except this one (exact wins over wildcard)
+//	"someuser/ephemerd" = "vm"     # fork stays on VM
+type MacOSRunnerConfig struct {
+	Mode      string            `toml:"mode"`       // "vm" (default) or "native"
+	MaxNative int               `toml:"max_native"` // max concurrent native jobs (default 4)
+	User      string            `toml:"user"`       // existing user for native runners (empty = ephemeral per-job user, recommended)
+	Repos     map[string]string `toml:"repos"`      // "org/repo" -> "vm" or "native"
+}
+
+// ModeForRepo returns "native" or "vm" for the given repo. Resolution order:
+//
+//  1. Exact match on "org/repo"
+//  2. Wildcard match on "org/*"
+//  3. Short-name fallback: if repo has no "/", match any "org/<repo>" key
+//  4. Top-level mode
+//  5. Default: "vm"
+//
+// The short-name fallback exists because some providers (GitHub polling)
+// currently emit event.Repo as just the repo name without the org prefix.
+// Config keys should always use "org/repo" format for disambiguation.
+func (m *MacOSRunnerConfig) ModeForRepo(repo string) string {
+	if m != nil && len(m.Repos) > 0 {
+		// 1. Exact match
+		if mode, ok := m.Repos[repo]; ok && isValidMode(mode) {
+			return mode
+		}
+
+		// 2. Wildcard: "org/*" matches any repo under that org
+		if slash := strings.IndexByte(repo, '/'); slash > 0 {
+			wildcard := repo[:slash] + "/*"
+			if mode, ok := m.Repos[wildcard]; ok && isValidMode(mode) {
+				return mode
+			}
+		}
+
+		// 3. Short-name fallback: repo="ephemerd" matches key "ephpm/ephemerd"
+		if !strings.Contains(repo, "/") {
+			suffix := "/" + repo
+			for key, mode := range m.Repos {
+				if strings.HasSuffix(key, suffix) && !strings.HasSuffix(key, "/*") && isValidMode(mode) {
+					return mode
+				}
+			}
+		}
+	}
+	if m != nil && isValidMode(m.Mode) {
+		return m.Mode
+	}
+	return "vm"
+}
+
+func isValidMode(mode string) bool {
+	return mode == "native" || mode == "vm"
+}
+
+// ResolvedMaxNative returns the max concurrent native macOS jobs,
+// defaulting to 4 if unset or non-positive.
+func (m *MacOSRunnerConfig) ResolvedMaxNative() int {
+	if m == nil || m.MaxNative <= 0 {
+		return 4
+	}
+	return m.MaxNative
 }
 
 // WindowsRunnerToml configures resource limits for Hyper-V isolated Windows

@@ -1,6 +1,20 @@
 # Native macOS Runner
 
-> **Status: proposed.** Not yet implemented.
+> **Status: implemented.** See `pkg/native/`. Notable deviations from this
+> proposal, discovered during implementation:
+>
+> - **Privilege dropping**: jobs run as a hidden `_ephemerd` service user
+>   (created lazily, like `_www`), not as the daemon's root user. Per-job
+>   ephemeral users were attempted but abandoned: macOS user *deletion*
+>   via dscl/sysadminctl requires Full Disk Access and wedges
+>   opendirectoryd without it, while creation works fine.
+> - **Sandbox network rules**: `sandbox-exec` does not support CIDR
+>   notation (`10.0.0.0/8`). The profile blocks localhost outbound and all
+>   port binding; RFC1918 blocking needs pf firewall rules (follow-up).
+> - **DEVELOPER_DIR** is resolved via `xcode-select -p` instead of
+>   hardcoding the Xcode.app path (hosts with only CLT broke otherwise).
+> - **Runner extraction** is OS-suffixed (`runners/<ver>-<goos>`) so the
+>   macOS host and Linux VM don't collide on the shared data dir.
 
 ## Problem
 
