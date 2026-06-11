@@ -87,7 +87,7 @@ func TestBuildBootInitrd_AppendsEphemerdLinux(t *testing.T) {
 	}
 
 	destPath := filepath.Join(dir, "initrd")
-	if err := buildBootInitrd(basePath, binPath, destPath); err != nil {
+	if err := buildBootInitrd(basePath, binPath, "", destPath); err != nil {
 		t.Fatalf("buildBootInitrd: %v", err)
 	}
 
@@ -137,7 +137,7 @@ func TestBuildBootInitrd_MissingBase(t *testing.T) {
 	if err := os.WriteFile(binPath, []byte("data"), 0o755); err != nil {
 		t.Fatalf("writing binary: %v", err)
 	}
-	err := buildBootInitrd(filepath.Join(dir, "missing-base"), binPath, filepath.Join(dir, "out"))
+	err := buildBootInitrd(filepath.Join(dir, "missing-base"), binPath, "", filepath.Join(dir, "out"))
 	if err == nil {
 		t.Error("expected error for missing base initrd")
 	}
@@ -149,9 +149,85 @@ func TestBuildBootInitrd_MissingBinary(t *testing.T) {
 	if err := writeGzippedCPIO(basePath, map[string][]byte{"x": []byte("y")}); err != nil {
 		t.Fatalf("writing base: %v", err)
 	}
-	err := buildBootInitrd(basePath, filepath.Join(dir, "missing-bin"), filepath.Join(dir, "out"))
+	err := buildBootInitrd(basePath, filepath.Join(dir, "missing-bin"), "", filepath.Join(dir, "out"))
 	if err == nil {
 		t.Error("expected error for missing ephemerd-linux")
+	}
+}
+
+func TestBuildBootInitrd_AppendsHostConfig(t *testing.T) {
+	dir := t.TempDir()
+	basePath := filepath.Join(dir, "initrd-base")
+	if err := writeGzippedCPIO(basePath, map[string][]byte{"x": []byte("y")}); err != nil {
+		t.Fatalf("writing base: %v", err)
+	}
+	binPath := filepath.Join(dir, "ephemerd-linux")
+	if err := os.WriteFile(binPath, []byte("elf"), 0o755); err != nil {
+		t.Fatalf("writing binary: %v", err)
+	}
+	cfgPath := filepath.Join(dir, "config.toml")
+	cfgBody := []byte("[dind]\nenabled = true\nallow_privileged = true\n")
+	if err := os.WriteFile(cfgPath, cfgBody, 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	destPath := filepath.Join(dir, "initrd")
+	if err := buildBootInitrd(basePath, binPath, cfgPath, destPath); err != nil {
+		t.Fatalf("buildBootInitrd: %v", err)
+	}
+
+	got, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatalf("reading boot initrd: %v", err)
+	}
+	baseData, err := os.ReadFile(basePath)
+	if err != nil {
+		t.Fatalf("reading base: %v", err)
+	}
+	gr, err := gzip.NewReader(bytes.NewReader(got[len(baseData):]))
+	if err != nil {
+		t.Fatalf("appended tail is not gzip: %v", err)
+	}
+	defer func() { _ = gr.Close() }()
+	cpio, err := io.ReadAll(gr)
+	if err != nil {
+		t.Fatalf("reading appended cpio: %v", err)
+	}
+	if !bytes.Contains(cpio, []byte("assets/config.toml")) {
+		t.Error("appended cpio does not contain assets/config.toml path")
+	}
+	if !bytes.Contains(cpio, cfgBody) {
+		t.Error("appended cpio does not contain config body")
+	}
+}
+
+// TestBuildBootInitrd_MissingHostConfigIsNotFatal asserts the no-config
+// path: a fresh install where config.toml doesn't exist yet must still
+// produce a bootable initrd (in-VM daemon runs on defaults + cmdline).
+func TestBuildBootInitrd_MissingHostConfigIsNotFatal(t *testing.T) {
+	dir := t.TempDir()
+	basePath := filepath.Join(dir, "initrd-base")
+	if err := writeGzippedCPIO(basePath, map[string][]byte{"x": []byte("y")}); err != nil {
+		t.Fatalf("writing base: %v", err)
+	}
+	binPath := filepath.Join(dir, "ephemerd-linux")
+	if err := os.WriteFile(binPath, []byte("elf"), 0o755); err != nil {
+		t.Fatalf("writing binary: %v", err)
+	}
+
+	destPath := filepath.Join(dir, "initrd")
+	if err := buildBootInitrd(basePath, binPath, filepath.Join(dir, "nonexistent-config.toml"), destPath); err != nil {
+		t.Fatalf("buildBootInitrd should tolerate a missing host config: %v", err)
+	}
+	got, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatalf("reading boot initrd: %v", err)
+	}
+	if bytes.Contains(got[len(got)/2:], []byte("assets/config.toml")) {
+		// Cheap sanity: the tail shouldn't reference a config we never had.
+		// (Scan the back half only — the base could theoretically contain
+		// the string, though our fixture doesn't.)
+		t.Error("initrd tail references assets/config.toml despite missing source")
 	}
 }
 

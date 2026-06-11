@@ -47,11 +47,20 @@ type LinuxVMConfig struct {
 	DindEnabled bool
 
 	// DindAllowPrivileged forwards the host's dind.allow_privileged setting
-	// to the in-VM ephemerd via the kernel cmdline. Without this, the in-VM
-	// daemon reads its own (minimal) config and Linux defaults to false,
-	// rejecting `docker run --privileged` siblings even when the host
-	// operator explicitly opted in.
+	// to the in-VM ephemerd via the kernel cmdline. Kept as a fallback for
+	// environments where the Plan9 host-config share fails to mount (e.g.
+	// stripped kernel without 9p modules); the share normally supersedes
+	// this by carrying the same value through the shared config.toml.
 	DindAllowPrivileged bool
+
+	// HostDataDir is the host's ephemerd data directory. When set,
+	// <HostDataDir>/config.toml is appended into the runtime-generated
+	// boot-initrd tail (next to ephemerd-linux) and staged at
+	// /etc/ephemerd/config.toml inside the VM, so any host-side setting
+	// takes effect on the next VM boot without per-setting kernel cmdline
+	// plumbing. A missing config.toml is non-fatal (fresh installs run on
+	// defaults). See docs/arch/host-config-initrd.md.
+	HostDataDir string
 
 	Log *slog.Logger
 }

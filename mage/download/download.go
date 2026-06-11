@@ -1618,8 +1618,27 @@ if [ "$DIND" = "1" ]; then
         DIND_FLAG="$DIND_FLAG --dind-allow-privileged"
     fi
 fi
-echo "ephemerd-init: launching ephemerd-linux (dind=$DIND allow_privileged=$DIND_ALLOW_PRIV)"
+
+# Host config rides in via the runtime-generated initrd tail (the same
+# mechanism that delivers ephemerd-linux — see pkg/vm.buildBootInitrd).
+# When present, copy it into the VM rootfs and point ephemerd at it so
+# every host-side setting (dind.*, runtime.rlimits, future knobs) takes
+# effect on this VM boot with no per-setting plumbing. When absent
+# (fresh install before config.toml exists), the kernel-cmdline flags
+# above keep the in-VM daemon working on defaults.
+# See docs/arch/host-config-initrd.md.
+CONFIG_FLAG=""
+if [ -f /assets/config.toml ]; then
+    mkdir -p /newroot/etc/ephemerd
+    cp /assets/config.toml /newroot/etc/ephemerd/config.toml
+    chmod 600 /newroot/etc/ephemerd/config.toml
+    CONFIG_FLAG="--config /etc/ephemerd/config.toml"
+    echo "ephemerd-init: host config staged at /etc/ephemerd/config.toml"
+fi
+
+echo "ephemerd-init: launching ephemerd-linux (dind=$DIND allow_privileged=$DIND_ALLOW_PRIV host_config=${CONFIG_FLAG:+yes})"
 exec switch_root /newroot /usr/local/bin/ephemerd-linux serve \
+    $CONFIG_FLAG \
     --data-dir /var/lib/ephemerd \
     --containerd-tcp-port "$CONTAINERD_PORT" \
     --containerd-tcp-addr 0.0.0.0 \

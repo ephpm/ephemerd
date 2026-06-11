@@ -51,7 +51,10 @@ func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool
 			DiskSizeGB:          linuxVMDiskSizeGB,
 			DindEnabled:         dindEnabled,
 			DindAllowPrivileged: dindAllowPrivileged,
-			Log:                 log,
+			// Share the host's data dir read-only so the in-VM ephemerd
+			// reads the same config.toml. See docs/arch/plan9-config-share.md.
+			HostDataDir: dataDir,
+			Log:         log,
 		})
 		if err != nil {
 			log.Warn("Linux VM not started — Linux jobs will not be available on this host", "error", err)

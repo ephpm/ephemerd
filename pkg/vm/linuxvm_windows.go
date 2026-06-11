@@ -287,13 +287,20 @@ func (l *hypervLinuxVM) extractAssets() error {
 	}
 
 	// Build the final initrd by appending a cpio with /assets/ephemerd-linux
-	// to the base initrd. Cheap (a few file ops + gzip on a single 240MB blob)
-	// and idempotent, so we run it on every start. HCS reads InitRdPath only
-	// when the VM is created, so this must happen before createAndBootVM.
+	// (and the host's config.toml when present) to the base initrd. Cheap
+	// (a few file ops + gzip on a single 240MB blob) and idempotent, so we
+	// run it on every start. HCS reads InitRdPath only when the VM is
+	// created, so this must happen before createAndBootVM. Re-running on
+	// every boot is what gives "edit config.toml + restart ephemerd =
+	// in-VM daemon sees the change" with no per-setting plumbing.
 	bootInitrd := filepath.Join(l.vmDir, "initrd")
 	baseInitrd := filepath.Join(l.vmDir, "initrd-base")
 	ephemerdBin := filepath.Join(l.vmDir, "ephemerd-linux")
-	if err := buildBootInitrd(baseInitrd, ephemerdBin, bootInitrd); err != nil {
+	hostConfig := ""
+	if l.cfg.HostDataDir != "" {
+		hostConfig = filepath.Join(l.cfg.HostDataDir, "config.toml")
+	}
+	if err := buildBootInitrd(baseInitrd, ephemerdBin, hostConfig, bootInitrd); err != nil {
 		return fmt.Errorf("building boot initrd: %w", err)
 	}
 	if err := grantVmFileAccess(bootInitrd); err != nil {
@@ -517,6 +524,10 @@ func (l *hypervLinuxVM) createAndBootVM() error {
 	//   /dev/sda as root and find init there, which fails on an unformatted VHDX.
 	// - 8250_core: enable serial UART for console output via named pipe
 	// - ephemerd.*: custom params parsed by our init script
+	// The dind* params are redundant when the host's config.toml rides in
+	// via the initrd tail (the in-VM ephemerd reads the same [dind]
+	// section the host does). Kept as a fallback for the no-config path —
+	// fresh installs where config.toml doesn't exist yet.
 	dindFlag := ""
 	if l.cfg.DindEnabled {
 		dindFlag = " ephemerd.dind=1"
@@ -588,6 +599,7 @@ func (l *hypervLinuxVM) createAndBootVM() error {
 			},
 		},
 	}
+
 
 	l.cfg.Log.Info("creating Hyper-V Linux VM",
 		"name", l.vmName,
