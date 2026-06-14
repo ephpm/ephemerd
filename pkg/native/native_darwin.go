@@ -447,9 +447,23 @@ func (r *Runner) deleteKeychain() {
 // GenerateSandboxProfile returns a macOS sandbox profile that restricts
 // the runner process. Paths are templated with the job-specific directories.
 func GenerateSandboxProfile(jobDir, dataDir string) string {
-	// Resolve to absolute paths for the sandbox profile
-	absJobDir, _ := filepath.Abs(jobDir)
-	absDataDir, _ := filepath.Abs(dataDir)
+	// Resolve to absolute, symlink-free paths. The sandbox matches against
+	// kernel (resolved) paths: /var and /tmp are symlinks to /private/var
+	// and /private/tmp on macOS, so rules written with the unresolved
+	// config paths (e.g. /var/lib/ephemerd/...) silently never match.
+	resolve := func(p string) string {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			abs = p
+		}
+		if real, err := filepath.EvalSymlinks(abs); err == nil {
+			return real
+		}
+		return abs
+	}
+	absJobDir := resolve(jobDir)
+	absDataDir := resolve(dataDir)
+	homeDir := resolve(os.Getenv("HOME"))
 
 	// NOTE: this profile is allow-by-default with an explicit deny list.
 	// For native (no-VM) execution the stronger posture is deny-by-default
@@ -482,11 +496,24 @@ func GenerateSandboxProfile(jobDir, dataDir string) string {
 ;; Isolate this job from sibling jobs and ephemerd internal state.
 ;; All native job workspaces live under <dataDir>/native/<jobID>, and
 ;; every native job runs as the same _ephemerd uid, so without this a
-;; job could read a concurrent job's checkout token or source. Deny the
-;; whole native subtree (read AND write); the job's own dir is re-allowed
-;; below, and sandbox-exec applies the last matching rule.
-(deny file-read* (subpath "%[2]s/native"))
+;; job could read a concurrent job's checkout token or source.
+;;
+;; Deny file-read-DATA (not file-read*) on the native subtree: on a
+;; directory that blocks readdir (can't list a sibling's contents), on a
+;; file it blocks reading contents. file-read-metadata stays allowed so
+;; lstat/realpath path resolution can traverse THROUGH native/ — denying
+;; metadata breaks the .NET host with "Failed to resolve full path of the
+;; current executable" (exit 133).
+(deny file-read-data (subpath "%[2]s/native"))
 (deny file-write* (subpath "%[2]s/native"))
+
+;; Re-allow reading the native directory NODE itself (not its children).
+;; getcwd() and bash walk UP from the job's runner dir and must readdir
+;; native/ to learn the job-id component name; without this they fail
+;; with "getcwd: cannot access parent directories" and run.sh won't exec.
+;; This leaks the list of concurrent job-id directory names (not their
+;; contents) — job ids are not secret.
+(allow file-read-data (literal "%[2]s/native"))
 
 ;; Block sensitive host paths entirely — read and write. .ssh was
 ;; previously read-only-denied, leaving a writable authorized_keys hole
@@ -505,12 +532,17 @@ func GenerateSandboxProfile(jobDir, dataDir string) string {
 (deny file-write* (subpath "/Applications"))
 (deny file-write* (subpath "/usr/local"))
 
-;; Re-allow this job's own workspace (read + write). Placed AFTER the
-;; native-subtree deny above so it wins for the job's own directory.
+;; Re-allow this job's own workspace (read + write). The explicit
+;; file-read-data is required IN ADDITION to file-read*: macOS sandbox
+;; resolves a specific-operation deny (the file-read-data deny on the
+;; native subtree above) over a later wildcard allow (file-read*), so the
+;; read-data re-allow must name the operation explicitly to win for this
+;; job's own files.
 (allow file-read* (subpath "%[3]s"))
+(allow file-read-data (subpath "%[3]s"))
 (allow file-write* (subpath "%[3]s"))
 (allow file-write* (subpath "/private/tmp"))
-`, os.Getenv("HOME"), absDataDir, absJobDir)
+`, homeDir, absDataDir, absJobDir)
 }
 
 // symlinkHomebrew creates symlinks from /opt/homebrew/bin/* into the
