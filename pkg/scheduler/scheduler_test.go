@@ -1014,3 +1014,57 @@ func TestServeTunnelWithReconnect_CancelExitsCleanly(t *testing.T) {
 		t.Fatal("serveTunnelWithReconnect did not exit after context cancel")
 	}
 }
+
+// --- nativeMacSem tests ---
+
+func TestNew_NativeMacSemDefault(t *testing.T) {
+	s := New(Config{Log: testLogger()})
+	if cap(s.nativeMacSem) != 4 {
+		t.Errorf("nativeMacSem capacity = %d, want default 4", cap(s.nativeMacSem))
+	}
+}
+
+func TestNew_NativeMacSemCustom(t *testing.T) {
+	s := New(Config{MaxNativeMac: 6, Log: testLogger()})
+	if cap(s.nativeMacSem) != 6 {
+		t.Errorf("nativeMacSem capacity = %d, want 6", cap(s.nativeMacSem))
+	}
+}
+
+func TestNew_NativeMacSemNegative(t *testing.T) {
+	s := New(Config{MaxNativeMac: -1, Log: testLogger()})
+	if cap(s.nativeMacSem) != 4 {
+		t.Errorf("nativeMacSem capacity = %d, want default 4", cap(s.nativeMacSem))
+	}
+}
+
+// --- canHandleJob with native mode ---
+
+func TestCanHandleJob_MacOSNativeMode(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS-specific test")
+	}
+
+	// Without VM config but with native mode function, should accept macOS jobs
+	s := New(Config{
+		MacOSModeForRepo: func(_ string) string { return "native" },
+		Log:              testLogger(),
+	})
+
+	if !s.canHandleJob([]string{"self-hosted", "macos"}) {
+		t.Error("canHandleJob should accept macOS when MacOSModeForRepo is set")
+	}
+}
+
+func TestCanHandleJob_MacOSNoConfig(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS-specific test")
+	}
+
+	// Without VM config and without native mode, should reject macOS jobs
+	s := New(Config{Log: testLogger()})
+
+	if s.canHandleJob([]string{"self-hosted", "macos"}) {
+		t.Error("canHandleJob should reject macOS when neither VMConfig nor MacOSModeForRepo is set")
+	}
+}

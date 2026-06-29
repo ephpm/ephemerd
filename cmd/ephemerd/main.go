@@ -585,6 +585,10 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		ShutdownTimeout:    cfg.Runner.ParsedShutdownTimeout(),
 		LogRetention:       cfg.Log.LogRetentionDuration(),
 		RunnerImageForRepo: cfg.Runner.ImageForRepoOS,
+		MaxNativeMac:       cfg.Runner.MacOS.ResolvedMaxNative(),
+		MacOSModeForRepo:   cfg.Runner.MacOS.ModeForRepo,
+		NativeMacUser:      cfg.Runner.MacOS.User,
+		RunnerDir:          rm.Dir(),
 		Log:                log,
 	})
 

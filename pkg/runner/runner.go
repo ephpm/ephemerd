@@ -35,9 +35,11 @@ func New(dataDir string, log *slog.Logger) *Manager {
 }
 
 // Dir returns the path to the extracted runner directory.
+// The path is OS-specific (e.g. runners/2.333.1-linux) so that macOS
+// and Linux extractions don't collide on shared filesystems (virtio-fs).
 // Call Extract() first to ensure it exists.
 func (m *Manager) Dir() string {
-	return filepath.Join(m.dataDir, "runners", Version)
+	return filepath.Join(m.dataDir, "runners", Version+"-"+goruntime.GOOS)
 }
 
 // Entrypoint returns the runner entrypoint command for the current OS.
