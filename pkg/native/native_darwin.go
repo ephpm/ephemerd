@@ -475,21 +475,20 @@ func GenerateSandboxProfile(jobDir, dataDir string) string {
 	return fmt.Sprintf(`(version 1)
 (allow default)
 
-;; === Network isolation ===
-;; Note: sandbox-exec does not support CIDR notation for IP addresses.
-;; Private network blocking (10.x, 172.16.x, 192.168.x) requires pf
-;; firewall rules — handled separately. The sandbox blocks localhost
-;; and port binding to prevent inter-job communication.
-
-;; Allow DNS before blocking localhost (macOS resolves via mDNSResponder on 127.0.0.1)
-(allow network-outbound (remote udp "localhost:53"))
-(allow network-outbound (remote tcp "localhost:53"))
-
-;; Block outbound to localhost (daemon control socket, other jobs)
-(deny network-outbound (remote ip "localhost:*"))
-
-;; Block binding to any port — prevents jobs from running servers
-(deny network-bind (local ip "*:*"))
+;; === Network ===
+;; Loopback (bind AND outbound) is explicitly allowed: CI test suites
+;; routinely spin up a local server on 127.0.0.1:<ephemeral> and connect
+;; to it. An earlier revision denied network-bind and localhost-outbound
+;; to stop inter-job loopback snooping, but that broke any test that
+;; binds a socket (EPERM on bind) while providing no real protection:
+;; sandbox-exec cannot express CIDR rules, so LAN/RFC1918 egress control
+;; was never actually enforced here — that remains a pf-firewall
+;; follow-up. Inter-job data isolation is provided by the filesystem
+;; rules below (a sibling job's dir is unreadable), not by the network
+;; layer. So: leave loopback fully usable and defer real network
+;; egress filtering to pf.
+(allow network-bind)
+(allow network-outbound)
 
 ;; === Filesystem isolation ===
 

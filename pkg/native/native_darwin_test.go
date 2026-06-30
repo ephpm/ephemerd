@@ -35,10 +35,8 @@ func TestGenerateSandboxProfile(t *testing.T) {
 		desc   string
 		substr string
 	}{
-		{"allows DNS UDP", `(allow network-outbound (remote udp "localhost:53"))`},
-		{"allows DNS TCP", `(allow network-outbound (remote tcp "localhost:53"))`},
-		{"blocks localhost", `(deny network-outbound (remote ip "localhost:*"))`},
-		{"blocks port binding", `(deny network-bind (local ip "*:*"))`},
+		{"allows socket bind (loopback test servers)", `(allow network-bind)`},
+		{"allows outbound (loopback test clients)", `(allow network-outbound)`},
 		{"blocks sibling job read-data", `(deny file-read-data (subpath "` + resolvedData + `/native"))`},
 		{"blocks sibling job writes", `(deny file-write* (subpath "` + resolvedData + `/native"))`},
 		{"allows native dir node read (getcwd)", `(allow file-read-data (literal "` + resolvedData + `/native"))`},
@@ -62,6 +60,17 @@ func TestGenerateSandboxProfile(t *testing.T) {
 	for _, c := range checks {
 		if !strings.Contains(profile, c.substr) {
 			t.Errorf("sandbox profile missing %s: expected substring %q", c.desc, c.substr)
+		}
+	}
+
+	// Regression guard: a blanket network-bind deny breaks every CI test
+	// that binds a loopback socket (EPERM). It must never reappear.
+	for _, banned := range []string{
+		`(deny network-bind`,
+		`(deny network-outbound (remote ip "localhost`,
+	} {
+		if strings.Contains(profile, banned) {
+			t.Errorf("sandbox profile must not contain %q — it blocks loopback test servers", banned)
 		}
 	}
 }
