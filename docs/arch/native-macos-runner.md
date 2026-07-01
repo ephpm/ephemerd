@@ -362,6 +362,46 @@ installs.
 each other. One job upgrading a formula mid-build could break another
 job. Per-job prefix keeps them independent.
 
+### Host provisioning contract (build dependencies)
+
+Native mode runs jobs **on the bare host** — no per-job VM, no container
+image. This is the key operational difference from the VM path, and it
+has a consequence that bit us in production:
+
+> Any build dependency a workflow assumes is "already installed" must
+> actually exist **on the host**.
+
+In the VM path those deps lived in the macOS VM **base disk image**
+(Tart-provisioned once: Xcode, Homebrew, `brew install llvm@17`, …). The
+`runner-ci-macos-deps` OCI image only carried ephemerd's own Go tooling
+(golangci-lint, mage, runner tarballs) as a VM overlay — it never held
+the language/build toolchains. So there is **no image to unzip** onto a
+native host: the deps only ever existed inside a full macOS disk image,
+for which we have no portable manifest.
+
+Concretely, ephpm's Rust build pins
+`LIBCLANG_PATH=$(brew --prefix llvm@17)/lib` for bindgen. On the VM that
+path existed (baked into base.img); on a fresh native host it did not,
+and every `Build` job died with `Unable to find libclang`. The `Test`
+(nextest) jobs passed because they don't invoke bindgen.
+
+Two ways to satisfy the contract; a fleet should pick one:
+
+1. **Provision the host** to match what workflows expect. Run
+   `scripts/provision-native-macos.sh` on each native runner host and
+   extend its formula list whenever a job fails on a missing dep. Simple,
+   but host state must be kept in sync across the fleet.
+
+2. **Workflows install their own deps** (the reproducible, host-agnostic
+   option, and the one the per-job Homebrew overlay above was designed
+   for): add `brew install llvm@17 …` to the macOS job. Installs land in
+   the job's writable prefix and are discarded with the job. Preferred
+   long-term, but it's a change in the *consuming* repo's workflow, not
+   ephemerd.
+
+Either way, native mode's dependency surface is the host, not an image —
+that is the durable takeaway.
+
 ### 2. Keychain: per-job temporary keychain
 
 Each native job gets its own temporary keychain:
