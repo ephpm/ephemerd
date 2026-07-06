@@ -108,6 +108,7 @@ type Scheduler struct {
 	running   map[jobKey]*runningJob
 	seen      map[jobKey]time.Time    // recently handled jobs for dedup
 	pending   map[jobKey]struct{}     // jobs dispatched to a handler but not yet holding sem
+	attempts  map[jobKey]int          // provisioning passes per job, for zombie detection
 	mu        sync.Mutex
 	sem          chan struct{} // local/native job concurrency limiter
 	linuxSem     chan struct{} // Linux dispatch (VM) concurrency limiter
@@ -118,6 +119,19 @@ type Scheduler struct {
 }
 
 const seenTTL = 10 * time.Minute
+
+// maxProvisionAttempts caps how many times a single job may be provisioned
+// before it is treated as an undispatchable "zombie" and skipped.
+//
+// A live job reaches provisioning once: it runs to completion, GitHub marks
+// it done, and it stops appearing in the queued-jobs poll. A zombie — a job
+// GitHub keeps listing as queued but never actually dispatches to a runner
+// (classically a workflow run superseded by a newer commit on a workflow
+// without concurrency:cancel-in-progress) — reappears every seenTTL and
+// would otherwise re-provision a full runner/VM forever. Since the seen
+// dedup lets a given job past provisioning only ~once per seenTTL, this is
+// ~maxProvisionAttempts * seenTTL (~50 min) of retries before giving up.
+const maxProvisionAttempts = 5
 
 // SetMacOSVMConfig enables macOS job support after startup. This is used when
 // the macOS disk image is being provisioned in the background — the scheduler
@@ -207,6 +221,7 @@ func New(cfg Config) *Scheduler {
 		running:      make(map[jobKey]*runningJob),
 		seen:         make(map[jobKey]time.Time),
 		pending:      make(map[jobKey]struct{}),
+		attempts:     make(map[jobKey]int),
 		sem:          make(chan struct{}, cfg.MaxConcurrent),
 		linuxSem:     make(chan struct{}, cfg.MaxConcurrent),
 		macSem:       make(chan struct{}, macVMs),
@@ -542,6 +557,28 @@ func (s *Scheduler) handleQueued(ctx context.Context, event providers.JobEvent) 
 	}
 	s.pending[key] = struct{}{}
 	s.seen[key] = time.Now()
+
+	// Zombie guard: a job that keeps reaching provisioning but never runs to
+	// completion (GitHub lists it queued but never dispatches it) is skipped
+	// after maxProvisionAttempts so it stops re-provisioning a runner/VM on
+	// every seenTTL. The counter is pruned in cleanSeen once the job stops
+	// appearing (GitHub finished/cancelled it), so a later legitimate rerun
+	// starts fresh.
+	s.attempts[key]++
+	if s.attempts[key] > maxProvisionAttempts {
+		delete(s.pending, key)
+		attempts := s.attempts[key]
+		s.mu.Unlock()
+		// Warn once when first crossing the cap; stay quiet on later polls.
+		if attempts == maxProvisionAttempts+1 {
+			log.Warn("job repeatedly provisioned but never ran to completion — treating as undispatchable (zombie) and skipping",
+				"attempts", maxProvisionAttempts,
+				"hint", "workflow run is likely superseded; cancel it or add concurrency:cancel-in-progress")
+		} else {
+			log.Debug("skipping zombie job (already over provision cap)", "attempts", attempts)
+		}
+		return
+	}
 
 	if s.draining {
 		s.mu.Unlock()
@@ -1352,6 +1389,9 @@ func (s *Scheduler) cleanSeen() {
 	for id, t := range s.seen {
 		if time.Since(t) > seenTTL {
 			delete(s.seen, id)
+			// Job stopped appearing in the queue (finished/cancelled) — reset
+			// its zombie counter so a future legitimate rerun starts fresh.
+			delete(s.attempts, id)
 		}
 	}
 }

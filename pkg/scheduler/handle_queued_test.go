@@ -354,3 +354,67 @@ func TestBackoffDuration_AfterSuccessReset(t *testing.T) {
 	}
 	resetBackoff(repo)
 }
+
+// TestHandleQueued_ZombieSkip verifies that a job which keeps reaching
+// provisioning but never runs to completion (GitHub lists it queued forever)
+// is skipped after maxProvisionAttempts, instead of re-provisioning on every
+// poll. draining=true keeps any real provisioning from happening — the zombie
+// check runs before the drain check, so the attempt counter still advances.
+func TestHandleQueued_ZombieSkip(t *testing.T) {
+	mp := newMockProvider("github")
+	s := New(Config{Providers: []providers.Provider{mp}, Log: testLogger()})
+	s.draining = true
+
+	event := providers.JobEvent{Provider: mp, Action: "queued", Repo: "myrepo", JobID: 7}
+	key := keyFor(event)
+
+	// Simulate the seenTTL gap between polls by clearing the dedup entries so
+	// each call is treated as a fresh provisioning pass.
+	for i := 0; i < maxProvisionAttempts+3; i++ {
+		s.mu.Lock()
+		delete(s.seen, key)
+		delete(s.pending, key)
+		s.mu.Unlock()
+		s.handleQueued(context.Background(), event)
+	}
+
+	s.mu.Lock()
+	attempts := s.attempts[key]
+	s.mu.Unlock()
+
+	// The counter keeps climbing past the cap (each poll still increments).
+	if attempts <= maxProvisionAttempts {
+		t.Errorf("attempts = %d, want > %d (cap should be exceeded)", attempts, maxProvisionAttempts)
+	}
+	// A zombie is never claimed.
+	if got := len(mp.claims); got != 0 {
+		t.Errorf("zombie job should never be claimed, got %d claims", got)
+	}
+}
+
+// TestCleanSeen_PrunesAttempts verifies the zombie counter is reset once a
+// job stops appearing in the queue (its seen entry expires), so a later
+// legitimate rerun of the same job id starts fresh.
+func TestCleanSeen_PrunesAttempts(t *testing.T) {
+	s := New(Config{Log: testLogger()})
+	key := jobKey{Provider: "github", JobID: 99}
+
+	s.mu.Lock()
+	s.seen[key] = time.Now().Add(-seenTTL - time.Minute) // expired
+	s.attempts[key] = maxProvisionAttempts + 2
+	s.mu.Unlock()
+
+	s.cleanSeen()
+
+	s.mu.Lock()
+	_, seenExists := s.seen[key]
+	_, attemptsExist := s.attempts[key]
+	s.mu.Unlock()
+
+	if seenExists {
+		t.Error("expired seen entry should be pruned")
+	}
+	if attemptsExist {
+		t.Error("attempts counter should be pruned alongside the seen entry")
+	}
+}
