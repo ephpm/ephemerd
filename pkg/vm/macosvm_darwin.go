@@ -576,6 +576,51 @@ func (m *darwinMacOSVM) injectRunnerIntoClone(ctx context.Context) error {
 	return nil
 }
 
+// macOSRunnerSetupScript is the bash run over SSH to start the GHA runner in a
+// per-job macOS VM. It takes one %s: the base64 JIT config.
+//
+// Key invariant: it ALWAYS refreshes /Users/admin/actions-runner from the
+// freshly-copied /Library/ephemerd/runner and kills any already-running
+// runner first. A runner baked into the base image at provisioning time goes
+// stale when the pinned runner version is bumped — GitHub deprecates the old
+// version, its broker refuses the JIT runner, so the runner registers and
+// reports "ready" but is never assigned its job and the VM job loops forever.
+// Native jobs are unaffected (they run the host runner directly). An earlier
+// revision only copied when no run.sh already existed, which silently used the
+// stale baked runner; never reintroduce that guard.
+const macOSRunnerSetupScript = `
+# Firewall: block private networks EXCEPT the Vz NAT subnet
+cat > /tmp/pf-ephemerd.conf << 'PFEOF'
+pass quick to 192.168.64.0/24
+block out quick to 10.0.0.0/8
+block out quick to 172.16.0.0/12
+block out quick to 192.168.0.0/16
+block out quick to 169.254.0.0/16
+pass out all
+PFEOF
+sudo pfctl -f /tmp/pf-ephemerd.conf -e 2>/dev/null || true
+
+# Always run the runner ephemerd just provided, not a stale baked copy.
+RUNNER_SRC="/Library/ephemerd/runner"
+RUNNER_DIR="/Users/admin/actions-runner"
+pkill -f Runner.Listener 2>/dev/null || true
+if [ -f "$RUNNER_SRC/run.sh" ]; then
+  rm -rf "$RUNNER_DIR"
+  cp -R "$RUNNER_SRC" "$RUNNER_DIR"
+  chown -R admin:staff "$RUNNER_DIR"
+fi
+cd "$RUNNER_DIR"
+./run.sh --jitconfig '%s' </dev/null >/tmp/runner.log 2>&1 &
+RUNNER_PID=$!
+disown $RUNNER_PID 2>/dev/null || true
+
+# Randomize password LAST
+RAND_PASS=$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)
+dscl . -passwd /Users/admin admin "$RAND_PASS" 2>/dev/null || true
+
+echo "runner started (pid=$RUNNER_PID)"
+`
+
 // setupRunnerViaSSH connects to the VM using the Tart default credentials
 // (admin/admin) and starts the GitHub Actions runner. This is more reliable
 // than LaunchDaemons which may be blocked by SIP/SSV on modern macOS.
@@ -693,39 +738,10 @@ func (m *darwinMacOSVM) setupRunnerViaSSH(ctx context.Context, ip string) error 
 	}
 
 	// Start the runner + firewall in the background (fire and forget).
-	// Runner binary is pre-installed in the base image (inherited by clone).
-	// Only JIT config is per-job, passed inline.
-	setupScript := fmt.Sprintf(`
-# Firewall: block private networks EXCEPT the Vz NAT subnet
-cat > /tmp/pf-ephemerd.conf << 'PFEOF'
-pass quick to 192.168.64.0/24
-block out quick to 10.0.0.0/8
-block out quick to 172.16.0.0/12
-block out quick to 192.168.0.0/16
-block out quick to 169.254.0.0/16
-pass out all
-PFEOF
-sudo pfctl -f /tmp/pf-ephemerd.conf -e 2>/dev/null || true
-
-# Runner is pre-installed at /Library/ephemerd/runner/ (Data volume).
-# Copy to home dir so the runner has a writable work directory.
-RUNNER_SRC="/Library/ephemerd/runner"
-RUNNER_DIR="/Users/admin/actions-runner"
-if [ ! -f "$RUNNER_DIR/run.sh" ] && [ -f "$RUNNER_SRC/run.sh" ]; then
-  cp -R "$RUNNER_SRC" "$RUNNER_DIR"
-  chown -R admin:staff "$RUNNER_DIR"
-fi
-cd "$RUNNER_DIR"
-./run.sh --jitconfig '%s' </dev/null >/tmp/runner.log 2>&1 &
-RUNNER_PID=$!
-disown $RUNNER_PID 2>/dev/null || true
-
-# Randomize password LAST
-RAND_PASS=$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)
-dscl . -passwd /Users/admin admin "$RAND_PASS" 2>/dev/null || true
-
-echo "runner started (pid=$RUNNER_PID)"
-`, strings.TrimSpace(string(jitData)))
+	// The runner is copied fresh into the VM before this runs; see
+	// macOSRunnerSetupScript for why we always refresh it. Only the JIT
+	// config is per-job, passed inline.
+	setupScript := fmt.Sprintf(macOSRunnerSetupScript, strings.TrimSpace(string(jitData)))
 
 	session, err := client.NewSession()
 	if err != nil {
