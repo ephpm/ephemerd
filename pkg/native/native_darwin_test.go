@@ -112,14 +112,14 @@ func TestNewCreatesWorkspace(t *testing.T) {
 		t.Fatalf("New() error: %v", err)
 	}
 
-	// Verify expected directories exist
+	// Verify expected directories exist. Note: there is no per-job "homebrew"
+	// dir — native jobs use the host's shared /opt/homebrew (read-only) so tool
+	// checks like `spc doctor` see the host's installed formulae.
 	expectedDirs := []string{
 		"home",
 		"tmp",
 		"work",
 		"runner",
-		filepath.Join("homebrew", "bin"),
-		filepath.Join("homebrew", "Cellar"),
 		"keychain",
 	}
 	for _, d := range expectedDirs {
