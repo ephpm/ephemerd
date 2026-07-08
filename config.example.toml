@@ -1,6 +1,6 @@
 [github]
 # Authentication: personal access token OR GitHub App credentials.
-# Use one approach — if app_id is set, it takes priority over token.
+# Use one approach  -  if app_id is set, it takes priority over token.
 # token = "ghp_your_token_here"
 
 # GitHub App authentication (recommended):
@@ -62,6 +62,48 @@ job_timeout = "2h"
 
 # Time to wait for running jobs during graceful shutdown
 shutdown_timeout = "5m"
+
+# Claim retry queue.
+#
+# GitHub does not re-deliver workflow_job webhooks. When ephemerd's
+# initial claim/provision attempt fails for a transient reason
+# (rate-limit exhausted, transient 5xx, network blip), the job would
+# otherwise be lost. The retry queue schedules re-attempts on a
+# jittered exponential backoff ladder and gives up after max_age.
+#
+# When the last GitHub API response reported remaining=0 with a known
+# reset time, the next attempt is snapped to just after reset instead
+# of falling through the ladder, so we do not burn attempts against a
+# provably-exhausted budget.
+#
+# Enabled by default. Set enabled = false to restore the pre-existing
+# "log and drop" behavior.
+# [runner.claim_retry]
+# enabled  = true
+# max_age  = "90m"
+# schedule = ["30s", "1m", "2m", "5m", "10m"]
+# jitter   = 0.2
+
+# Claim retry queue.
+#
+# GitHub does not re-deliver workflow_job webhooks. When ephemerd's
+# initial claim/provision attempt fails for a transient reason
+# (rate-limit exhausted, transient 5xx, network blip), the job would
+# otherwise be lost. The retry queue schedules re-attempts on a
+# jittered exponential backoff ladder and gives up after max_age.
+#
+# When the last GitHub API response says remaining==0 with a known
+# reset time, the next attempt is snapped to just after reset instead
+# of falling through the ladder, so we don't burn attempts against a
+# provably-exhausted budget.
+#
+# Enabled by default. Set enabled = false to restore the pre-existing
+# "log and drop" behavior.
+# [runner.claim_retry]
+# enabled  = true
+# max_age  = "90m"
+# schedule = ["30s", "1m", "2m", "5m", "10m"]
+# jitter   = 0.2
 
 [vm.linux]
 # Enable a Linux VM for running Linux jobs on Windows/macOS hosts.
