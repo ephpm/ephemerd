@@ -10,7 +10,11 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"sync/atomic"
+	"time"
 
+	"github.com/ephpm/ephemerd/pkg/metrics"
 	gh "github.com/google/go-github/v72/github"
 	"gopkg.in/yaml.v3"
 )
@@ -28,9 +32,23 @@ type Config struct {
 
 // Client handles GitHub API interactions and webhook events.
 type Client struct {
-	cfg    Config
-	client *gh.Client
-	app    *AppAuth // nil when using PAT
+	cfg      Config
+	client   *gh.Client
+	app      *AppAuth      // nil when using PAT
+	lastRate *rateSnapshot // last observed rate-limit state (nil in tests using SetHTTPClient)
+}
+
+// RateSnapshot returns the last-observed rate-limit state. The scheduler
+// uses this to bias retry backoff — when remaining==0 and now < reset,
+// the next attempt is scheduled just after reset instead of blindly
+// falling through the exponential-backoff ladder. Fields are zero-valued
+// when the client hasn't yet made a request or was created via the
+// bare test constructor.
+func (c *Client) RateSnapshot() (remaining, limit int64, reset, updated time.Time) {
+	if c.lastRate == nil {
+		return 0, 0, time.Time{}, time.Time{}
+	}
+	return c.lastRate.Snapshot()
 }
 
 // JobEvent is emitted when a workflow_job webhook fires.
@@ -42,22 +60,40 @@ type JobEvent struct {
 
 // New creates a GitHub client.
 // Uses AppAuth for dynamic token refresh when configured, otherwise a static PAT.
+//
+// All GitHub API responses flow through rateTrackingTransport, which parses
+// the X-RateLimit-* headers and updates the ephemerd_github_api_rate_*
+// gauges. Operators use ephemerd_github_api_rate_updated_seconds to tell a
+// current-but-exhausted budget from a stale reading.
 func New(cfg Config) (*Client, error) {
 	var c *gh.Client
+	var lastRate rateSnapshot
 	if cfg.AppAuth != nil {
-		// Use a custom transport that injects the latest token on each request.
+		// Use a custom transport that injects the latest token on each
+		// request, then wrap it in the rate tracker so every response
+		// updates the metrics.
 		httpClient := &http.Client{
-			Transport: &appAuthTransport{app: cfg.AppAuth},
+			Transport: &rateTrackingTransport{
+				next: &appAuthTransport{app: cfg.AppAuth},
+				last: &lastRate,
+			},
 		}
 		c = gh.NewClient(httpClient)
 	} else {
-		c = gh.NewClient(nil).WithAuthToken(cfg.Token)
+		httpClient := &http.Client{
+			Transport: &rateTrackingTransport{
+				next: http.DefaultTransport,
+				last: &lastRate,
+			},
+		}
+		c = gh.NewClient(httpClient).WithAuthToken(cfg.Token)
 	}
 
 	return &Client{
-		cfg:    cfg,
-		client: c,
-		app:    cfg.AppAuth,
+		cfg:      cfg,
+		client:   c,
+		app:      cfg.AppAuth,
+		lastRate: &lastRate,
 	}, nil
 }
 
@@ -70,6 +106,77 @@ func (t *appAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	req = req.Clone(req.Context())
 	req.Header.Set("Authorization", "token "+t.app.Token())
 	return http.DefaultTransport.RoundTrip(req)
+}
+
+// rateSnapshot is the last observed GitHub rate-limit state. All fields
+// are stored as int64 unix seconds / counts so atomic loads and stores
+// are lock-free.
+type rateSnapshot struct {
+	remaining   atomic.Int64 // X-RateLimit-Remaining
+	limit       atomic.Int64 // X-RateLimit-Limit
+	resetUnix   atomic.Int64 // X-RateLimit-Reset (unix seconds)
+	updatedUnix atomic.Int64 // when we last parsed rate headers
+}
+
+// Snapshot returns a point-in-time copy for use by the scheduler retry
+// queue (rate-aware backoff).
+func (r *rateSnapshot) Snapshot() (remaining, limit int64, reset, updated time.Time) {
+	remaining = r.remaining.Load()
+	limit = r.limit.Load()
+	if u := r.resetUnix.Load(); u > 0 {
+		reset = time.Unix(u, 0)
+	}
+	if u := r.updatedUnix.Load(); u > 0 {
+		updated = time.Unix(u, 0)
+	}
+	return remaining, limit, reset, updated
+}
+
+// rateTrackingTransport wraps another RoundTripper and updates the rate
+// gauges + a shared rateSnapshot from response headers on every call.
+type rateTrackingTransport struct {
+	next http.RoundTripper
+	last *rateSnapshot
+}
+
+func (t *rateTrackingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.next.RoundTrip(req)
+	if resp != nil {
+		t.observe(resp)
+	}
+	return resp, err
+}
+
+// observe parses X-RateLimit-* headers from a response and updates
+// metrics + the shared rateSnapshot. Called on every response, including
+// error responses (429/5xx) — those still carry the rate headers.
+func (t *rateTrackingTransport) observe(resp *http.Response) {
+	rem := resp.Header.Get("X-RateLimit-Remaining")
+	if rem == "" {
+		// Not every endpoint returns rate headers (e.g. some GraphQL
+		// paths). Don't touch the gauge — a fresher value is better
+		// than clobbering with 0.
+		return
+	}
+	if v, err := strconv.ParseInt(rem, 10, 64); err == nil {
+		t.last.remaining.Store(v)
+		metrics.GitHubAPIRateRemaining.Set(float64(v))
+	}
+	if lim := resp.Header.Get("X-RateLimit-Limit"); lim != "" {
+		if v, err := strconv.ParseInt(lim, 10, 64); err == nil {
+			t.last.limit.Store(v)
+			metrics.GitHubAPIRateLimit.Set(float64(v))
+		}
+	}
+	if reset := resp.Header.Get("X-RateLimit-Reset"); reset != "" {
+		if v, err := strconv.ParseInt(reset, 10, 64); err == nil {
+			t.last.resetUnix.Store(v)
+			metrics.GitHubAPIRateResetSeconds.Set(float64(v))
+		}
+	}
+	now := time.Now().Unix()
+	t.last.updatedUnix.Store(now)
+	metrics.GitHubAPIRateUpdatedSeconds.Set(float64(now))
 }
 
 // SetHTTPClient replaces the underlying go-github client.
