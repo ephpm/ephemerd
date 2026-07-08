@@ -312,55 +312,46 @@ mode overrides.
 
 ## Decisions
 
-### 1. Homebrew: per-job writable prefix over shared read-only base
+### 1. Homebrew: shared host prefix, read-only
 
-Jobs need `brew install` for build deps, but we can't let one job's
-installs pollute another. The solution uses Homebrew's relocatable
-architecture:
-
-**Host setup (one-time):** `/opt/homebrew` is pre-installed with common
-tools (Go, mage, etc.) and marked read-only for the runner user.
-
-**Per-job overlay:**
-
-```
-<data_dir>/native/<job-id>/
-  └── homebrew/           → HOMEBREW_PREFIX, HOMEBREW_CELLAR, HOMEBREW_TEMP
-      ├── Cellar/         → per-job installs land here
-      ├── lib/
-      ├── bin/            → symlinked from /opt/homebrew/bin at job start
-      └── Homebrew/       → lightweight Homebrew checkout (or symlink)
-```
-
-Environment for the runner process:
+Native jobs use the host's real Homebrew at `/opt/homebrew` directly:
 
 ```bash
-HOMEBREW_PREFIX=<job_dir>/homebrew
-HOMEBREW_CELLAR=<job_dir>/homebrew/Cellar
+HOMEBREW_PREFIX=/opt/homebrew
+HOMEBREW_CELLAR=/opt/homebrew/Cellar
 HOMEBREW_TEMP=<job_dir>/tmp
-PATH=<job_dir>/homebrew/bin:/opt/homebrew/bin:/usr/local/bin:...
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 ```
 
-How it works:
+The sandbox denies writes to `/opt/homebrew` (see the profile above), so
+a job can *use* the installed formulae but cannot mutate them — one job
+can't pollute another or upgrade a formula out from under a concurrent
+build. Isolation comes from the write-deny, not from a separate prefix.
 
-1. At job start, create `<job_dir>/homebrew/bin` and symlink all
-   executables from `/opt/homebrew/bin` into it. This gives the job
-   read access to pre-installed tools.
-2. Set `HOMEBREW_PREFIX` and `HOMEBREW_CELLAR` to the per-job dir.
-   Any `brew install` writes to the job's Cellar, not the host's.
-3. The job's `homebrew/bin` is first in PATH, so newly installed
-   formulas shadow the host versions if there's a conflict.
-4. At job end, `rm -rf <job_dir>` deletes everything — installs,
-   caches, temp files.
+**Host setup:** every build dependency a workflow expects must be
+installed on the host and kept current. See
+`scripts/provision-native-macos.sh` for the formula list and a
+`--check` mode.
 
-**Why not a full Homebrew clone?** Cloning the Homebrew repo takes
-~10 seconds and ~500 MB. Symlinking the host's existing install is
-instant and zero-copy. The job only needs a writable prefix for new
-installs.
+**Why not a per-job writable prefix?** The original design gave each job
+its own `HOMEBREW_PREFIX=<job_dir>/homebrew` with an empty Cellar and only
+symlinked the host's *binaries* into PATH. That broke any tool that asks
+Homebrew "is X installed?" through the Cellar/formula metadata rather than
+PATH — notably `spc doctor` (static-php-cli, used by php-sdk's macOS
+build). It saw the empty per-job Cellar, decided pkg-config / cmake / etc.
+were missing, and tried to install them — which then failed on the
+sandbox's `/opt/homebrew` write-deny (reported misleadingly as a network
+error). Sharing the host prefix read-only makes those checks pass while
+keeping isolation.
 
-**Why not just share `/opt/homebrew` read-write?** Jobs would step on
-each other. One job upgrading a formula mid-build could break another
-job. Per-job prefix keeps them independent.
+**Trade-off — the host is now the source of truth.** Because jobs can't
+`brew install` or `brew upgrade`, a formula the host lacks *or one that
+has gone outdated upstream* will fail any workflow step that runs
+`brew install <it>` (that command attempts an upgrade, which the sandbox
+blocks — this is exactly how a stale `llvm` failed a php-sdk build until
+the host was upgraded). Keep the host provisioned and current: run
+`scripts/provision-native-macos.sh` after adding a dependency, and
+`brew upgrade` periodically so outdated formulae don't regress builds.
 
 ### 2. Keychain: per-job temporary keychain
 
