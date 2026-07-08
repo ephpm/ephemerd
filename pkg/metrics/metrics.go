@@ -56,9 +56,36 @@ var (
 	}, []string{"endpoint", "status_code"})
 
 	// GitHubAPIRateRemaining tracks the remaining GitHub API rate limit.
+	// Updated on every GitHub API response from X-RateLimit-Remaining;
+	// pair with GitHubAPIRateUpdatedSeconds so operators can distinguish
+	// "0 and current" from "0 and stale".
 	GitHubAPIRateRemaining = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "ephemerd_github_api_rate_remaining",
-		Help: "Remaining GitHub API rate limit quota.",
+		Help: "Remaining GitHub API rate limit quota (last observed).",
+	})
+
+	// GitHubAPIRateLimit reports the ceiling for the current window
+	// (typically 5000/hr for app installations, 60 for unauthenticated).
+	GitHubAPIRateLimit = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "ephemerd_github_api_rate_limit",
+		Help: "GitHub API rate limit ceiling for the current window (last observed).",
+	})
+
+	// GitHubAPIRateResetSeconds is the unix timestamp at which the rate
+	// window resets, taken from X-RateLimit-Reset.
+	GitHubAPIRateResetSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "ephemerd_github_api_rate_reset_seconds",
+		Help: "Unix timestamp of the next GitHub rate-limit window reset.",
+	})
+
+	// GitHubAPIRateUpdatedSeconds is the unix timestamp of the most
+	// recent GitHub API response that carried rate headers. Operators
+	// use `time() - ephemerd_github_api_rate_updated_seconds` to age
+	// out a stale-looking `_rate_remaining` reading — if the update
+	// timestamp is older than the reset timestamp, the gauge is stale.
+	GitHubAPIRateUpdatedSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "ephemerd_github_api_rate_updated_seconds",
+		Help: "Unix timestamp of the last GitHub API response that carried rate headers.",
 	})
 
 	// GitHubPollTotal counts polling cycles.
