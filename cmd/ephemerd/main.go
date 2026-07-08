@@ -570,6 +570,26 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		log.Info("polling mode enabled (no tunnel, no webhook secret)")
 	}
 
+	// Build the claim retry queue config. Wired here (not in Load) so
+	// the RateHint closure can bind to the actual GitHub provider
+	// instance: the retry queue uses the last-observed rate snapshot to
+	// snap the next attempt just past the reset window when the API
+	// budget is exhausted.
+	retryCfg := scheduler.RetryConfig{
+		Enabled:  cfg.Runner.ClaimRetryEnabled(),
+		Schedule: cfg.Runner.ClaimRetrySchedule(),
+		MaxAge:   cfg.Runner.ClaimRetryMaxAge(),
+		Jitter:   cfg.Runner.ClaimRetryJitter(),
+		RateHint: buildRateHint(activeProviders),
+	}
+	if retryCfg.Enabled {
+		log.Info("claim retry queue enabled",
+			"max_age", retryCfg.MaxAge,
+			"schedule", retryCfg.Schedule,
+			"jitter", retryCfg.Jitter,
+			"rate_aware", retryCfg.RateHint != nil)
+	}
+
 	// Start scheduler (ties CI provider jobs to container lifecycle)
 	sched := scheduler.New(scheduler.Config{
 		Runtime:            rt,
@@ -591,6 +611,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		ShutdownTimeout:    cfg.Runner.ParsedShutdownTimeout(),
 		LogRetention:       cfg.Log.LogRetentionDuration(),
 		RunnerImageForRepo: cfg.Runner.ImageForRepoOS,
+		Retry:              retryCfg,
 		Log:                log,
 	})
 
@@ -787,6 +808,28 @@ func pollInterval(cfg *config.Config) time.Duration {
 	default:
 		return 30 * time.Second
 	}
+}
+
+// buildRateHint returns a rate-hint closure that the scheduler's retry
+// queue uses to bias backoff toward the next GitHub rate-limit reset.
+// Returns nil when no rate-aware provider is present; the retry queue
+// honors nil and falls through to the plain jittered backoff ladder.
+//
+// Currently only the GitHub provider surfaces rate data. If additional
+// providers grow rate tracking, extend this to combine them (typically:
+// use the earliest available reset time).
+func buildRateHint(active []providers.Provider) func() (int64, time.Time, time.Time) {
+	for _, p := range active {
+		gp, ok := p.(*githubProv.Provider)
+		if !ok {
+			continue
+		}
+		return func() (int64, time.Time, time.Time) {
+			remaining, _, reset, updated := gp.RateSnapshot()
+			return remaining, reset, updated
+		}
+	}
+	return nil
 }
 
 // crictlCmd exposes the upstream crictl CLI against ephemerd's embedded

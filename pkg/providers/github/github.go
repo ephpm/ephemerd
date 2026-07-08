@@ -176,6 +176,15 @@ func (p *Provider) CleanStaleWebhooks(ctx context.Context) {
 	p.client.CleanStaleWebhooks(ctx)
 }
 
+// RateSnapshot exposes the underlying GitHub client's last-observed
+// rate-limit state so the scheduler's retry queue can bias backoff:
+// when remaining==0 with a fresh update timestamp and reset > now, the
+// next attempt is snapped just past the reset. Zero values mean "no
+// data yet" (the client has not yet made a request).
+func (p *Provider) RateSnapshot() (remaining, limit int64, reset, updated time.Time) {
+	return p.client.RateSnapshot()
+}
+
 // CatchUpPoll fires a single poll to discover jobs queued while ephemerd was
 // offline. Used in webhook mode (where continuous polling is disabled) to catch
 // jobs that transitioned to "queued" before webhooks could be registered —

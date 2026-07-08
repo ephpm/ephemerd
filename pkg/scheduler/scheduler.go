@@ -46,6 +46,14 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	LogRetention    time.Duration // max age for job log files (default 7d)
 
+	// Retry configures the claim/provision retry queue. When the initial
+	// attempt to claim a queued job fails with a retryable error
+	// (rate-limit exhausted, transient 5xx, network), the job is
+	// enqueued and re-attempted on a backoff ladder rather than lost.
+	// GitHub does not re-deliver workflow_job webhooks. Leave zero-valued
+	// (Enabled=false) to keep the pre-existing "log and drop" behavior.
+	Retry RetryConfig
+
 	// RunnerImageForRepo resolves the per-repo, per-OS image override
 	// configured under [runner.images]. Returns "" when no override is
 	// set; the scheduler then falls back to the provider per-OS default
@@ -108,6 +116,10 @@ type Scheduler struct {
 	macSem    chan struct{} // macOS VM concurrency limiter (Vz has a hard cap)
 	draining  bool         // true when shutting down, rejects new jobs
 	startTime time.Time
+
+	// retry holds pending re-attempts for jobs whose initial claim
+	// failed with a retryable error. Nil when Config.Retry.Enabled=false.
+	retry *retryQueue
 }
 
 const seenTTL = 10 * time.Minute
@@ -189,7 +201,7 @@ func New(cfg Config) *Scheduler {
 		}
 	}
 
-	return &Scheduler{
+	s := &Scheduler{
 		cfg:       cfg,
 		running:   make(map[jobKey]*runningJob),
 		seen:      make(map[jobKey]time.Time),
@@ -199,6 +211,18 @@ func New(cfg Config) *Scheduler {
 		macSem:    make(chan struct{}, macVMs),
 		startTime: time.Now(),
 	}
+	// Only construct the retry queue when the caller explicitly enabled
+	// it. A disabled queue is safe to leave nil; enqueueRetryIfEligible
+	// nil-checks so the "log and drop" path is a no-op for opted-out
+	// callers.
+	if cfg.Retry.Enabled {
+		log := cfg.Log
+		if log == nil {
+			log = slog.Default()
+		}
+		s.retry = newRetryQueue(cfg.Retry, log.With("component", "retry_queue"))
+	}
+	return s
 }
 
 // Run starts the scheduler. It discovers jobs via polling (default) or
@@ -222,6 +246,12 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			}
 		}
 	}()
+
+	// Drive the claim/provision retry queue if configured. Nil-safe when
+	// Retry.Enabled is false.
+	if s.retry != nil {
+		go s.retry.Run(ctx)
+	}
 
 	// Clean old job logs on startup, then periodically every hour.
 	// Retention period is configurable via [log] log_retention (default 7d).
@@ -427,6 +457,14 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			case "queued":
 				metrics.JobsQueuedTotal.Inc()
 				go s.handleQueued(ctx, event)
+			case "in_progress":
+				// Job was picked up (possibly by a peer daemon
+				// sharing the installation token). Drop any
+				// outstanding retry so we stop reattempting a job
+				// that's already running elsewhere. Nil-safe.
+				if s.retry != nil {
+					s.retry.Drop(keyFor(event))
+				}
 			case "completed":
 				go s.handleCompleted(ctx, event)
 			}
@@ -615,10 +653,15 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 	const maxNameRetries = 3
 	claim, err := s.claimJob(ctx, &event, labels, log, maxNameRetries)
 	if err != nil {
-		log.Error("failed to claim job", "error", err)
+		log.Error("failed to claim job", "error", err, "error_class", classifyErr(err))
 		unsee()
-		time.Sleep(backoffDuration(event.Repo))
 		<-s.linuxSem
+		// Replaces the old blind time.Sleep(backoffDuration): the
+		// sem is released FIRST so we do not hold a slot idle across
+		// the wait, then a rate-aware jittered retry is enqueued
+		// (no-op when Retry.Enabled is false or the error is not
+		// retryable).
+		s.enqueueRetryIfEligible(event, err)
 		return
 	}
 
@@ -744,13 +787,13 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 	const maxNameRetries = 3
 	claim, err := s.claimJob(ctx, &event, labels, log, maxNameRetries)
 	if err != nil {
-		log.Error("failed to claim job", "error", err)
+		log.Error("failed to claim job", "error", err, "error_class", classifyErr(err))
 		if artifactsDir != "" {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
 		unsee()
-		time.Sleep(backoffDuration(event.Repo))
 		<-s.macSem
+		s.enqueueRetryIfEligible(event, err)
 		return
 	}
 
@@ -961,13 +1004,16 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 	const maxNameRetries = 3
 	claim, err := s.claimJob(ctx, &event, labels, log, maxNameRetries)
 	if err != nil {
-		log.Error("failed to claim job", "error", err)
+		log.Error("failed to claim job", "error", err, "error_class", classifyErr(err))
 		if artifactsDir != "" {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
 		unsee()
-		time.Sleep(5 * time.Second) // back off to avoid tight retry loops on rate limits
 		<-s.sem
+		// Replaces the old blind 5s sleep with a rate-aware jittered
+		// retry. No-op when Retry is disabled or the error is not
+		// retryable.
+		s.enqueueRetryIfEligible(event, err)
 		return
 	}
 
@@ -1065,6 +1111,13 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event providers.JobEven
 	jobID := event.JobID
 	key := keyFor(event)
 	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo)
+
+	// Drop any outstanding retry attempts: the provider says this job
+	// is finished, so re-attempting would waste API budget and could
+	// register ghost runners. Nil-safe.
+	if s.retry != nil {
+		s.retry.Drop(key)
+	}
 
 	s.mu.Lock()
 	job, exists := s.running[key]
@@ -1217,6 +1270,40 @@ func (s *Scheduler) cleanSeen() {
 			delete(s.seen, id)
 		}
 	}
+}
+
+// enqueueRetryIfEligible passes err through the retry queue, if enabled.
+// The retryHandler callback re-invokes handleQueued with the ORIGINAL
+// event when the backoff timer fires. Non-retryable errors and disabled
+// queues are a no-op. Safe to call with s.retry == nil.
+func (s *Scheduler) enqueueRetryIfEligible(event providers.JobEvent, err error) {
+	if s.retry == nil {
+		return
+	}
+	s.retry.Add(event, s.retryHandler, err)
+}
+
+// retryHandler is the callback the retry queue invokes on each fire.
+// It re-enters the top-level dispatch (handleQueued) with the ORIGINAL
+// event. Because handleQueued would otherwise dedup our own retry via
+// the seen/pending maps, we clear those entries first.
+//
+// Return value: always nil. handleQueued dispatches asynchronously into
+// concurrency slots so we cannot know synchronously whether the retry
+// succeeded; on failure the handler self-enqueues via
+// enqueueRetryIfEligible, and on success any future completed webhook
+// harmlessly Drops the (already-absent) key.
+func (s *Scheduler) retryHandler(ctx context.Context, event providers.JobEvent) error {
+	key := keyFor(event)
+	s.mu.Lock()
+	// Clear seen/pending so handleQueued does not dedup our own retry.
+	// Leave running alone: if the job got picked up elsewhere, we
+	// want handleQueued's running-check to short-circuit.
+	delete(s.seen, key)
+	delete(s.pending, key)
+	s.mu.Unlock()
+	s.handleQueued(ctx, event)
+	return nil
 }
 
 // buildLabelsForOS builds runner labels for a given target OS.

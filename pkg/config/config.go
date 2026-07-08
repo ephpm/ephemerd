@@ -453,6 +453,42 @@ type RunnerConfig struct {
 	JobTimeout      string            `toml:"job_timeout"`
 	ShutdownTimeout string            `toml:"shutdown_timeout"`
 	Windows         WindowsRunnerToml `toml:"windows"`
+
+	// ClaimRetry controls the in-memory retry queue for jobs whose
+	// initial claim / provision attempt fails with a transient error
+	// (rate limit, 5xx, network). GitHub does not re-deliver
+	// workflow_job webhooks, so without this queue any queued job that
+	// hit an API blip at claim time would be lost until human
+	// intervention.
+	ClaimRetry ClaimRetryToml `toml:"claim_retry"`
+}
+
+// ClaimRetryToml configures the scheduler's claim-retry queue.
+//
+// Enabled defaults to true when the [runner.claim_retry] table is
+// omitted (see RunnerConfig.ClaimRetryEnabled). Losing queued jobs to
+// transient errors is almost never what an operator wants; set
+// enabled = false to restore the pre-existing "log and drop" behavior.
+type ClaimRetryToml struct {
+	// Enabled toggles the retry queue. Nil = default true; operators
+	// disable by explicitly setting enabled = false.
+	Enabled *bool `toml:"enabled"`
+
+	// MaxAge is the total time budget from first failure to giving up.
+	// Accepts Go duration strings ("90m", "1h30m"). Default 90m.
+	MaxAge string `toml:"max_age"`
+
+	// Schedule is the ordered backoff ladder. Each entry is the base
+	// delay for one attempt; jitter is applied on top. Default is
+	// {30s, 1m, 2m, 5m, 10m}. Use a shorter schedule for shorter
+	// MaxAge, or a longer one to let jobs marinate through extended
+	// outages.
+	Schedule []string `toml:"schedule"`
+
+	// Jitter is the +/- fraction applied to each delay (0.0-1.0).
+	// Default 0.2 (+/-20%). Set 0 to disable jitter (useful in tests,
+	// rarely useful in production).
+	Jitter *float64 `toml:"jitter"`
 }
 
 // WindowsRunnerToml configures resource limits for Hyper-V isolated Windows
@@ -503,6 +539,67 @@ func (r *RunnerConfig) ImageForRepo(repo string) string {
 		return img
 	}
 	return r.DefaultImage
+}
+
+// ClaimRetryEnabled reports whether the claim retry queue should run.
+// Defaults to true (retries on) when the table is omitted or Enabled is
+// nil; operators opt out with `enabled = false`.
+func (r *RunnerConfig) ClaimRetryEnabled() bool {
+	if r == nil || r.ClaimRetry.Enabled == nil {
+		return true
+	}
+	return *r.ClaimRetry.Enabled
+}
+
+// ClaimRetryMaxAge returns the retry queue give-up threshold. Defaults
+// to 90 minutes when unset or unparseable.
+func (r *RunnerConfig) ClaimRetryMaxAge() time.Duration {
+	if r == nil || r.ClaimRetry.MaxAge == "" {
+		return 90 * time.Minute
+	}
+	if d, err := time.ParseDuration(r.ClaimRetry.MaxAge); err == nil && d > 0 {
+		return d
+	}
+	return 90 * time.Minute
+}
+
+// ClaimRetrySchedule returns the retry backoff ladder. Defaults to
+// {30s, 1m, 2m, 5m, 10m} when unset. Unparseable entries are dropped;
+// if all entries fail to parse, the default is returned.
+func (r *RunnerConfig) ClaimRetrySchedule() []time.Duration {
+	def := []time.Duration{
+		30 * time.Second,
+		1 * time.Minute,
+		2 * time.Minute,
+		5 * time.Minute,
+		10 * time.Minute,
+	}
+	if r == nil || len(r.ClaimRetry.Schedule) == 0 {
+		return def
+	}
+	out := make([]time.Duration, 0, len(r.ClaimRetry.Schedule))
+	for _, s := range r.ClaimRetry.Schedule {
+		if d, err := time.ParseDuration(s); err == nil && d > 0 {
+			out = append(out, d)
+		}
+	}
+	if len(out) == 0 {
+		return def
+	}
+	return out
+}
+
+// ClaimRetryJitter returns the retry backoff jitter fraction. Defaults
+// to 0.2 (+/-20%). Values outside [0,1] are clamped to the default.
+func (r *RunnerConfig) ClaimRetryJitter() float64 {
+	if r == nil || r.ClaimRetry.Jitter == nil {
+		return 0.2
+	}
+	j := *r.ClaimRetry.Jitter
+	if j < 0 || j > 1 {
+		return 0.2
+	}
+	return j
 }
 
 // ParsedPollInterval returns the poll interval as a time.Duration.
