@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	RunnerVersion        = "2.333.1"
+	RunnerVersion        = "2.335.1"
 	CNIVersion           = "1.6.2"
 	ContainerdVersion    = "2.2.2"
 	RuncVersion          = "1.3.4"

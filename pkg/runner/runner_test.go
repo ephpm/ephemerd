@@ -383,3 +383,85 @@ func TestFindTarball_MatchesPlatform(t *testing.T) {
 		}
 	}
 }
+
+// --- version-aware tarball selection (regression: shipping a deprecated runner) ---
+
+func TestParseRunnerVersion(t *testing.T) {
+	cases := []struct {
+		name string
+		want []int
+	}{
+		{"actions-runner-osx-arm64-2.335.1.tar.gz", []int{2, 335, 1}},
+		{"actions-runner-linux-arm64-2.333.1.tar.gz", []int{2, 333, 1}},
+		{"actions-runner-win-x64-2.340.0.zip", []int{2, 340, 0}},
+		{".gitkeep", nil},
+		{"garbage", nil},
+	}
+	for _, c := range cases {
+		got := parseRunnerVersion(c.name)
+		if len(got) != len(c.want) {
+			t.Errorf("parseRunnerVersion(%q) = %v, want %v", c.name, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("parseRunnerVersion(%q) = %v, want %v", c.name, got, c.want)
+				break
+			}
+		}
+	}
+}
+
+func TestCompareRunnerVersions(t *testing.T) {
+	cases := []struct {
+		a, b []int
+		want int // sign
+	}{
+		{[]int{2, 335, 1}, []int{2, 333, 1}, +1}, // the bug: 335 must beat 333
+		{[]int{2, 333, 1}, []int{2, 335, 1}, -1},
+		{[]int{2, 335, 1}, []int{2, 335, 1}, 0},
+		{[]int{2, 335}, []int{2, 335, 1}, -1}, // missing component counts as 0
+		{[]int{2, 340, 0}, []int{2, 335, 9}, +1},
+		{nil, []int{2, 335, 1}, -1}, // unparseable sorts lowest
+	}
+	for _, c := range cases {
+		got := compareRunnerVersions(c.a, c.b)
+		if (got > 0) != (c.want > 0) || (got < 0) != (c.want < 0) || (got == 0) != (c.want == 0) {
+			t.Errorf("compareRunnerVersions(%v,%v) sign = %d, want sign %d", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+// TestFindTarball_PicksHighestVersion guards the real embedded FS: whatever
+// versions are present, findTarball must return the newest one for this OS so a
+// leftover older tarball can never ship a GitHub-deprecated runner.
+func TestFindTarball_PicksHighestVersion(t *testing.T) {
+	m := &Manager{}
+	got, err := m.findTarball()
+	if err != nil {
+		t.Fatalf("findTarball: %v", err)
+	}
+	chosen := parseRunnerVersion(got)
+
+	entries, err := runnerFS.ReadDir("embed")
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	var osPrefix string
+	switch goruntime.GOOS {
+	case "windows":
+		osPrefix = "actions-runner-win-"
+	case "darwin":
+		osPrefix = "actions-runner-osx-"
+	default:
+		osPrefix = "actions-runner-linux-"
+	}
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), osPrefix) {
+			continue
+		}
+		if compareRunnerVersions(parseRunnerVersion(e.Name()), chosen) > 0 {
+			t.Errorf("findTarball chose %q but a newer tarball %q is embedded", got, e.Name())
+		}
+	}
+}
