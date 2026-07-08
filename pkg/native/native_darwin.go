@@ -220,8 +220,6 @@ func New(dataDir, jobID, jitConfig, runnerSrc string, log *slog.Logger) (*Runner
 		filepath.Join(jobDir, "tmp"),
 		filepath.Join(jobDir, "work"),
 		filepath.Join(jobDir, "runner"),
-		filepath.Join(jobDir, "homebrew", "bin"),
-		filepath.Join(jobDir, "homebrew", "Cellar"),
 		filepath.Join(jobDir, "keychain"),
 	}
 	for _, d := range dirs {
@@ -264,25 +262,25 @@ func (r *Runner) Start(ctx context.Context) error {
 		// Non-fatal: jobs that don't need signing will work fine
 	}
 
-	// Symlink Homebrew binaries from host
-	if err := symlinkHomebrew(filepath.Join(r.jobDir, "homebrew", "bin")); err != nil {
-		r.log.Warn("failed to symlink homebrew binaries", "error", err)
-		// Non-fatal: host may not have Homebrew installed
-	}
-
 	// Build environment
 	homeDir := filepath.Join(r.jobDir, "home")
 	tmpDir := filepath.Join(r.jobDir, "tmp")
 	workDir := filepath.Join(r.jobDir, "work")
-	brewDir := filepath.Join(r.jobDir, "homebrew")
 
+	// Use the host's real Homebrew (read-only: the sandbox denies writes to
+	// /opt/homebrew). Pointing HOMEBREW_PREFIX/CELLAR at a per-job empty prefix
+	// made `brew list`-style checks (e.g. spc doctor) see nothing installed, so
+	// tools tried to (re)install formulae the host already has — then failed on
+	// the write-deny. Sharing the host prefix read-only lets jobs USE the
+	// pre-installed deps without being able to mutate them.
+	const hostBrewPrefix = "/opt/homebrew"
 	env := []string{
 		"HOME=" + homeDir,
 		"TMPDIR=" + tmpDir,
 		"RUNNER_WORK_FOLDER=" + workDir,
-		"PATH=" + filepath.Join(brewDir, "bin") + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-		"HOMEBREW_PREFIX=" + brewDir,
-		"HOMEBREW_CELLAR=" + filepath.Join(brewDir, "Cellar"),
+		"PATH=" + hostBrewPrefix + "/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+		"HOMEBREW_PREFIX=" + hostBrewPrefix,
+		"HOMEBREW_CELLAR=" + hostBrewPrefix + "/Cellar",
 		"HOMEBREW_TEMP=" + tmpDir,
 		"LANG=en_US.UTF-8",
 	}
@@ -543,28 +541,6 @@ func GenerateSandboxProfile(jobDir, dataDir string) string {
 (allow file-write* (subpath "%[3]s"))
 (allow file-write* (subpath "/private/tmp"))
 `, homeDir, absDataDir, absJobDir)
-}
-
-// symlinkHomebrew creates symlinks from /opt/homebrew/bin/* into the
-// per-job homebrew bin directory, giving jobs read access to pre-installed
-// tools while keeping their own installs isolated.
-func symlinkHomebrew(destBin string) error {
-	const hostBin = "/opt/homebrew/bin"
-	entries, err := os.ReadDir(hostBin)
-	if err != nil {
-		return fmt.Errorf("reading %s: %w", hostBin, err)
-	}
-	for _, e := range entries {
-		src := filepath.Join(hostBin, e.Name())
-		dst := filepath.Join(destBin, e.Name())
-		if err := os.Symlink(src, dst); err != nil {
-			// Skip if symlink already exists
-			if !os.IsExist(err) {
-				return fmt.Errorf("symlinking %s: %w", e.Name(), err)
-			}
-		}
-	}
-	return nil
 }
 
 // copyRunnerFiles copies the runner directory to the per-job location.
