@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+	"strconv"
 	"strings"
 )
 
@@ -113,7 +114,16 @@ func (m *Manager) Extract() error {
 	return nil
 }
 
-// findTarball locates the runner archive in the embedded filesystem for the current OS.
+// findTarball locates the runner archive in the embedded filesystem for the
+// current OS, preferring the HIGHEST embedded version.
+//
+// Selecting by version (rather than "first prefix match") is critical: the
+// embed directory can legitimately hold more than one version — a RunnerVersion
+// bump downloads the new tarball but leaves the old one behind — and ReadDir
+// returns them sorted, so a naive first-match ships the OLDER runner. GitHub
+// deprecates old runner versions and refuses their connections, which silently
+// fails every job ("Runner version vX is deprecated and cannot receive
+// messages"). Always pick the newest so a leftover tarball can't regress us.
 func (m *Manager) findTarball() (string, error) {
 	// Runner archives are named: actions-runner-{os}-{arch}-{version}.{ext}
 	// os: linux, win, osx
@@ -132,11 +142,20 @@ func (m *Manager) findTarball() (string, error) {
 		return "", fmt.Errorf("reading embedded files: %w", err)
 	}
 
+	var best string
+	var bestVer []int
 	for _, e := range entries {
 		name := e.Name()
-		if strings.HasPrefix(name, osPrefix) {
-			return "embed/" + name, nil
+		if !strings.HasPrefix(name, osPrefix) {
+			continue
 		}
+		ver := parseRunnerVersion(name)
+		if best == "" || compareRunnerVersions(ver, bestVer) > 0 {
+			best, bestVer = name, ver
+		}
+	}
+	if best != "" {
+		return "embed/" + best, nil
 	}
 
 	// Fall back to first non-gitkeep file if no OS match
@@ -148,7 +167,46 @@ func (m *Manager) findTarball() (string, error) {
 		return "embed/" + name, nil
 	}
 
-	return "", fmt.Errorf("no runner archive found in embedded files (did you run 'make download-runner'?)")
+	return "", fmt.Errorf("no runner archive found in embedded files (did you run 'mage download'?)")
+}
+
+// parseRunnerVersion extracts the numeric version components from a runner
+// archive name like "actions-runner-osx-arm64-2.335.1.tar.gz" -> [2 335 1].
+// Names it can't parse return nil, which sorts lowest.
+func parseRunnerVersion(name string) []int {
+	base := strings.TrimSuffix(strings.TrimSuffix(name, ".tar.gz"), ".zip")
+	idx := strings.LastIndex(base, "-")
+	if idx < 0 {
+		return nil
+	}
+	parts := strings.Split(base[idx+1:], ".")
+	nums := make([]int, 0, len(parts))
+	for _, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return nil
+		}
+		nums = append(nums, n)
+	}
+	return nums
+}
+
+// compareRunnerVersions returns >0 if a>b, <0 if a<b, 0 if equal, comparing
+// numeric components left to right (a missing component counts as 0).
+func compareRunnerVersions(a, b []int) int {
+	for i := 0; i < len(a) || i < len(b); i++ {
+		var ai, bi int
+		if i < len(a) {
+			ai = a[i]
+		}
+		if i < len(b) {
+			bi = b[i]
+		}
+		if ai != bi {
+			return ai - bi
+		}
+	}
+	return 0
 }
 
 func extractZipFromReader(r io.Reader, dest string) error {
