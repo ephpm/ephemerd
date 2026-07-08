@@ -560,8 +560,14 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			return fmt.Errorf("creating tunnel provider: %w", err)
 		}
 		log.Info("webhook tunnel configured", "provider", cfg.Webhook.Tunnel)
+	} else if cfg.Webhook.Secret != "" {
+		// No tunnel, but a webhook secret is configured — the operator is
+		// running webhooks via an external ingress (reverse proxy, LB, etc.).
+		// Scheduler treats this as webhook mode (see scheduler.Run:
+		// useWebhook = Tunnel != nil || WebhookSecret != "").
+		log.Info("webhook mode enabled (external ingress, no tunnel provider)")
 	} else {
-		log.Info("polling mode enabled (tunnel disabled)")
+		log.Info("polling mode enabled (no tunnel, no webhook secret)")
 	}
 
 	// Start scheduler (ties CI provider jobs to container lifecycle)
