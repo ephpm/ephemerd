@@ -178,6 +178,75 @@ func TestValidate_AcceptsEnvToken(t *testing.T) {
 	}
 }
 
+func TestValidate_ExternalTunnel_RequiresSecret(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_x")
+
+	cfg := &Config{
+		GitHub:  GitHubConfig{Owner: "org"},
+		Webhook: WebhookConfig{Tunnel: "external"},
+	}
+	if err := cfg.validate(); err == nil {
+		t.Fatal(`expected error: tunnel="external" without a secret must be rejected`)
+	}
+}
+
+func TestValidate_ExternalTunnel_KeepsSecretAndDefaultsPort(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_x")
+
+	const secret = "deadbeefcafe"
+	cfg := &Config{
+		GitHub:  GitHubConfig{Owner: "org"},
+		Webhook: WebhookConfig{Tunnel: "external", Secret: secret},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// External ingress: the secret must match the external webhook config, so
+	// it must never be regenerated.
+	if cfg.Webhook.Secret != secret {
+		t.Errorf("Secret = %q, want it left untouched (%q)", cfg.Webhook.Secret, secret)
+	}
+	if cfg.Webhook.Port != 8080 {
+		t.Errorf("Port = %d, want default 8080", cfg.Webhook.Port)
+	}
+}
+
+func TestValidate_ManagedTunnel_GeneratesSecret(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_x")
+
+	cfg := &Config{
+		GitHub:  GitHubConfig{Owner: "org"},
+		Webhook: WebhookConfig{Tunnel: "ngrok"},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Managed tunnels register the webhook themselves, so a generated secret is
+	// fine (and expected) when none was provided.
+	if cfg.Webhook.Secret == "" {
+		t.Error("expected a generated secret for a managed tunnel, got empty")
+	}
+}
+
+func TestValidate_NoneWithSecret_DefaultsPort(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_x")
+
+	const secret = "abc123"
+	cfg := &Config{
+		GitHub:  GitHubConfig{Owner: "org"},
+		Webhook: WebhookConfig{Tunnel: "none", Secret: secret},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Webhook.Secret != secret {
+		t.Errorf("Secret = %q, want %q (must not be regenerated)", cfg.Webhook.Secret, secret)
+	}
+	if cfg.Webhook.Port != 8080 {
+		t.Errorf("Port = %d, want default 8080 when a secret enables the receiver", cfg.Webhook.Port)
+	}
+}
+
 func TestValidate_AppID_RequiresInstallationID(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "")
 

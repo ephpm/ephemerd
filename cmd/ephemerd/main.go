@@ -551,17 +551,33 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		log.Info("DinD enabled — containers will have /var/run/docker.sock")
 	}
 
-	// Set up webhook tunnel if configured
+	// Set up webhook tunnel if configured.
 	var tunnelProvider tunnel.Provider
-	if cfg.Webhook.Tunnel != "none" {
+	switch cfg.Webhook.Tunnel {
+	case "none":
+		// No ephemerd-managed tunnel. If a webhook secret is set the scheduler
+		// still serves the /webhook/<provider> receiver (ingress arrives some
+		// other way) and disables polling; otherwise it falls back to polling.
+		if cfg.Webhook.Secret != "" {
+			log.Info("webhook mode enabled (external ingress, no managed tunnel)", "port", cfg.Webhook.Port)
+		} else {
+			log.Info("polling mode enabled (no tunnel, no webhook secret)")
+		}
+	case "external":
+		// A tunnel exists but is managed OUTSIDE ephemerd — e.g. a Cloudflare
+		// tunnel running on another host that forwards a public hostname to
+		// this port. ephemerd serves the webhook receiver and disables polling,
+		// but never creates a tunnel or auto-registers webhooks: that ingress
+		// and the GitHub webhook registration are owned externally. Requires a
+		// secret (validated in config) so signatures can be verified.
+		log.Info("webhook mode enabled (external tunnel, ingress managed outside ephemerd)", "port", cfg.Webhook.Port)
+	default:
 		var err error
 		tunnelProvider, err = tunnel.New(cfg.Webhook.Tunnel, cfg.Webhook.NgrokAuthtoken, cfg.Webhook.TunnelURL)
 		if err != nil {
 			return fmt.Errorf("creating tunnel provider: %w", err)
 		}
 		log.Info("webhook tunnel configured", "provider", cfg.Webhook.Tunnel)
-	} else {
-		log.Info("polling mode enabled (tunnel disabled)")
 	}
 
 	// Start scheduler (ties CI provider jobs to container lifecycle)

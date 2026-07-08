@@ -98,13 +98,19 @@ func (m MetricsConfig) ParsedContainerStatsInterval() time.Duration {
 
 // WebhookConfig configures webhook delivery and tunnel providers.
 // By default, ephemerd uses polling (tunnel = "none").
-// Set tunnel = "localtunnel" or "ngrok" for instant webhook delivery.
+// Set tunnel = "localtunnel" or "ngrok" for ephemerd to create and manage a
+// tunnel and auto-register the GitHub webhook. Set tunnel = "external" when a
+// tunnel is provided by something else (e.g. a Cloudflare tunnel on another
+// host that forwards a public hostname to this port): ephemerd then serves the
+// webhook receiver and disables polling, but does not create a tunnel or
+// register the webhook — that is owned externally, so a matching secret is
+// required.
 type WebhookConfig struct {
-	Secret           string `toml:"secret"`             // webhook HMAC secret (auto-generated if empty)
+	Secret           string `toml:"secret"`             // webhook HMAC secret (auto-generated for managed tunnels; required for "external")
 	Port             int    `toml:"port"`               // listen port for health endpoint (default 8080)
 	TLSCert          string `toml:"tls_cert"`           // TLS certificate path (direct TLS, no tunnel)
 	TLSKey           string `toml:"tls_key"`            // TLS private key path
-	Tunnel           string `toml:"tunnel"`             // "none" (default, polling), "localtunnel", or "ngrok"
+	Tunnel           string `toml:"tunnel"`             // "none" (default, polling), "external" (unmanaged ingress), "localtunnel", or "ngrok"
 	TunnelURL        string `toml:"tunnel_url"`         // localtunnel: self-hosted server URL
 	NgrokAuthtoken   string `toml:"ngrok_authtoken"`    // ngrok auth token (or use NGROK_AUTHTOKEN env)
 	TunnelMaxRetries int    `toml:"tunnel_max_retries"` // max consecutive reconnect failures before falling back to polling (default 5)
@@ -721,13 +727,35 @@ func (c *Config) validate() error {
 		}
 	}
 
-	// Generate a random webhook secret if not explicitly set and tunnel is active
-	if c.Webhook.Secret == "" && c.Webhook.Tunnel != "none" {
-		b := make([]byte, 32)
-		if _, err := rand.Read(b); err != nil {
-			return fmt.Errorf("generating webhook secret: %w", err)
+	// Webhook secret handling depends on who owns the tunnel:
+	//   - "external": ingress and the GitHub webhook are configured elsewhere,
+	//     so the secret must match that external config — we cannot invent one.
+	//   - managed tunnels ("localtunnel"/"ngrok"): ephemerd registers the
+	//     webhook itself, so a random secret is fine when none is provided.
+	//   - "none": polling (or external ingress with an explicit secret); nothing
+	//     to generate.
+	switch c.Webhook.Tunnel {
+	case "external":
+		if c.Webhook.Secret == "" {
+			return fmt.Errorf(`webhook.secret is required when webhook.tunnel = "external" (it must match the secret configured on the external GitHub webhook)`)
 		}
-		c.Webhook.Secret = hex.EncodeToString(b)
+	case "none":
+		// Nothing to generate; secret, if set, enables an externally-fronted
+		// webhook receiver, otherwise ephemerd polls.
+	default:
+		if c.Webhook.Secret == "" {
+			b := make([]byte, 32)
+			if _, err := rand.Read(b); err != nil {
+				return fmt.Errorf("generating webhook secret: %w", err)
+			}
+			c.Webhook.Secret = hex.EncodeToString(b)
+		}
+	}
+
+	// Any webhook mode (managed tunnel, or external/none with a secret) needs a
+	// listen port; default to 8080 when unset.
+	if c.Webhook.Port == 0 && (c.Webhook.Tunnel != "none" || c.Webhook.Secret != "") {
+		c.Webhook.Port = 8080
 	}
 
 	return nil
