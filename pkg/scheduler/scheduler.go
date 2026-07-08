@@ -532,13 +532,12 @@ func (s *Scheduler) handleQueued(ctx context.Context, event providers.JobEvent) 
 	key := keyFor(event)
 	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo)
 
-	// Skip jobs whose OS labels don't match this platform
-	if len(event.Labels) > 0 && !s.canHandleJob(event.Labels) {
-		log.Debug("skipping job, OS labels don't match this platform", "labels", event.Labels)
-		return
-	}
-
-	// Dedup: skip if we've already seen this job recently
+	// Dedup: check the running / pending / seen maps FIRST so a job we've
+	// already skipped for label mismatch doesn't get re-adjudicated (and
+	// re-logged) every poll cycle. Previously the label check ran before
+	// dedup and returned without recording anything in `seen`, so a
+	// polling provider would surface the same unclaimable queued job on
+	// every tick, spamming logs and draining API budget.
 	s.mu.Lock()
 	if _, exists := s.running[key]; exists {
 		s.mu.Unlock()
@@ -555,6 +554,18 @@ func (s *Scheduler) handleQueued(ctx context.Context, event providers.JobEvent) 
 		log.Debug("ignoring duplicate queued event, job recently handled")
 		return
 	}
+
+	// Skip jobs whose OS labels don't match this platform. Record in
+	// `seen` so subsequent poll/webhook re-deliveries short-circuit at
+	// the dedup check above; this is what makes label-mismatched jobs
+	// O(1) per event instead of O(polls-until-seenTTL-expires).
+	if len(event.Labels) > 0 && !s.canHandleJob(event.Labels) {
+		s.seen[key] = time.Now()
+		s.mu.Unlock()
+		log.Debug("skipping job, OS labels don't match this platform", "labels", event.Labels)
+		return
+	}
+
 	s.pending[key] = struct{}{}
 	s.seen[key] = time.Now()
 

@@ -163,7 +163,13 @@ func TestHandleQueued_AlreadyRunningWithProvider(t *testing.T) {
 }
 
 // TestHandleQueued_SkipsMismatchedLabels verifies canHandleJob rejection
-// before any side-effects are recorded.
+// records the job in `seen` so subsequent poll/webhook re-deliveries
+// short-circuit at the dedup check instead of re-adjudicating every tick.
+//
+// Previously the label check ran before `seen` was written, so a polling
+// provider would re-log "skipping job, OS labels don't match" every poll
+// cycle for the same unclaimable job (observed as a ~15s re-examination
+// loop that also drained the API rate budget).
 func TestHandleQueued_SkipsMismatchedLabels(t *testing.T) {
 	mp := newMockProvider("github")
 	s := New(Config{
@@ -193,9 +199,20 @@ func TestHandleQueued_SkipsMismatchedLabels(t *testing.T) {
 	}
 	s.mu.Lock()
 	_, seen := s.seen[keyFor(event)]
+	_, pending := s.pending[keyFor(event)]
 	s.mu.Unlock()
-	if seen {
-		t.Error("mismatched-label job should not be added to seen")
+	if !seen {
+		t.Error("mismatched-label job should be recorded in seen to prevent re-adjudication loops")
+	}
+	if pending {
+		t.Error("mismatched-label job should not be recorded in pending (we never took a slot)")
+	}
+
+	// Re-deliver the same event — the second call must short-circuit at
+	// the dedup check and never reach canHandleJob a second time.
+	s.handleQueued(context.Background(), event)
+	if got := len(mp.claims); got != 0 {
+		t.Errorf("re-delivered mismatched-label job should still not claim, got %d", got)
 	}
 }
 
