@@ -717,7 +717,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		// the wait, then a rate-aware jittered retry is enqueued
 		// (no-op when Retry.Enabled is false or the error is not
 		// retryable).
-		s.enqueueRetryIfEligible(event, err)
+		s.enqueueRetryIfEligible(ctx, event, err)
 		return
 	}
 
@@ -849,7 +849,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		}
 		unsee()
 		<-s.macSem
-		s.enqueueRetryIfEligible(event, err)
+		s.enqueueRetryIfEligible(ctx, event, err)
 		return
 	}
 
@@ -1011,8 +1011,9 @@ func (s *Scheduler) handleNativeMacOSJob(ctx context.Context, event providers.Jo
 	const maxNameRetries = 3
 	claim, err := s.claimJob(ctx, &event, labels, log, maxNameRetries)
 	if err != nil {
-		log.Error("failed to claim job", "error", err)
+		log.Error("failed to claim job", "error", err, "error_class", classifyErr(err))
 		unsee()
+		s.enqueueRetryIfEligible(ctx, event, err)
 		time.Sleep(backoffDuration(event.Repo))
 		<-s.nativeMacSem
 		return
@@ -1194,7 +1195,7 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 		// Replaces the old blind 5s sleep with a rate-aware jittered
 		// retry. No-op when Retry is disabled or the error is not
 		// retryable.
-		s.enqueueRetryIfEligible(event, err)
+		s.enqueueRetryIfEligible(ctx, event, err)
 		return
 	}
 
@@ -1464,7 +1465,15 @@ func (s *Scheduler) cleanSeen() {
 // The retryHandler callback re-invokes handleQueued with the ORIGINAL
 // event when the backoff timer fires. Non-retryable errors and disabled
 // queues are a no-op. Safe to call with s.retry == nil.
-func (s *Scheduler) enqueueRetryIfEligible(event providers.JobEvent, err error) {
+func (s *Scheduler) enqueueRetryIfEligible(ctx context.Context, event providers.JobEvent, err error) {
+	// On the retry path, retryHandler put a *error in the context: hand the
+	// claim error back to it (preserving the error class) instead of
+	// enqueuing. Enqueuing here as well would be undone by runOne's
+	// success-cleanup and lose the job.
+	if errPtr, ok := ctx.Value(retryAttemptCtxKey{}).(*error); ok && errPtr != nil {
+		*errPtr = err
+		return
+	}
 	if s.retry == nil {
 		return
 	}
@@ -1481,6 +1490,8 @@ func (s *Scheduler) enqueueRetryIfEligible(event providers.JobEvent, err error) 
 // succeeded; on failure the handler self-enqueues via
 // enqueueRetryIfEligible, and on success any future completed webhook
 // harmlessly Drops the (already-absent) key.
+type retryAttemptCtxKey struct{}
+
 func (s *Scheduler) retryHandler(ctx context.Context, event providers.JobEvent) error {
 	key := keyFor(event)
 	s.mu.Lock()
@@ -1490,8 +1501,15 @@ func (s *Scheduler) retryHandler(ctx context.Context, event providers.JobEvent) 
 	delete(s.seen, key)
 	delete(s.pending, key)
 	s.mu.Unlock()
-	s.handleQueued(ctx, event)
-	return nil
+	// Re-dispatch. enqueueRetryIfEligible, reached on a claim failure,
+	// writes the claim error into claimErr (and suppresses a duplicate
+	// enqueue) so we can return it. nil means the claim succeeded (or the
+	// job was picked up elsewhere) -> runOne drops the retry; a non-nil
+	// error -> runOne advances the backoff ladder with the real class.
+	var claimErr error
+	rctx := context.WithValue(ctx, retryAttemptCtxKey{}, &claimErr)
+	s.handleQueued(rctx, event)
+	return claimErr
 }
 
 // buildLabelsForOS builds runner labels for a given target OS.
