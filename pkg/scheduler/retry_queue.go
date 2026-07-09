@@ -390,7 +390,14 @@ func (q *retryQueue) fireDue(ctx context.Context) {
 	q.mu.Lock()
 	for len(q.heap) > 0 && !q.heap[0].nextAttempt.After(now) {
 		it := heap.Pop(&q.heap).(*retryItem)
-		delete(q.index, it.key)
+		// Intentionally DO NOT delete(q.index, it.key) here. Popping
+		// already set it.index = -1 (see retryHeap.Pop), so the item is
+		// out of the heap but stays registered in the index. That way a
+		// re-Add from runOne (on handler failure) hits the `existed`
+		// branch: it increments attempts and preserves firstFailure so
+		// the backoff ladder advances and MaxAge give-up eventually
+		// fires. runOne calls Drop on success to clean up the lingering
+		// index entry.
 		due = append(due, it)
 	}
 	q.mu.Unlock()
@@ -401,9 +408,10 @@ func (q *retryQueue) fireDue(ctx context.Context) {
 }
 
 // runOne invokes the handler once, and on failure re-adds via Add so the
-// backoff ladder advances. On success we do nothing  -  the handler took
-// over lifecycle tracking and any future completed webhook will Drop
-// the (already-absent) key harmlessly.
+// backoff ladder advances. On success it Drops the item's lingering index
+// entry (fireDue leaves it registered so a failure re-Add can advance the
+// ladder); the handler has taken over lifecycle tracking, so any future
+// completed webhook will Drop the (already-absent) key harmlessly.
 func (q *retryQueue) runOne(ctx context.Context, it *retryItem) {
 	q.log.Info("retry queue: firing attempt",
 		"job_id", it.event.JobID,
@@ -411,6 +419,12 @@ func (q *retryQueue) runOne(ctx context.Context, it *retryItem) {
 		"attempt", it.attempts+1)
 	err := it.handler(ctx, it.event)
 	if err == nil {
+		// fireDue intentionally leaves the popped item in q.index (so a
+		// failure re-Add advances the ladder). On success nothing will
+		// re-Add it, so drop the lingering index entry here to avoid a
+		// map leak. removeLocked tolerates index < 0 (the item is not in
+		// the heap), so a concurrent Drop that already fired is a no-op.
+		q.Drop(it.key)
 		return
 	}
 	// Re-enqueue on failure. Add() decides retry/give-up.
