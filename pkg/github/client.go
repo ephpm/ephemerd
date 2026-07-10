@@ -505,6 +505,7 @@ func (c *Client) WebhookHandler(secret string) (http.Handler, <-chan JobEvent) {
 			"repo", repoName,
 			"job_id", payload.WorkflowJob.GetID(),
 			"labels", payload.WorkflowJob.Labels,
+			"runner_name", payload.WorkflowJob.GetRunnerName(),
 		)
 
 		events <- JobEvent{

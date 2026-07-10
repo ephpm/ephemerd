@@ -84,26 +84,21 @@ shutdown_timeout = "5m"
 # schedule = ["30s", "1m", "2m", "5m", "10m"]
 # jitter   = 0.2
 
-# Claim retry queue.
+# Orphaned-runner sweep.
 #
-# GitHub does not re-deliver workflow_job webhooks. When ephemerd's
-# initial claim/provision attempt fails for a transient reason
-# (rate-limit exhausted, transient 5xx, network blip), the job would
-# otherwise be lost. The retry queue schedules re-attempts on a
-# jittered exponential backoff ladder and gives up after max_age.
+# ephemerd registers one just-in-time runner per queued job, but GitHub
+# assigns a registered runner to ANY queued job with matching labels.
+# Runner teardown therefore follows the assignment GitHub reports in
+# workflow_job webhooks (runner_name), not the job the runner was
+# dispatched for. A runner whose intended job was picked up elsewhere
+# and that never received a job of its own is destroyed and
+# deregistered after the grace window.
 #
-# When the last GitHub API response says remaining==0 with a known
-# reset time, the next attempt is snapped to just after reset instead
-# of falling through the ladder, so we don't burn attempts against a
-# provably-exhausted budget.
-#
-# Enabled by default. Set enabled = false to restore the pre-existing
-# "log and drop" behavior.
-# [runner.claim_retry]
-# enabled  = true
-# max_age  = "90m"
-# schedule = ["30s", "1m", "2m", "5m", "10m"]
-# jitter   = 0.2
+# Only active in webhook mode (polling mode has no in_progress events
+# to observe assignments with). Enabled by default.
+# [runner.orphan_sweep]
+# enabled = true
+# grace   = "10m"
 
 [vm.linux]
 # Enable a Linux VM for running Linux jobs on Windows/macOS hosts.
