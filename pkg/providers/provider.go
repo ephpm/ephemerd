@@ -109,6 +109,19 @@ type Webhook interface {
 	DeregisterWebhooks(ctx context.Context) error
 }
 
+// RunnerNameReporter is optionally implemented by providers whose
+// in_progress / completed JobEvents carry the assigned runner's name
+// (JobEvent.RunnerName). The scheduler only trusts "this runner was
+// never assigned a job" conclusions — e.g. the orphaned-runner sweep —
+// for runners dispatched via providers that report assignments.
+type RunnerNameReporter interface {
+	Provider
+
+	// ReportsRunnerNames returns true when the provider populates
+	// JobEvent.RunnerName on in_progress and completed events.
+	ReportsRunnerNames() bool
+}
+
 // PollConfig provides settings for poll-based job discovery.
 type PollConfig struct {
 	PollInterval int // seconds between polls (0 = provider default)
@@ -127,6 +140,17 @@ type JobEvent struct {
 	RunID      int64    // workflow run ID (GitHub/Forgejo) or pipeline ID (GitLab)
 	Labels     []string // runner labels/tags (e.g., ["self-hosted", "linux", "x64"])
 	Conclusion string   // for completed events: "success", "failure", "cancelled"
+
+	// RunnerName is the name of the runner the platform actually assigned
+	// the job to. GitHub populates it on "in_progress" and "completed"
+	// workflow_job webhook actions; it is empty on "queued" events, when a
+	// job was cancelled before any runner picked it up, and for providers
+	// that don't report it. The scheduler uses this to key runner teardown
+	// on the OBSERVED assignment rather than the dispatch intent — GitHub
+	// treats registered JIT runners with matching labels as fungible, so
+	// the runner ephemerd dispatched "for" a job is not necessarily the
+	// runner that ran it.
+	RunnerName string
 
 	// Raw holds the original forge-specific object for edge cases.
 	// GitHub: *github.WorkflowJob, Forgejo: task proto, GitLab: job payload.

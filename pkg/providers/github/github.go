@@ -35,8 +35,9 @@ type Provider struct {
 
 // Compile-time interface checks.
 var (
-	_ providers.Poll    = (*Provider)(nil)
-	_ providers.Webhook = (*Provider)(nil)
+	_ providers.Poll               = (*Provider)(nil)
+	_ providers.Webhook            = (*Provider)(nil)
+	_ providers.RunnerNameReporter = (*Provider)(nil)
 )
 
 // New creates a GitHub provider wrapping an existing GitHub client.
@@ -231,6 +232,17 @@ func (p *Provider) convertEvent(ev github.JobEvent) providers.JobEvent {
 		fe.JobID = ev.Job.GetID()
 		fe.RunID = ev.Job.GetRunID()
 		fe.Conclusion = ev.Job.GetConclusion()
+		// GitHub populates runner_name on in_progress and completed
+		// actions; empty on queued and for jobs cancelled before any
+		// runner picked them up.
+		fe.RunnerName = ev.Job.GetRunnerName()
 	}
 	return fe
 }
+
+// ReportsRunnerNames implements providers.RunnerNameReporter: GitHub
+// workflow_job webhooks carry runner_name on in_progress and completed
+// actions, so the scheduler may key runner teardown and the orphan
+// sweep on observed assignments for runners dispatched via this
+// provider.
+func (p *Provider) ReportsRunnerNames() bool { return true }

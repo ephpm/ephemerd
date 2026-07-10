@@ -55,6 +55,18 @@ type Config struct {
 	// (Enabled=false) to keep the pre-existing "log and drop" behavior.
 	Retry RetryConfig
 
+	// OrphanSweep configures teardown of dispatched runners that were
+	// never observed picking up a job. GitHub schedules JIT runners onto
+	// ANY queued job with matching labels, so the runner dispatched "for"
+	// a job may end up running a different one — leaving the runner that
+	// was dispatched for THAT job idle with no job-completion event ever
+	// pointing at it. The sweep destroys such runners once they have been
+	// idle-unbound for Grace. Only active in webhook mode and only for
+	// runners dispatched via providers that report runner assignments
+	// (providers.RunnerNameReporter) — otherwise "never observed bound"
+	// would just mean "we had no way to observe it".
+	OrphanSweep OrphanSweepConfig
+
 	// RunnerImageForRepo resolves the per-repo, per-OS image override
 	// configured under [runner.images]. Returns "" when no override is
 	// set; the scheduler then falls back to the provider per-OS default
@@ -92,6 +104,22 @@ func (s *Scheduler) resolveImage(ctx context.Context, event *providers.JobEvent,
 	return event.Provider.DefaultImageFor(os)
 }
 
+// OrphanSweepConfig tunes the orphaned-runner sweep. Zero-valued =
+// disabled (matching pre-existing behavior); the CLI enables it by
+// default with a 10-minute grace window.
+type OrphanSweepConfig struct {
+	// Enabled toggles the sweep.
+	Enabled bool
+
+	// Grace is how long a dispatched runner may remain unbound (never
+	// seen in an in_progress event) before it is destroyed. Defaults to
+	// 10 minutes when zero.
+	Grace time.Duration
+}
+
+// defaultOrphanGrace is applied when OrphanSweepConfig.Grace is zero.
+const defaultOrphanGrace = 10 * time.Minute
+
 // jobKey uniquely identifies a job across providers. Different providers
 // can return the same int64 job ID, so we include the provider name.
 type jobKey struct {
@@ -117,6 +145,8 @@ type Scheduler struct {
 	seen      map[jobKey]time.Time    // recently handled jobs for dedup
 	pending   map[jobKey]struct{}     // jobs dispatched to a handler but not yet holding sem
 	attempts  map[jobKey]int          // provisioning passes per job, for zombie detection
+	runners   map[string]*runnerBinding // dispatched runners by name; tracks observed job assignment
+	webhookMode bool                    // true when job events arrive via webhooks (in_progress observable)
 	mu        sync.Mutex
 	sem          chan struct{} // local/native job concurrency limiter
 	linuxSem     chan struct{} // Linux dispatch (VM) concurrency limiter
@@ -197,7 +227,69 @@ type runningJob struct {
 	startedAt     time.Time
 }
 
+// runnerName returns the name the runner was registered under with the
+// provider. Every provisioning path stores it on the claim; the Linux
+// dispatch path mirrors it in dispatched.
+func (rj *runningJob) runnerName() string {
+	if rj.dispatched != "" {
+		return rj.dispatched
+	}
+	if rj.claim != nil {
+		return rj.claim.RunnerName
+	}
+	return ""
+}
 
+// runnerBinding tracks which job a dispatched runner ACTUALLY picked up.
+//
+// ephemerd registers one JIT runner per queued job, but the platform's
+// scheduler does not honor that pairing: GitHub hands a registered
+// runner ANY queued job with matching labels. When several same-label
+// jobs queue at once (every multi-job workflow run), the runner
+// dispatched "for" job A routinely ends up running job B. Teardown must
+// therefore be keyed on the observed assignment (in_progress /
+// completed runner_name), not the dispatch intent — destroying
+// job.dispatched when job A completes kills whatever job the runner is
+// actually executing.
+type runnerBinding struct {
+	intentKey    jobKey    // job the runner was dispatched for (key into s.running)
+	boundKey     jobKey    // job the platform assigned (valid when bound)
+	bound        bool      // true once an in_progress event named this runner
+	dispatchedAt time.Time // when the runner was provisioned (orphan sweep)
+	observable   bool      // provider reports runner assignments (RunnerNameReporter)
+}
+
+// trackRunning files a provisioned runner's bookkeeping under its
+// dispatch-intent job key and opens a runner-name ledger entry so
+// in_progress / completed events can locate the runner by NAME
+// regardless of which job the platform actually assigned to it.
+func (s *Scheduler) trackRunning(key jobKey, rj *runningJob, provider providers.Provider) {
+	observable := false
+	if rnr, ok := provider.(providers.RunnerNameReporter); ok {
+		observable = rnr.ReportsRunnerNames()
+	}
+	s.mu.Lock()
+	s.running[key] = rj
+	if name := rj.runnerName(); name != "" {
+		s.runners[name] = &runnerBinding{
+			intentKey:    key,
+			dispatchedAt: time.Now(),
+			observable:   observable,
+		}
+	}
+	s.mu.Unlock()
+	metrics.JobsActive.Inc()
+}
+
+// untrackRunningLocked removes a runner's bookkeeping (running entry +
+// runner-name ledger). Caller holds s.mu and is responsible for the
+// actual teardown of the runner's resources.
+func (s *Scheduler) untrackRunningLocked(key jobKey, rj *runningJob) {
+	delete(s.running, key)
+	if name := rj.runnerName(); name != "" {
+		delete(s.runners, name)
+	}
+}
 
 // New creates a scheduler.
 func New(cfg Config) *Scheduler {
@@ -234,6 +326,7 @@ func New(cfg Config) *Scheduler {
 		seen:         make(map[jobKey]time.Time),
 		pending:      make(map[jobKey]struct{}),
 		attempts:     make(map[jobKey]int),
+		runners:      make(map[string]*runnerBinding),
 		sem:          make(chan struct{}, cfg.MaxConcurrent),
 		linuxSem:     make(chan struct{}, cfg.MaxConcurrent),
 		macSem:       make(chan struct{}, macVMs),
@@ -466,7 +559,14 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		}()
 	}
 
-	// Periodically clean up the seen-jobs dedup map
+	// Record the discovery mode: the orphaned-runner sweep is only safe
+	// when in_progress events are observable, i.e. in webhook mode.
+	s.mu.Lock()
+	s.webhookMode = useWebhook
+	s.mu.Unlock()
+
+	// Periodically clean up the seen-jobs dedup map and sweep orphaned
+	// runners (dispatched but never assigned a job by the platform).
 	cleanupTicker := time.NewTicker(5 * time.Minute)
 	defer cleanupTicker.Stop()
 
@@ -475,6 +575,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		select {
 		case <-cleanupTicker.C:
 			s.cleanSeen()
+			s.sweepOrphanRunners()
 
 		case <-ctx.Done():
 			s.cfg.Log.Info("shutting down scheduler")
@@ -487,13 +588,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 				metrics.JobsQueuedTotal.Inc()
 				go s.handleQueued(ctx, event)
 			case "in_progress":
-				// Job was picked up (possibly by a peer daemon
-				// sharing the installation token). Drop any
-				// outstanding retry so we stop reattempting a job
-				// that's already running elsewhere. Nil-safe.
-				if s.retry != nil {
-					s.retry.Drop(keyFor(event))
-				}
+				s.handleInProgress(event)
 			case "completed":
 				go s.handleCompleted(ctx, event)
 			}
@@ -730,8 +825,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 	}
 
 	// Track the dispatched job (env is nil — lifecycle managed by Linux VM worker)
-	s.mu.Lock()
-	s.running[key] = &runningJob{
+	s.trackRunning(key, &runningJob{
 		provider:   event.Provider,
 		claim:      claim,
 		repo:       event.Repo,
@@ -739,9 +833,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		cancel:     cancel,
 		dispatched: claim.RunnerName,
 		startedAt:  time.Now(),
-	}
-	s.mu.Unlock()
-	metrics.JobsActive.Inc()
+	}, event.Provider)
 
 	log.Info("Linux runner dispatched", "name", claim.RunnerName)
 
@@ -762,13 +854,17 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 			log.Info("dispatched runner exited", "exit_code", exitCode)
 		}
 
-		// Always clean up
+		// Always clean up. The entry may already be gone if a completed
+		// event tore this runner down by name (see handleCompleted).
 		s.mu.Lock()
 		rj, exists := s.running[key]
 		if exists {
-			delete(s.running, key)
+			s.untrackRunningLocked(key, rj)
 		}
 		s.mu.Unlock()
+		if exists {
+			metrics.JobsActive.Dec()
+		}
 
 		if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), claim.RunnerName); err != nil {
 			log.Warn("dispatch destroy failed", "error", err)
@@ -914,9 +1010,8 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 	}
 
 	// Track the running job
-	s.mu.Lock()
-	s.running[key] = &runningJob{
-		provider:   event.Provider,
+	s.trackRunning(key, &runningJob{
+		provider:     event.Provider,
 		claim:        claim,
 		repo:         event.Repo,
 		image:        image,
@@ -924,9 +1019,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		artifactsDir: artifactsDir,
 		macosVM:      macVM,
 		startedAt:    time.Now(),
-	}
-	s.mu.Unlock()
-	metrics.JobsActive.Inc()
+	}, event.Provider)
 
 	log.Info("macOS VM runner ready", "name", claim.RunnerName, "ip", ip)
 
@@ -951,8 +1044,9 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		s.mu.Lock()
 		rj, exists := s.running[key]
 		if exists {
-			delete(s.running, key)
+			s.untrackRunningLocked(key, rj)
 			s.mu.Unlock()
+			metrics.JobsActive.Dec()
 			rj.macosVM.Stop()
 			if rj.artifactsDir != "" {
 				artifacts.Cleanup(rj.artifactsDir, s.cfg.Log)
@@ -1044,17 +1138,14 @@ func (s *Scheduler) handleNativeMacOSJob(ctx context.Context, event providers.Jo
 	}
 
 	// Track the running job
-	s.mu.Lock()
-	s.running[key] = &runningJob{
+	s.trackRunning(key, &runningJob{
 		provider:     event.Provider,
 		claim:        claim,
 		repo:         event.Repo,
 		cancel:       cancel,
 		nativeRunner: nr,
 		startedAt:    time.Now(),
-	}
-	s.mu.Unlock()
-	metrics.JobsActive.Inc()
+	}, event.Provider)
 
 	log.Info("native macOS runner started", "name", claim.RunnerName)
 
@@ -1079,8 +1170,9 @@ func (s *Scheduler) handleNativeMacOSJob(ctx context.Context, event providers.Jo
 		s.mu.Lock()
 		rj, exists := s.running[key]
 		if exists {
-			delete(s.running, key)
+			s.untrackRunningLocked(key, rj)
 			s.mu.Unlock()
+			metrics.JobsActive.Dec()
 			nr.Stop()
 			if rj.provider != nil && rj.claim != nil {
 				if err := rj.provider.ReleaseJob(context.Background(), rj.claim); err != nil {
@@ -1218,18 +1310,16 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 	}
 
 	// Track the running job
-	s.mu.Lock()
-	s.running[key] = &runningJob{
+	s.trackRunning(key, &runningJob{
 		env:          env,
+		provider:     event.Provider,
 		claim:        claim,
 		repo:         event.Repo,
 		image:        image,
 		cancel:       cancel,
 		artifactsDir: artifactsDir,
 		startedAt:    time.Now(),
-	}
-	s.mu.Unlock()
-	metrics.JobsActive.Inc()
+	}, event.Provider)
 
 	log.Info("runner environment ready", "name", claim.RunnerName)
 
@@ -1258,8 +1348,9 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 		s.mu.Lock()
 		rj, exists := s.running[key]
 		if exists {
-			delete(s.running, key)
+			s.untrackRunningLocked(key, rj)
 			s.mu.Unlock()
+			metrics.JobsActive.Dec()
 			if err := s.cfg.Runtime.Destroy(context.Background(), env); err != nil {
 				log.Warn("failed to destroy runner environment", "error", err)
 			}
@@ -1277,6 +1368,51 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 	}()
 }
 
+// handleInProgress records which runner the platform ACTUALLY assigned
+// a job to. GitHub schedules JIT runners onto any queued job with
+// matching labels, so this routinely differs from the dispatch intent;
+// the binding recorded here is what keeps handleCompleted from
+// destroying a runner that is mid-flight on someone else's job. It also
+// drops any outstanding claim retry for the job (it's running — possibly
+// on a peer daemon — so re-attempting would register ghost runners).
+func (s *Scheduler) handleInProgress(event providers.JobEvent) {
+	key := keyFor(event)
+	if s.retry != nil {
+		s.retry.Drop(key)
+	}
+
+	name := event.RunnerName
+	if name == "" {
+		return
+	}
+
+	s.mu.Lock()
+	rb, owned := s.runners[name]
+	var intentKey jobKey
+	if owned {
+		rb.bound = true
+		rb.boundKey = key
+		intentKey = rb.intentKey
+	}
+	s.mu.Unlock()
+
+	if !owned {
+		return
+	}
+	if intentKey != key {
+		// The observability line for the fungibility race: GitHub gave
+		// our runner a different job than the one it was dispatched for.
+		s.cfg.Log.Info("runner picked up a different job than it was dispatched for",
+			"runner", name,
+			"dispatched_for_job", intentKey.JobID,
+			"assigned_job", key.JobID,
+			"repo", event.Repo,
+			"detail", "GitHub treats same-label JIT runners as fungible; teardown will follow the observed assignment")
+	} else {
+		s.cfg.Log.Debug("runner bound to its dispatched job", "runner", name, "job_id", key.JobID)
+	}
+}
+
 func (s *Scheduler) handleCompleted(ctx context.Context, event providers.JobEvent) {
 	jobID := event.JobID
 	key := keyFor(event)
@@ -1289,10 +1425,45 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event providers.JobEven
 		s.retry.Drop(key)
 	}
 
+	// Resolve which runner to tear down. The runner that ran this job is
+	// the one NAMED IN THE EVENT — not necessarily the one dispatched
+	// when the job queued (GitHub reassigns same-label JIT runners
+	// freely). Destroying job.dispatched here used to kill whichever job
+	// the reassigned runner was actually executing.
 	s.mu.Lock()
-	job, exists := s.running[key]
+	var job *runningJob
+	exists := false
+	ownerKey := key
+	if name := event.RunnerName; name != "" {
+		if rb, owned := s.runners[name]; owned {
+			if rj, ok := s.running[rb.intentKey]; ok && rj.runnerName() == name {
+				job, ownerKey, exists = rj, rb.intentKey, true
+			} else {
+				// Ledger points at an entry the wait-goroutine already
+				// cleaned up — drop the stale ledger record.
+				delete(s.runners, name)
+			}
+		}
+		// Not ours (peer daemon / foreign runner): nothing to destroy.
+		// If we dispatched an intent runner for this job it is still
+		// alive and unbound — it will pick up another queued job, exit
+		// on its own, or be culled by the orphan sweep.
+	} else if rj, ok := s.running[key]; ok {
+		// No runner named in the event (job cancelled before any runner
+		// picked it up, or a provider that doesn't report runner names).
+		// Fall back to the dispatch-intent runner, but only when it was
+		// never observed running a DIFFERENT job.
+		rb := s.runners[rj.runnerName()]
+		if rb == nil || !rb.bound || rb.boundKey == key {
+			job, exists = rj, true
+		} else {
+			log.Info("job completed without a runner name; leaving dispatch-intent runner alone (it is bound to another job)",
+				"runner", rj.runnerName(),
+				"bound_job", rb.boundKey.JobID)
+		}
+	}
 	if exists {
-		delete(s.running, key)
+		s.untrackRunningLocked(ownerKey, job)
 	}
 	s.mu.Unlock()
 
@@ -1303,7 +1474,13 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event providers.JobEven
 	conclusion := event.Conclusion
 	log.Info("job completed, destroying runner environment",
 		"conclusion", conclusion,
+		"runner", job.runnerName(),
 	)
+	if ownerKey != key {
+		log.Info("destroying runner under its observed assignment, not its dispatch intent",
+			"runner", job.runnerName(),
+			"dispatched_for_job", ownerKey.JobID)
+	}
 
 	// Record metrics
 	providerName := ""
@@ -1383,6 +1560,7 @@ func (s *Scheduler) destroyAll() {
 		jobs[k] = v
 	}
 	s.running = make(map[jobKey]*runningJob)
+	s.runners = make(map[string]*runnerBinding)
 	s.mu.Unlock()
 
 	for key, job := range jobs {
@@ -1445,6 +1623,94 @@ func (s *Scheduler) cleanSeen() {
 			// Job stopped appearing in the queue (finished/cancelled) — reset
 			// its zombie counter so a future legitimate rerun starts fresh.
 			delete(s.attempts, id)
+		}
+	}
+}
+
+// sweepOrphanRunners destroys dispatched runners that were never
+// observed picking up a job within the configured grace window.
+//
+// Before teardown was keyed on observed assignments, every completed
+// event destroyed the runner dispatched for that job — which implicitly
+// (and often wrongly) cleaned up runners whose job was taken by a peer.
+// Now that a completed event only touches the runner named in it, a
+// runner whose intended job was cancelled before assignment (with no
+// runner_name in the completed event and a binding elsewhere), or whose
+// job was grabbed by another daemon's runner, has no event that will
+// ever destroy it. The sweep is that replacement cleanup.
+//
+// Safety: only runs in webhook mode (in poll mode there are no
+// in_progress events, so "never observed bound" is meaningless) and only
+// for runners dispatched via providers that report runner assignments.
+func (s *Scheduler) sweepOrphanRunners() {
+	if !s.cfg.OrphanSweep.Enabled {
+		return
+	}
+	grace := s.cfg.OrphanSweep.Grace
+	if grace <= 0 {
+		grace = defaultOrphanGrace
+	}
+
+	type victim struct {
+		name string
+		key  jobKey
+		rj   *runningJob
+	}
+	var victims []victim
+
+	s.mu.Lock()
+	if !s.webhookMode {
+		s.mu.Unlock()
+		return
+	}
+	for name, rb := range s.runners {
+		if rb.bound || !rb.observable || time.Since(rb.dispatchedAt) < grace {
+			continue
+		}
+		rj, ok := s.running[rb.intentKey]
+		if !ok {
+			// Stale ledger entry — the wait-goroutine already cleaned up.
+			delete(s.runners, name)
+			continue
+		}
+		if rj.runnerName() != name {
+			continue
+		}
+		s.untrackRunningLocked(rb.intentKey, rj)
+		victims = append(victims, victim{name: name, key: rb.intentKey, rj: rj})
+	}
+	s.mu.Unlock()
+
+	for _, v := range victims {
+		s.cfg.Log.Warn("destroying orphaned runner: dispatched but never assigned a job within the grace window",
+			"runner", v.name,
+			"dispatched_for_job", v.key.JobID,
+			"grace", grace)
+		metrics.JobsActive.Dec()
+		v.rj.cancel()
+		if v.rj.macosVM != nil {
+			v.rj.macosVM.Stop()
+		} else if v.rj.nativeRunner != nil {
+			v.rj.nativeRunner.Stop()
+		} else if v.rj.dispatched != "" && s.cfg.LinuxDispatcher != nil {
+			if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), v.rj.dispatched); err != nil {
+				s.cfg.Log.Warn("failed to destroy orphaned dispatched runner", "runner", v.name, "error", err)
+			}
+		} else if v.rj.env != nil {
+			if err := s.cfg.Runtime.Destroy(context.Background(), v.rj.env); err != nil {
+				s.cfg.Log.Warn("failed to destroy orphaned runner environment", "runner", v.name, "error", err)
+			}
+		}
+		if v.rj.artifactsDir != "" {
+			artifacts.Cleanup(v.rj.artifactsDir, s.cfg.Log)
+		}
+		// Deregister the JIT runner from the provider: it never ran a
+		// job, so it will not auto-remove itself and would otherwise
+		// linger as an offline ghost.
+		if v.rj.provider != nil && v.rj.claim != nil {
+			if err := v.rj.provider.ReleaseJob(context.Background(), v.rj.claim); err != nil {
+				s.cfg.Log.Debug("deregister orphaned runner", "runner", v.name, "error", err)
+			}
 		}
 	}
 }

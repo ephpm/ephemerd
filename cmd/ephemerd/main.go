@@ -600,6 +600,19 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			"rate_aware", retryCfg.RateHint != nil)
 	}
 
+	// Orphaned-runner sweep: destroys dispatched runners that were never
+	// assigned a job within the grace window. GitHub schedules JIT
+	// runners onto any queued job with matching labels, so runner
+	// teardown is keyed to observed assignments; the sweep is the
+	// cleanup path for runners whose intended job ran elsewhere.
+	orphanCfg := scheduler.OrphanSweepConfig{
+		Enabled: cfg.Runner.OrphanSweepEnabled(),
+		Grace:   cfg.Runner.OrphanSweepGrace(),
+	}
+	if orphanCfg.Enabled {
+		log.Info("orphaned-runner sweep enabled", "grace", orphanCfg.Grace)
+	}
+
 	// Start scheduler (ties CI provider jobs to container lifecycle)
 	sched := scheduler.New(scheduler.Config{
 		Runtime:            rt,
@@ -626,6 +639,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		NativeMacUser:      cfg.Runner.MacOS.User,
 		RunnerDir:          rm.Dir(),
 		Retry:              retryCfg,
+		OrphanSweep:        orphanCfg,
 		Log:                log,
 	})
 

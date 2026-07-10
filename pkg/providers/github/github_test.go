@@ -110,6 +110,46 @@ func TestConvertEvent_NilJob(t *testing.T) {
 	}
 }
 
+func TestConvertEvent_RunnerName(t *testing.T) {
+	p := New(nil, slog.Default(), "", "")
+
+	id := int64(86444761252)
+	runnerName := "ephemerd-github-ephpm-kind_cope"
+	job := &gh.WorkflowJob{
+		ID:         &id,
+		RunnerName: &runnerName,
+		Labels:     []string{"self-hosted", "linux"},
+	}
+
+	ev := p.convertEvent(ghclient.JobEvent{
+		Action: "in_progress",
+		Repo:   "ephpm/ephemerd",
+		Job:    job,
+	})
+
+	if ev.RunnerName != runnerName {
+		t.Errorf("RunnerName = %q, want %q", ev.RunnerName, runnerName)
+	}
+
+	// Queued events (and cancelled-before-assignment completions) carry
+	// no runner_name — the field must stay empty, not panic.
+	ev = p.convertEvent(ghclient.JobEvent{
+		Action: "queued",
+		Repo:   "ephpm/ephemerd",
+		Job:    &gh.WorkflowJob{ID: &id},
+	})
+	if ev.RunnerName != "" {
+		t.Errorf("RunnerName = %q for queued event, want empty", ev.RunnerName)
+	}
+}
+
+func TestReportsRunnerNames(t *testing.T) {
+	p := New(nil, slog.Default(), "", "")
+	if !p.ReportsRunnerNames() {
+		t.Error("ReportsRunnerNames() = false, want true — GitHub webhooks carry runner_name")
+	}
+}
+
 func TestStop_NilCancel(t *testing.T) {
 	p := New(nil, slog.Default(), "", "")
 	if err := p.Stop(context.Background()); err != nil {

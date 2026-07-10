@@ -2078,3 +2078,45 @@ func TestMacOSRunnerConfig_ResolvedMaxNative(t *testing.T) {
 		})
 	}
 }
+
+func TestOrphanSweepEnabled(t *testing.T) {
+	boolPtr := func(b bool) *bool { return &b }
+	tests := []struct {
+		name string
+		cfg  *RunnerConfig
+		want bool
+	}{
+		{"nil config defaults to true", nil, true},
+		{"omitted table defaults to true", &RunnerConfig{}, true},
+		{"explicit true", &RunnerConfig{OrphanSweep: OrphanSweepToml{Enabled: boolPtr(true)}}, true},
+		{"explicit false disables", &RunnerConfig{OrphanSweep: OrphanSweepToml{Enabled: boolPtr(false)}}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.OrphanSweepEnabled(); got != tt.want {
+				t.Errorf("OrphanSweepEnabled() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOrphanSweepGrace(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *RunnerConfig
+		want time.Duration
+	}{
+		{"nil config defaults to 10m", nil, 10 * time.Minute},
+		{"empty defaults to 10m", &RunnerConfig{}, 10 * time.Minute},
+		{"custom duration", &RunnerConfig{OrphanSweep: OrphanSweepToml{Grace: "25m"}}, 25 * time.Minute},
+		{"unparseable defaults to 10m", &RunnerConfig{OrphanSweep: OrphanSweepToml{Grace: "soon"}}, 10 * time.Minute},
+		{"non-positive defaults to 10m", &RunnerConfig{OrphanSweep: OrphanSweepToml{Grace: "-5m"}}, 10 * time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.OrphanSweepGrace(); got != tt.want {
+				t.Errorf("OrphanSweepGrace() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

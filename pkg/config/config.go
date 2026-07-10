@@ -469,6 +469,32 @@ type RunnerConfig struct {
 	// hit an API blip at claim time would be lost until human
 	// intervention.
 	ClaimRetry ClaimRetryToml `toml:"claim_retry"`
+
+	// OrphanSweep controls teardown of runners that were dispatched for
+	// a job but never observed picking one up. GitHub assigns JIT
+	// runners to ANY queued job with matching labels, so runner
+	// lifecycle is keyed to the observed assignment; a runner whose
+	// intended job went elsewhere and that never got a job of its own is
+	// destroyed after the grace window.
+	OrphanSweep OrphanSweepToml `toml:"orphan_sweep"`
+}
+
+// OrphanSweepToml configures the scheduler's orphaned-runner sweep.
+//
+// Enabled defaults to true when the [runner.orphan_sweep] table is
+// omitted. The sweep only acts in webhook mode (in polling mode there
+// are no in_progress events, so ephemerd cannot tell an orphaned runner
+// from a busy one) and only for providers that report runner
+// assignments (GitHub).
+type OrphanSweepToml struct {
+	// Enabled toggles the sweep. Nil = default true; operators disable
+	// by explicitly setting enabled = false.
+	Enabled *bool `toml:"enabled"`
+
+	// Grace is how long a dispatched runner may sit without being
+	// assigned a job before it is destroyed and deregistered. Accepts
+	// Go duration strings ("10m", "1h"). Default 10m.
+	Grace string `toml:"grace"`
 }
 
 // ClaimRetryToml configures the scheduler's claim-retry queue.
@@ -673,6 +699,29 @@ func (r *RunnerConfig) ClaimRetrySchedule() []time.Duration {
 		return def
 	}
 	return out
+}
+
+// OrphanSweepEnabled reports whether the orphaned-runner sweep should
+// run. Defaults to true when the table is omitted or Enabled is nil;
+// operators opt out with `enabled = false`.
+func (r *RunnerConfig) OrphanSweepEnabled() bool {
+	if r == nil || r.OrphanSweep.Enabled == nil {
+		return true
+	}
+	return *r.OrphanSweep.Enabled
+}
+
+// OrphanSweepGrace returns how long a dispatched runner may remain
+// unassigned before the sweep destroys it. Defaults to 10 minutes when
+// unset or unparseable.
+func (r *RunnerConfig) OrphanSweepGrace() time.Duration {
+	if r == nil || r.OrphanSweep.Grace == "" {
+		return 10 * time.Minute
+	}
+	if d, err := time.ParseDuration(r.OrphanSweep.Grace); err == nil && d > 0 {
+		return d
+	}
+	return 10 * time.Minute
 }
 
 // ClaimRetryJitter returns the retry backoff jitter fraction. Defaults
