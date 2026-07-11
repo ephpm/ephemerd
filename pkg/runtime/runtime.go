@@ -762,8 +762,13 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	if goruntime.GOOS == "windows" && r.cfg.Network != nil {
 		result, err := r.cfg.Network.Setup(ctx, id, "")
 		if err != nil {
-			r.cfg.Log.Warn("failed to setup Windows network endpoint", "id", id, "error", err)
-		} else if result != nil {
+			// Setup applies the per-endpoint egress ACLs (RFC1918 + link-local
+			// block) and returns an error if it could not — there is no global
+			// firewall backstop on Windows. Fail CLOSED: abort the job rather
+			// than start a container with an unfirewalled (or absent) endpoint.
+			return nil, fmt.Errorf("setting up Windows network endpoint for %s: %w", id, err)
+		}
+		if result != nil {
 			windowsEndpointID = result.EndpointID
 			windowsNetNS = result.NetNS
 			opts = append(opts, withWindowsNetwork(windowsNetNS, windowsEndpointID))

@@ -8,47 +8,78 @@ import (
 	"syscall"
 )
 
-// everyoneSID is the well-known SID for "Everyone" (S-1-1-0). We grant to
-// Everyone because Hyper-V utility VMs (used for the isolated Windows
-// containers we create via containerd's runhcs shim) open host paths through
-// a virtual account that does NOT inherit membership in
-// "NT VIRTUAL MACHINE\Virtual Machines" (S-1-5-83-0) on Windows 11 client
-// SKUs — we verified this empirically by observing VSMB Modify failures with
-// ACCESS_DENIED even after the VM group had full inherited rights. The
-// grants are narrowed by path: the parent runners directory only needs
-// traverse (RX, no inheritance to children), while each per-job directory
-// gets Modify with inheritance. That preserves isolation between concurrent
-// jobs — the utility VM for job A can traverse `runners` but cannot touch
-// job B's subdirectory because only job A's dir has an ACE for it.
-const everyoneSID = "S-1-1-0"
+// Well-known SIDs used for the per-job runner-directory DACLs.
+//
+//   - vmGroupSID (S-1-5-83-0) = "NT VIRTUAL MACHINE\Virtual Machines". Hyper-V
+//     utility VMs (used for the isolated Windows containers we create via
+//     containerd's runhcs shim) open host paths — the VSMB-shared per-job
+//     runner directory — through a per-VM virtual account whose token is a
+//     member of this group. This is the exact principal hcsshim itself grants
+//     when it prepares a host path for VSMB: see
+//     github.com/Microsoft/hcsshim/internal/security.GrantVmGroupAccess, which
+//     sets a DACL entry for sidVMGroup = "S-1-5-83-0" *directly* on the target
+//     path (it never relies on inheritance from the VM Machines group).
+//   - systemSID (S-1-5-18)  = "NT AUTHORITY\SYSTEM" — the account the ephemerd
+//     daemon runs as; it must retain access to manage these dirs.
+//   - adminsSID (S-1-5-32-544) = "BUILTIN\Administrators".
+//
+// We previously granted "Everyone" (S-1-1-0) here on the theory that the VM
+// group ACE "does not reliably inherit" on Windows 11 client SKUs. That
+// conflated two things: the VM group ACE does not *inherit* from a parent, but
+// hcsshim's approach never relies on inheritance — it grants the VM group SID
+// directly on the specific path the utility VM opens. Granting Everyone was
+// scoped by *path*, not *principal*, so any local user or sibling job that
+// could reach the filesystem read every job's checkout, artifacts, and
+// (transiently) its JIT runner config. Granting S-1-5-83-0 directly, per path,
+// gives the utility VM exactly the access it needs while keeping other
+// principals out.
+const (
+	vmGroupSID = "S-1-5-83-0"
+	systemSID  = "S-1-5-18"
+	adminsSID  = "S-1-5-32-544"
+)
 
-// grantHyperVTraverse grants Everyone read+execute (traverse) on a directory
-// without inheritance. Use this on the runners parent directory so Hyper-V
-// utility VMs can step into any per-job subdirectory whose DACL explicitly
-// grants them Modify access.
+// grantHyperVTraverse locks down the runners parent directory: it breaks
+// inheritance from the world-traversable C:\ProgramData ACL, re-grants only
+// SYSTEM + Administrators (so the daemon can still manage the tree), and grants
+// the Hyper-V VM group traverse (read+execute) so utility VMs can step into a
+// per-job subdirectory whose DACL explicitly grants them Modify. None of these
+// ACEs are inheritable, so they do not propagate into per-job subdirectories.
 func grantHyperVTraverse(path string) error {
-	// RX = GENERIC_READ + GENERIC_EXECUTE (traverse). No (OI)(CI) flags, so
-	// the ACE applies only to the directory itself and does not leak into
-	// per-job subdirectories.
-	cmd := exec.Command("icacls", path, "/grant", "*"+everyoneSID+":(RX)", "/C", "/Q")
+	// /inheritance:r removes inherited ACEs (so ProgramData's world-readable
+	// ACL no longer applies to this tree). We then explicitly re-grant the
+	// principals that must retain access. RX = read+execute (traverse); no
+	// (OI)(CI) flags, so the ACEs apply only to this directory itself.
+	cmd := exec.Command("icacls", path,
+		"/inheritance:r",
+		"/grant", "*"+systemSID+":(RX)",
+		"/grant", "*"+adminsSID+":(RX)",
+		"/grant", "*"+vmGroupSID+":(RX)",
+		"/C", "/Q")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("icacls grant Everyone RX on %s: %w: %s", path, err, string(out))
+		return fmt.Errorf("icacls lock-down + grant VM-group RX on %s: %w: %s", path, err, string(out))
 	}
 	return nil
 }
 
-// grantHyperVModify grants Everyone Modify on a per-job directory, with
-// Object Inherit + Container Inherit so files the runner writes during the
+// grantHyperVModify grants the Hyper-V VM group Modify on a per-job directory,
+// with Object Inherit + Container Inherit so files the runner writes during the
 // job also get the ACE. Modify covers read+write+execute+delete but NOT
-// changing the DACL itself.
+// changing the DACL itself. Because the ACE is scoped to the VM group SID
+// (S-1-5-83-0) rather than Everyone, other local users and other jobs' non-VM
+// processes are excluded. The residual is that a *concurrent* job's utility VM
+// (a distinct virtual account, but still a VM-group member) could in principle
+// open this directory — the same trust boundary hcsshim itself uses for VSMB,
+// and a strict improvement over Everyone, which also admitted every
+// interactive/local/authenticated principal on the host.
 func grantHyperVModify(path string) error {
-	cmd := exec.Command("icacls", path, "/grant", "*"+everyoneSID+":(OI)(CI)M", "/C", "/Q")
+	cmd := exec.Command("icacls", path, "/grant", "*"+vmGroupSID+":(OI)(CI)M", "/C", "/Q")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("icacls grant Everyone M on %s: %w: %s", path, err, string(out))
+		return fmt.Errorf("icacls grant VM-group M on %s: %w: %s", path, err, string(out))
 	}
 	return nil
 }

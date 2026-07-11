@@ -99,9 +99,18 @@ func (w *windowsNetworking) setup(ctx context.Context, id string, netns string) 
 		return nil, fmt.Errorf("creating HCN endpoint for %s: %w", id, err)
 	}
 
-	// Apply ACL policies to block private network access
+	// Apply ACL policies to block private network access. This is the ONLY
+	// egress restriction on Windows (there is no global firewall backstop —
+	// installFirewallRules is a no-op), so a failure here means the container
+	// would otherwise run with unrestricted egress to the host LAN, other
+	// RFC1918 services, and link-local metadata endpoints. Fail CLOSED: tear
+	// down the endpoint we just created and refuse the job rather than start a
+	// container we cannot firewall.
 	if err := w.applyACLPolicies(created); err != nil {
-		w.cfg.Log.Warn("failed to apply ACL policies", "id", id, "error", err)
+		if delErr := created.Delete(); delErr != nil {
+			w.cfg.Log.Warn("failed to delete endpoint after ACL failure", "id", id, "error", delErr)
+		}
+		return nil, fmt.Errorf("applying egress ACL policies for %s (refusing to start unfirewalled): %w", id, err)
 	}
 
 	// Create an HCN network namespace and attach the endpoint.
@@ -151,18 +160,27 @@ func (w *windowsNetworking) teardown(ctx context.Context, id string, netns strin
 	return nil
 }
 
-// applyACLPolicies blocks container traffic to RFC 1918 and link-local ranges.
-func (w *windowsNetworking) applyACLPolicies(endpoint *hcn.HostComputeEndpoint) error {
-	blocked := []string{
-		"10.0.0.0/8",
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-		"169.254.0.0/16",
-	}
+// egressBlockedCIDRs are the RFC 1918 + link-local ranges a job container must
+// not reach. 169.254.0.0/16 also covers cloud-metadata endpoints
+// (169.254.169.254). This is the complete intended egress deny list; every
+// entry (except the container's own DefaultSubnet) must become an enforced
+// block rule or the container is under-firewalled.
+var egressBlockedCIDRs = []string{
+	"10.0.0.0/8",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
+	"169.254.0.0/16",
+}
 
+// buildEgressBlockPolicies constructs the per-endpoint block ACLs from
+// egressBlockedCIDRs. It fails closed: a marshal error on any rule, or an empty
+// resulting set, is an error rather than a silently weaker rule set. Split out
+// from applyACLPolicies so the (pure) rule construction is unit-testable
+// without a live HCN endpoint.
+func buildEgressBlockPolicies() ([]hcn.EndpointPolicy, error) {
 	var policies []hcn.EndpointPolicy
 
-	for _, cidr := range blocked {
+	for _, cidr := range egressBlockedCIDRs {
 		if cidr == DefaultSubnet {
 			continue
 		}
@@ -178,7 +196,9 @@ func (w *windowsNetworking) applyACLPolicies(endpoint *hcn.HostComputeEndpoint) 
 
 		settings, err := json.Marshal(acl)
 		if err != nil {
-			continue
+			// Fail closed: a rule we cannot serialize is a rule we cannot
+			// enforce. Do not skip it and continue with a weaker rule set.
+			return nil, fmt.Errorf("marshaling egress block ACL for %s: %w", cidr, err)
 		}
 
 		policies = append(policies, hcn.EndpointPolicy{
@@ -187,13 +207,27 @@ func (w *windowsNetworking) applyACLPolicies(endpoint *hcn.HostComputeEndpoint) 
 		})
 	}
 
-	if len(policies) > 0 {
-		return endpoint.ApplyPolicy(hcn.RequestTypeAdd, hcn.PolicyEndpointRequest{
-			Policies: policies,
-		})
+	if len(policies) == 0 {
+		// Nothing to block would mean no egress restriction at all — treat as
+		// an error so the caller refuses to start an unfirewalled container.
+		return nil, fmt.Errorf("no egress block ACLs constructed (would run unfirewalled)")
 	}
 
-	return nil
+	return policies, nil
+}
+
+// applyACLPolicies blocks container traffic to RFC 1918 and link-local ranges.
+// The full rule set is built up front and applied atomically; any failure is
+// returned so the caller (setup) can treat it as fatal for the job.
+func (w *windowsNetworking) applyACLPolicies(endpoint *hcn.HostComputeEndpoint) error {
+	policies, err := buildEgressBlockPolicies()
+	if err != nil {
+		return err
+	}
+
+	return endpoint.ApplyPolicy(hcn.RequestTypeAdd, hcn.PolicyEndpointRequest{
+		Policies: policies,
+	})
 }
 
 func (w *windowsNetworking) installFirewallRules() error {
