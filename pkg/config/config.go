@@ -106,11 +106,17 @@ func (m MetricsConfig) ParsedContainerStatsInterval() time.Duration {
 // register the webhook — that is owned externally, so a matching secret is
 // required.
 type WebhookConfig struct {
-	Secret           string `toml:"secret"`             // webhook HMAC secret (auto-generated for managed tunnels; required for "external")
-	Port             int    `toml:"port"`               // listen port for health endpoint (default 8080)
-	TLSCert          string `toml:"tls_cert"`           // TLS certificate path (direct TLS, no tunnel)
-	TLSKey           string `toml:"tls_key"`            // TLS private key path
-	Tunnel           string `toml:"tunnel"`             // "none" (default, polling), "external" (unmanaged ingress), "localtunnel", or "ngrok"
+	Secret  string `toml:"secret"`   // webhook HMAC secret (auto-generated for managed tunnels; required for "external")
+	Port    int    `toml:"port"`     // listen port for health endpoint (default 8080)
+	TLSCert string `toml:"tls_cert"` // TLS certificate path (direct TLS, no tunnel)
+	TLSKey  string `toml:"tls_key"`  // TLS private key path
+	Tunnel  string `toml:"tunnel"`   // "none" (default, polling), "external" (unmanaged ingress), "localtunnel", or "ngrok"
+	// ExternalURL is the public base URL of the externally-managed tunnel
+	// (e.g. https://mac.tricorder.cc). When set with tunnel="external",
+	// ephemerd registers each tracked repo's webhook to
+	// <external_url>/webhook/<provider> using the secret. Ignored for managed
+	// tunnels (they use the tunnel's own URL) and for polling.
+	ExternalURL      string `toml:"external_url"`
 	TunnelURL        string `toml:"tunnel_url"`         // localtunnel: self-hosted server URL
 	NgrokAuthtoken   string `toml:"ngrok_authtoken"`    // ngrok auth token (or use NGROK_AUTHTOKEN env)
 	TunnelMaxRetries int    `toml:"tunnel_max_retries"` // max consecutive reconnect failures before falling back to polling (default 5)
@@ -915,10 +921,27 @@ func (c *Config) validate() error {
 		if c.Webhook.Secret == "" {
 			return fmt.Errorf(`webhook.secret is required when webhook.tunnel = "external" (it must match the secret configured on the external GitHub webhook)`)
 		}
+		// When external_url is set, ephemerd auto-registers each tracked repo's
+		// webhook. That requires a secret (already validated above). Trim a
+		// trailing slash so <external_url>/webhook/<provider> is well-formed.
+		if c.Webhook.ExternalURL != "" {
+			c.Webhook.ExternalURL = strings.TrimRight(c.Webhook.ExternalURL, "/")
+		}
 	case "none":
+		// external_url only makes sense with tunnel="external": for managed
+		// tunnels ephemerd derives the URL from the tunnel provider, and for
+		// polling there is no receiver to point a webhook at.
+		if c.Webhook.ExternalURL != "" {
+			return fmt.Errorf(`webhook.external_url is only valid when webhook.tunnel = "external"`)
+		}
 		// Nothing to generate; secret, if set, enables an externally-fronted
 		// webhook receiver, otherwise ephemerd polls.
 	default:
+		// Managed tunnels ("localtunnel"/"ngrok") derive the webhook URL from
+		// the tunnel provider's own public URL; external_url has no meaning here.
+		if c.Webhook.ExternalURL != "" {
+			return fmt.Errorf(`webhook.external_url is only valid when webhook.tunnel = "external"`)
+		}
 		if c.Webhook.Secret == "" {
 			b := make([]byte, 32)
 			if _, err := rand.Read(b); err != nil {

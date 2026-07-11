@@ -177,6 +177,14 @@ func TestRegisterWebhooks_RepoLevel(t *testing.T) {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/repos/testorg/repo1/hooks", func(w http.ResponseWriter, r *http.Request) {
+		// RegisterWebhooks first lists existing hooks (idempotency check).
+		// Return an empty list so the create path runs.
+		if r.Method == http.MethodGet {
+			if err := json.NewEncoder(w).Encode([]map[string]any{}); err != nil {
+				t.Logf("encoding: %v", err)
+			}
+			return
+		}
 		if r.Method != http.MethodPost {
 			t.Errorf("method = %s, want POST", r.Method)
 		}
@@ -254,6 +262,182 @@ func TestRegisterWebhooks_OrgLevel(t *testing.T) {
 	}
 }
 
+// TestRegisterWebhooks_Idempotent_RepoLevel asserts that when a repo already
+// has a hook pointing at the target URL, RegisterWebhooks reuses it and does
+// NOT issue a create (which GitHub would reject with 422). This is the safety
+// property the external-tunnel path depends on: it re-registers on every start.
+func TestRegisterWebhooks_Idempotent_RepoLevel(t *testing.T) {
+	const url = "https://tunnel.example.com/webhook"
+	var createCalls atomic.Int64
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/testorg/repo1/hooks", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			// A hook already exists for this URL.
+			resp := []map[string]any{{
+				"id":     int64(555),
+				"config": map[string]any{"url": url},
+			}}
+			if err := json.NewEncoder(w).Encode(resp); err != nil {
+				t.Logf("encoding: %v", err)
+			}
+		case http.MethodPost:
+			createCalls.Add(1)
+			w.WriteHeader(201)
+			if err := json.NewEncoder(w).Encode(map[string]any{"id": 999}); err != nil {
+				t.Logf("encoding: %v", err)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	c, srv := newTestClientWithServer(t, mux)
+	defer srv.Close()
+
+	hooks, err := c.RegisterWebhooks(context.Background(), url, "secret")
+	if err != nil {
+		t.Fatalf("RegisterWebhooks() error: %v", err)
+	}
+	if n := createCalls.Load(); n != 0 {
+		t.Errorf("create was called %d times, want 0 (existing hook should be reused)", n)
+	}
+	if len(hooks) != 1 {
+		t.Fatalf("got %d hooks, want 1", len(hooks))
+	}
+	if hooks[0].HookID != 555 {
+		t.Errorf("hook ID = %d, want 555 (the existing hook)", hooks[0].HookID)
+	}
+	if hooks[0].Repo != "repo1" {
+		t.Errorf("hook repo = %q, want %q", hooks[0].Repo, "repo1")
+	}
+}
+
+// TestRegisterWebhooks_Idempotent_DifferentURLCreates asserts that an existing
+// hook with a DIFFERENT URL does not suppress creation of the one we want.
+func TestRegisterWebhooks_Idempotent_DifferentURLCreates(t *testing.T) {
+	const wantURL = "https://tunnel.example.com/webhook"
+	var createCalls atomic.Int64
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/testorg/repo1/hooks", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			resp := []map[string]any{{
+				"id":     int64(1),
+				"config": map[string]any{"url": "https://other.example.com/webhook"},
+			}}
+			if err := json.NewEncoder(w).Encode(resp); err != nil {
+				t.Logf("encoding: %v", err)
+			}
+		case http.MethodPost:
+			createCalls.Add(1)
+			w.WriteHeader(201)
+			if err := json.NewEncoder(w).Encode(map[string]any{"id": 777}); err != nil {
+				t.Logf("encoding: %v", err)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	c, srv := newTestClientWithServer(t, mux)
+	defer srv.Close()
+
+	hooks, err := c.RegisterWebhooks(context.Background(), wantURL, "secret")
+	if err != nil {
+		t.Fatalf("RegisterWebhooks() error: %v", err)
+	}
+	if n := createCalls.Load(); n != 1 {
+		t.Errorf("create was called %d times, want 1 (existing hook has a different URL)", n)
+	}
+	if len(hooks) != 1 || hooks[0].HookID != 777 {
+		t.Fatalf("hooks = %+v, want one hook with ID 777", hooks)
+	}
+}
+
+// TestRegisterWebhooks_Idempotent_ListErrorFallsBackToCreate asserts that when
+// the list-existing-hooks call fails, RegisterWebhooks still attempts a create
+// rather than silently doing nothing — the create then surfaces any real error.
+func TestRegisterWebhooks_Idempotent_ListErrorFallsBackToCreate(t *testing.T) {
+	var createCalls atomic.Int64
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/testorg/repo1/hooks", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.WriteHeader(http.StatusInternalServerError)
+		case http.MethodPost:
+			createCalls.Add(1)
+			w.WriteHeader(201)
+			if err := json.NewEncoder(w).Encode(map[string]any{"id": 42}); err != nil {
+				t.Logf("encoding: %v", err)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	c, srv := newTestClientWithServer(t, mux)
+	defer srv.Close()
+
+	hooks, err := c.RegisterWebhooks(context.Background(), "https://tunnel.example.com/webhook", "secret")
+	if err != nil {
+		t.Fatalf("RegisterWebhooks() error: %v", err)
+	}
+	if n := createCalls.Load(); n != 1 {
+		t.Errorf("create was called %d times, want 1 (list error should fall back to create)", n)
+	}
+	if len(hooks) != 1 || hooks[0].HookID != 42 {
+		t.Fatalf("hooks = %+v, want one hook with ID 42", hooks)
+	}
+}
+
+// TestRegisterWebhooks_Idempotent_OrgLevel mirrors the repo-level idempotency
+// test for the org-level path.
+func TestRegisterWebhooks_Idempotent_OrgLevel(t *testing.T) {
+	const url = "https://tunnel.example.com/webhook"
+	var createCalls atomic.Int64
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/orgs/testorg/hooks", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			resp := []map[string]any{{
+				"id":     int64(321),
+				"config": map[string]any{"url": url},
+			}}
+			if err := json.NewEncoder(w).Encode(resp); err != nil {
+				t.Logf("encoding: %v", err)
+			}
+		case http.MethodPost:
+			createCalls.Add(1)
+			w.WriteHeader(201)
+			if err := json.NewEncoder(w).Encode(map[string]any{"id": 888}); err != nil {
+				t.Logf("encoding: %v", err)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	c, srv := newTestClientWithServer(t, mux)
+	defer srv.Close()
+	c.cfg.Repos = nil // org-level
+
+	hooks, err := c.RegisterWebhooks(context.Background(), url, "secret")
+	if err != nil {
+		t.Fatalf("RegisterWebhooks() error: %v", err)
+	}
+	if n := createCalls.Load(); n != 0 {
+		t.Errorf("create was called %d times, want 0 (existing org hook should be reused)", n)
+	}
+	if len(hooks) != 1 || hooks[0].HookID != 321 {
+		t.Fatalf("hooks = %+v, want one hook with ID 321", hooks)
+	}
+}
+
 func TestRegisterWebhooks_APIError(t *testing.T) {
 	mux := http.NewServeMux()
 
@@ -281,10 +465,10 @@ func TestRegisterWebhooks_APIError(t *testing.T) {
 func TestRegisterWebhooks_RollbackOnPartialFailure(t *testing.T) {
 	var (
 		mu              sync.Mutex
-		createdHookIDs  = map[string]int64{} // repo -> assigned hook id
-		deleted         = map[string]bool{}  // repo:hookID -> true
-		nextHookID      int64                = 100
-		failOnRepo                           = "repo3" // 3rd repo fails
+		createdHookIDs        = map[string]int64{} // repo -> assigned hook id
+		deleted               = map[string]bool{}  // repo:hookID -> true
+		nextHookID      int64 = 100
+		failOnRepo            = "repo3" // 3rd repo fails
 		gotCreateOrder  []string
 		gotDeletedOrder []string
 	)

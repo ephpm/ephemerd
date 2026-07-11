@@ -591,7 +591,7 @@ func TestBackoffDuration_ProviderEventSequence(t *testing.T) {
 		{"S", 0}, // success — reset
 		{"F", 2 * time.Second},
 		{"F", 4 * time.Second},
-		{"S", 0}, // success — reset
+		{"S", 0},               // success — reset
 		{"F", 2 * time.Second}, // back to base
 	}
 
@@ -662,12 +662,12 @@ type mockMacOSVM struct {
 	ip string
 }
 
-func (m *mockMacOSVM) WriteJITConfig(string) error                          { return nil }
-func (m *mockMacOSVM) Start(ctx context.Context) error                      { return nil }
-func (m *mockMacOSVM) WaitForRunner(ctx context.Context) (string, error)    { return m.ip, nil }
-func (m *mockMacOSVM) RunnerAddress() string                                { return m.ip }
-func (m *mockMacOSVM) Wait(ctx context.Context) (int, error)                { return 0, nil }
-func (m *mockMacOSVM) Stop()                                                {}
+func (m *mockMacOSVM) WriteJITConfig(string) error                       { return nil }
+func (m *mockMacOSVM) Start(ctx context.Context) error                   { return nil }
+func (m *mockMacOSVM) WaitForRunner(ctx context.Context) (string, error) { return m.ip, nil }
+func (m *mockMacOSVM) RunnerAddress() string                             { return m.ip }
+func (m *mockMacOSVM) Wait(ctx context.Context) (int, error)             { return 0, nil }
+func (m *mockMacOSVM) Stop()                                             {}
 
 func newVMSSHTestMux(s *Scheduler) *http.ServeMux {
 	mux := http.NewServeMux()
@@ -835,6 +835,16 @@ type mockWebhookProvider struct {
 	mockProvider
 	registered   atomic.Int32
 	deregistered atomic.Int32
+
+	// registerErr, when set, is returned by RegisterWebhooks to exercise the
+	// best-effort external-registration path (which logs and continues).
+	registerErr error
+
+	// lastURL/lastSecret capture the most recent RegisterWebhooks arguments so
+	// external-registration tests can assert the URL was built correctly.
+	regMu      sync.Mutex
+	lastURL    string
+	lastSecret string
 }
 
 func newMockWebhookProvider() *mockWebhookProvider {
@@ -847,9 +857,13 @@ func (m *mockWebhookProvider) WebhookHandler(_ string) (http.Handler, <-chan pro
 	return http.NewServeMux(), make(chan providers.JobEvent)
 }
 
-func (m *mockWebhookProvider) RegisterWebhooks(_ context.Context, _, _ string) error {
+func (m *mockWebhookProvider) RegisterWebhooks(_ context.Context, url, secret string) error {
 	m.registered.Add(1)
-	return nil
+	m.regMu.Lock()
+	m.lastURL = url
+	m.lastSecret = secret
+	m.regMu.Unlock()
+	return m.registerErr
 }
 
 func (m *mockWebhookProvider) DeregisterWebhooks(_ context.Context) error {
@@ -1066,5 +1080,68 @@ func TestCanHandleJob_MacOSNoConfig(t *testing.T) {
 
 	if s.canHandleJob([]string{"self-hosted", "macos"}) {
 		t.Error("canHandleJob should reject macOS when neither VMConfig nor MacOSModeForRepo is set")
+	}
+}
+
+// TestRegisterExternalWebhooks_BuildsURLAndSecret verifies the external-tunnel
+// registration helper points each webhook-capable provider at
+// <ExternalURL>/webhook/<provider> with the configured secret.
+func TestRegisterExternalWebhooks_BuildsURLAndSecret(t *testing.T) {
+	whp := newMockWebhookProvider()
+	s := New(Config{
+		Log:           testLogger(),
+		Providers:     []providers.Provider{whp},
+		WebhookSecret: "s3cr3t",
+		ExternalURL:   "https://mac.tricorder.cc",
+	})
+
+	s.registerExternalWebhooks(context.Background(), []providers.Webhook{whp})
+
+	if got := whp.registered.Load(); got != 1 {
+		t.Fatalf("RegisterWebhooks called %d times, want 1", got)
+	}
+	whp.regMu.Lock()
+	gotURL, gotSecret := whp.lastURL, whp.lastSecret
+	whp.regMu.Unlock()
+
+	wantURL := "https://mac.tricorder.cc/webhook/test-webhook"
+	if gotURL != wantURL {
+		t.Errorf("registered URL = %q, want %q", gotURL, wantURL)
+	}
+	if gotSecret != "s3cr3t" {
+		t.Errorf("registered secret = %q, want %q", gotSecret, "s3cr3t")
+	}
+	// External hooks are operator-owned: the helper must never deregister them.
+	if got := whp.deregistered.Load(); got != 0 {
+		t.Errorf("DeregisterWebhooks called %d times, want 0", got)
+	}
+}
+
+// TestRegisterExternalWebhooks_ContinuesOnError verifies a registration failure
+// for one provider is logged and skipped (best-effort) rather than aborting —
+// and that subsequent providers still get registered.
+func TestRegisterExternalWebhooks_ContinuesOnError(t *testing.T) {
+	failing := newMockWebhookProvider()
+	failing.name = "failing"
+	failing.registerErr = errors.New("boom")
+
+	ok := newMockWebhookProvider()
+	ok.name = "ok"
+
+	s := New(Config{
+		Log:           testLogger(),
+		Providers:     []providers.Provider{failing, ok},
+		WebhookSecret: "s3cr3t",
+		ExternalURL:   "https://mac.tricorder.cc",
+	})
+
+	// Should not panic or return; both providers are attempted.
+	s.registerExternalWebhooks(context.Background(), []providers.Webhook{failing, ok})
+
+	if got := failing.registered.Load(); got != 1 {
+		t.Errorf("failing provider RegisterWebhooks called %d times, want 1", got)
+	}
+	if got := ok.registered.Load(); got != 1 {
+		t.Errorf("ok provider RegisterWebhooks called %d times, want 1 (must run despite earlier failure)", got)
 	}
 }

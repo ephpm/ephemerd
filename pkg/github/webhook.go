@@ -15,6 +15,12 @@ type ManagedWebhook struct {
 
 // RegisterWebhooks creates workflow_job webhooks on each configured repo (or the org)
 // pointing at the given URL with the given secret. Returns the managed hooks for cleanup.
+//
+// It is idempotent: before creating a hook it lists the existing hooks and, if
+// one already points at webhookURL, reuses it instead of creating a duplicate.
+// GitHub rejects a duplicate hook config with HTTP 422, so without this the
+// external-tunnel path (which re-registers on every startup) would fail on the
+// second boot. The list-then-skip approach makes repeated registration a no-op.
 func (c *Client) RegisterWebhooks(ctx context.Context, webhookURL, secret string) ([]ManagedWebhook, error) {
 	hook := &gh.Hook{
 		Config: &gh.HookConfig{
@@ -28,6 +34,10 @@ func (c *Client) RegisterWebhooks(ctx context.Context, webhookURL, secret string
 	}
 
 	if c.IsOrgLevel() {
+		if id, ok := c.findOrgHook(ctx, webhookURL); ok {
+			c.cfg.Log.Info("org webhook already registered, skipping create", "hook_id", id, "url", webhookURL)
+			return []ManagedWebhook{{HookID: id}}, nil
+		}
 		created, _, err := c.client.Organizations.CreateHook(ctx, c.cfg.Owner, hook)
 		if err != nil {
 			return nil, fmt.Errorf("creating org webhook for %s: %w", c.cfg.Owner, err)
@@ -38,6 +48,11 @@ func (c *Client) RegisterWebhooks(ctx context.Context, webhookURL, secret string
 
 	var managed []ManagedWebhook
 	for _, repo := range c.cfg.Repos {
+		if id, ok := c.findRepoHook(ctx, repo, webhookURL); ok {
+			c.cfg.Log.Info("repo webhook already registered, skipping create", "repo", repo, "hook_id", id, "url", webhookURL)
+			managed = append(managed, ManagedWebhook{Repo: repo, HookID: id})
+			continue
+		}
 		created, _, err := c.client.Repositories.CreateHook(ctx, c.cfg.Owner, repo, hook)
 		if err != nil {
 			// Clean up any hooks we already created
@@ -53,6 +68,48 @@ func (c *Client) RegisterWebhooks(ctx context.Context, webhookURL, secret string
 	}
 
 	return managed, nil
+}
+
+// findOrgHook returns the ID of an existing org-level hook whose config URL
+// matches webhookURL. The bool is false when none matches or the list call
+// fails — callers then fall back to CreateHook (surfacing any real error, e.g.
+// a genuine 422, at create time rather than swallowing it here).
+func (c *Client) findOrgHook(ctx context.Context, webhookURL string) (int64, bool) {
+	hooks, _, err := c.client.Organizations.ListHooks(ctx, c.cfg.Owner, nil)
+	if err != nil {
+		c.cfg.Log.Debug("could not list org webhooks for idempotency check", "error", err)
+		return 0, false
+	}
+	for _, h := range hooks {
+		if hookURLMatches(h, webhookURL) {
+			return h.GetID(), true
+		}
+	}
+	return 0, false
+}
+
+// findRepoHook returns the ID of an existing repo hook whose config URL matches
+// webhookURL. See findOrgHook for the false semantics.
+func (c *Client) findRepoHook(ctx context.Context, repo, webhookURL string) (int64, bool) {
+	hooks, _, err := c.client.Repositories.ListHooks(ctx, c.cfg.Owner, repo, nil)
+	if err != nil {
+		c.cfg.Log.Debug("could not list repo webhooks for idempotency check", "repo", repo, "error", err)
+		return 0, false
+	}
+	for _, h := range hooks {
+		if hookURLMatches(h, webhookURL) {
+			return h.GetID(), true
+		}
+	}
+	return 0, false
+}
+
+// hookURLMatches reports whether a hook's config URL equals webhookURL.
+func hookURLMatches(h *gh.Hook, webhookURL string) bool {
+	if h == nil || h.Config == nil {
+		return false
+	}
+	return h.Config.GetURL() == webhookURL
 }
 
 // DeregisterWebhooks removes all managed webhooks. Called on shutdown.
