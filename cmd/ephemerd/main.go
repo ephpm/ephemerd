@@ -236,12 +236,19 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		// with the existing bridge's IP.
 		networking.CleanStaleBridge(log)
 
+		// Control ports the in-VM daemon exposes on the bridge gateway that
+		// containers must never reach: containerd (TCP), the unauthenticated
+		// dispatch gRPC server (containerd+1), and the debug exec server
+		// (containerd+2). See startWorkerDebugExec / StartDispatchServer above.
+		controlPorts := []int{int(containerdTCPPort), int(containerdTCPPort) + 1, int(containerdTCPPort) + 2}
+
 		net, err := networking.New(networking.Config{
-			DataDir:   configDir,
-			Subnet:    cfg.Network.Subnet,
-			MTU:       cfg.Network.MTU,
-			CNIBinDir: cm.Dir(),
-			Log:       log,
+			DataDir:      configDir,
+			Subnet:       cfg.Network.Subnet,
+			MTU:          cfg.Network.MTU,
+			CNIBinDir:    cm.Dir(),
+			ControlPorts: controlPorts,
+			Log:          log,
 		})
 		if err != nil {
 			return fmt.Errorf("initializing networking: %w", err)
@@ -638,6 +645,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		MacOSModeForRepo:   cfg.Runner.MacOS.ModeForRepo,
 		NativeMacUser:      cfg.Runner.MacOS.User,
 		RunnerDir:          rm.Dir(),
+		PrivateKeyPath:     cfg.GitHub.PrivateKeyPath,
 		Retry:              retryCfg,
 		OrphanSweep:        orphanCfg,
 		Log:                log,

@@ -13,12 +13,23 @@ const DefaultSubnet = "10.88.0.0/16"
 
 // Config for container networking.
 type Config struct {
-	DataDir       string
-	Subnet        string // container subnet (auto-selected if empty)
-	MTU           int    // bridge MTU (auto-detected from host if 0)
-	CNIBinDir     string // path to CNI plugin binaries (Linux only, ignored elsewhere)
-	GatewayPorts  []int  // extra TCP ports to allow from containers to the gateway (e.g., module proxy)
-	Log           *slog.Logger
+	DataDir      string
+	Subnet       string // container subnet (auto-selected if empty)
+	MTU          int    // bridge MTU (auto-detected from host if 0)
+	CNIBinDir    string // path to CNI plugin binaries (Linux only, ignored elsewhere)
+	GatewayPorts []int  // extra TCP ports to allow from containers to the gateway (e.g., module proxy)
+
+	// ControlPorts are TCP ports the ephemerd control plane binds on the
+	// gateway (bridge) address that MUST NOT be reachable from inside
+	// containers: the in-VM containerd (default 10000), the unauthenticated
+	// dispatch gRPC server (containerd+1), and the debug exec server
+	// (containerd+2). The firewall adds targeted INPUT DROP rules from the
+	// container subnet to the gateway on these ports. Empty = no INPUT
+	// control-plane rules (e.g. a bare-metal Linux host with no in-VM
+	// dispatch server listening on the bridge).
+	ControlPorts []int
+
+	Log *slog.Logger
 }
 
 // pickSubnet tries the default subnet first. If it conflicts with an existing

@@ -27,25 +27,25 @@ import (
 
 // Config for the scheduler.
 type Config struct {
-	Runtime         *runtime.Runtime
-	Providers       []providers.Provider
-	Artifacts       *artifacts.Extractor  // OCI image layer extractor for macOS VM jobs (nil if not available)
-	LinuxDispatcher *DispatchClient       // if non-nil, Linux jobs are dispatched to a Linux VM worker via gRPC
-	MacOSVMConfig     *vm.MacOSVMConfig     // if non-nil, macOS-native jobs are enabled (darwin only)
-	DataDir           string                // ephemerd data directory (used for artifact extraction paths)
-	MaxConcurrent     int
-	MaxMacOSVMs       int                   // max concurrent macOS VMs (Vz limit; default auto-detected)
-	Labels          []string
-	PollInterval    time.Duration // if >0, use polling mode (default)
-	WebhookPort     int           // listen port for health/webhook server
-	WebhookSecret   string        // webhook signature secret
-	TLSCert         string        // TLS certificate path
-	TLSKey          string        // TLS private key path
-	Tunnel            tunnel.Provider // if non-nil, creates a public tunnel for webhooks
-	TunnelMaxRetries  int             // max consecutive reconnect failures before fallback to polling (0 = default 5)
-	JobTimeout        time.Duration
-	ShutdownTimeout time.Duration
-	LogRetention    time.Duration // max age for job log files (default 7d)
+	Runtime          *runtime.Runtime
+	Providers        []providers.Provider
+	Artifacts        *artifacts.Extractor // OCI image layer extractor for macOS VM jobs (nil if not available)
+	LinuxDispatcher  *DispatchClient      // if non-nil, Linux jobs are dispatched to a Linux VM worker via gRPC
+	MacOSVMConfig    *vm.MacOSVMConfig    // if non-nil, macOS-native jobs are enabled (darwin only)
+	DataDir          string               // ephemerd data directory (used for artifact extraction paths)
+	MaxConcurrent    int
+	MaxMacOSVMs      int // max concurrent macOS VMs (Vz limit; default auto-detected)
+	Labels           []string
+	PollInterval     time.Duration   // if >0, use polling mode (default)
+	WebhookPort      int             // listen port for health/webhook server
+	WebhookSecret    string          // webhook signature secret
+	TLSCert          string          // TLS certificate path
+	TLSKey           string          // TLS private key path
+	Tunnel           tunnel.Provider // if non-nil, creates a public tunnel for webhooks
+	TunnelMaxRetries int             // max consecutive reconnect failures before fallback to polling (0 = default 5)
+	JobTimeout       time.Duration
+	ShutdownTimeout  time.Duration
+	LogRetention     time.Duration // max age for job log files (default 7d)
 
 	// Retry configures the claim/provision retry queue. When the initial
 	// attempt to claim a queued job fails with a retryable error
@@ -77,6 +77,7 @@ type Config struct {
 	MacOSModeForRepo func(repo string) string // returns "native" or "vm" per repo (nil = always VM)
 	NativeMacUser    string                   // non-root user for native macOS runner processes
 	RunnerDir        string                   // path to extracted GHA runner binary dir (runner.Manager.Dir())
+	PrivateKeyPath   string                   // GitHub App private_key_path, denied read access in the native sandbox (empty for PAT auth)
 
 	Log *slog.Logger
 }
@@ -85,10 +86,10 @@ type Config struct {
 //
 // Resolution order:
 //
-//	1. Image declared in the workflow YAML (FetchJobImage)
-//	2. Per-repo override from [runner.images.<repo>].<os>
-//	3. Provider per-OS default (DefaultImageFor)
-//	4. Empty — runtime.Create picks its host-aware fallback
+//  1. Image declared in the workflow YAML (FetchJobImage)
+//  2. Per-repo override from [runner.images.<repo>].<os>
+//  3. Provider per-OS default (DefaultImageFor)
+//  4. Empty — runtime.Create picks its host-aware fallback
 func (s *Scheduler) resolveImage(ctx context.Context, event *providers.JobEvent, os string) string {
 	if event == nil || event.Provider == nil {
 		return ""
@@ -140,20 +141,20 @@ func keyFor(event providers.JobEvent) jobKey {
 // When a job is queued, it provisions a runner environment.
 // When the job completes, it destroys the environment.
 type Scheduler struct {
-	cfg       Config
-	running   map[jobKey]*runningJob
-	seen      map[jobKey]time.Time    // recently handled jobs for dedup
-	pending   map[jobKey]struct{}     // jobs dispatched to a handler but not yet holding sem
-	attempts  map[jobKey]int          // provisioning passes per job, for zombie detection
-	runners   map[string]*runnerBinding // dispatched runners by name; tracks observed job assignment
-	webhookMode bool                    // true when job events arrive via webhooks (in_progress observable)
-	mu        sync.Mutex
+	cfg          Config
+	running      map[jobKey]*runningJob
+	seen         map[jobKey]time.Time      // recently handled jobs for dedup
+	pending      map[jobKey]struct{}       // jobs dispatched to a handler but not yet holding sem
+	attempts     map[jobKey]int            // provisioning passes per job, for zombie detection
+	runners      map[string]*runnerBinding // dispatched runners by name; tracks observed job assignment
+	webhookMode  bool                      // true when job events arrive via webhooks (in_progress observable)
+	mu           sync.Mutex
 	sem          chan struct{} // local/native job concurrency limiter
 	linuxSem     chan struct{} // Linux dispatch (VM) concurrency limiter
 	macSem       chan struct{} // macOS VM concurrency limiter (Vz has a hard cap)
 	nativeMacSem chan struct{} // native macOS job concurrency limiter (separate from VM limit)
-	draining     bool         // true when shutting down, rejects new jobs
-	startTime time.Time
+	draining     bool          // true when shutting down, rejects new jobs
+	startTime    time.Time
 
 	// retry holds pending re-attempts for jobs whose initial claim
 	// failed with a retryable error. Nil when Config.Retry.Enabled=false.
@@ -220,11 +221,11 @@ type runningJob struct {
 	repo         string
 	image        string
 	cancel       context.CancelFunc
-	artifactsDir string    // non-empty if OCI artifacts were extracted for this job
-	dispatched    string    // non-empty if dispatched to Linux VM worker (stores container name)
-	macosVM       vm.MacOSVM // non-nil if running as a macOS VM job
-	nativeRunner  interface{ Stop() } // non-nil if running as a native macOS job
-	startedAt     time.Time
+	artifactsDir string              // non-empty if OCI artifacts were extracted for this job
+	dispatched   string              // non-empty if dispatched to Linux VM worker (stores container name)
+	macosVM      vm.MacOSVM          // non-nil if running as a macOS VM job
+	nativeRunner interface{ Stop() } // non-nil if running as a native macOS job
+	startedAt    time.Time
 }
 
 // runnerName returns the name the runner was registered under with the
@@ -1103,7 +1104,7 @@ func (s *Scheduler) handleNativeMacOSJob(ctx context.Context, event providers.Jo
 	}
 
 	// Create the native runner
-	nr, err := native.New(s.cfg.DataDir, fmt.Sprintf("%d", jobID), claim.RunnerConfig, s.cfg.RunnerDir, log)
+	nr, err := native.New(s.cfg.DataDir, fmt.Sprintf("%d", jobID), claim.RunnerConfig, s.cfg.RunnerDir, s.cfg.PrivateKeyPath, log)
 	if err != nil {
 		log.Error("failed to create native runner", "error", err)
 		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
@@ -1613,7 +1614,6 @@ func (s *Scheduler) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		s.cfg.Log.Error("failed to encode healthz response", "error", err)
 	}
 }
-
 
 func (s *Scheduler) cleanSeen() {
 	s.mu.Lock()
