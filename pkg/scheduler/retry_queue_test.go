@@ -361,3 +361,132 @@ func TestRetryQueue_Disabled_IsNoOp(t *testing.T) {
 		t.Error("Enabled() = true, want false")
 	}
 }
+
+// TestRetryQueue_LadderAdvancesThroughFirePath is the regression test for
+// the bug where fireDue deleted the popped item from q.index, so the
+// re-Add in runOne always hit the `!existed` branch and rebuilt a FRESH
+// item (attempts reset to 1, firstFailure reset to now). The observable
+// symptoms were: the backoff ladder never advanced past schedule[0]
+// (~30s forever) and the MaxAge give-up never triggered.
+//
+// This test drives the REAL fire path (fireDue -> runOne -> re-Add) with
+// an always-failing handler and asserts:
+//  1. The re-schedule delay grows 30s -> 1m -> 2m across successive fires.
+//  2. attempts increments monotonically and firstFailure is preserved.
+//  3. The item is dropped once its age exceeds MaxAge.
+//
+// Against the un-fixed code the delay stays pinned at 30s and the item
+// never gives up, so both the ladder and give-up assertions fail.
+func TestRetryQueue_LadderAdvancesThroughFirePath(t *testing.T) {
+	base := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	clk := newFakeClock(base)
+	// MaxAge chosen so the ladder (30s,1m,2m clamped) runs several rungs
+	// before we deliberately blow past it at the end.
+	q := newRetryQueue(RetryConfig{
+		Enabled:  true,
+		Schedule: []time.Duration{30 * time.Second, 1 * time.Minute, 2 * time.Minute},
+		Jitter:   0,
+		MaxAge:   10 * time.Minute,
+		Now:      clk.Now,
+	}, testLogger())
+
+	ev := mkEvent(42)
+
+	var calls atomic.Int32
+	handler := func(_ context.Context, _ providers.JobEvent) error {
+		calls.Add(1)
+		return errors.New("HTTP 500 server error")
+	}
+
+	// Seed the queue as the claim path would: first failure -> attempt 1,
+	// scheduled 30s out.
+	q.Add(ev, handler, errors.New("HTTP 500 server error"))
+	key := keyFor(ev)
+	it := q.index[key]
+	if it == nil {
+		t.Fatal("expected item in index after seed Add")
+	}
+	if it.attempts != 1 {
+		t.Fatalf("attempts after seed = %d, want 1", it.attempts)
+	}
+	if got := it.nextAttempt.Sub(clk.Now()); got != 30*time.Second {
+		t.Fatalf("seed delay = %v, want 30s", got)
+	}
+	firstFailure := it.firstFailure
+
+	// fireAndWait drives fireDue and blocks until the goroutine it spawns
+	// (runOne) has finished its re-Add, detected by attempts reaching the
+	// expected value. This avoids racing the fire goroutine.
+	fireAndWait := func(expectAttempts int) {
+		q.fireDue(context.Background())
+		deadline := time.After(2 * time.Second)
+		for {
+			q.mu.Lock()
+			cur, ok := q.index[key]
+			var attempts int
+			if ok {
+				attempts = cur.attempts
+			}
+			q.mu.Unlock()
+			if ok && attempts == expectAttempts {
+				return
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("timed out waiting for attempts=%d (have ok=%v attempts=%d)", expectAttempts, ok, attempts)
+			case <-time.After(2 * time.Millisecond):
+			}
+		}
+	}
+
+	// Fire 1: 30s scheduled -> advance to it, fire. runOne fails and
+	// re-Adds: attempts 1->2, next delay should be 1m (ladder[1]).
+	clk.Advance(30 * time.Second)
+	fireAndWait(2)
+	it = q.index[key]
+	if got := it.nextAttempt.Sub(clk.Now()); got != 1*time.Minute {
+		t.Errorf("after fire 1: delay = %v, want 1m (ladder must advance, not reset to 30s)", got)
+	}
+	if !it.firstFailure.Equal(firstFailure) {
+		t.Errorf("after fire 1: firstFailure changed %v -> %v (must be preserved)", firstFailure, it.firstFailure)
+	}
+
+	// Fire 2: advance the 1m, fire. attempts 2->3, next delay 2m (ladder[2]).
+	clk.Advance(1 * time.Minute)
+	fireAndWait(3)
+	it = q.index[key]
+	if got := it.nextAttempt.Sub(clk.Now()); got != 2*time.Minute {
+		t.Errorf("after fire 2: delay = %v, want 2m", got)
+	}
+
+	// Fire 3: advance the 2m, fire. attempts 3->4, past ladder end so
+	// clamps to last rung (2m). Still under MaxAge (total ~3.5m).
+	clk.Advance(2 * time.Minute)
+	fireAndWait(4)
+	it = q.index[key]
+	if got := it.nextAttempt.Sub(clk.Now()); got != 2*time.Minute {
+		t.Errorf("after fire 3: delay = %v, want 2m (clamped)", got)
+	}
+
+	// Now blow past MaxAge: jump the clock well beyond the 10m budget
+	// from firstFailure, then fire once more. runOne fails, re-Adds, and
+	// Add's give-up check fires -> item removed from the queue entirely.
+	clk.Advance(20 * time.Minute)
+	q.fireDue(context.Background())
+	deadline := time.After(2 * time.Second)
+	for {
+		if q.Len() == 0 {
+			q.mu.Lock()
+			_, stillIndexed := q.index[key]
+			q.mu.Unlock()
+			if !stillIndexed {
+				break
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for MaxAge give-up; Len=%d", q.Len())
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}

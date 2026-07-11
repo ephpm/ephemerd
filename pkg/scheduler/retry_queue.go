@@ -390,7 +390,10 @@ func (q *retryQueue) fireDue(ctx context.Context) {
 	q.mu.Lock()
 	for len(q.heap) > 0 && !q.heap[0].nextAttempt.After(now) {
 		it := heap.Pop(&q.heap).(*retryItem)
-		delete(q.index, it.key)
+		// Intentionally DO NOT delete(q.index, it.key) here: leaving the
+		// popped item registered lets a failure re-Add (via runOne) find
+		// it and advance attempts/preserve firstFailure, rather than
+		// building a fresh item that resets the ladder and MaxAge.
 		due = append(due, it)
 	}
 	q.mu.Unlock()
@@ -411,6 +414,10 @@ func (q *retryQueue) runOne(ctx context.Context, it *retryItem) {
 		"attempt", it.attempts+1)
 	err := it.handler(ctx, it.event)
 	if err == nil {
+		// fireDue leaves the popped item in q.index so a failure re-Add
+		// advances the ladder; on success nothing re-Adds it, so drop the
+		// lingering index entry here. removeLocked tolerates index < 0.
+		q.Drop(it.key)
 		return
 	}
 	// Re-enqueue on failure. Add() decides retry/give-up.
