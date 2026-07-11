@@ -100,6 +100,35 @@ shutdown_timeout = "5m"
 # enabled = true
 # grace   = "10m"
 
+# macOS job routing and native-runner hardening.
+#
+# macOS jobs can run either in a per-job VM (default, strongest isolation) or
+# natively on the host inside a sandbox-exec profile (faster, weaker boundary).
+# [runner.macos]
+# mode       = "vm"      # default mode: "vm" or "native"
+# max_native = 4         # max concurrent native jobs
+# user       = "ciuser"  # optional existing user for native runners
+#
+# max_processes: ulimit -u applied to each native job BEFORE the runner execs,
+# for fork-bomb / runaway-fork defense. Default 2048 (generous — clang/php fork
+# heavily). Set 0 for unlimited.
+#
+# NOTE: macOS has no cgroups, so RAM and disk CANNOT be hard-capped on the
+# native path. max_processes is fork-bomb/CPU defense only; use mode = "vm"
+# for untrusted memory/disk DoS resistance.
+# max_processes = 2048
+#
+# sandbox_strict: switch the native sandbox from allow-by-default (deny-list)
+# to deny-by-default (allow-list). Much stronger, but the allow-list is not
+# guaranteed to cover every toolchain — OPT-IN and default false. Live-smoke-
+# test on your host before enabling; missing paths/services surface as sandbox
+# denials in the system log and can be added to the strict allow-list.
+# sandbox_strict = false
+#
+# [runner.macos.repos]
+# "ephpm/*"           = "native"  # all repos in org run native
+# "ephpm/secret-repo" = "vm"      # except this one (exact match wins)
+
 [vm.linux]
 # Enable a Linux VM for running Linux jobs on Windows/macOS hosts.
 # On Windows: creates a WSL2 distro with an embedded ephemerd binary.

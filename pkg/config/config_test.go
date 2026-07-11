@@ -2079,6 +2079,47 @@ func TestMacOSRunnerConfig_ResolvedMaxNative(t *testing.T) {
 	}
 }
 
+func TestMacOSRunnerConfig_ResolvedMaxProcesses(t *testing.T) {
+	intPtr := func(n int) *int { return &n }
+	tests := []struct {
+		name string
+		cfg  *MacOSRunnerConfig
+		want int
+	}{
+		{"nil config defaults to 2048", nil, 2048},
+		{"unset (nil ptr) defaults to 2048", &MacOSRunnerConfig{}, 2048},
+		{"explicit zero means unlimited", &MacOSRunnerConfig{MaxProcesses: intPtr(0)}, 0},
+		{"negative treated as unlimited", &MacOSRunnerConfig{MaxProcesses: intPtr(-1)}, 0},
+		{"positive value used", &MacOSRunnerConfig{MaxProcesses: intPtr(4096)}, 4096},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.ResolvedMaxProcesses(); got != tt.want {
+				t.Errorf("ResolvedMaxProcesses() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMacOSRunnerConfig_StrictSandbox(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *MacOSRunnerConfig
+		want bool
+	}{
+		{"nil config is false", nil, false},
+		{"unset defaults to false", &MacOSRunnerConfig{}, false},
+		{"explicit true", &MacOSRunnerConfig{SandboxStrict: true}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.StrictSandbox(); got != tt.want {
+				t.Errorf("StrictSandbox() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestOrphanSweepEnabled(t *testing.T) {
 	boolPtr := func(b bool) *bool { return &b }
 	tests := []struct {

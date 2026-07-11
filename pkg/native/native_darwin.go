@@ -183,6 +183,12 @@ func lookupCredential(username string) (*syscall.Credential, error) {
 	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}, nil
 }
 
+// defaultMaxProcesses is the fork-bomb ulimit -u applied to native jobs when
+// the operator does not override it. Generous on purpose: clang, php, and
+// parallel build tools legitimately fork hundreds of children, but 2048 still
+// stops a runaway fork bomb from exhausting the host process table.
+const defaultMaxProcesses = 2048
+
 // Runner executes a GitHub Actions runner directly on the macOS host
 // inside a per-job sandbox. Each job gets its own workspace, HOME,
 // TMPDIR, keychain, and Homebrew prefix.
@@ -193,13 +199,28 @@ type Runner struct {
 	runnerSrc string // path to extracted GHA runner (runner.Manager.Dir())
 	log       *slog.Logger
 
-	jobDir       string // <dataDir>/native/<jobID>/
-	pemPath      string // configured GitHub App private_key_path (empty if unset / PAT auth)
-	keychainPath string // per-job keychain
-	runAsUser    string // existing user to run as (empty = _ephemerd service user)
-	jobUID       uint32 // uid the runner executes as
-	cmd          *exec.Cmd
-	pgid         int
+	jobDir        string // <dataDir>/native/<jobID>/
+	pemPath       string // configured GitHub App private_key_path (empty if unset / PAT auth)
+	keychainPath  string // per-job keychain
+	runAsUser     string // existing user to run as (empty = _ephemerd service user)
+	jobUID        uint32 // uid the runner executes as
+	sandboxStrict bool   // deny-by-default sandbox profile (opt-in)
+	maxProcesses  int    // ulimit -u for the job (0 = unlimited)
+	cmd           *exec.Cmd
+	pgid          int
+}
+
+// SetSandboxStrict enables the deny-by-default sandbox profile. Opt-in: the
+// strict allow-list is not guaranteed to cover every toolchain and must be
+// live-smoke-tested before it is turned on for a host.
+func (r *Runner) SetSandboxStrict(strict bool) {
+	r.sandboxStrict = strict
+}
+
+// SetMaxProcesses sets the ulimit -u process cap applied before the runner is
+// exec'd. 0 disables the cap (unlimited).
+func (r *Runner) SetMaxProcesses(n int) {
+	r.maxProcesses = n
 }
 
 // SetRunAsUser configures a non-root user to run the runner process as.
@@ -235,13 +256,14 @@ func New(dataDir, jobID, jitConfig, runnerSrc, pemPath string, log *slog.Logger)
 	}
 
 	return &Runner{
-		dataDir:   dataDir,
-		jobID:     jobID,
-		jitConfig: jitConfig,
-		runnerSrc: runnerSrc,
-		pemPath:   pemPath,
-		log:       log,
-		jobDir:    jobDir,
+		dataDir:      dataDir,
+		jobID:        jobID,
+		jitConfig:    jitConfig,
+		runnerSrc:    runnerSrc,
+		pemPath:      pemPath,
+		log:          log,
+		jobDir:       jobDir,
+		maxProcesses: defaultMaxProcesses,
 	}, nil
 }
 
@@ -255,10 +277,31 @@ func (r *Runner) Start(ctx context.Context) error {
 		return fmt.Errorf("copying runner files: %w", err)
 	}
 
+	// Use the host's real Homebrew (read-only: the sandbox denies writes to
+	// /opt/homebrew). Pointing HOMEBREW_PREFIX/CELLAR at a per-job empty prefix
+	// made `brew list`-style checks (e.g. spc doctor) see nothing installed, so
+	// tools tried to (re)install formulae the host already has — then failed on
+	// the write-deny. Sharing the host prefix read-only lets jobs USE the
+	// pre-installed deps without being able to mutate them.
+	const hostBrewPrefix = "/opt/homebrew"
+
+	// Resolve the host's active developer directory (full Xcode or Command
+	// Line Tools) up-front: strict-mode needs it in the allow-list, and the
+	// runner needs it in DEVELOPER_DIR. Hardcoding the Xcode.app path breaks
+	// xcrun shims (git, clang) on hosts with only CLT installed.
+	developerDir := ""
+	if devDir, err := exec.Command("xcode-select", "-p").Output(); err == nil {
+		developerDir = strings.TrimSpace(string(devDir))
+	}
+
 	// Generate and write sandbox profile
 	profilePath := filepath.Join(r.jobDir, "sandbox.sb")
-	profile := GenerateSandboxProfile(r.jobDir, r.dataDir, r.pemPath)
-	if err := os.WriteFile(profilePath, []byte(profile), 0o644); err != nil {
+	profile := GenerateSandboxProfile(r.jobDir, r.dataDir, r.pemPath, SandboxOptions{
+		Strict:         r.sandboxStrict,
+		HomebrewPrefix: hostBrewPrefix,
+		DeveloperDir:   developerDir,
+	})
+	if err := os.WriteFile(profilePath, []byte(profile), 0o600); err != nil {
 		return fmt.Errorf("writing sandbox profile: %w", err)
 	}
 
@@ -274,13 +317,6 @@ func (r *Runner) Start(ctx context.Context) error {
 	tmpDir := filepath.Join(r.jobDir, "tmp")
 	workDir := filepath.Join(r.jobDir, "work")
 
-	// Use the host's real Homebrew (read-only: the sandbox denies writes to
-	// /opt/homebrew). Pointing HOMEBREW_PREFIX/CELLAR at a per-job empty prefix
-	// made `brew list`-style checks (e.g. spc doctor) see nothing installed, so
-	// tools tried to (re)install formulae the host already has — then failed on
-	// the write-deny. Sharing the host prefix read-only lets jobs USE the
-	// pre-installed deps without being able to mutate them.
-	const hostBrewPrefix = "/opt/homebrew"
 	env := []string{
 		"HOME=" + homeDir,
 		"TMPDIR=" + tmpDir,
@@ -291,19 +327,20 @@ func (r *Runner) Start(ctx context.Context) error {
 		"HOMEBREW_TEMP=" + tmpDir,
 		"LANG=en_US.UTF-8",
 	}
-	// Point DEVELOPER_DIR at the host's active developer directory
-	// (full Xcode or Command Line Tools). Hardcoding the Xcode.app path
-	// breaks xcrun shims (git, clang) on hosts with only CLT installed.
-	if devDir, err := exec.Command("xcode-select", "-p").Output(); err == nil {
-		env = append(env, "DEVELOPER_DIR="+strings.TrimSpace(string(devDir)))
+	if developerDir != "" {
+		env = append(env, "DEVELOPER_DIR="+developerDir)
 	}
 	if r.keychainPath != "" {
 		env = append(env, "EPHEMERD_KEYCHAIN="+r.keychainPath)
 	}
 
-	// Launch via sandbox-exec for filesystem/network isolation
-	r.cmd = exec.CommandContext(ctx, "sandbox-exec", "-f", profilePath,
-		"./run.sh", "--jitconfig", r.jitConfig)
+	// Launch via sandbox-exec for filesystem/network isolation, wrapped in a
+	// shell that applies resource limits (ulimit) BEFORE exec so they bind the
+	// runner and its whole process tree. macOS has no cgroups, so this is the
+	// only fork-bomb/CPU defense available on the native path; RAM and disk
+	// still cannot be hard-capped here (use the VM path for that).
+	launchName, launchArgs := buildLaunchArgs(profilePath, r.jitConfig, r.maxProcesses)
+	r.cmd = exec.CommandContext(ctx, launchName, launchArgs...)
 	r.cmd.Dir = runnerDir
 	r.cmd.Env = env
 
@@ -449,13 +486,37 @@ func (r *Runner) deleteKeychain() {
 	}
 }
 
+// SandboxOptions carries the knobs GenerateSandboxProfile needs beyond the
+// job/data/pem paths.
+type SandboxOptions struct {
+	// Strict switches from allow-by-default (deny-list) to deny-by-default
+	// (allow-list). Opt-in; default false keeps today's already-smoke-tested
+	// allow-by-default profile byte-for-byte identical.
+	Strict bool
+	// HomebrewPrefix is the host Homebrew prefix (e.g. /opt/homebrew) the
+	// runner uses read-only. Needed in the strict allow-list.
+	HomebrewPrefix string
+	// DeveloperDir is the resolved active Xcode / CLT path (xcode-select -p).
+	// Needed in the strict allow-list so clang/git shims work. May be empty.
+	DeveloperDir string
+}
+
 // GenerateSandboxProfile returns a macOS sandbox profile that restricts
 // the runner process. Paths are templated with the job-specific directories.
 //
 // pemPath is the configured GitHub App private_key_path (may be empty).
 // When set it is denied explicitly as a belt-and-suspenders measure on top
 // of the broad /Users content deny below.
-func GenerateSandboxProfile(jobDir, dataDir, pemPath string) string {
+//
+// Two postures:
+//   - opts.Strict == false (default): allow-by-default with an explicit
+//     deny-list. This is the previously-smoke-tested behavior and is emitted
+//     byte-for-byte as before when strict is off.
+//   - opts.Strict == true (opt-in): deny-by-default with an explicit
+//     allow-list for the paths/services a GHA runner + toolchain needs, with
+//     the same tier-1/tier-2 denies layered on top. Much stronger, but not
+//     guaranteed complete for every toolchain — must be live-tested.
+func GenerateSandboxProfile(jobDir, dataDir, pemPath string, opts SandboxOptions) string {
 	// Resolve to absolute, symlink-free paths. The sandbox matches against
 	// kernel (resolved) paths: /var and /tmp are symlinks to /private/var
 	// and /private/tmp on macOS, so rules written with the unresolved
@@ -490,15 +551,22 @@ func GenerateSandboxProfile(jobDir, dataDir, pemPath string) string {
 `, absPem, filepath.Dir(absPem))
 	}
 
-	// NOTE: this profile is allow-by-default with an explicit deny list.
-	// For native (no-VM) execution the stronger posture is deny-by-default
-	// with an allow list, but that requires enumerating every path the GHA
-	// runner + toolchains legitimately touch and live-testing on macOS so
-	// jobs don't break. Tracked as a follow-up (see PR discussion). The
-	// denies below close the concrete job-to-job and job-to-daemon read
-	// holes that matter most on a shared host.
+	// === Preamble: (allow default) vs (deny default) + strict allow-list ===
+	//
+	// The tier-1/tier-2 DENIES below apply in BOTH postures. In strict mode
+	// they are redundant with (deny default) for most paths but still
+	// meaningful: they win over the broad strict allows (e.g. read+exec of
+	// /usr), so a secret that lives under an otherwise-allowed prefix stays
+	// denied.
+	var preamble string
+	if opts.Strict {
+		preamble = strictPreamble(absJobDir, opts)
+	} else {
+		preamble = "(allow default)"
+	}
+
 	return fmt.Sprintf(`(version 1)
-(allow default)
+%[5]s
 
 ;; === Network isolation ===
 ;; Note: sandbox-exec does not support CIDR notation for IP addresses.
@@ -515,6 +583,27 @@ func GenerateSandboxProfile(jobDir, dataDir, pemPath string) string {
 
 ;; Block binding to any port — prevents jobs from running servers
 (deny network-bind (local ip "*:*"))
+
+;; === Process isolation (NATIVE-3, tier-2) ===
+;; Block this job from inspecting OTHER processes' state (argv, env,
+;; fds) via libproc / proc_pidinfo. Every native job runs as the same
+;; _ephemerd uid, and the JIT registration credential is passed on
+;; run.sh's argv, so without this a sibling job could read it via ps or
+;; a proc_pidinfo call. process-info* on (target others) blocks that
+;; path; a job inspecting its OWN process tree (wait/kill/signal, and
+;; proc_pidinfo on self) is unaffected.
+;;
+;; RESIDUAL — read the PR body: this does NOT close the argv leak
+;; completely. On macOS the KERN_PROCARGS2 sysctl returns another pid's
+;; argv and is NOT mediated by sandbox-exec (verified: neither
+;; process-info* nor a blanket sysctl-read deny stops it, and a blanket
+;; sysctl-read deny additionally breaks CPU-count detection). An
+;; in-sandbox reader can therefore still recover a sibling's argv via
+;; KERN_PROCARGS2, and a root/unsandboxed observer always can. The
+;; complete fix is not passing the credential on argv (blocked upstream:
+;; the GHA runner only accepts --jitconfig inline) or the VM path. This
+;; rule still closes the common ps/libproc vector at zero cost to builds.
+(deny process-info* (target others))
 
 ;; === Filesystem isolation ===
 
@@ -584,11 +673,120 @@ func GenerateSandboxProfile(jobDir, dataDir, pemPath string) string {
 ;; native subtree above) over a later wildcard allow (file-read*), so the
 ;; read-data re-allow must name the operation explicitly to win for this
 ;; job's own files.
+;;
+;; NATIVE-5 (tier-2): the world-shared /private/tmp write allow was
+;; removed. Jobs get TMPDIR=<jobDir>/tmp (under this subtree), so scratch
+;; writes still land in the per-job workspace and the cross-job /tmp
+;; channel is closed. Tools that hardcode /tmp instead of honoring TMPDIR
+;; will now be denied there — flagged for a live smoke test.
 (allow file-read* (subpath "%[3]s"))
 (allow file-read-data (subpath "%[3]s"))
 (allow file-write* (subpath "%[3]s"))
-(allow file-write* (subpath "/private/tmp"))
-`, homeDir, absDataDir, absJobDir, pemDenies)
+`, homeDir, absDataDir, absJobDir, pemDenies, preamble)
+}
+
+// strictPreamble builds the deny-by-default header and the explicit
+// allow-list a GHA runner + typical toolchain needs. It is only used when
+// SandboxOptions.Strict is true. The tier-1/tier-2 DENIES in the main body
+// still layer on top of these allows (a specific-operation deny wins over a
+// broad allow), so job-to-job and job-to-daemon holes stay closed.
+//
+// This allow-list is a best-effort starting point, NOT a proven-complete
+// set — that is precisely why strict mode is opt-in and default-off. Expect
+// to add entries after live smoke tests (missing mach services, sysctls, or
+// dylib paths surface as sandbox denials in the system log).
+func strictPreamble(absJobDir string, opts SandboxOptions) string {
+	brew := opts.HomebrewPrefix
+	if brew == "" {
+		brew = "/opt/homebrew"
+	}
+	// Developer dir allow only if resolved; an empty (subpath "") would
+	// match everything and silently defeat deny-by-default.
+	var devAllow string
+	if opts.DeveloperDir != "" {
+		devAllow = fmt.Sprintf("(allow file-read* process-exec (subpath \"%s\"))\n", opts.DeveloperDir)
+	}
+	return fmt.Sprintf(`;; === STRICT MODE: deny-by-default + explicit allow-list (opt-in) ===
+;; Everything not explicitly allowed here (or re-allowed for the per-job
+;; workspace below) is denied. This is a starting allow-list; add entries
+;; after live smoke tests surface missing services in the system log.
+(deny default)
+
+;; Import Apple's system base profile. Under (deny default) a process
+;; cannot even complete dyld startup without the mach/iokit/dyld-shared-
+;; cache allows this bundle provides; without it /bin/echo SIGABRTs before
+;; main(). Verified: importing system.sb lets sysctl, bash+fork, and file
+;; writes run under deny-default (see PR body live-test notes).
+(import "system.sb")
+
+;; Core read+exec system trees the runner/toolchain load binaries and
+;; dylibs from.
+(allow file-read* process-exec
+  (subpath "/usr")
+  (subpath "/bin")
+  (subpath "/sbin")
+  (subpath "/System")
+  (subpath "/Library")
+  (subpath "/Applications")
+  (subpath "/private/var/select")
+  (subpath "/etc")
+  (subpath "%[1]s"))
+%[2]s
+;; Per-job workspace: full read+write (home, tmp, work, runner, keychain,
+;; and TMPDIR which lives under it). The main body re-allows this too; it
+;; is repeated here so deny-default does not swallow it before those rules.
+(allow file-read* file-write* (subpath "%[3]s"))
+
+;; Process + fork so the runner can spawn job steps and toolchains.
+(allow process-fork)
+(allow process-exec)
+
+;; Network egress (private ranges are blocked by pf, localhost by the
+;; deny below in the main body).
+(allow network-outbound)
+
+;; Sysctls the Go/.NET runtimes and build tools read (CPU count, memory,
+;; page size). NOT a blanket sysctl-read gap: the KERN_PROCARGS2 argv leak
+;; is not mediated by sandbox-exec regardless (see NATIVE-3 note), so
+;; allowing sysctl-read here does not widen the argv exposure; it only lets
+;; hw.ncpu-style build detection work.
+(allow sysctl-read)
+
+;; Mach services the runner, clang, and DNS resolution look up. system.sb
+;; already allows the core set; this is belt-and-suspenders for toolchains.
+(allow mach-lookup)
+
+;; POSIX IPC / shared memory used by toolchains.
+(allow ipc-posix-shm)
+
+;; Allow signalling our own process tree.
+(allow signal (target self))
+`, brew, devAllow, absJobDir)
+}
+
+// buildLaunchArgs constructs the command name + args for launching the
+// runner. The launch is wrapped in a shell so a ulimit can be applied BEFORE
+// exec, binding the runner and its whole process tree. maxProc is the
+// ulimit -u value; 0 skips the limit (unlimited). No memory (-v) or CPU-time
+// (-t) limit is set by default: macOS has no cgroups, so those are too easy
+// to trip on legitimate heavy builds. This is fork-bomb/CPU defense only.
+//
+// Kept as a standalone function so the argv construction is unit-testable
+// without launching a real sandbox-exec.
+func buildLaunchArgs(profilePath, jitConfig string, maxProc int) (string, []string) {
+	// Build the ulimit prefix. Values are integers (maxProc, from config) so
+	// no shell-escaping of untrusted input is needed here; profilePath and
+	// jitConfig are passed as separate exec args to sandbox-exec, not
+	// interpolated into the shell string, so a jitConfig with shell
+	// metacharacters cannot break out.
+	var ulimitPrefix string
+	if maxProc > 0 {
+		ulimitPrefix = fmt.Sprintf("ulimit -u %d; ", maxProc)
+	}
+	script := ulimitPrefix + `exec sandbox-exec -f "$1" ./run.sh --jitconfig "$2"`
+	// $0 is a label; "$1"/"$2" receive profilePath/jitConfig via argv so no
+	// interpolation into the script body occurs.
+	return "/bin/sh", []string{"-c", script, "ephemerd-native", profilePath, jitConfig}
 }
 
 // copyRunnerFiles copies the runner directory to the per-job location.
