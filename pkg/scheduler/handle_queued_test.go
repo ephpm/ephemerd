@@ -15,6 +15,7 @@ type claimErrorProvider struct {
 	mockProvider
 	err          error
 	releaseCount atomic.Int32
+	claims       atomic.Int32
 }
 
 func newClaimErrorProvider(name string, err error) *claimErrorProvider {
@@ -25,6 +26,7 @@ func newClaimErrorProvider(name string, err error) *claimErrorProvider {
 }
 
 func (p *claimErrorProvider) ClaimJob(_ context.Context, _ *providers.JobEvent, _ string, _ []string) (*providers.Claim, error) {
+	p.claims.Add(1)
 	return nil, p.err
 }
 
