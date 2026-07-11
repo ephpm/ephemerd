@@ -194,6 +194,7 @@ type Runner struct {
 	log       *slog.Logger
 
 	jobDir       string // <dataDir>/native/<jobID>/
+	pemPath      string // configured GitHub App private_key_path (empty if unset / PAT auth)
 	keychainPath string // per-job keychain
 	runAsUser    string // existing user to run as (empty = _ephemerd service user)
 	jobUID       uint32 // uid the runner executes as
@@ -211,7 +212,12 @@ func (r *Runner) SetRunAsUser(username string) {
 
 // New creates a native macOS runner for a single job. It prepares the
 // workspace directory structure but does not start the runner process.
-func New(dataDir, jobID, jitConfig, runnerSrc string, log *slog.Logger) (*Runner, error) {
+//
+// pemPath is the configured GitHub App private_key_path (empty for PAT
+// auth). It is threaded into the sandbox profile so the runner is denied
+// read access to the operator's App private key even though the daemon
+// runs as root with no HOME — see GenerateSandboxProfile.
+func New(dataDir, jobID, jitConfig, runnerSrc, pemPath string, log *slog.Logger) (*Runner, error) {
 	jobDir := filepath.Join(dataDir, "native", jobID)
 
 	// Create workspace directories
@@ -233,6 +239,7 @@ func New(dataDir, jobID, jitConfig, runnerSrc string, log *slog.Logger) (*Runner
 		jobID:     jobID,
 		jitConfig: jitConfig,
 		runnerSrc: runnerSrc,
+		pemPath:   pemPath,
 		log:       log,
 		jobDir:    jobDir,
 	}, nil
@@ -250,7 +257,7 @@ func (r *Runner) Start(ctx context.Context) error {
 
 	// Generate and write sandbox profile
 	profilePath := filepath.Join(r.jobDir, "sandbox.sb")
-	profile := GenerateSandboxProfile(r.jobDir, r.dataDir)
+	profile := GenerateSandboxProfile(r.jobDir, r.dataDir, r.pemPath)
 	if err := os.WriteFile(profilePath, []byte(profile), 0o644); err != nil {
 		return fmt.Errorf("writing sandbox profile: %w", err)
 	}
@@ -444,7 +451,11 @@ func (r *Runner) deleteKeychain() {
 
 // GenerateSandboxProfile returns a macOS sandbox profile that restricts
 // the runner process. Paths are templated with the job-specific directories.
-func GenerateSandboxProfile(jobDir, dataDir string) string {
+//
+// pemPath is the configured GitHub App private_key_path (may be empty).
+// When set it is denied explicitly as a belt-and-suspenders measure on top
+// of the broad /Users content deny below.
+func GenerateSandboxProfile(jobDir, dataDir, pemPath string) string {
 	// Resolve to absolute, symlink-free paths. The sandbox matches against
 	// kernel (resolved) paths: /var and /tmp are symlinks to /private/var
 	// and /private/tmp on macOS, so rules written with the unresolved
@@ -462,6 +473,22 @@ func GenerateSandboxProfile(jobDir, dataDir string) string {
 	absJobDir := resolve(jobDir)
 	absDataDir := resolve(dataDir)
 	homeDir := resolve(os.Getenv("HOME"))
+
+	// Belt-and-suspenders deny for the configured GitHub App private key.
+	// The broad /Users content deny below already covers a key under any
+	// user's home, but the PEM can live outside /Users (e.g. /etc,
+	// /var/lib/ephemerd) so name it — and its parent dir — explicitly.
+	// Resolved through the same helper so symlinked config paths match the
+	// kernel's view.
+	var pemDenies string
+	if pemPath != "" {
+		absPem := resolve(pemPath)
+		pemDenies = fmt.Sprintf(`
+;; === GitHub App private key (belt and suspenders) ===
+(deny file-read* (literal "%[1]s"))
+(deny file-read* (subpath "%[2]s"))
+`, absPem, filepath.Dir(absPem))
+	}
 
 	// NOTE: this profile is allow-by-default with an explicit deny list.
 	// For native (no-VM) execution the stronger posture is deny-by-default
@@ -513,6 +540,27 @@ func GenerateSandboxProfile(jobDir, dataDir string) string {
 ;; contents) — job ids are not secret.
 (allow file-read-data (literal "%[2]s/native"))
 
+;; Block reading the CONTENTS of every user's home under /Users. The
+;; daemon runs as root with no HOME, so a deny anchored on $HOME (below)
+;; targets "/.ssh" and leaves the operator's real ~/.ssh — including the
+;; GitHub App PEM and every other dotfile secret — readable under
+;; (allow default). This closes that hole host-wide without depending on
+;; the daemon's HOME.
+;;
+;; Deny file-read-DATA (not file-read*), mirroring the native/ subtree
+;; technique above: on a file it blocks reading contents; on a directory
+;; it blocks readdir. file-read-METADATA stays allowed so lstat/realpath
+;; path resolution can traverse THROUGH /Users (denying metadata breaks
+;; getcwd and the .NET host's executable-path resolution).
+(deny file-read-data (subpath "/Users"))
+(deny file-write* (subpath "/Users"))
+
+;; Re-allow reading the /Users directory NODE itself (not its children),
+;; same reason as the native/ node re-allow: getcwd()/bash walk UP through
+;; /Users and must readdir it to resolve the current path. This leaks the
+;; list of usernames (not their file contents) — usernames are not secret.
+(allow file-read-data (literal "/Users"))
+
 ;; Block sensitive host paths entirely — read and write. .ssh was
 ;; previously read-only-denied, leaving a writable authorized_keys hole
 ;; on any host where the runner uid can reach the operator's home.
@@ -524,7 +572,7 @@ func GenerateSandboxProfile(jobDir, dataDir string) string {
 (deny file-write* (literal "%[2]s/ephemerd.sock"))
 (deny file-read* (subpath "%[2]s/vm"))
 (deny file-write* (subpath "%[2]s/vm"))
-
+%[4]s
 ;; Block writes to shared tools (read-only access only)
 (deny file-write* (subpath "/opt/homebrew"))
 (deny file-write* (subpath "/Applications"))
@@ -540,7 +588,7 @@ func GenerateSandboxProfile(jobDir, dataDir string) string {
 (allow file-read-data (subpath "%[3]s"))
 (allow file-write* (subpath "%[3]s"))
 (allow file-write* (subpath "/private/tmp"))
-`, homeDir, absDataDir, absJobDir)
+`, homeDir, absDataDir, absJobDir, pemDenies)
 }
 
 // copyRunnerFiles copies the runner directory to the per-job location.

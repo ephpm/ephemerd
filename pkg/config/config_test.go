@@ -1931,12 +1931,12 @@ owner = "testorg"
 	}
 }
 
-func TestResolvedAllowPrivileged_DefaultByOS(t *testing.T) {
+func TestResolvedAllowPrivileged_DefaultOffEveryOS(t *testing.T) {
+	// Secure default (DIND-1): privileged is opt-in on ALL platforms, so the
+	// default must resolve false regardless of GOOS.
 	d := DindConfig{}
-	got := d.ResolvedAllowPrivileged()
-	wantTrue := goruntime.GOOS != "linux"
-	if got != wantTrue {
-		t.Errorf("default ResolvedAllowPrivileged on GOOS=%s = %v, want %v", goruntime.GOOS, got, wantTrue)
+	if d.ResolvedAllowPrivileged() {
+		t.Errorf("default ResolvedAllowPrivileged on GOOS=%s = true, want false (privileged must be opt-in)", goruntime.GOOS)
 	}
 }
 
@@ -1976,9 +1976,9 @@ enabled = true
 	if cfg.Dind.AllowPrivileged != nil {
 		t.Errorf("AllowPrivileged ptr = %v, want nil (key not set in TOML)", *cfg.Dind.AllowPrivileged)
 	}
-	want := goruntime.GOOS != "linux"
-	if got := cfg.Dind.ResolvedAllowPrivileged(); got != want {
-		t.Errorf("ResolvedAllowPrivileged on GOOS=%s = %v, want %v", goruntime.GOOS, got, want)
+	// Omitted key → secure default false on every platform.
+	if got := cfg.Dind.ResolvedAllowPrivileged(); got {
+		t.Errorf("ResolvedAllowPrivileged on GOOS=%s = true, want false (default off)", goruntime.GOOS)
 	}
 }
 

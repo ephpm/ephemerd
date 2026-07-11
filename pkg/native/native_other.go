@@ -12,7 +12,7 @@ import (
 type Runner struct{}
 
 // New returns an error on non-darwin platforms.
-func New(_, _, _, _ string, _ *slog.Logger) (*Runner, error) {
+func New(_, _, _, _, _ string, _ *slog.Logger) (*Runner, error) {
 	return nil, fmt.Errorf("native macOS runner is only supported on darwin")
 }
 

@@ -206,22 +206,20 @@ type DindConfig struct {
 }
 
 // ResolvedAllowPrivileged returns whether privileged dind sibling
-// containers are allowed, applying the platform-aware default when the
-// operator hasn't set the key explicitly.
+// containers are allowed, applying the secure default when the operator
+// hasn't set the key explicitly.
 //
-// Default policy:
-//   - Windows / macOS host → true. The dind containerd backing store
-//     runs inside a VM that ephemerd manages (WSL2/Hyper-V on Windows,
-//     Vz on macOS), so the worst-case escape stays inside that VM.
-//   - Linux host → false. ephemerd runs directly on the host with no
-//     VM fence, so a privileged escape is bare-metal-host compromise.
-//     Operators that trust their workloads (e.g. internal CI for KIND
-//     tests) can opt in via `allow_privileged = true`.
+// Default policy: false on ALL platforms. Privileged is opt-in everywhere.
+// A privileged sibling container is effectively root on whatever host runs
+// the backing containerd, so shipping it on-by-default is unsafe even where
+// a VM fence limits the blast radius (Windows/macOS) — an operator that
+// needs it (KIND clusters, nested containerd, /dev/fuse) opts in explicitly
+// with `allow_privileged = true`.
 func (d *DindConfig) ResolvedAllowPrivileged() bool {
 	if d.AllowPrivileged != nil {
 		return *d.AllowPrivileged
 	}
-	return goruntime.GOOS != "linux"
+	return false
 }
 
 // DindCachePruneInterval returns the prune interval with the default
