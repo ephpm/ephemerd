@@ -73,11 +73,13 @@ type Config struct {
 	// and finally the runtime's host-aware default. Nil-safe.
 	RunnerImageForRepo func(repo, os string) string
 
-	MaxNativeMac     int                      // max concurrent native macOS jobs (default 4)
-	MacOSModeForRepo func(repo string) string // returns "native" or "vm" per repo (nil = always VM)
-	NativeMacUser    string                   // non-root user for native macOS runner processes
-	RunnerDir        string                   // path to extracted GHA runner binary dir (runner.Manager.Dir())
-	PrivateKeyPath   string                   // GitHub App private_key_path, denied read access in the native sandbox (empty for PAT auth)
+	MaxNativeMac      int                      // max concurrent native macOS jobs (default 4)
+	MacOSModeForRepo  func(repo string) string // returns "native" or "vm" per repo (nil = always VM)
+	NativeMacUser     string                   // non-root user for native macOS runner processes
+	NativeMacStrict   bool                     // opt-in deny-by-default sandbox for native macOS jobs
+	NativeMacMaxProcs int                      // ulimit -u for native macOS jobs (0 = unlimited; default 2048)
+	RunnerDir         string                   // path to extracted GHA runner binary dir (runner.Manager.Dir())
+	PrivateKeyPath    string                   // GitHub App private_key_path, denied read access in the native sandbox (empty for PAT auth)
 
 	Log *slog.Logger
 }
@@ -1117,6 +1119,8 @@ func (s *Scheduler) handleNativeMacOSJob(ctx context.Context, event providers.Jo
 	if s.cfg.NativeMacUser != "" {
 		nr.SetRunAsUser(s.cfg.NativeMacUser)
 	}
+	nr.SetSandboxStrict(s.cfg.NativeMacStrict)
+	nr.SetMaxProcesses(s.cfg.NativeMacMaxProcs)
 
 	var jobCtx context.Context
 	var cancel context.CancelFunc

@@ -29,7 +29,7 @@ func TestGenerateSandboxProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	profile := GenerateSandboxProfile(jobDir, dataDir, "")
+	profile := GenerateSandboxProfile(jobDir, dataDir, "", SandboxOptions{})
 
 	checks := []struct {
 		desc   string
@@ -59,7 +59,7 @@ func TestGenerateSandboxProfile(t *testing.T) {
 		{"re-allows job dir reads", `(allow file-read* (subpath "` + resolvedJob + `"))`},
 		{"re-allows job dir read-data", `(allow file-read-data (subpath "` + resolvedJob + `"))`},
 		{"allows job dir writes", `(allow file-write* (subpath "` + resolvedJob + `"))`},
-		{"allows /private/tmp writes", `(allow file-write* (subpath "/private/tmp"))`},
+		{"denies other process inspection (NATIVE-3)", `(deny process-info* (target others))`},
 	}
 
 	for _, c := range checks {
@@ -67,6 +67,40 @@ func TestGenerateSandboxProfile(t *testing.T) {
 			t.Errorf("sandbox profile missing %s: expected substring %q", c.desc, c.substr)
 		}
 	}
+
+	// NATIVE-5 (FIX B): the world-shared /private/tmp write allow must be
+	// gone. Jobs write scratch to TMPDIR=<jobDir>/tmp (under the job subtree).
+	if strings.Contains(profile, `(allow file-write* (subpath "/private/tmp"))`) {
+		t.Errorf("sandbox profile must NOT grant /private/tmp write (NATIVE-5), got:\n%s", profile)
+	}
+
+	// Default (non-strict) mode must remain allow-by-default so the parent's
+	// already-smoke-tested behavior is unchanged when sandbox_strict=false.
+	// Check the preamble LINE, since a comment legitimately says "(allow
+	// default)".
+	if !containsLine(profile, "(allow default)") {
+		t.Errorf("default-mode profile must be allow-by-default, got:\n%s", profile)
+	}
+	if containsLine(profile, "(deny default)") {
+		t.Errorf("default-mode profile must NOT be deny-by-default, got:\n%s", profile)
+	}
+}
+
+// containsLine reports whether any non-comment line of the profile, after
+// trimming whitespace, exactly equals want. Sandbox comments start with ";;",
+// so this distinguishes an actual rule from an explanatory comment that
+// happens to mention the same S-expression.
+func containsLine(profile, want string) bool {
+	for _, line := range strings.Split(profile, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, ";;") {
+			continue
+		}
+		if trimmed == want {
+			return true
+		}
+	}
+	return false
 }
 
 // TestGenerateSandboxProfile_ResolvesSymlinks pins the /var → /private/var
@@ -90,7 +124,7 @@ func TestGenerateSandboxProfile_ResolvesSymlinks(t *testing.T) {
 
 	// Generate using the SYMLINK path — the profile must contain the
 	// resolved target, and not rules pointing at the symlink.
-	profile := GenerateSandboxProfile(filepath.Join(linkData, "native", "j1"), linkData, "")
+	profile := GenerateSandboxProfile(filepath.Join(linkData, "native", "j1"), linkData, "", SandboxOptions{})
 
 	if !strings.Contains(profile, `(deny file-read-data (subpath "`+resolvedData+`/native"))`) {
 		t.Errorf("profile should deny the RESOLVED native path %q, got:\n%s", resolvedData, profile)
@@ -128,7 +162,7 @@ func TestGenerateSandboxProfile_PEMDenies(t *testing.T) {
 	}
 	resolvedPemDir := filepath.Dir(resolvedPem)
 
-	profile := GenerateSandboxProfile(jobDir, dataDir, pemPath)
+	profile := GenerateSandboxProfile(jobDir, dataDir, pemPath, SandboxOptions{})
 
 	wantLiteral := `(deny file-read* (literal "` + resolvedPem + `"))`
 	if !strings.Contains(profile, wantLiteral) {
@@ -151,7 +185,7 @@ func TestGenerateSandboxProfile_NoPEM(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	profile := GenerateSandboxProfile(jobDir, dataDir, "")
+	profile := GenerateSandboxProfile(jobDir, dataDir, "", SandboxOptions{})
 	if strings.Contains(profile, `(literal ""))`) {
 		t.Errorf("profile must not emit an empty literal deny when no PEM is set, got:\n%s", profile)
 	}
@@ -177,7 +211,7 @@ func TestGenerateSandboxProfile_JobHomeUnaffected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	profile := GenerateSandboxProfile(jobDir, dataDir, "")
+	profile := GenerateSandboxProfile(jobDir, dataDir, "", SandboxOptions{})
 
 	// The job dir (which contains home/) must be re-allowed for read+write,
 	// and must not sit under /Users so the /Users deny can't reach it.
@@ -283,4 +317,159 @@ func TestCopyRunnerFiles(t *testing.T) {
 	if info.Mode()&0o100 == 0 {
 		t.Error("run.sh should be executable")
 	}
+}
+
+// TestGenerateSandboxProfile_ProcessInfoDeny pins NATIVE-3 (FIX A): the
+// profile denies OTHER-process inspection so a sibling native job (same
+// _ephemerd uid) can't read the JIT credential from run.sh's argv via
+// ps/libproc. See the residual note in the profile: this does NOT close the
+// KERN_PROCARGS2 sysctl leak, which sandbox-exec cannot mediate.
+func TestGenerateSandboxProfile_ProcessInfoDeny(t *testing.T) {
+	base := t.TempDir()
+	dataDir := filepath.Join(base, "data")
+	jobDir := filepath.Join(dataDir, "native", "job123")
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	profile := GenerateSandboxProfile(jobDir, dataDir, "", SandboxOptions{})
+	if !strings.Contains(profile, `(deny process-info* (target others))`) {
+		t.Errorf("profile must deny other-process inspection (NATIVE-3), got:\n%s", profile)
+	}
+	// A blanket sysctl-read deny must NOT be present in default mode: it does
+	// not close the KERN_PROCARGS2 leak and breaks CPU-count detection. Only
+	// strict mode (which allows sysctl-read explicitly) may mention it.
+	if strings.Contains(profile, "(deny sysctl-read)") {
+		t.Errorf("default profile must not blanket-deny sysctl-read (breaks CPU detection), got:\n%s", profile)
+	}
+}
+
+// TestGenerateSandboxProfile_StrictMode pins NATIVE-2 (FIX D): strict mode
+// emits (deny default) and the core allow-list entries a GHA runner needs,
+// while default mode stays (allow default).
+func TestGenerateSandboxProfile_StrictMode(t *testing.T) {
+	base := t.TempDir()
+	dataDir := filepath.Join(base, "data")
+	jobDir := filepath.Join(dataDir, "native", "job123")
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resolvedJob, err := filepath.EvalSymlinks(jobDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	strict := GenerateSandboxProfile(jobDir, dataDir, "", SandboxOptions{
+		Strict:         true,
+		HomebrewPrefix: "/opt/homebrew",
+		DeveloperDir:   "/Library/Developer/CommandLineTools",
+	})
+
+	// Deny-by-default header. Check the preamble LINE (not a substring
+	// anywhere) because an explanatory comment elsewhere legitimately mentions
+	// "(allow default)".
+	if !containsLine(strict, "(deny default)") {
+		t.Errorf("strict profile must be deny-by-default, got:\n%s", strict)
+	}
+	if containsLine(strict, "(allow default)") {
+		t.Errorf("strict profile must NOT emit (allow default) as a rule, got:\n%s", strict)
+	}
+
+	// Core allow-list entries the runner + toolchain need.
+	wants := []string{
+		`(subpath "/usr")`,
+		`(subpath "/System")`,
+		`(subpath "/opt/homebrew")`,
+		`(subpath "/Library/Developer/CommandLineTools")`,
+		`(allow file-read* file-write* (subpath "` + resolvedJob + `"))`,
+		`(allow process-fork)`,
+		`(allow process-exec)`,
+		`(allow network-outbound)`,
+		`(allow sysctl-read)`,
+		`(allow mach-lookup)`,
+	}
+	for _, w := range wants {
+		if !strings.Contains(strict, w) {
+			t.Errorf("strict profile missing allow-list entry %q, got:\n%s", w, strict)
+		}
+	}
+
+	// Tier-1/tier-2 denies must still layer on top in strict mode.
+	for _, deny := range []string{
+		`(deny process-info* (target others))`,
+		`(deny file-write* (subpath "/Users"))`,
+		`(deny network-bind (local ip "*:*"))`,
+	} {
+		if !strings.Contains(strict, deny) {
+			t.Errorf("strict profile missing layered deny %q, got:\n%s", deny, strict)
+		}
+	}
+}
+
+// TestGenerateSandboxProfile_StrictNoEmptyDeveloperDir guards against an
+// empty DEVELOPER_DIR producing (subpath "") which would match everything and
+// silently defeat deny-by-default.
+func TestGenerateSandboxProfile_StrictNoEmptyDeveloperDir(t *testing.T) {
+	base := t.TempDir()
+	dataDir := filepath.Join(base, "data")
+	jobDir := filepath.Join(dataDir, "native", "job123")
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	strict := GenerateSandboxProfile(jobDir, dataDir, "", SandboxOptions{Strict: true})
+	if strings.Contains(strict, `(subpath ""))`) {
+		t.Errorf("strict profile must not emit an empty subpath allow, got:\n%s", strict)
+	}
+}
+
+// TestBuildLaunchArgs pins NATIVE-6 (FIX C): the runner is launched under a
+// shell that applies ulimit -u BEFORE exec'ing sandbox-exec, and the
+// profile/jitConfig are passed as positional args (not interpolated into the
+// script body) so a jitConfig with shell metacharacters can't break out.
+func TestBuildLaunchArgs(t *testing.T) {
+	const profile = "/data/native/42/sandbox.sb"
+	const jit = "eyJib2d1cyI6InZhbHVlIn0="
+
+	t.Run("with process limit", func(t *testing.T) {
+		name, args := buildLaunchArgs(profile, jit, 2048)
+		if name != "/bin/sh" {
+			t.Fatalf("launch name = %q, want /bin/sh", name)
+		}
+		if len(args) < 5 || args[0] != "-c" {
+			t.Fatalf("args = %v, want -c <script> <label> <profile> <jit>", args)
+		}
+		script := args[1]
+		if !strings.Contains(script, "ulimit -u 2048; ") {
+			t.Errorf("script missing ulimit prefix, got: %q", script)
+		}
+		if !strings.Contains(script, `exec sandbox-exec -f "$1" ./run.sh --jitconfig "$2"`) {
+			t.Errorf("script missing sandbox-exec exec line, got: %q", script)
+		}
+		// profile and jit are passed positionally as $1/$2, NOT interpolated.
+		if args[len(args)-2] != profile || args[len(args)-1] != jit {
+			t.Errorf("profile/jit not passed positionally: %v", args)
+		}
+		if strings.Contains(script, jit) || strings.Contains(script, profile) {
+			t.Errorf("script body must not interpolate profile/jit (injection risk): %q", script)
+		}
+	})
+
+	t.Run("no memory or cpu-time limit by default", func(t *testing.T) {
+		_, args := buildLaunchArgs(profile, jit, 2048)
+		script := args[1]
+		if strings.Contains(script, "ulimit -v") || strings.Contains(script, "ulimit -t") {
+			t.Errorf("default launch must not set -v/-t (too easy to kill heavy builds): %q", script)
+		}
+	})
+
+	t.Run("unlimited when maxProc is zero", func(t *testing.T) {
+		_, args := buildLaunchArgs(profile, jit, 0)
+		script := args[1]
+		if strings.Contains(script, "ulimit -u") {
+			t.Errorf("maxProc=0 must not set a ulimit, got: %q", script)
+		}
+		if !strings.Contains(script, "exec sandbox-exec") {
+			t.Errorf("script must still exec sandbox-exec, got: %q", script)
+		}
+	})
 }

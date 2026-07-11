@@ -544,6 +544,38 @@ type MacOSRunnerConfig struct {
 	MaxNative int               `toml:"max_native"` // max concurrent native jobs (default 4)
 	User      string            `toml:"user"`       // existing user for native runners (empty = ephemeral per-job user, recommended)
 	Repos     map[string]string `toml:"repos"`      // "org/repo" -> "vm" or "native"
+
+	// SandboxStrict switches the native sandbox profile from allow-by-default
+	// (deny-list) to deny-by-default (allow-list). Default false. Strict mode
+	// is a much stronger posture but requires enumerating every path a GHA
+	// runner + toolchain legitimately touches, so it is opt-in and needs a
+	// live smoke test on the target host before enabling.
+	SandboxStrict bool `toml:"sandbox_strict"`
+
+	// MaxProcesses caps the number of processes (ulimit -u) a native job may
+	// spawn, providing fork-bomb defense. Default 2048 (generous — clang/php
+	// fork heavily). 0 = unlimited (no ulimit set). Note: macOS has no
+	// cgroups, so RAM and disk cannot be hard-capped on the native path; use
+	// the VM path for untrusted memory/disk DoS resistance.
+	MaxProcesses *int `toml:"max_processes"`
+}
+
+// ResolvedMaxProcesses returns the ulimit -u value for native jobs.
+// Unset (nil) defaults to 2048. An explicit 0 means unlimited (return 0 so
+// the caller skips the ulimit). A negative value is treated as unlimited.
+func (m *MacOSRunnerConfig) ResolvedMaxProcesses() int {
+	if m == nil || m.MaxProcesses == nil {
+		return 2048
+	}
+	if *m.MaxProcesses < 0 {
+		return 0
+	}
+	return *m.MaxProcesses
+}
+
+// StrictSandbox reports whether deny-by-default sandbox mode is enabled.
+func (m *MacOSRunnerConfig) StrictSandbox() bool {
+	return m != nil && m.SandboxStrict
 }
 
 // ModeForRepo returns "native" or "vm" for the given repo. Resolution order:

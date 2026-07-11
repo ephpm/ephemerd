@@ -644,6 +644,8 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		MaxNativeMac:       cfg.Runner.MacOS.ResolvedMaxNative(),
 		MacOSModeForRepo:   cfg.Runner.MacOS.ModeForRepo,
 		NativeMacUser:      cfg.Runner.MacOS.User,
+		NativeMacStrict:    cfg.Runner.MacOS.StrictSandbox(),
+		NativeMacMaxProcs:  cfg.Runner.MacOS.ResolvedMaxProcesses(),
 		RunnerDir:          rm.Dir(),
 		PrivateKeyPath:     cfg.GitHub.PrivateKeyPath,
 		Retry:              retryCfg,

@@ -19,6 +19,12 @@ func New(_, _, _, _, _ string, _ *slog.Logger) (*Runner, error) {
 // SetRunAsUser is a stub on non-darwin platforms.
 func (r *Runner) SetRunAsUser(_ string) {}
 
+// SetSandboxStrict is a stub on non-darwin platforms.
+func (r *Runner) SetSandboxStrict(_ bool) {}
+
+// SetMaxProcesses is a stub on non-darwin platforms.
+func (r *Runner) SetMaxProcesses(_ int) {}
+
 // Start is a stub on non-darwin platforms.
 func (r *Runner) Start(_ context.Context) error {
 	return fmt.Errorf("native macOS runner is only supported on darwin")

@@ -62,7 +62,9 @@ func (m *darwinMacOSVM) WriteJITConfig(encodedJIT string) error {
 		return fmt.Errorf("creating job directory: %w", err)
 	}
 	jitPath := filepath.Join(m.jobDir, ".jit_config")
-	if err := os.WriteFile(jitPath, []byte(encodedJIT), 0o644); err != nil {
+	// MACVM-1: the JIT config is a runner registration credential blob; keep
+	// it owner-only on the host before the guest picks it up (was 0644).
+	if err := os.WriteFile(jitPath, []byte(encodedJIT), 0o600); err != nil {
 		return fmt.Errorf("writing JIT config: %w", err)
 	}
 
@@ -415,7 +417,6 @@ func (m *darwinMacOSVM) discoverIP() (string, error) {
 	return "", fmt.Errorf("MAC %s not found in ARP table", m.macAddr)
 }
 
-
 func (m *darwinMacOSVM) Wait(ctx context.Context) (int, error) {
 	// The macOS VM stays alive after the runner process exits (unlike
 	// containers which exit with PID 1). Poll via SSH to detect when
@@ -557,7 +558,9 @@ func (m *darwinMacOSVM) injectRunnerIntoClone(ctx context.Context) error {
 	if err := os.MkdirAll(jitDir, 0o755); err != nil {
 		return fmt.Errorf("creating JIT dir: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(jitDir, ".jit_config"), jitData, 0o644); err != nil {
+	// MACVM-2: JIT config is a credential blob; owner-only inside the mounted
+	// clone as well (was 0644).
+	if err := os.WriteFile(filepath.Join(jitDir, ".jit_config"), jitData, 0o600); err != nil {
 		return fmt.Errorf("writing JIT config: %w", err)
 	}
 
