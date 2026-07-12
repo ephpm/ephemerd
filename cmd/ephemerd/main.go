@@ -585,7 +585,16 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		}
 	default:
 		var err error
-		tunnelProvider, err = tunnel.New(cfg.Webhook.Tunnel, cfg.Webhook.NgrokAuthtoken, cfg.Webhook.TunnelURL)
+		tunnelProvider, err = tunnel.New(tunnel.Options{
+			Provider:            cfg.Webhook.Tunnel,
+			NgrokAuthtoken:      cfg.Webhook.NgrokAuthtoken,
+			LocalTunnelBaseURL:  cfg.Webhook.TunnelURL,
+			CloudflaredToken:    cfg.Webhook.CloudflaredToken,
+			CloudflaredHostname: cfg.Webhook.CloudflaredHostname,
+			CloudflaredVersion:  cfg.Webhook.CloudflaredVersion,
+			CloudflaredDataDir:  configDir,
+			CloudflaredPort:     cfg.Webhook.Port,
+		})
 		if err != nil {
 			return fmt.Errorf("creating tunnel provider: %w", err)
 		}

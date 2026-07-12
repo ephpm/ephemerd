@@ -27,6 +27,17 @@ owner = "your-org"
 # tunnel = "ngrok"
 # ngrok_authtoken = "your_ngrok_token"   # or set NGROK_AUTHTOKEN env var
 
+# To use a Cloudflare Tunnel (requires a Cloudflare zone):
+# Create the tunnel + DNS route in the Cloudflare dashboard (or via API),
+# then give ephemerd the tunnel token and the public hostname. Ephemerd
+# downloads the cloudflared binary into its data dir, runs it as a managed
+# subprocess bound to ephemerd's lifetime, and auto-registers the GitHub
+# webhook at https://<hostname>/webhook/github.
+# tunnel = "cloudflared"
+# cloudflared_token = "eyJhIjoi..."          # or set CLOUDFLARE_TUNNEL_TOKEN env var
+# cloudflared_hostname = "ci.example.com"    # public FQDN routed to the tunnel
+# cloudflared_version = "2026.6.1"           # optional; pinned download version
+
 # To use direct TLS instead of a tunnel (VPS with a public IP):
 # tunnel = "none"
 # tls_cert = "/etc/ephemerd/tls.crt"

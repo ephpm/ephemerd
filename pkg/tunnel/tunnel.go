@@ -18,14 +18,42 @@ type Provider interface {
 	PublicURL() string
 }
 
-// New creates a tunnel provider from config.
-func New(provider, authtoken, baseURL string) (Provider, error) {
-	switch provider {
+// Options are the union of settings any provider might need. Fields
+// unused by the chosen provider are ignored — this keeps the constructor
+// signature stable as new providers land.
+type Options struct {
+	Provider string // "ngrok" | "localtunnel" | "cloudflared"
+
+	// ngrok
+	NgrokAuthtoken string
+
+	// localtunnel
+	LocalTunnelBaseURL string
+
+	// cloudflared
+	CloudflaredToken    string
+	CloudflaredHostname string
+	CloudflaredVersion  string
+	CloudflaredDataDir  string // <ephemerd data dir> — provider carves out cloudflared/ under this
+	CloudflaredPort     int    // local webhook port cloudflared forwards to
+}
+
+// New creates a tunnel provider from the options.
+func New(o Options) (Provider, error) {
+	switch o.Provider {
 	case "ngrok":
-		return NewNgrok(authtoken)
+		return NewNgrok(o.NgrokAuthtoken)
 	case "localtunnel":
-		return NewLocalTunnel(baseURL), nil
+		return NewLocalTunnel(o.LocalTunnelBaseURL), nil
+	case "cloudflared":
+		return NewCloudflared(CloudflaredOptions{
+			Token:    o.CloudflaredToken,
+			Hostname: o.CloudflaredHostname,
+			Version:  o.CloudflaredVersion,
+			DataDir:  o.CloudflaredDataDir,
+			Port:     o.CloudflaredPort,
+		})
 	default:
-		return nil, fmt.Errorf("unknown tunnel provider: %q (supported: ngrok, localtunnel)", provider)
+		return nil, fmt.Errorf("unknown tunnel provider: %q (supported: ngrok, localtunnel, cloudflared)", o.Provider)
 	}
 }
