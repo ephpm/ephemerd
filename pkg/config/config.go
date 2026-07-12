@@ -128,6 +128,16 @@ type WebhookConfig struct {
 	CloudflaredToken    string `toml:"cloudflared_token"`    // tunnel run token (or use CLOUDFLARE_TUNNEL_TOKEN env)
 	CloudflaredHostname string `toml:"cloudflared_hostname"` // public FQDN of the tunnel (e.g. "runner.example.com"); required for GitHub webhook registration
 	CloudflaredVersion  string `toml:"cloudflared_version"`  // pinned cloudflared release (e.g. "2026.6.1"); defaults to a known-good version if empty
+
+	// Pool marks this instance as one member of a pool of ephemerd nodes
+	// sharing a single public webhook URL (e.g. cloudflared tunnel replicas
+	// behind one hostname). In pool mode webhook registration is
+	// adopt-or-create (an existing hook with the same URL is converged, not
+	// duplicated), the hook is never deregistered on shutdown (pool-mates
+	// still need it), and the startup stale-hook sweep is skipped (it cannot
+	// tell a pool-mate's live hook from a stale one). Requires an explicit
+	// shared webhook.secret — every pool member must present the same one.
+	Pool bool `toml:"pool"`
 }
 
 // NetworkConfig configures container networking.
@@ -924,6 +934,13 @@ func (c *Config) validate() error {
 	//     webhook itself, so a random secret is fine when none is provided.
 	//   - "none": polling (or external ingress with an explicit secret); nothing
 	//     to generate.
+	// Pool mode shares one webhook (and its HMAC secret) across many nodes.
+	// An auto-generated secret would differ per node and break signature
+	// verification on every member except whichever registered the hook.
+	if c.Webhook.Pool && c.Webhook.Secret == "" {
+		return fmt.Errorf(`webhook.secret is required when webhook.pool = true (every pool member must share the same secret)`)
+	}
+
 	switch c.Webhook.Tunnel {
 	case "external":
 		if c.Webhook.Secret == "" {
