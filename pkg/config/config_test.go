@@ -2247,3 +2247,27 @@ func TestOrphanSweepGrace(t *testing.T) {
 		})
 	}
 }
+
+func TestResolvedReconcileInterval(t *testing.T) {
+	cases := []struct {
+		in   string
+		want time.Duration
+	}{
+		{"", 30 * time.Minute},         // default (backstop only; event-driven self-heal is primary)
+		{"2m", 2 * time.Minute},        // custom
+		{"90s", 90 * time.Second},      // custom
+		{"garbage", 30 * time.Minute},  // unparseable -> default
+		{"0s", 0},                      // explicit disable
+		{"-1m", 0},                     // negative -> disabled
+	}
+	for _, c := range cases {
+		w := &WebhookConfig{ReconcileInterval: c.in}
+		if got := w.ResolvedReconcileInterval(); got != c.want {
+			t.Errorf("ResolvedReconcileInterval(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+	// nil-safe
+	if got := (*WebhookConfig)(nil).ResolvedReconcileInterval(); got != 30*time.Minute {
+		t.Errorf("nil ResolvedReconcileInterval() = %v, want 30m", got)
+	}
+}

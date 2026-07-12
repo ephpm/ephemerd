@@ -138,6 +138,36 @@ type WebhookConfig struct {
 	// tell a pool-mate's live hook from a stale one). Requires an explicit
 	// shared webhook.secret — every pool member must present the same one.
 	Pool bool `toml:"pool"`
+
+	// ReconcileInterval controls the webhook-mode reconcile sweep: how often
+	// ephemerd re-runs the catch-up poll to pick up jobs that got stranded.
+	//
+	// This is a LAST-RESORT backstop only for genuinely DROPPED webhook
+	// deliveries (network/tunnel loss where GitHub's own redelivery also
+	// missed us). The common stranding case — a fungibly-reassigned runner
+	// leaving its dispatched job queued — is now healed instantly and
+	// event-drivenly by the scheduler on runner exit, without polling. So this
+	// runs at a low frequency: empty = default 30m; a zero/negative duration
+	// disables it entirely (relying purely on the event-driven path + GitHub's
+	// delivery retries).
+	ReconcileInterval string `toml:"reconcile_interval"`
+}
+
+// ResolvedReconcileInterval returns the webhook-mode reconcile sweep interval:
+// 30m by default (empty or unparseable), the parsed value otherwise, and 0
+// (disabled) only when explicitly set to a zero/negative duration.
+func (w *WebhookConfig) ResolvedReconcileInterval() time.Duration {
+	if w == nil || w.ReconcileInterval == "" {
+		return 30 * time.Minute
+	}
+	d, err := time.ParseDuration(w.ReconcileInterval)
+	if err != nil {
+		return 30 * time.Minute
+	}
+	if d < 0 {
+		return 0
+	}
+	return d
 }
 
 // NetworkConfig configures container networking.

@@ -645,6 +645,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		MaxMacOSVMs:        cfg.VM.MacOS.MaxConcurrent,
 		Labels:             cfg.Runner.ExtraLabels,
 		PollInterval:       pollInterval(cfg),
+		ReconcileInterval:  cfg.Webhook.ResolvedReconcileInterval(),
 		WebhookPort:        cfg.Webhook.Port,
 		WebhookSecret:      cfg.Webhook.Secret,
 		TLSCert:            cfg.Webhook.TLSCert,
