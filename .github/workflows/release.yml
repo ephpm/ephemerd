@@ -23,8 +23,22 @@ env:
   GO_VERSION: "1.26.1"
 
 jobs:
+  # Cheap gate: reject malformed tags before burning four platform builds.
+  # Allows vX.Y.Z plus prerelease suffixes (v0.0.0-test1) for rehearsals.
+  validate:
+    name: Validate tag
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Check tag format
+        run: |
+          if ! echo "${GITHUB_REF_NAME}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
+            echo "tag '${GITHUB_REF_NAME}' is not vX.Y.Z[-suffix]; refusing to release"
+            exit 1
+          fi
+
   build-linux-amd64:
     name: Build (Linux amd64)
+    needs: validate
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v6
@@ -36,11 +50,21 @@ jobs:
         run: /opt/ephemerd-ci/entrypoint-cache.sh
         continue-on-error: true
 
+      # The image cache may hold a runner tarball from an older pin
+      # (Dockerfile ARG vs mage/download/download.go). go:embed picks up
+      # every tarball in the dir, so a stale one would bloat the release
+      # binary by ~100 MB. Drop them and let mage fetch the pinned version.
+      - name: Purge stale runner tarballs from cache
+        run: rm -f pkg/runner/embed/actions-runner-*.tar.gz
+
       - name: Build Linux amd64 binary
         run: mage build:build
 
       - name: Verify binary
-        run: ./ephemerd --version
+        run: |
+          ./ephemerd --version
+          ./ephemerd --version | grep -F "${GITHUB_REF_NAME}" || {
+            echo "stamped version does not match tag ${GITHUB_REF_NAME}"; exit 1; }
 
       - name: Package
         run: tar -czf "ephemerd_${GITHUB_REF_NAME}_linux_amd64.tar.gz" ephemerd
@@ -53,6 +77,7 @@ jobs:
 
   build-linux-arm64:
     name: Build (Linux arm64)
+    needs: validate
     runs-on: [self-hosted, linux, arm64]
     steps:
       - uses: actions/checkout@v6
@@ -70,7 +95,10 @@ jobs:
         run: mage build:build
 
       - name: Verify binary
-        run: ./ephemerd --version
+        run: |
+          ./ephemerd --version
+          ./ephemerd --version | grep -F "${GITHUB_REF_NAME}" || {
+            echo "stamped version does not match tag ${GITHUB_REF_NAME}"; exit 1; }
 
       - name: Package
         run: tar -czf "ephemerd_${GITHUB_REF_NAME}_linux_arm64.tar.gz" ephemerd
@@ -83,6 +111,7 @@ jobs:
 
   build-windows-amd64:
     name: Build (Windows amd64)
+    needs: validate
     runs-on: [self-hosted, windows, x64]
     steps:
       - uses: actions/checkout@v6
@@ -107,7 +136,12 @@ jobs:
         run: mage build:windows
 
       - name: Verify binary
-        run: .\ephemerd.exe --version
+        run: |
+          .\ephemerd.exe --version
+          if (-not ((.\ephemerd.exe --version) -match [regex]::Escape($env:GITHUB_REF_NAME))) {
+            Write-Error "stamped version does not match tag $env:GITHUB_REF_NAME"
+            exit 1
+          }
 
       - name: Package
         run: Compress-Archive -Path .\ephemerd.exe -DestinationPath "ephemerd_${env:GITHUB_REF_NAME}_windows_amd64.zip" -Force
@@ -120,6 +154,7 @@ jobs:
 
   build-darwin-arm64:
     name: Build (macOS arm64)
+    needs: validate
     runs-on: [self-hosted, macos, arm64]
     steps:
       - uses: actions/checkout@v6
@@ -142,6 +177,8 @@ jobs:
       - name: Verify binary
         run: |
           ./ephemerd --version
+          ./ephemerd --version | grep -F "${GITHUB_REF_NAME}" || {
+            echo "stamped version does not match tag ${GITHUB_REF_NAME}"; exit 1; }
           codesign -v ./ephemerd && echo "codesigned" || echo "NOT codesigned"
 
       - name: Package
@@ -178,13 +215,15 @@ jobs:
           sha256sum * > checksums.txt
           cat checksums.txt
 
+      # softprops/action-gh-release talks to the Releases API directly —
+      # no gh CLI dependency on the runner image. Draft stays on as the
+      # manual publish gate; prerelease only for suffixed tags (v0.0.0-rc1)
+      # so a published vX.Y.Z takes the releases/latest slot.
       - name: Create draft release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --draft \
-            --prerelease \
-            --generate-notes \
-            --title "${GITHUB_REF_NAME}" \
-            dist/*
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          name: ${{ github.ref_name }}
+          files: dist/*

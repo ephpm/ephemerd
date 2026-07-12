@@ -13,7 +13,7 @@
 FROM ghcr.io/actions/actions-runner:latest
 
 # Pinned versions — keep in sync with mage/download/download.go
-ARG RUNNER_VERSION=2.333.1
+ARG RUNNER_VERSION=2.335.1
 ARG CNI_VERSION=1.6.2
 ARG CONTAINERD_VERSION=2.2.2
 ARG RUNC_VERSION=1.3.4
