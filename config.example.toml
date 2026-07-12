@@ -16,6 +16,11 @@ owner = "your-org"
 # repos = ["repo1", "repo2"]
 
 [webhook]
+# Webhook-mode reconcile sweep: how often ephemerd re-runs the catch-up poll to
+# pick up jobs stranded by fungible-runner churn or a missed/deduped webhook
+# delivery. Low-frequency safety net (webhooks are the primary path), so it
+# costs far fewer API calls than continuous polling. Default 5m; "0s" disables.
+# reconcile_interval = "5m"
 # By default, ephemerd polls the GitHub API every 10s for new jobs.
 # No inbound ports or tunnels required.
 

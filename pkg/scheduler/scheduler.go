@@ -27,22 +27,23 @@ import (
 
 // Config for the scheduler.
 type Config struct {
-	Runtime          *runtime.Runtime
-	Providers        []providers.Provider
-	Artifacts        *artifacts.Extractor // OCI image layer extractor for macOS VM jobs (nil if not available)
-	LinuxDispatcher  *DispatchClient      // if non-nil, Linux jobs are dispatched to a Linux VM worker via gRPC
-	MacOSVMConfig    *vm.MacOSVMConfig    // if non-nil, macOS-native jobs are enabled (darwin only)
-	DataDir          string               // ephemerd data directory (used for artifact extraction paths)
-	MaxConcurrent    int
-	MaxMacOSVMs      int // max concurrent macOS VMs (Vz limit; default auto-detected)
-	Labels           []string
-	PollInterval     time.Duration   // if >0, use polling mode (default)
-	WebhookPort      int             // listen port for health/webhook server
-	WebhookSecret    string          // webhook signature secret
-	TLSCert          string          // TLS certificate path
-	TLSKey           string          // TLS private key path
-	Tunnel           tunnel.Provider // if non-nil, creates a public tunnel for webhooks
-	TunnelMaxRetries int             // max consecutive reconnect failures before fallback to polling (0 = default 5)
+	Runtime           *runtime.Runtime
+	Providers         []providers.Provider
+	Artifacts         *artifacts.Extractor // OCI image layer extractor for macOS VM jobs (nil if not available)
+	LinuxDispatcher   *DispatchClient      // if non-nil, Linux jobs are dispatched to a Linux VM worker via gRPC
+	MacOSVMConfig     *vm.MacOSVMConfig    // if non-nil, macOS-native jobs are enabled (darwin only)
+	DataDir           string               // ephemerd data directory (used for artifact extraction paths)
+	MaxConcurrent     int
+	MaxMacOSVMs       int // max concurrent macOS VMs (Vz limit; default auto-detected)
+	Labels            []string
+	PollInterval      time.Duration   // if >0, use polling mode (default)
+	ReconcileInterval time.Duration   // webhook mode: periodic catch-up sweep for stranded jobs (0 = disabled)
+	WebhookPort       int             // listen port for health/webhook server
+	WebhookSecret     string          // webhook signature secret
+	TLSCert           string          // TLS certificate path
+	TLSKey            string          // TLS private key path
+	Tunnel            tunnel.Provider // if non-nil, creates a public tunnel for webhooks
+	TunnelMaxRetries  int             // max consecutive reconnect failures before fallback to polling (0 = default 5)
 
 	// ExternalURL is the public base URL of an externally-managed tunnel
 	// (tunnel = "external"). When set alongside webhook mode and NO managed
@@ -612,6 +613,18 @@ func (s *Scheduler) Run(ctx context.Context) error {
 				s.cfg.Log.Warn("startup poll failed", "provider", name, "error", err)
 			}
 		}()
+	}
+
+	// Webhook mode has no continuous poll, so a job that gets stranded — the
+	// runner it was dispatched for exited having been handed a sibling's job
+	// (same-label JIT runners are fungible), or its "queued" webhook was missed
+	// or deduped — would otherwise sit queued forever. Re-run the catch-up poll
+	// periodically as a low-frequency safety net. Swept jobs still flow through
+	// handleQueued's seen/running/zombie/canHandle checks, so anything already
+	// running or recently handled is skipped (no double-provision), and a
+	// genuinely undispatchable job still hits the zombie cap and stops.
+	if useWebhook && s.cfg.ReconcileInterval > 0 {
+		go s.runReconcileLoop(ctx)
 	}
 
 	// Record the discovery mode: the orphaned-runner sweep is only safe
@@ -1821,6 +1834,41 @@ func (s *Scheduler) retryHandler(ctx context.Context, event providers.JobEvent) 
 	rctx := context.WithValue(ctx, retryAttemptCtxKey{}, &claimErr)
 	s.handleQueued(rctx, event)
 	return claimErr
+}
+
+// runReconcileLoop periodically re-runs each provider's catch-up poll while in
+// webhook mode, so stranded jobs (fungible-runner churn, or a missed/deduped
+// delivery) get re-provisioned rather than sitting queued forever. It is a
+// low-frequency safety net; the per-job seen/running/zombie/canHandle checks in
+// handleQueued still gate every swept job, so there is no double-provision.
+func (s *Scheduler) runReconcileLoop(ctx context.Context) {
+	var catchers []providers.Provider
+	for _, p := range s.cfg.Providers {
+		if _, ok := p.(interface{ CatchUpPoll(context.Context) error }); ok {
+			catchers = append(catchers, p)
+		}
+	}
+	if len(catchers) == 0 {
+		return
+	}
+	s.cfg.Log.Info("webhook reconcile poll enabled", "interval", s.cfg.ReconcileInterval)
+	ticker := time.NewTicker(s.cfg.ReconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, p := range catchers {
+				catcher := p.(interface{ CatchUpPoll(context.Context) error })
+				if err := catcher.CatchUpPoll(ctx); err != nil {
+					s.cfg.Log.Warn("reconcile poll failed", "provider", p.Name(), "error", err)
+					continue
+				}
+				s.cfg.Log.Debug("reconcile poll: swept queued jobs", "provider", p.Name())
+			}
+		}
+	}
 }
 
 // buildLabelsForOS builds runner labels for a given target OS.

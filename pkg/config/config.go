@@ -138,6 +138,32 @@ type WebhookConfig struct {
 	// tell a pool-mate's live hook from a stale one). Requires an explicit
 	// shared webhook.secret — every pool member must present the same one.
 	Pool bool `toml:"pool"`
+
+	// ReconcileInterval controls the webhook-mode reconcile sweep: how often
+	// ephemerd re-runs the catch-up poll to pick up jobs that got stranded
+	// (fungible-runner churn consuming the work, or a missed/deduped webhook
+	// delivery) instead of leaving them queued forever. This is a low-frequency
+	// SAFETY NET, not the primary path (webhooks are), so it costs far fewer API
+	// calls than continuous polling. Empty = default 5m; a zero/negative
+	// duration disables it.
+	ReconcileInterval string `toml:"reconcile_interval"`
+}
+
+// ResolvedReconcileInterval returns the webhook-mode reconcile sweep interval:
+// 5m by default (empty or unparseable), the parsed value otherwise, and 0
+// (disabled) only when explicitly set to a zero/negative duration.
+func (w *WebhookConfig) ResolvedReconcileInterval() time.Duration {
+	if w == nil || w.ReconcileInterval == "" {
+		return 5 * time.Minute
+	}
+	d, err := time.ParseDuration(w.ReconcileInterval)
+	if err != nil {
+		return 5 * time.Minute
+	}
+	if d < 0 {
+		return 0
+	}
+	return d
 }
 
 // NetworkConfig configures container networking.
