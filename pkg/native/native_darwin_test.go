@@ -473,3 +473,24 @@ func TestBuildLaunchArgs(t *testing.T) {
 		}
 	})
 }
+
+// TestStrictProfile_ToolchainAllowsResolved guards the two fixes that make
+// strict mode actually usable (validated live against clang/curl/git):
+//   - /etc must be the RESOLVED /private/etc (curl/openssl reads
+//     /private/etc/ssl/openssl.cnf; a bare "/etc" allow matches nothing
+//     because the sandbox matches kernel paths).
+//   - /private/var/folders (DARWIN_USER_CACHE_DIR) must be read+write or
+//     clang/xcrun fail with "couldn't create cache file".
+func TestStrictProfile_ToolchainAllowsResolved(t *testing.T) {
+	p := GenerateSandboxProfile("/var/lib/ephemerd/native/j1", "/var/lib/ephemerd", "",
+		SandboxOptions{Strict: true, HomebrewPrefix: "/opt/homebrew", DeveloperDir: "/Library/Developer/CommandLineTools"})
+	if !strings.Contains(p, `(subpath "/private/etc")`) {
+		t.Error("strict profile must allow the RESOLVED /private/etc (curl/openssl)")
+	}
+	if strings.Contains(p, `  (subpath "/etc")`) {
+		t.Error("strict profile must NOT use the unresolved /etc (symlink matches nothing)")
+	}
+	if !strings.Contains(p, `(allow file-read* file-write* (subpath "/private/var/folders"))`) {
+		t.Error("strict profile must allow read+write to /private/var/folders (toolchain cache)")
+	}
+}

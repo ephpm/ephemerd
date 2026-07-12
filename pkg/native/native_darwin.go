@@ -729,9 +729,20 @@ func strictPreamble(absJobDir string, opts SandboxOptions) string {
   (subpath "/Library")
   (subpath "/Applications")
   (subpath "/private/var/select")
-  (subpath "/etc")
+  (subpath "/private/etc")
   (subpath "%[1]s"))
 %[2]s
+;; NOTE: use the RESOLVED /private/etc, not /etc. /etc is a symlink to
+;; /private/etc and the sandbox matches kernel (resolved) paths, so an
+;; "/etc" allow silently matches nothing — which broke curl/openssl
+;; (fopen /private/etc/ssl/openssl.cnf -> "Operation not permitted").
+;;
+;; Toolchain per-user cache (DARWIN_USER_CACHE_DIR): clang, xcrun and
+;; friends write their module/compile cache under /var/folders/...
+;; (resolved /private/var/folders) regardless of TMPDIR. Without this,
+;; clang fails with "couldn't create cache file" and compilation dies.
+(allow file-read* file-write* (subpath "/private/var/folders"))
+
 ;; Per-job workspace: full read+write (home, tmp, work, runner, keychain,
 ;; and TMPDIR which lives under it). The main body re-allows this too; it
 ;; is repeated here so deny-default does not swallow it before those rules.
