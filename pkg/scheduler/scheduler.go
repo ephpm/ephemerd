@@ -43,9 +43,18 @@ type Config struct {
 	TLSKey           string          // TLS private key path
 	Tunnel           tunnel.Provider // if non-nil, creates a public tunnel for webhooks
 	TunnelMaxRetries int             // max consecutive reconnect failures before fallback to polling (0 = default 5)
-	JobTimeout       time.Duration
-	ShutdownTimeout  time.Duration
-	LogRetention     time.Duration // max age for job log files (default 7d)
+
+	// ExternalURL is the public base URL of an externally-managed tunnel
+	// (tunnel = "external"). When set alongside webhook mode and NO managed
+	// Tunnel, the scheduler registers each webhook-capable provider's hook to
+	// <ExternalURL>/webhook/<provider> on startup, so the operator doesn't
+	// have to hand-add a hook per repo. External hooks are operator-owned and
+	// are NOT deregistered on shutdown. Empty means "receiver only, don't
+	// touch the platform's webhooks".
+	ExternalURL     string
+	JobTimeout      time.Duration
+	ShutdownTimeout time.Duration
+	LogRetention    time.Duration // max age for job log files (default 7d)
 
 	// Retry configures the claim/provision retry queue. When the initial
 	// attempt to claim a queued job fails with a retryable error
@@ -507,6 +516,28 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		}()
 	}
 	defer func() { _ = server.Shutdown(context.Background()) }()
+
+	// External-tunnel webhook auto-registration.
+	//
+	// With a managed tunnel (Tunnel != nil) the block above already registered
+	// hooks against the tunnel's own PublicURL(). The "external" mode has no
+	// managed tunnel — ingress is fronted by something else (e.g. a Cloudflare
+	// tunnel on another host) — so ephemerd historically only served the
+	// receiver and left the operator to hand-add a hook per repo. When
+	// ExternalURL is configured we register each webhook-capable provider's
+	// hook to <ExternalURL>/webhook/<provider> here instead, mirroring the
+	// managed-tunnel block but using the configured URL.
+	//
+	// Two deliberate differences from the managed path:
+	//   - Registration failure does NOT abort startup. The receiver is already
+	//     serving; the operator can still add hooks by hand, so we log a WARN
+	//     and continue rather than returning an error.
+	//   - We do NOT deregister on shutdown. External hooks are operator-owned
+	//     and must persist across restarts (unlike the managed tunnel's
+	//     ephemeral hooks, which serveTunnelWithReconnect tears down).
+	if s.cfg.Tunnel == nil && useWebhook && s.cfg.ExternalURL != "" {
+		s.registerExternalWebhooks(ctx, whProviders)
+	}
 
 	// Start polling for all poll-capable providers (those not using webhooks,
 	// or all of them when webhook mode is off).
@@ -1832,6 +1863,33 @@ const (
 	tunnelMaxReconnectDelay = 60 * time.Second
 	defaultTunnelMaxRetries = 5
 )
+
+// registerExternalWebhooks registers each webhook-capable provider's hook to
+// <ExternalURL>/webhook/<provider> using the configured secret. It is called
+// only for the external-tunnel path (tunnel = "external" with external_url set,
+// no managed Tunnel) — the managed-tunnel path registers against the tunnel's
+// own PublicURL() in Run().
+//
+// Unlike the managed path this is best-effort: the webhook receiver is already
+// serving, so a registration failure is logged as a WARN and skipped rather
+// than aborting startup — the operator can still add the hook by hand. The
+// underlying provider RegisterWebhooks is idempotent (it reuses an existing
+// hook with the same URL), so this is safe to run on every startup. Hooks are
+// NOT deregistered on shutdown: external hooks are operator-owned and must
+// persist across restarts.
+func (s *Scheduler) registerExternalWebhooks(ctx context.Context, whProviders []providers.Webhook) {
+	for _, whp := range whProviders {
+		name := whp.(providers.Provider).Name()
+		webhookURL := s.cfg.ExternalURL + "/webhook/" + name
+		s.cfg.Log.Info("registering external webhook", "provider", name, "url", webhookURL)
+		if err := whp.RegisterWebhooks(ctx, webhookURL, s.cfg.WebhookSecret); err != nil {
+			s.cfg.Log.Warn("failed to register external webhook (continuing; add the hook manually if needed)",
+				"provider", name, "url", webhookURL, "error", err)
+			continue
+		}
+		s.cfg.Log.Info("external webhook registered", "provider", name, "url", webhookURL)
+	}
+}
 
 // serveTunnelWithReconnect serves the webhook HTTP server on a tunnel listener,
 // automatically re-establishing the tunnel and re-registering webhooks when the

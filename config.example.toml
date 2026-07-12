@@ -34,6 +34,18 @@ owner = "your-org"
 # secret = "your_webhook_secret"   # must be stable when not using a tunnel
 # port = 8080
 
+# To use an externally-managed tunnel (e.g. a Cloudflare tunnel on another host
+# that forwards a public hostname to this port). ephemerd serves the webhook
+# receiver and disables polling but does not create a tunnel:
+# tunnel = "external"
+# secret = "your_webhook_secret"        # required; must match the hook's secret
+# external_url = "https://mac.tricorder.cc"   # optional: public base URL of the
+#     # external tunnel. When set, ephemerd auto-registers each tracked repo's
+#     # webhook to <external_url>/webhook/<provider> on startup (idempotently) so
+#     # you don't have to hand-add a hook per repo. External hooks are NOT
+#     # removed on shutdown. Leave unset to add the hooks manually.
+# port = 8080
+
 [network]
 # Container subnet. Ephemerd auto-picks a free subnet if this conflicts with
 # an existing network (e.g. Podman, Docker). You don't need to change this.

@@ -574,10 +574,15 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		// A tunnel exists but is managed OUTSIDE ephemerd — e.g. a Cloudflare
 		// tunnel running on another host that forwards a public hostname to
 		// this port. ephemerd serves the webhook receiver and disables polling,
-		// but never creates a tunnel or auto-registers webhooks: that ingress
-		// and the GitHub webhook registration are owned externally. Requires a
-		// secret (validated in config) so signatures can be verified.
+		// but never creates a tunnel: that ingress is owned externally.
+		// Requires a secret (validated in config) so signatures can be
+		// verified. When external_url is also set, the scheduler auto-registers
+		// each tracked repo's webhook to <external_url>/webhook/<provider> on
+		// startup (idempotently); otherwise the operator adds hooks by hand.
 		log.Info("webhook mode enabled (external tunnel, ingress managed outside ephemerd)", "port", cfg.Webhook.Port)
+		if cfg.Webhook.ExternalURL != "" {
+			log.Info("external webhook auto-registration enabled", "external_url", cfg.Webhook.ExternalURL)
+		}
 	default:
 		var err error
 		tunnelProvider, err = tunnel.New(cfg.Webhook.Tunnel, cfg.Webhook.NgrokAuthtoken, cfg.Webhook.TunnelURL)
@@ -637,6 +642,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		TLSKey:             cfg.Webhook.TLSKey,
 		Tunnel:             tunnelProvider,
 		TunnelMaxRetries:   cfg.Webhook.TunnelMaxRetries,
+		ExternalURL:        cfg.Webhook.ExternalURL,
 		JobTimeout:         cfg.Runner.ParsedJobTimeout(),
 		ShutdownTimeout:    cfg.Runner.ParsedShutdownTimeout(),
 		LogRetention:       cfg.Log.LogRetentionDuration(),

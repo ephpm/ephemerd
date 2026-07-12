@@ -211,6 +211,72 @@ func TestValidate_ExternalTunnel_KeepsSecretAndDefaultsPort(t *testing.T) {
 	}
 }
 
+func TestValidate_ExternalURL_TrimsTrailingSlash(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_x")
+
+	cfg := &Config{
+		GitHub: GitHubConfig{Owner: "org"},
+		Webhook: WebhookConfig{
+			Tunnel:      "external",
+			Secret:      "s3cr3t",
+			ExternalURL: "https://mac.tricorder.cc/",
+		},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := cfg.Webhook.ExternalURL, "https://mac.tricorder.cc"; got != want {
+		t.Errorf("ExternalURL = %q, want trailing slash trimmed to %q", got, want)
+	}
+}
+
+func TestValidate_ExternalURL_RequiresSecret(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_x")
+
+	// external_url is set but no secret: the "external requires a secret" rule
+	// fires first, so validation must reject this.
+	cfg := &Config{
+		GitHub: GitHubConfig{Owner: "org"},
+		Webhook: WebhookConfig{
+			Tunnel:      "external",
+			ExternalURL: "https://mac.tricorder.cc",
+		},
+	}
+	if err := cfg.validate(); err == nil {
+		t.Fatal(`expected error: tunnel="external" with external_url but no secret must be rejected`)
+	}
+}
+
+func TestValidate_ExternalURL_RejectedForPolling(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_x")
+
+	cfg := &Config{
+		GitHub: GitHubConfig{Owner: "org"},
+		Webhook: WebhookConfig{
+			Tunnel:      "none",
+			ExternalURL: "https://mac.tricorder.cc",
+		},
+	}
+	if err := cfg.validate(); err == nil {
+		t.Fatal(`expected error: external_url with tunnel="none" must be rejected`)
+	}
+}
+
+func TestValidate_ExternalURL_RejectedForManagedTunnel(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_x")
+
+	cfg := &Config{
+		GitHub: GitHubConfig{Owner: "org"},
+		Webhook: WebhookConfig{
+			Tunnel:      "ngrok",
+			ExternalURL: "https://mac.tricorder.cc",
+		},
+	}
+	if err := cfg.validate(); err == nil {
+		t.Fatal(`expected error: external_url with a managed tunnel must be rejected`)
+	}
+}
+
 func TestValidate_ManagedTunnel_GeneratesSecret(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "ghp_x")
 
