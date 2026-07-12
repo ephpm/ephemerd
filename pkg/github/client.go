@@ -28,6 +28,11 @@ type Config struct {
 
 	// App auth (used instead of Token when set)
 	AppAuth *AppAuth
+
+	// PoolMode changes webhook lifecycle semantics for nodes sharing one
+	// public webhook URL: registration adopts an existing same-URL hook,
+	// deregistration is a no-op, and the stale-hook sweep is skipped.
+	PoolMode bool
 }
 
 // Client handles GitHub API interactions and webhook events.

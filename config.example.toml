@@ -57,6 +57,14 @@ owner = "your-org"
 #     # removed on shutdown. Leave unset to add the hooks manually.
 # port = 8080
 
+# Pool mode: multiple ephemerd nodes sharing one public webhook URL (e.g.
+# tunnel replicas behind one hostname). Registration adopts an existing
+# same-URL hook instead of duplicating it, shutdown leaves the shared hook
+# in place for pool-mates, and the startup stale-hook sweep is skipped.
+# Every member MUST use the same explicit secret.
+# pool = true
+# secret = "shared_across_all_pool_members"
+
 [network]
 # Container subnet. Ephemerd auto-picks a free subnet if this conflicts with
 # an existing network (e.g. Podman, Docker). You don't need to change this.

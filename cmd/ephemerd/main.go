@@ -746,10 +746,11 @@ func initProviders(cfg *config.Config, log *slog.Logger) ([]providers.Provider, 
 	// GitHub: configured when owner or token is set
 	if cfg.GitHub.Owner != "" || cfg.GitHub.Token != "" {
 		ghCfg := github.Config{
-			Token: cfg.GitHub.Token,
-			Owner: cfg.GitHub.Owner,
-			Repos: cfg.GitHub.Repos,
-			Log:   log,
+			Token:    cfg.GitHub.Token,
+			Owner:    cfg.GitHub.Owner,
+			Repos:    cfg.GitHub.Repos,
+			Log:      log,
+			PoolMode: cfg.Webhook.Pool,
 		}
 		if cfg.GitHub.AppID != 0 {
 			appAuth, err := github.NewAppAuth(

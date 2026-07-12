@@ -20,7 +20,13 @@ type ManagedWebhook struct {
 // one already points at webhookURL, reuses it instead of creating a duplicate.
 // GitHub rejects a duplicate hook config with HTTP 422, so without this the
 // external-tunnel path (which re-registers on every startup) would fail on the
-// second boot. The list-then-skip approach makes repeated registration a no-op.
+// second boot.
+//
+// In pool mode the reuse is upgraded to adopt: the existing hook (registered
+// by a pool-mate) is edited in place so secret/events/active converge on this
+// member's config — pool members must present one shared secret. A create
+// that still races a pool-mate to a 422 resolves by adopting the winner's
+// hook.
 func (c *Client) RegisterWebhooks(ctx context.Context, webhookURL, secret string) ([]ManagedWebhook, error) {
 	hook := &gh.Hook{
 		Config: &gh.HookConfig{
@@ -34,12 +40,24 @@ func (c *Client) RegisterWebhooks(ctx context.Context, webhookURL, secret string
 	}
 
 	if c.IsOrgLevel() {
-		if id, ok := c.findOrgHook(ctx, webhookURL); ok {
+		if c.cfg.PoolMode {
+			if m, ok, err := c.adoptOrgWebhook(ctx, webhookURL, hook); err != nil {
+				return nil, err
+			} else if ok {
+				return []ManagedWebhook{m}, nil
+			}
+		} else if id, ok := c.findOrgHook(ctx, webhookURL); ok {
 			c.cfg.Log.Info("org webhook already registered, skipping create", "hook_id", id, "url", webhookURL)
 			return []ManagedWebhook{{HookID: id}}, nil
 		}
 		created, _, err := c.client.Organizations.CreateHook(ctx, c.cfg.Owner, hook)
 		if err != nil {
+			if c.cfg.PoolMode {
+				// Lost a registration race with a pool-mate: adopt theirs.
+				if m, ok, adoptErr := c.adoptOrgWebhook(ctx, webhookURL, hook); adoptErr == nil && ok {
+					return []ManagedWebhook{m}, nil
+				}
+			}
 			return nil, fmt.Errorf("creating org webhook for %s: %w", c.cfg.Owner, err)
 		}
 		c.cfg.Log.Info("registered org webhook", "hook_id", created.GetID(), "url", webhookURL)
@@ -48,17 +66,34 @@ func (c *Client) RegisterWebhooks(ctx context.Context, webhookURL, secret string
 
 	var managed []ManagedWebhook
 	for _, repo := range c.cfg.Repos {
-		if id, ok := c.findRepoHook(ctx, repo, webhookURL); ok {
+		if c.cfg.PoolMode {
+			if m, ok, err := c.adoptRepoWebhook(ctx, repo, webhookURL, hook); err != nil {
+				return nil, err
+			} else if ok {
+				managed = append(managed, m)
+				continue
+			}
+		} else if id, ok := c.findRepoHook(ctx, repo, webhookURL); ok {
 			c.cfg.Log.Info("repo webhook already registered, skipping create", "repo", repo, "hook_id", id, "url", webhookURL)
 			managed = append(managed, ManagedWebhook{Repo: repo, HookID: id})
 			continue
 		}
 		created, _, err := c.client.Repositories.CreateHook(ctx, c.cfg.Owner, repo, hook)
 		if err != nil {
-			// Clean up any hooks we already created
-			for _, m := range managed {
-				if delErr := c.deleteWebhook(ctx, m); delErr != nil {
-					c.cfg.Log.Warn("failed to clean up webhook after partial failure", "repo", m.Repo, "error", delErr)
+			if c.cfg.PoolMode {
+				if m, ok, adoptErr := c.adoptRepoWebhook(ctx, repo, webhookURL, hook); adoptErr == nil && ok {
+					managed = append(managed, m)
+					continue
+				}
+			}
+			// Clean up any hooks we already created. In pool mode adopted
+			// or shared hooks must survive — a partial failure on one repo
+			// must not tear down the hook pool-mates rely on.
+			if !c.cfg.PoolMode {
+				for _, m := range managed {
+					if delErr := c.deleteWebhook(ctx, m); delErr != nil {
+						c.cfg.Log.Warn("failed to clean up webhook after partial failure", "repo", m.Repo, "error", delErr)
+					}
 				}
 			}
 			return nil, fmt.Errorf("creating webhook for %s/%s: %w", c.cfg.Owner, repo, err)
@@ -112,8 +147,54 @@ func hookURLMatches(h *gh.Hook, webhookURL string) bool {
 	return h.Config.GetURL() == webhookURL
 }
 
+// adoptOrgWebhook looks for an existing org hook with the same URL and, when
+// found, edits it in place so secret/events/active converge on our config.
+func (c *Client) adoptOrgWebhook(ctx context.Context, webhookURL string, desired *gh.Hook) (ManagedWebhook, bool, error) {
+	hooks, _, err := c.client.Organizations.ListHooks(ctx, c.cfg.Owner, nil)
+	if err != nil {
+		return ManagedWebhook{}, false, fmt.Errorf("listing org webhooks for adoption: %w", err)
+	}
+	for _, h := range hooks {
+		if h.GetConfig().GetURL() != webhookURL {
+			continue
+		}
+		if _, _, err := c.client.Organizations.EditHook(ctx, c.cfg.Owner, h.GetID(), desired); err != nil {
+			return ManagedWebhook{}, false, fmt.Errorf("adopting org webhook %d: %w", h.GetID(), err)
+		}
+		c.cfg.Log.Info("adopted existing org webhook (pool mode)", "hook_id", h.GetID(), "url", webhookURL)
+		return ManagedWebhook{HookID: h.GetID()}, true, nil
+	}
+	return ManagedWebhook{}, false, nil
+}
+
+// adoptRepoWebhook is the repo-level twin of adoptOrgWebhook.
+func (c *Client) adoptRepoWebhook(ctx context.Context, repo, webhookURL string, desired *gh.Hook) (ManagedWebhook, bool, error) {
+	hooks, _, err := c.client.Repositories.ListHooks(ctx, c.cfg.Owner, repo, nil)
+	if err != nil {
+		return ManagedWebhook{}, false, fmt.Errorf("listing webhooks for %s/%s for adoption: %w", c.cfg.Owner, repo, err)
+	}
+	for _, h := range hooks {
+		if h.GetConfig().GetURL() != webhookURL {
+			continue
+		}
+		if _, _, err := c.client.Repositories.EditHook(ctx, c.cfg.Owner, repo, h.GetID(), desired); err != nil {
+			return ManagedWebhook{}, false, fmt.Errorf("adopting webhook %d on %s/%s: %w", h.GetID(), c.cfg.Owner, repo, err)
+		}
+		c.cfg.Log.Info("adopted existing repo webhook (pool mode)", "repo", repo, "hook_id", h.GetID(), "url", webhookURL)
+		return ManagedWebhook{Repo: repo, HookID: h.GetID()}, true, nil
+	}
+	return ManagedWebhook{}, false, nil
+}
+
 // DeregisterWebhooks removes all managed webhooks. Called on shutdown.
+// No-op in pool mode: the hook is shared with pool-mates that are still
+// serving; the pool's lifecycle owner (e.g. mayfly destroying the pool)
+// removes it when the last member goes away.
 func (c *Client) DeregisterWebhooks(ctx context.Context, hooks []ManagedWebhook) {
+	if c.cfg.PoolMode {
+		c.cfg.Log.Debug("pool mode: leaving shared webhook registered on shutdown")
+		return
+	}
 	for _, m := range hooks {
 		if err := c.deleteWebhook(ctx, m); err != nil {
 			c.cfg.Log.Warn("failed to remove webhook on shutdown", "repo", m.Repo, "hook_id", m.HookID, "error", err)
@@ -130,7 +211,16 @@ func (c *Client) DeregisterWebhooks(ctx context.Context, hooks []ManagedWebhook)
 // CleanStaleWebhooks removes any workflow_job webhooks left behind by previous
 // ephemerd instances that crashed or were killed without cleanup. Called on
 // startup before registering new webhooks to avoid hitting GitHub's 20-hook limit.
+//
+// Skipped entirely in pool mode: this sweep deletes every workflow_job hook
+// it can see, and in a pooled fleet those are live hooks belonging to
+// pool-mates (or other pools). Adoption in RegisterWebhooks makes the sweep
+// unnecessary for pooled nodes — same-URL hooks are reused, not duplicated.
 func (c *Client) CleanStaleWebhooks(ctx context.Context) {
+	if c.cfg.PoolMode {
+		c.cfg.Log.Debug("pool mode: skipping stale webhook sweep")
+		return
+	}
 	if c.IsOrgLevel() {
 		hooks, _, err := c.client.Organizations.ListHooks(ctx, c.cfg.Owner, nil)
 		if err != nil {

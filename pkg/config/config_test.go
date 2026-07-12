@@ -178,6 +178,26 @@ func TestValidate_AcceptsEnvToken(t *testing.T) {
 	}
 }
 
+func TestValidate_PoolMode_RequiresSecret(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_x")
+
+	cfg := &Config{
+		GitHub:  GitHubConfig{Owner: "org"},
+		Webhook: WebhookConfig{Tunnel: "localtunnel", Pool: true},
+	}
+	if err := cfg.validate(); err == nil {
+		t.Fatal("expected error: pool = true without an explicit shared secret must be rejected")
+	}
+
+	cfg.Webhook.Secret = "shared-across-pool"
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error with explicit secret: %v", err)
+	}
+	if cfg.Webhook.Secret != "shared-across-pool" {
+		t.Errorf("Secret regenerated in pool mode: %q", cfg.Webhook.Secret)
+	}
+}
+
 func TestValidate_ExternalTunnel_RequiresSecret(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "ghp_x")
 
