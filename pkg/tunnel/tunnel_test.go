@@ -41,6 +41,11 @@ func TestNew(t *testing.T) {
 			wantErr:  true,
 		},
 		{
+			name:     "cloudflared without token errors",
+			provider: "cloudflared",
+			wantErr:  true,
+		},
+		{
 			name:     "empty provider",
 			provider: "",
 			wantErr:  true,
@@ -52,7 +57,11 @@ func TestNew(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p, err := New(tt.provider, tt.authtoken, tt.baseURL)
+			p, err := New(Options{
+				Provider:           tt.provider,
+				NgrokAuthtoken:     tt.authtoken,
+				LocalTunnelBaseURL: tt.baseURL,
+			})
 			if tt.wantErr {
 				if err == nil {
 					t.Errorf("New(%q) = nil error, want error", tt.provider)

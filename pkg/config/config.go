@@ -98,11 +98,10 @@ func (m MetricsConfig) ParsedContainerStatsInterval() time.Duration {
 
 // WebhookConfig configures webhook delivery and tunnel providers.
 // By default, ephemerd uses polling (tunnel = "none").
-// Set tunnel = "localtunnel" or "ngrok" for ephemerd to create and manage a
-// tunnel and auto-register the GitHub webhook. Set tunnel = "external" when a
-// tunnel is provided by something else (e.g. a Cloudflare tunnel on another
-// host that forwards a public hostname to this port): ephemerd then serves the
-// webhook receiver and disables polling, but does not create a tunnel or
+// Set tunnel = "localtunnel", "ngrok", or "cloudflared" for ephemerd to create
+// and manage a tunnel and auto-register the GitHub webhook. Set tunnel =
+// "external" when a tunnel is provided by something else: ephemerd then serves
+// the webhook receiver and disables polling, but does not create a tunnel or
 // register the webhook — that is owned externally, so a matching secret is
 // required.
 type WebhookConfig struct {
@@ -110,7 +109,7 @@ type WebhookConfig struct {
 	Port    int    `toml:"port"`     // listen port for health endpoint (default 8080)
 	TLSCert string `toml:"tls_cert"` // TLS certificate path (direct TLS, no tunnel)
 	TLSKey  string `toml:"tls_key"`  // TLS private key path
-	Tunnel  string `toml:"tunnel"`   // "none" (default, polling), "external" (unmanaged ingress), "localtunnel", or "ngrok"
+	Tunnel  string `toml:"tunnel"`   // "none" (default, polling), "external" (unmanaged ingress), "localtunnel", "ngrok", or "cloudflared"
 	// ExternalURL is the public base URL of the externally-managed tunnel
 	// (e.g. https://mac.tricorder.cc). When set with tunnel="external",
 	// ephemerd registers each tracked repo's webhook to
@@ -120,6 +119,15 @@ type WebhookConfig struct {
 	TunnelURL        string `toml:"tunnel_url"`         // localtunnel: self-hosted server URL
 	NgrokAuthtoken   string `toml:"ngrok_authtoken"`    // ngrok auth token (or use NGROK_AUTHTOKEN env)
 	TunnelMaxRetries int    `toml:"tunnel_max_retries"` // max consecutive reconnect failures before falling back to polling (default 5)
+
+	// cloudflared: tunnel = "cloudflared". Ephemerd runs cloudflared as a
+	// managed subprocess bound to its own lifetime (child gets SIGTERM on
+	// parent exit). The tunnel and its DNS record must be provisioned in
+	// Cloudflare beforehand — ephemerd only runs the client. The token
+	// authenticates and identifies which tunnel to connect.
+	CloudflaredToken    string `toml:"cloudflared_token"`    // tunnel run token (or use CLOUDFLARE_TUNNEL_TOKEN env)
+	CloudflaredHostname string `toml:"cloudflared_hostname"` // public FQDN of the tunnel (e.g. "runner.example.com"); required for GitHub webhook registration
+	CloudflaredVersion  string `toml:"cloudflared_version"`  // pinned cloudflared release (e.g. "2026.6.1"); defaults to a known-good version if empty
 }
 
 // NetworkConfig configures container networking.
@@ -936,6 +944,23 @@ func (c *Config) validate() error {
 		}
 		// Nothing to generate; secret, if set, enables an externally-fronted
 		// webhook receiver, otherwise ephemerd polls.
+	case "cloudflared":
+		if c.Webhook.CloudflaredToken == "" {
+			c.Webhook.CloudflaredToken = os.Getenv("CLOUDFLARE_TUNNEL_TOKEN")
+		}
+		if c.Webhook.CloudflaredToken == "" {
+			return fmt.Errorf(`webhook.cloudflared_token is required when webhook.tunnel = "cloudflared" (or set CLOUDFLARE_TUNNEL_TOKEN env)`)
+		}
+		if c.Webhook.CloudflaredHostname == "" {
+			return fmt.Errorf(`webhook.cloudflared_hostname is required when webhook.tunnel = "cloudflared" (the public FQDN cloudflared exposes)`)
+		}
+		if c.Webhook.Secret == "" {
+			b := make([]byte, 32)
+			if _, err := rand.Read(b); err != nil {
+				return fmt.Errorf("generating webhook secret: %w", err)
+			}
+			c.Webhook.Secret = hex.EncodeToString(b)
+		}
 	default:
 		// Managed tunnels ("localtunnel"/"ngrok") derive the webhook URL from
 		// the tunnel provider's own public URL; external_url has no meaning here.
