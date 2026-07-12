@@ -40,28 +40,54 @@ const (
 )
 
 // grantHyperVTraverse locks down the runners parent directory: it breaks
-// inheritance from the world-traversable C:\ProgramData ACL, re-grants only
-// SYSTEM + Administrators (so the daemon can still manage the tree), and grants
-// the Hyper-V VM group traverse (read+execute) so utility VMs can step into a
-// per-job subdirectory whose DACL explicitly grants them Modify. None of these
-// ACEs are inheritable, so they do not propagate into per-job subdirectories.
+// inheritance from the world-traversable C:\ProgramData ACL, re-grants
+// SYSTEM + Administrators FULL control (so the daemon can still create, clean,
+// and manage per-job subdirectories), and grants the Hyper-V VM group
+// traverse-only (read+execute) so utility VMs can step into a per-job
+// subdirectory whose DACL explicitly grants them Modify.
+//
+// The principal grants differ deliberately:
+//   - SYSTEM/Administrators get (OI)(CI)F: the daemon runs as SYSTEM and MUST
+//     retain write on this directory — it creates each `job-<id>` dir here at
+//     Create() time (copyDirForJob) and removes orphan `job-*` dirs here at
+//     startup. Granting only (RX) would break inheritance's SYSTEM full-control
+//     ACE and leave the daemon unable to add or delete subdirectories, failing
+//     every Windows job that needs a runner mount. The inheritable flags also
+//     ensure per-job dirs stay daemon-manageable (create/cleanup/RemoveAll).
+//   - The VM group gets (RX) with NO inherit flags: utility VMs only need to
+//     traverse the parent to reach their own job dir, and each job dir receives
+//     its own explicit VM-group Modify ACE in grantHyperVModify — we do not want
+//     a blanket inherited VM-group ACE on every child.
 func grantHyperVTraverse(path string) error {
-	// /inheritance:r removes inherited ACEs (so ProgramData's world-readable
-	// ACL no longer applies to this tree). We then explicitly re-grant the
-	// principals that must retain access. RX = read+execute (traverse); no
-	// (OI)(CI) flags, so the ACEs apply only to this directory itself.
-	cmd := exec.Command("icacls", path,
-		"/inheritance:r",
-		"/grant", "*"+systemSID+":(RX)",
-		"/grant", "*"+adminsSID+":(RX)",
-		"/grant", "*"+vmGroupSID+":(RX)",
-		"/C", "/Q")
+	cmd := exec.Command("icacls", traverseGrantArgs(path)...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("icacls lock-down + grant VM-group RX on %s: %w: %s", path, err, string(out))
+		return fmt.Errorf("icacls lock-down + grant SYSTEM/Admins F, VM-group RX on %s: %w: %s", path, err, string(out))
 	}
 	return nil
+}
+
+// traverseGrantArgs builds the icacls arguments for the runners parent
+// lock-down. Split out so the grant POLICY (who gets what) is unit-testable
+// without a live Windows host or actually invoking icacls.
+//
+//   - /inheritance:r drops inherited ACEs (removing ProgramData's world-readable
+//     grant) — but that also drops the inherited SYSTEM/Admins full-control ACE,
+//     so we MUST re-grant them write or the daemon can no longer create/clean
+//     per-job dirs here.
+//   - SYSTEM + Administrators: (OI)(CI)F — full and inheritable.
+//   - VM group: (RX) only, non-inheritable — traverse to reach a job dir; each
+//     job dir gets its own explicit VM-group Modify ACE in grantHyperVModify.
+func traverseGrantArgs(path string) []string {
+	return []string{
+		path,
+		"/inheritance:r",
+		"/grant", "*" + systemSID + ":(OI)(CI)F",
+		"/grant", "*" + adminsSID + ":(OI)(CI)F",
+		"/grant", "*" + vmGroupSID + ":(RX)",
+		"/C", "/Q",
+	}
 }
 
 // grantHyperVModify grants the Hyper-V VM group Modify on a per-job directory,
@@ -75,11 +101,18 @@ func grantHyperVTraverse(path string) error {
 // and a strict improvement over Everyone, which also admitted every
 // interactive/local/authenticated principal on the host.
 func grantHyperVModify(path string) error {
-	cmd := exec.Command("icacls", path, "/grant", "*"+vmGroupSID+":(OI)(CI)M", "/C", "/Q")
+	cmd := exec.Command("icacls", modifyGrantArgs(path)...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("icacls grant VM-group M on %s: %w: %s", path, err, string(out))
 	}
 	return nil
+}
+
+// modifyGrantArgs builds the icacls arguments granting the VM group Modify on a
+// per-job directory, inheritable so files the runner writes also get the ACE.
+// Split out for the same unit-testability reason as traverseGrantArgs.
+func modifyGrantArgs(path string) []string {
+	return []string{path, "/grant", "*" + vmGroupSID + ":(OI)(CI)M", "/C", "/Q"}
 }
