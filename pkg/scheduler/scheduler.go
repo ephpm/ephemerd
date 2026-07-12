@@ -584,6 +584,27 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		if !ok {
 			continue
 		}
+		// CatchUpPoll emits into the provider's poll-event channel. In
+		// polling mode the Start() forwarder above already drains it, but
+		// in webhook mode Start() is never called and NOTHING reads that
+		// channel — the caught-up events would sit in the channel buffer
+		// forever and the startup recovery would silently do nothing
+		// (queued jobs stay queued until a human re-delivers webhooks).
+		// Wire the drain before firing the poll.
+		if useWebhook {
+			if ep, ok := p.(interface{ Events() <-chan providers.JobEvent }); ok {
+				go func(ch <-chan providers.JobEvent) {
+					for ev := range ch {
+						events <- ev
+					}
+				}(ep.Events())
+			} else {
+				s.cfg.Log.Warn(
+					"provider supports CatchUpPoll but not Events(); startup recovery may be a no-op in webhook mode",
+					"provider", p.Name(),
+				)
+			}
+		}
 		name := p.Name()
 		s.cfg.Log.Info("startup poll: checking for queued jobs", "provider", name)
 		go func() {

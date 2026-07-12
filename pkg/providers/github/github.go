@@ -79,6 +79,14 @@ func (p *Provider) DefaultImageFor(os string) string {
 }
 func (p *Provider) DefaultJobImage() string { return "" }
 
+// Events exposes the provider's poll-event channel without starting the
+// poll loop. In webhook mode the scheduler never calls Start(), but
+// CatchUpPoll still emits into this channel — the scheduler must drain it
+// or the startup recovery events rot in the channel buffer unobserved.
+func (p *Provider) Events() <-chan providers.JobEvent {
+	return p.events
+}
+
 func (p *Provider) Start(ctx context.Context, cfg providers.PollConfig) (<-chan providers.JobEvent, error) {
 	ctx, p.cancel = context.WithCancel(ctx)
 
