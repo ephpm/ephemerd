@@ -2253,10 +2253,10 @@ func TestResolvedReconcileInterval(t *testing.T) {
 		in   string
 		want time.Duration
 	}{
-		{"", 5 * time.Minute},          // default
+		{"", 30 * time.Minute},         // default (backstop only; event-driven self-heal is primary)
 		{"2m", 2 * time.Minute},        // custom
 		{"90s", 90 * time.Second},      // custom
-		{"garbage", 5 * time.Minute},   // unparseable -> default
+		{"garbage", 30 * time.Minute},  // unparseable -> default
 		{"0s", 0},                      // explicit disable
 		{"-1m", 0},                     // negative -> disabled
 	}
@@ -2267,7 +2267,7 @@ func TestResolvedReconcileInterval(t *testing.T) {
 		}
 	}
 	// nil-safe
-	if got := (*WebhookConfig)(nil).ResolvedReconcileInterval(); got != 5*time.Minute {
-		t.Errorf("nil ResolvedReconcileInterval() = %v, want 5m", got)
+	if got := (*WebhookConfig)(nil).ResolvedReconcileInterval(); got != 30*time.Minute {
+		t.Errorf("nil ResolvedReconcileInterval() = %v, want 30m", got)
 	}
 }

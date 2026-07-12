@@ -156,10 +156,12 @@ type Scheduler struct {
 	cfg          Config
 	running      map[jobKey]*runningJob
 	seen         map[jobKey]time.Time      // recently handled jobs for dedup
+	started      map[jobKey]time.Time      // jobs OBSERVED going in_progress/completed (webhook mode); the event-driven "satisfied" signal
 	pending      map[jobKey]struct{}       // jobs dispatched to a handler but not yet holding sem
 	attempts     map[jobKey]int            // provisioning passes per job, for zombie detection
 	runners      map[string]*runnerBinding // dispatched runners by name; tracks observed job assignment
 	webhookMode  bool                      // true when job events arrive via webhooks (in_progress observable)
+	runCtx       context.Context           // scheduler root context (set once at Run start); used for event-driven re-dispatch
 	mu           sync.Mutex
 	sem          chan struct{} // local/native job concurrency limiter
 	linuxSem     chan struct{} // Linux dispatch (VM) concurrency limiter
@@ -337,6 +339,7 @@ func New(cfg Config) *Scheduler {
 		cfg:          cfg,
 		running:      make(map[jobKey]*runningJob),
 		seen:         make(map[jobKey]time.Time),
+		started:      make(map[jobKey]time.Time),
 		pending:      make(map[jobKey]struct{}),
 		attempts:     make(map[jobKey]int),
 		runners:      make(map[string]*runnerBinding),
@@ -363,6 +366,13 @@ func New(cfg Config) *Scheduler {
 // Run starts the scheduler. It discovers jobs via polling (default) or
 // webhooks (when TLS certs are configured), and manages runner lifecycle.
 func (s *Scheduler) Run(ctx context.Context) error {
+	// Record the root context for event-driven re-dispatch (reprovisionIfStranded).
+	// Set once here, before any events are processed or wait-goroutines spawned,
+	// so it carries no per-job/retry context values.
+	s.mu.Lock()
+	s.runCtx = ctx
+	s.mu.Unlock()
+
 	events := make(chan providers.JobEvent, 32)
 
 	// Set static metrics
@@ -615,14 +625,16 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		}()
 	}
 
-	// Webhook mode has no continuous poll, so a job that gets stranded — the
-	// runner it was dispatched for exited having been handed a sibling's job
-	// (same-label JIT runners are fungible), or its "queued" webhook was missed
-	// or deduped — would otherwise sit queued forever. Re-run the catch-up poll
-	// periodically as a low-frequency safety net. Swept jobs still flow through
-	// handleQueued's seen/running/zombie/canHandle checks, so anything already
-	// running or recently handled is skipped (no double-provision), and a
-	// genuinely undispatchable job still hits the zombie cap and stops.
+	// Webhook mode has no continuous poll. The common stranding case — a
+	// fungibly-reassigned runner exiting having run a sibling's job and leaving
+	// its own dispatched job queued — is healed instantly and event-drivenly by
+	// reprovisionIfStranded on runner exit (see the wait-goroutines). This
+	// periodic catch-up poll is only a LAST-RESORT backstop for genuinely
+	// DROPPED webhook deliveries, so it runs at a low frequency (default 30m).
+	// Swept jobs still flow through handleQueued's seen/running/zombie/canHandle
+	// checks, so anything already running or recently handled is skipped (no
+	// double-provision), and a genuinely undispatchable job still hits the
+	// zombie cap and stops.
 	if useWebhook && s.cfg.ReconcileInterval > 0 {
 		go s.runReconcileLoop(ctx)
 	}
@@ -947,6 +959,10 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 				log.Debug("deregister runner after dispatch cleanup", "error", err)
 			}
 		}
+
+		// Self-heal: if this runner exited without its dispatched job ever
+		// being observed to run (fungibly reassigned to a sibling), re-provision.
+		s.reprovisionIfStranded(ctx, event)
 	}()
 }
 
@@ -1127,6 +1143,9 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		} else {
 			s.mu.Unlock()
 		}
+
+		// Self-heal: re-provision if this VM's dispatched job never ran.
+		s.reprovisionIfStranded(ctx, event)
 	}()
 }
 
@@ -1253,6 +1272,9 @@ func (s *Scheduler) handleNativeMacOSJob(ctx context.Context, event providers.Jo
 		} else {
 			s.mu.Unlock()
 		}
+
+		// Self-heal: re-provision if this runner's dispatched job never ran.
+		s.reprovisionIfStranded(ctx, event)
 	}()
 }
 
@@ -1436,6 +1458,9 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 		} else {
 			s.mu.Unlock()
 		}
+
+		// Self-heal: re-provision if this runner's dispatched job never ran.
+		s.reprovisionIfStranded(ctx, event)
 	}()
 }
 
@@ -1451,6 +1476,16 @@ func (s *Scheduler) handleInProgress(event providers.JobEvent) {
 	if s.retry != nil {
 		s.retry.Drop(key)
 	}
+
+	// The job actually started running somewhere (on our runner, a peer
+	// daemon's, or a fungibly-reassigned sibling runner). Record it as
+	// satisfied so reprovisionIfStranded won't re-provision it when the
+	// runner we originally dispatched for it exits. This is the core of the
+	// event-driven self-heal: a job is "handled" when we OBSERVE it start,
+	// not when we optimistically dispatch a runner for it.
+	s.mu.Lock()
+	s.started[key] = time.Now()
+	s.mu.Unlock()
 
 	name := event.RunnerName
 	if name == "" {
@@ -1502,6 +1537,12 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event providers.JobEven
 	// freely). Destroying job.dispatched here used to kill whichever job
 	// the reassigned runner was actually executing.
 	s.mu.Lock()
+	// The job reached a terminal state — definitely don't re-provision it,
+	// even if its dispatch-intent runner exits afterwards. Records the same
+	// satisfied signal as in_progress in case the in_progress delivery was
+	// missed (a cancelled-before-start job goes queued -> completed with no
+	// in_progress at all).
+	s.started[key] = time.Now()
 	var job *runningJob
 	exists := false
 	ownerKey := key
@@ -1695,6 +1736,22 @@ func (s *Scheduler) cleanSeen() {
 			delete(s.attempts, id)
 		}
 	}
+	// Prune the started (satisfied) set. It must outlive the LONGEST runner in
+	// a cohort: a sibling runner dispatched for job X that instead ran a long
+	// job doesn't exit — and thus can't falsely re-provision the already-run
+	// X — until its own job finishes, up to JobTimeout after dispatch. Keep
+	// started entries at least that long (plus a margin) so the satisfied
+	// signal is still present when that late exit checks it.
+	startedTTL := s.cfg.JobTimeout + seenTTL
+	if s.cfg.JobTimeout <= 0 {
+		// No job timeout configured: fall back to GitHub's own max job runtime.
+		startedTTL = 6 * time.Hour
+	}
+	for id, t := range s.started {
+		if time.Since(t) > startedTTL {
+			delete(s.started, id)
+		}
+	}
 }
 
 // sweepOrphanRunners destroys dispatched runners that were never
@@ -1836,11 +1893,87 @@ func (s *Scheduler) retryHandler(ctx context.Context, event providers.JobEvent) 
 	return claimErr
 }
 
+// reprovisionIfStranded re-provisions a job whose dispatched runner has just
+// exited WITHOUT that job ever being observed to start. It is called at the end
+// of every wait-goroutine (i.e. on every runner exit).
+//
+// This is the event-driven fix for the fungible-runner stranding problem.
+// GitHub treats same-label JIT runners as interchangeable, so the runner we
+// dispatched "for" job A routinely runs a sibling job B instead. When that
+// runner exits (having run B), A may still be queued with no runner to run it.
+// handleQueued marked A "seen" on the QUEUED event — an optimistic bet that the
+// runner we brought up would run A — so nothing else re-provisions it and A sits
+// queued until the seen entry ages out (~10m) or the low-frequency reconcile
+// poll happens to sweep it. Instead, we react to the event we already have: the
+// runner exit. If we never observed A go in_progress or completed (started[A]
+// unset), A never actually ran, so we clear its seen dedup and re-dispatch it
+// immediately — no polling, nothing lost.
+//
+// Guards:
+//   - Webhook mode only. in_progress/completed events (which set started) are
+//     only observable via webhooks; in poll mode "never started" is meaningless
+//     and the continuous poll already reconciles stranded jobs.
+//   - started[key] set => the job ran (on our runner, a peer's, or a sibling) —
+//     satisfied, do nothing.
+//   - running/pending[key] set => already being (re-)handled, don't double.
+//   - attempts over the zombie cap => undispatchable, stop (a superseded run
+//     would otherwise re-provision on every runner exit forever).
+//
+// Re-dispatch is launched in its own goroutine (mirroring the Run loop's
+// `go s.handleQueued`) so it never blocks on the concurrency slot the exiting
+// wait-goroutine is about to release.
+func (s *Scheduler) reprovisionIfStranded(ctx context.Context, event providers.JobEvent) {
+	key := keyFor(event)
+
+	s.mu.Lock()
+	if !s.webhookMode || s.draining {
+		s.mu.Unlock()
+		return
+	}
+	if _, started := s.started[key]; started {
+		s.mu.Unlock()
+		return
+	}
+	if _, ok := s.running[key]; ok {
+		s.mu.Unlock()
+		return
+	}
+	if _, ok := s.pending[key]; ok {
+		s.mu.Unlock()
+		return
+	}
+	if s.attempts[key] > maxProvisionAttempts {
+		s.mu.Unlock()
+		return
+	}
+	// Clear the seen dedup so handleQueued acts on our re-dispatch. Leave
+	// attempts intact: handleQueued increments it, so repeated stranding of a
+	// genuinely undispatchable job still converges on the zombie cap.
+	delete(s.seen, key)
+	// Re-dispatch from the scheduler root context, not the exiting
+	// wait-goroutine's captured ctx — that ctx may carry a stale retry marker
+	// (retryAttemptCtxKey) from the original claim retry, which would misroute
+	// a re-claim failure. Fall back to the passed ctx when runCtx is unset
+	// (e.g. unit tests that call this without going through Run).
+	dispatchCtx := s.runCtx
+	s.mu.Unlock()
+	if dispatchCtx == nil {
+		dispatchCtx = ctx
+	}
+
+	s.cfg.Log.Info("dispatched runner exited but its job was never observed running; re-provisioning",
+		"job_id", key.JobID,
+		"repo", event.Repo,
+		"detail", "same-label JIT runners are fungible; the runner likely ran a sibling job and left this one queued")
+	go s.handleQueued(dispatchCtx, event)
+}
+
 // runReconcileLoop periodically re-runs each provider's catch-up poll while in
-// webhook mode, so stranded jobs (fungible-runner churn, or a missed/deduped
-// delivery) get re-provisioned rather than sitting queued forever. It is a
-// low-frequency safety net; the per-job seen/running/zombie/canHandle checks in
-// handleQueued still gate every swept job, so there is no double-provision.
+// webhook mode. It is now a LAST-RESORT backstop for genuinely dropped webhook
+// deliveries — the common fungible-runner stranding case is handled instantly
+// and event-drivenly by reprovisionIfStranded on runner exit, so this runs at a
+// low frequency (default 30m). The per-job seen/running/zombie/canHandle checks
+// in handleQueued still gate every swept job, so there is no double-provision.
 func (s *Scheduler) runReconcileLoop(ctx context.Context) {
 	var catchers []providers.Provider
 	for _, p := range s.cfg.Providers {
