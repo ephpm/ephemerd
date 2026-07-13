@@ -297,7 +297,15 @@ func ldflags() string {
 		version, download.RunnerVersion, download.CNIVersion)
 }
 
+// gitVersion resolves the version to stamp into binaries. EPHEMERD_VERSION
+// wins when set — release workflows pass the tag ref explicitly because not
+// every build environment has git available (the Windows runner's checkout
+// falls back to a REST-API tarball with no .git dir, where `git describe`
+// can only ever fail and everything would silently stamp as "dev").
 func gitVersion() string {
+	if v := strings.TrimSpace(os.Getenv("EPHEMERD_VERSION")); v != "" {
+		return v
+	}
 	out, err := exec.Command("git", "describe", "--tags", "--always", "--dirty").Output()
 	if err != nil {
 		return "dev"
