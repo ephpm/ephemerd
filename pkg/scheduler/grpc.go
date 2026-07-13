@@ -39,9 +39,16 @@ func (s *Scheduler) startControlServer() (func(), error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", socketPath, err)
 	}
-	if err := os.Chmod(socketPath, 0o600); err != nil {
-		_ = lis.Close()
-		return nil, fmt.Errorf("chmod %s: %w", socketPath, err)
+	// Restrict the control socket to privileged principals. The control API can
+	// KillJob (DoS) and stream GetJobLogs (may contain job secrets), so it must
+	// not be reachable by ordinary local users. On POSIX this is chmod 0600; on
+	// Windows POSIX mode bits are a near-no-op for an AF_UNIX socket file, so
+	// secureControlSocket applies a real NTFS ACL (SYSTEM + Administrators only).
+	if err := secureControlSocket(socketPath); err != nil {
+		if closeErr := lis.Close(); closeErr != nil {
+			s.cfg.Log.Warn("closing control socket listener after ACL failure", "error", closeErr)
+		}
+		return nil, fmt.Errorf("securing control socket %s: %w", socketPath, err)
 	}
 
 	srv := grpc.NewServer()
