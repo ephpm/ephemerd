@@ -21,6 +21,10 @@ permissions:
 
 env:
   GO_VERSION: "1.26.1"
+  # Stamp binaries from the tag ref, not `git describe` — the Windows
+  # runner has no git on PATH, so its checkout is a REST-API tarball
+  # without a .git dir and describe-based stamping yields "dev".
+  EPHEMERD_VERSION: ${{ github.ref_name }}
 
 jobs:
   # Cheap gate: reject malformed tags before burning four platform builds.
