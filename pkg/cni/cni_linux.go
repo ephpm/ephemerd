@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 //go:embed all:embed
@@ -79,21 +80,26 @@ func (m *Manager) Extract() error {
 	return nil
 }
 
+// findTarball selects the CNI plugins archive matching this binary's arch.
+// The macOS build cross-compiles ephemerd-linux for arm64, but the embed dir
+// can hold BOTH cni-plugins-linux-amd64 and -arm64 (the amd64 one lingers
+// from the CI cache). `//go:embed all:embed` then bundles both, so a naive
+// "first entry" pick returns amd64 and the arm64 Linux VM fails every CNI
+// exec with "exec format error". Select by runtime.GOARCH instead.
 func (m *Manager) findTarball() (string, error) {
 	entries, err := cniFS.ReadDir("embed")
 	if err != nil {
 		return "", fmt.Errorf("reading embedded files: %w", err)
 	}
-
+	names := make([]string, 0, len(entries))
 	for _, e := range entries {
-		name := e.Name()
-		if name == ".gitkeep" {
-			continue
-		}
-		return filepath.Join("embed", name), nil
+		names = append(names, e.Name())
 	}
-
-	return "", fmt.Errorf("no CNI plugins archive found in embedded files (did you run 'make download-cni'?)")
+	name, err := selectCNITarball(names, runtime.GOARCH)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join("embed", name), nil
 }
 
 func extractTarGz(r io.Reader, dest string) error {
