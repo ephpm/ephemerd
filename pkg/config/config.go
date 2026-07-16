@@ -16,22 +16,24 @@ import (
 )
 
 type Config struct {
-	GitHub      GitHubConfig      `toml:"github"`
-	GitHubExtra []GitHubConfig    `toml:"github_extra"` // additional GitHub owners, each with its own auth ([[github_extra]])
-	Forgejo     ForgejoConfig     `toml:"forgejo"`
-	Gitea       GiteaConfig       `toml:"gitea"`
-	GitLab      GitLabConfig      `toml:"gitlab"`
-	Woodpecker  WoodpeckerConfig  `toml:"woodpecker"`
-	Webhook     WebhookConfig     `toml:"webhook"`
-	Containerd  ContainerdConfig  `toml:"containerd"`
-	Network     NetworkConfig     `toml:"network"`
-	VM          VMConfig          `toml:"vm"`
-	Dind        DindConfig        `toml:"dind"`
-	ModuleProxy ModuleProxyConfig `toml:"module_proxy"`
-	Runtime     RuntimeConfig     `toml:"runtime"`
-	Runner      RunnerConfig      `toml:"runner"`
-	Metrics     MetricsConfig     `toml:"metrics"`
-	Log         LogConfig         `toml:"log"`
+	GitHub        GitHubConfig        `toml:"github"`
+	GitHubExtra   []GitHubConfig      `toml:"github_extra"` // additional GitHub owners, each with its own auth ([[github_extra]])
+	Forgejo       ForgejoConfig       `toml:"forgejo"`
+	Gitea         GiteaConfig         `toml:"gitea"`
+	GitLab        GitLabConfig        `toml:"gitlab"`
+	Woodpecker    WoodpeckerConfig    `toml:"woodpecker"`
+	Webhook       WebhookConfig       `toml:"webhook"`
+	Containerd    ContainerdConfig    `toml:"containerd"`
+	Network       NetworkConfig       `toml:"network"`
+	VM            VMConfig            `toml:"vm"`
+	Dind          DindConfig          `toml:"dind"`
+	ModuleProxy   ModuleProxyConfig   `toml:"module_proxy"`
+	CargoProxy    CargoProxyConfig    `toml:"cargo_proxy"`
+	ComposerProxy ComposerProxyConfig `toml:"composer_proxy"`
+	Runtime       RuntimeConfig       `toml:"runtime"`
+	Runner        RunnerConfig        `toml:"runner"`
+	Metrics       MetricsConfig       `toml:"metrics"`
+	Log           LogConfig           `toml:"log"`
 }
 
 // GitHubTargets returns every configured GitHub target: the primary [github]
@@ -315,6 +317,28 @@ type ModuleProxyConfig struct {
 	Enabled  bool   `toml:"enabled"`  // enable Go module caching proxy
 	Port     int    `toml:"port"`     // listen port on bridge gateway (default 8082)
 	Upstream string `toml:"upstream"` // upstream proxy URL (default "https://proxy.golang.org")
+	Cleanup  bool   `toml:"cleanup"`  // wipe cache on shutdown (default true)
+}
+
+// CargoProxyConfig configures the Rust crates caching proxy.
+// When enabled, ephemerd runs a caching reverse proxy on the bridge gateway
+// in front of the crates.io sparse registry. Containers receive the CARGO_*
+// source-replacement env vars automatically.
+type CargoProxyConfig struct {
+	Enabled  bool   `toml:"enabled"`  // enable Rust crates caching proxy
+	Port     int    `toml:"port"`     // listen port on bridge gateway (default 8083)
+	Upstream string `toml:"upstream"` // upstream sparse index URL (default "https://index.crates.io")
+	Cleanup  bool   `toml:"cleanup"`  // wipe cache on shutdown (default true)
+}
+
+// ComposerProxyConfig configures the PHP Composer/Packagist caching proxy.
+// When enabled, ephemerd runs a caching reverse proxy on the bridge gateway
+// in front of repo.packagist.org. Containers receive COMPOSER_REPO_PACKAGIST
+// automatically.
+type ComposerProxyConfig struct {
+	Enabled  bool   `toml:"enabled"`  // enable Composer/Packagist caching proxy
+	Port     int    `toml:"port"`     // listen port on bridge gateway (default 8084)
+	Upstream string `toml:"upstream"` // upstream Packagist repo URL (default "https://repo.packagist.org")
 	Cleanup  bool   `toml:"cleanup"`  // wipe cache on shutdown (default true)
 }
 

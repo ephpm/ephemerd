@@ -27,6 +27,8 @@ import (
 	"github.com/ephpm/ephemerd/pkg/providers/gitea"
 	githubProv "github.com/ephpm/ephemerd/pkg/providers/github"
 	"github.com/ephpm/ephemerd/pkg/proxies"
+	cargoproxy "github.com/ephpm/ephemerd/pkg/proxies/cargo"
+	composerproxy "github.com/ephpm/ephemerd/pkg/proxies/composer"
 	goproxy "github.com/ephpm/ephemerd/pkg/proxies/go"
 	"github.com/ephpm/ephemerd/pkg/runner"
 	"github.com/ephpm/ephemerd/pkg/runtime"
@@ -380,6 +382,20 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	if cfg.ModuleProxy.Enabled {
 		gatewayPorts = append(gatewayPorts, modProxyPort)
 	}
+	cargoProxyPort := cfg.CargoProxy.Port
+	if cargoProxyPort == 0 {
+		cargoProxyPort = 8083
+	}
+	if cfg.CargoProxy.Enabled {
+		gatewayPorts = append(gatewayPorts, cargoProxyPort)
+	}
+	composerProxyPort := cfg.ComposerProxy.Port
+	if composerProxyPort == 0 {
+		composerProxyPort = 8084
+	}
+	if cfg.ComposerProxy.Enabled {
+		gatewayPorts = append(gatewayPorts, composerProxyPort)
+	}
 
 	// Initialize container networking
 	net, err := networking.New(networking.Config{
@@ -426,6 +442,66 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			defer func() {
 				if err := goProxy.Stop(); err != nil {
 					log.Warn("error stopping Go module proxy", "error", err)
+				}
+			}()
+		}
+	}
+
+	// Start Rust crates caching proxy if enabled
+	if cfg.CargoProxy.Enabled {
+		upstream := cfg.CargoProxy.Upstream
+		if upstream == "" {
+			upstream = "https://index.crates.io"
+		}
+		cleanup := cfg.CargoProxy.Cleanup
+		if !cleanup {
+			cleanup = true
+		}
+
+		cargoProxy := cargoproxy.New(cargoproxy.Config{
+			CacheDir:   joinPath(configDir, "cache", "cargo"),
+			Upstream:   upstream,
+			ListenAddr: fmt.Sprintf("%s:%d", net.GatewayIP(), cargoProxyPort),
+			Cleanup:    cleanup,
+			Log:        log,
+		})
+		if err := cargoProxy.Start(); err != nil {
+			log.Warn("failed to start cargo crates proxy, continuing without it", "error", err)
+		} else {
+			cacheProxies = append(cacheProxies, cargoProxy)
+			defer func() {
+				if err := cargoProxy.Stop(); err != nil {
+					log.Warn("error stopping cargo crates proxy", "error", err)
+				}
+			}()
+		}
+	}
+
+	// Start Composer/Packagist caching proxy if enabled
+	if cfg.ComposerProxy.Enabled {
+		upstream := cfg.ComposerProxy.Upstream
+		if upstream == "" {
+			upstream = "https://repo.packagist.org"
+		}
+		cleanup := cfg.ComposerProxy.Cleanup
+		if !cleanup {
+			cleanup = true
+		}
+
+		composerProxy := composerproxy.New(composerproxy.Config{
+			CacheDir:   joinPath(configDir, "cache", "composer"),
+			Upstream:   upstream,
+			ListenAddr: fmt.Sprintf("%s:%d", net.GatewayIP(), composerProxyPort),
+			Cleanup:    cleanup,
+			Log:        log,
+		})
+		if err := composerProxy.Start(); err != nil {
+			log.Warn("failed to start composer packagist proxy, continuing without it", "error", err)
+		} else {
+			cacheProxies = append(cacheProxies, composerProxy)
+			defer func() {
+				if err := composerProxy.Stop(); err != nil {
+					log.Warn("error stopping composer packagist proxy", "error", err)
 				}
 			}()
 		}
