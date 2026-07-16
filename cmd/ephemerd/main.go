@@ -744,25 +744,27 @@ func initProviders(cfg *config.Config, log *slog.Logger) ([]providers.Provider, 
 		}
 	}
 
-	// GitHub: configured when owner or token is set
-	if cfg.GitHub.Owner != "" || cfg.GitHub.Token != "" {
+	// GitHub: one provider per configured target. Each target has its own
+	// owner + auth (App or PAT), so ephemerd can serve several owners at once
+	// (e.g. an org via a GitHub App and a personal account via a PAT).
+	for _, ghc := range cfg.GitHubTargets() {
 		ghCfg := github.Config{
-			Token:    cfg.GitHub.Token,
-			Owner:    cfg.GitHub.Owner,
-			Repos:    cfg.GitHub.Repos,
+			Token:    ghc.Token,
+			Owner:    ghc.Owner,
+			Repos:    ghc.Repos,
 			Log:      log,
 			PoolMode: cfg.Webhook.Pool,
 		}
-		if cfg.GitHub.AppID != 0 {
+		if ghc.AppID != 0 {
 			appAuth, err := github.NewAppAuth(
-				cfg.GitHub.AppID,
-				cfg.GitHub.InstallationID,
-				cfg.GitHub.PrivateKeyPath,
+				ghc.AppID,
+				ghc.InstallationID,
+				ghc.PrivateKeyPath,
 				log,
 			)
 			if err != nil {
 				cleanup()
-				return nil, nil, fmt.Errorf("initializing github app auth: %w", err)
+				return nil, nil, fmt.Errorf("initializing github app auth for %s: %w", ghc.Owner, err)
 			}
 			ghCfg.AppAuth = appAuth
 			cleanups = append(cleanups, appAuth.Stop)
@@ -770,12 +772,12 @@ func initProviders(cfg *config.Config, log *slog.Logger) ([]providers.Provider, 
 		ghClient, err := github.New(ghCfg)
 		if err != nil {
 			cleanup()
-			return nil, nil, fmt.Errorf("creating github client: %w", err)
+			return nil, nil, fmt.Errorf("creating github client for %s: %w", ghc.Owner, err)
 		}
 		active = append(active, githubProv.New(ghClient, log,
-			cfg.GitHub.DefaultImageFor("linux"),
-			cfg.GitHub.DefaultImageFor("windows")))
-		log.Info("provider enabled", "provider", "github", "owner", cfg.GitHub.Owner)
+			ghc.DefaultImageFor("linux"),
+			ghc.DefaultImageFor("windows")))
+		log.Info("provider enabled", "provider", "github", "owner", ghc.Owner)
 	}
 
 	// Forgejo: configured when instance_url is set

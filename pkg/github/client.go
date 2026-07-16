@@ -56,6 +56,9 @@ func (c *Client) RateSnapshot() (remaining, limit int64, reset, updated time.Tim
 	return c.lastRate.Snapshot()
 }
 
+// Owner returns the GitHub org/user this client is scoped to.
+func (c *Client) Owner() string { return c.cfg.Owner }
+
 // JobEvent is emitted when a workflow_job webhook fires.
 type JobEvent struct {
 	Action string

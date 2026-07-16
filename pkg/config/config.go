@@ -17,6 +17,7 @@ import (
 
 type Config struct {
 	GitHub      GitHubConfig      `toml:"github"`
+	GitHubExtra []GitHubConfig    `toml:"github_extra"` // additional GitHub owners, each with its own auth ([[github_extra]])
 	Forgejo     ForgejoConfig     `toml:"forgejo"`
 	Gitea       GiteaConfig       `toml:"gitea"`
 	GitLab      GitLabConfig      `toml:"gitlab"`
@@ -33,6 +34,19 @@ type Config struct {
 	Log         LogConfig         `toml:"log"`
 }
 
+// GitHubTargets returns every configured GitHub target: the primary [github]
+// (when set) followed by any [[github_extra]] entries. Each target carries its
+// own owner + auth, so ephemerd can serve multiple owners at once (e.g. an org
+// via a GitHub App and a personal account via a PAT).
+func (c *Config) GitHubTargets() []GitHubConfig {
+	var targets []GitHubConfig
+	if c.GitHub.Owner != "" || c.GitHub.Token != "" || c.GitHub.AppID != 0 {
+		targets = append(targets, c.GitHub)
+	}
+	targets = append(targets, c.GitHubExtra...)
+	return targets
+}
+
 // Provider returns the name of the first configured forge provider.
 // Returns "github" by default for backward compatibility.
 func (c *Config) Provider() string {
@@ -47,7 +61,7 @@ func (c *Config) Provider() string {
 // A provider is "configured" if its credential/URL fields are set.
 func (c *Config) Providers() []string {
 	var ps []string
-	if c.GitHub.Owner != "" || c.GitHub.Token != "" || c.GitHub.AppID != 0 {
+	if len(c.GitHubTargets()) > 0 {
 		ps = append(ps, "github")
 	}
 	if c.Forgejo.InstanceURL != "" {
@@ -1033,25 +1047,44 @@ func (c *Config) validate() error {
 }
 
 func (c *Config) validateGitHub() error {
-	// Fall back to GITHUB_TOKEN env var if no token is configured
+	// Fall back to GITHUB_TOKEN env var for the primary [github] target.
 	if c.GitHub.Token == "" {
 		c.GitHub.Token = os.Getenv("GITHUB_TOKEN")
 	}
-	if c.GitHub.Token == "" && c.GitHub.AppID == 0 {
+	primary := c.GitHub.Owner != "" || c.GitHub.Token != "" || c.GitHub.AppID != 0
+	if primary {
+		if err := validateGitHubTarget(&c.GitHub, "github"); err != nil {
+			return err
+		}
+	}
+	// Each [[github_extra]] target is self-contained (its own owner + auth).
+	for i := range c.GitHubExtra {
+		if err := validateGitHubTarget(&c.GitHubExtra[i], fmt.Sprintf("github_extra[%d]", i)); err != nil {
+			return err
+		}
+	}
+	if !primary && len(c.GitHubExtra) == 0 {
 		return fmt.Errorf("github.token or github.app_id is required (or set GITHUB_TOKEN env var)")
 	}
-	if c.GitHub.AppID != 0 {
-		if c.GitHub.InstallationID == 0 {
-			return fmt.Errorf("github.installation_id is required when using github.app_id")
-		}
-		if c.GitHub.PrivateKeyPath == "" {
-			return fmt.Errorf("github.private_key_path is required when using github.app_id")
-		}
-	}
-	if c.GitHub.Owner == "" {
-		return fmt.Errorf("github.owner is required")
-	}
 	// repos is optional — if empty, ephemerd registers org-level runners
+	return nil
+}
+
+func validateGitHubTarget(g *GitHubConfig, label string) error {
+	if g.Token == "" && g.AppID == 0 {
+		return fmt.Errorf("%s.token or %s.app_id is required", label, label)
+	}
+	if g.AppID != 0 {
+		if g.InstallationID == 0 {
+			return fmt.Errorf("%s.installation_id is required when using app_id", label)
+		}
+		if g.PrivateKeyPath == "" {
+			return fmt.Errorf("%s.private_key_path is required when using app_id", label)
+		}
+	}
+	if g.Owner == "" {
+		return fmt.Errorf("%s.owner is required", label)
+	}
 	return nil
 }
 

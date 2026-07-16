@@ -444,6 +444,10 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	useTLS := s.cfg.TLSCert != "" && s.cfg.TLSKey != ""
 
 	// Collect webhook-capable providers and mount per-provider webhook paths.
+	// pathOf gives each provider a stable, unique path — normally
+	// "/webhook/<name>", but when several providers share a name (one GitHub
+	// provider per owner) it disambiguates by owner so they never collide.
+	pathOf := webhookPathOf(s.cfg.Providers)
 	var whProviders []providers.Webhook
 	if useWebhook {
 		for _, p := range s.cfg.Providers {
@@ -452,7 +456,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 				continue
 			}
 			whProviders = append(whProviders, whp)
-			path := "/webhook/" + p.Name()
+			path := pathOf(p)
 			handler, webhookEvents := whp.WebhookHandler(s.cfg.WebhookSecret)
 			mux.Handle(path, handler)
 
@@ -495,7 +499,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 
 		// Register webhooks for each webhook-capable provider.
 		for _, whp := range whProviders {
-			webhookURL := s.cfg.Tunnel.PublicURL() + "/webhook/" + whp.(providers.Provider).Name()
+			webhookURL := s.cfg.Tunnel.PublicURL() + pathOf(whp.(providers.Provider))
 			s.cfg.Log.Info("webhook tunnel ready", "provider", whp.(providers.Provider).Name(), "url", webhookURL)
 			if err := whp.RegisterWebhooks(ctx, webhookURL, s.cfg.WebhookSecret); err != nil {
 				return fmt.Errorf("registering webhooks for %s: %w", whp.(providers.Provider).Name(), err)
@@ -2079,10 +2083,35 @@ const (
 // hook with the same URL), so this is safe to run on every startup. Hooks are
 // NOT deregistered on shutdown: external hooks are operator-owned and must
 // persist across restarts.
+// webhookPathOf returns a function that gives each provider a stable, unique
+// webhook path. Normally "/webhook/<name>", but when more than one
+// webhook-capable provider shares a name — e.g. one GitHub provider per owner —
+// the path is disambiguated by owner ("/webhook/<name>/<owner>") so they never
+// collide on the same mux path or webhook URL. Single-provider deployments keep
+// the plain "/webhook/<name>" (no path change on upgrade).
+func webhookPathOf(all []providers.Provider) func(providers.Provider) string {
+	counts := map[string]int{}
+	for _, p := range all {
+		if _, ok := p.(providers.Webhook); ok {
+			counts[p.Name()]++
+		}
+	}
+	return func(p providers.Provider) string {
+		base := "/webhook/" + p.Name()
+		if counts[p.Name()] > 1 {
+			if o, ok := p.(interface{ Owner() string }); ok && o.Owner() != "" {
+				return base + "/" + o.Owner()
+			}
+		}
+		return base
+	}
+}
+
 func (s *Scheduler) registerExternalWebhooks(ctx context.Context, whProviders []providers.Webhook) {
+	pathOf := webhookPathOf(s.cfg.Providers)
 	for _, whp := range whProviders {
 		name := whp.(providers.Provider).Name()
-		webhookURL := s.cfg.ExternalURL + "/webhook/" + name
+		webhookURL := s.cfg.ExternalURL + pathOf(whp.(providers.Provider))
 		s.cfg.Log.Info("registering external webhook", "provider", name, "url", webhookURL)
 		if err := whp.RegisterWebhooks(ctx, webhookURL, s.cfg.WebhookSecret); err != nil {
 			s.cfg.Log.Warn("failed to register external webhook (continuing; add the hook manually if needed)",
@@ -2217,9 +2246,14 @@ func (s *Scheduler) serveTunnelWithReconnect(ctx context.Context, handler http.H
 		}
 
 		// Tunnel is back — re-register webhooks with the new URL for all providers.
+		provs := make([]providers.Provider, len(whProviders))
+		for i, w := range whProviders {
+			provs[i] = w.(providers.Provider)
+		}
+		pathOf := webhookPathOf(provs)
 		allOK := true
 		for _, whp := range whProviders {
-			webhookURL := s.cfg.Tunnel.PublicURL() + "/webhook/" + whp.(providers.Provider).Name()
+			webhookURL := s.cfg.Tunnel.PublicURL() + pathOf(whp.(providers.Provider))
 			if err := whp.RegisterWebhooks(ctx, webhookURL, s.cfg.WebhookSecret); err != nil {
 				s.cfg.Log.Error("failed to re-register webhooks after tunnel reconnect",
 					"provider", whp.(providers.Provider).Name(), "error", err)
