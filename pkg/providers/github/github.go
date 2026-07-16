@@ -57,6 +57,11 @@ func New(client *github.Client, log *slog.Logger, linuxImage, windowsImage strin
 
 func (p *Provider) Name() string { return "github" }
 
+// Owner returns the GitHub org/user this provider serves. The scheduler uses
+// it to give each target a distinct webhook path when several GitHub providers
+// (one per owner) run in the same daemon.
+func (p *Provider) Owner() string { return p.client.Owner() }
+
 // DefaultImage returns the Linux runner image (legacy alias for the
 // scheduler's per-OS resolution). New callers should use DefaultImageFor.
 func (p *Provider) DefaultImage() string {
