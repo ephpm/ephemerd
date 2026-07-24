@@ -206,10 +206,24 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		defer func() { _ = os.Remove(pidFile) }()
 	}
 
+	// Ensure the host<->VM dispatch channel has a shared bearer token before
+	// booting any VM. On a host that dispatches Linux jobs into a VM (Windows
+	// Hyper-V / macOS Vz) the token both authenticates the host client and
+	// rides into the guest inside config.toml, where the in-VM dispatch server
+	// reads the identical value. Skipped in containerd-only (in-VM) mode: that
+	// daemon consumes the token delivered in config.toml and must never rewrite
+	// the shared config file. A one-time persist so the value is stable across
+	// restarts and reaches the VM.
+	if !containerdOnly {
+		if err := cfg.EnsureDispatchToken(configFile, scheduler.GenerateDispatchToken); err != nil {
+			return fmt.Errorf("ensuring dispatch token: %w", err)
+		}
+	}
+
 	// Start container runtime.
 	// On Linux/Windows: embedded containerd runs in-process.
 	// On macOS: boot a Linux VM via Virtualization.framework, containerd runs inside it.
-	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, containerdTCPAddr, cfg.Dind.Enabled, cfg.Dind.ResolvedAllowPrivileged(), cfg.VM.Linux.CPUs, cfg.VM.Linux.MemoryMB, cfg.VM.Linux.DiskSizeGB)
+	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, containerdTCPAddr, cfg.Dind.Enabled, cfg.Dind.ResolvedAllowPrivileged(), cfg.VM.Linux.CPUs, cfg.VM.Linux.MemoryMB, cfg.VM.Linux.DiskSizeGB, cfg.Dispatch.Token)
 	if err != nil {
 		return fmt.Errorf("starting container runtime: %w", err)
 	}
@@ -333,11 +347,22 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		}
 
 		dispatchPort := int(containerdTCPPort) + 1
+		// The shared dispatch token rode into this VM inside config.toml (the
+		// host minted + persisted it before boot). Require it on every RPC so
+		// nothing else on the VM network — including job containers — can drive
+		// CreateJob/WaitJob/DestroyJob. An empty token here means the host
+		// delivered a config without one; StartDispatchServer logs loudly and
+		// runs unauthenticated in that (misconfigured) case rather than
+		// silently wedging dispatch.
+		if cfg.Dispatch.Token == "" {
+			log.Warn("dispatch: no shared token in config — the dispatch gRPC server will start UNAUTHENTICATED; ensure the host persisted [dispatch].token into the config delivered to this VM")
+		}
 		ds, dispatchCleanup := scheduler.StartDispatchServer(scheduler.DispatchServerConfig{
 			Port:          dispatchPort,
 			Runtime:       rt,
 			Log:           log,
 			StatsInterval: cfg.Metrics.ParsedContainerStatsInterval(),
+			Token:         cfg.Dispatch.Token,
 			// No per-container caps configured for Linux today; samplers
 			// surface the kernel-reported limit when present.
 		})
@@ -672,11 +697,12 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	// Start metrics server if enabled
 	if cfg.Metrics.Enabled {
 		metricsCleanup := metrics.Serve(ctx, metrics.ServerConfig{
-			Port:    cfg.Metrics.Port,
-			Path:    cfg.Metrics.Path,
-			TLSCert: cfg.Metrics.TLSCert,
-			TLSKey:  cfg.Metrics.TLSKey,
-			Log:     log,
+			Port:     cfg.Metrics.Port,
+			Path:     cfg.Metrics.Path,
+			TLSCert:  cfg.Metrics.TLSCert,
+			TLSKey:   cfg.Metrics.TLSKey,
+			BindAddr: cfg.Metrics.BindAddr,
+			Log:      log,
 		})
 		defer metricsCleanup()
 
@@ -749,11 +775,13 @@ func initProviders(cfg *config.Config, log *slog.Logger) ([]providers.Provider, 
 	// (e.g. an org via a GitHub App and a personal account via a PAT).
 	for _, ghc := range cfg.GitHubTargets() {
 		ghCfg := github.Config{
-			Token:    ghc.Token,
-			Owner:    ghc.Owner,
-			Repos:    ghc.Repos,
-			Log:      log,
-			PoolMode: cfg.Webhook.Pool,
+			Token:          ghc.Token,
+			Owner:          ghc.Owner,
+			Repos:          ghc.Repos,
+			Log:            log,
+			PoolMode:       cfg.Webhook.Pool,
+			AllowedRepos:   ghc.DispatchPolicy.AllowedRepos,
+			RequiredLabels: ghc.DispatchPolicy.RequiredLabels,
 		}
 		if ghc.AppID != 0 {
 			appAuth, err := github.NewAppAuth(

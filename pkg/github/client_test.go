@@ -443,9 +443,13 @@ func TestWebhookHandler_IgnoresUntrackedRepo(t *testing.T) {
 	}
 }
 
-func TestWebhookHandler_NoSecretSkipsVerification(t *testing.T) {
+// TestWebhookHandler_NoSecretFailsClosed verifies that when no HMAC secret is
+// configured the handler refuses every request rather than accepting unsigned
+// (attacker-forgeable) payloads. Supported configs always set a secret before
+// mounting the handler; this guards the misconfiguration footgun.
+func TestWebhookHandler_NoSecretFailsClosed(t *testing.T) {
 	c := newTestClient()
-	handler, _ := c.WebhookHandler("") // no secret
+	handler, events := c.WebhookHandler("") // no secret
 
 	payload := map[string]any{
 		"action": "queued",
@@ -465,8 +469,14 @@ func TestWebhookHandler_NoSecretSkipsVerification(t *testing.T) {
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("no-secret status = %d, want %d", w.Code, http.StatusOK)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("no-secret status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+	// And no job event should have been emitted.
+	select {
+	case evt := <-events:
+		t.Fatalf("expected no event when secret missing, got %+v", evt)
+	default:
 	}
 }
 

@@ -33,6 +33,18 @@ type Config struct {
 	// public webhook URL: registration adopts an existing same-URL hook,
 	// deregistration is a no-op, and the stale-hook sweep is skipped.
 	PoolMode bool
+
+	// AllowedRepos is an OPTIONAL dispatch allowlist. When non-empty, only jobs
+	// whose repository name is in this list may dispatch a runner. Empty (the
+	// default) preserves the historical behavior of dispatching for any tracked
+	// repo. Defense-in-depth beneath GitHub's outside-collaborator approval.
+	AllowedRepos []string
+
+	// RequiredLabels is an OPTIONAL dispatch allowlist. When non-empty, an
+	// incoming job must carry at least one of these labels (in addition to the
+	// mandatory self-hosted gate) before it dispatches. Empty imposes no extra
+	// label requirement.
+	RequiredLabels []string
 }
 
 // Client handles GitHub API interactions and webhook events.
@@ -456,20 +468,30 @@ func (c *Client) WebhookHandler(secret string) (http.Handler, <-chan JobEvent) {
 			return
 		}
 
+		// Fail closed: without a secret we cannot authenticate the sender, so
+		// every payload would be attacker-forgeable (spoofed workflow_job
+		// events dispatch runners). Refuse to process instead of trusting
+		// unsigned input. Supported configs always populate a secret before the
+		// handler is mounted (see config.validate), so this only fires on a
+		// genuine misconfiguration.
+		if secret == "" {
+			c.cfg.Log.Error("webhook rejected: no HMAC secret configured; refusing to process unsigned payloads")
+			http.Error(w, "webhook secret not configured", http.StatusServiceUnavailable)
+			return
+		}
+
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
 
-		// Verify webhook signature
-		if secret != "" {
-			sig := r.Header.Get("X-Hub-Signature-256")
-			if !verifySignature(body, sig, secret) {
-				c.cfg.Log.Warn("webhook signature verification failed")
-				http.Error(w, "forbidden", http.StatusForbidden)
-				return
-			}
+		// Verify webhook signature (constant-time, before parsing the body).
+		sig := r.Header.Get("X-Hub-Signature-256")
+		if !verifySignature(body, sig, secret) {
+			c.cfg.Log.Warn("webhook signature verification failed")
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
 		}
 
 		eventType := r.Header.Get("X-GitHub-Event")
@@ -508,6 +530,21 @@ func (c *Client) WebhookHandler(secret string) (http.Handler, <-chan JobEvent) {
 			return
 		}
 
+		// Optional dispatch allowlist (defense-in-depth under GitHub's own
+		// outside-collaborator approval gate). Default (empty policy) allows
+		// everything, so existing setups are unaffected. A blocked job is
+		// acknowledged with 200 (GitHub does not redeliver on non-2xx, and this
+		// is an intentional drop, not an error).
+		if !c.dispatchAllowed(repoName, payload.WorkflowJob.Labels) {
+			c.cfg.Log.Warn("webhook event blocked by dispatch policy",
+				"repo", repoName,
+				"job_id", payload.WorkflowJob.GetID(),
+				"labels", payload.WorkflowJob.Labels,
+			)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
 		c.cfg.Log.Info("webhook event",
 			"action", payload.Action,
 			"repo", repoName,
@@ -539,6 +576,43 @@ func (c *Client) isTrackedRepo(repo string) bool {
 		}
 	}
 	return false
+}
+
+// dispatchAllowed applies the optional dispatch allowlist. An empty policy (no
+// AllowedRepos and no RequiredLabels) allows everything, preserving historical
+// behavior. When AllowedRepos is set, the repo must be listed. When
+// RequiredLabels is set, the job must carry at least one of those labels.
+func (c *Client) dispatchAllowed(repo string, labels []string) bool {
+	if len(c.cfg.AllowedRepos) > 0 {
+		allowed := false
+		for _, r := range c.cfg.AllowedRepos {
+			if r == repo {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return false
+		}
+	}
+	if len(c.cfg.RequiredLabels) > 0 {
+		hasLabel := false
+		for _, want := range c.cfg.RequiredLabels {
+			for _, l := range labels {
+				if l == want {
+					hasLabel = true
+					break
+				}
+			}
+			if hasLabel {
+				break
+			}
+		}
+		if !hasLabel {
+			return false
+		}
+	}
+	return true
 }
 
 func isSelfHosted(labels []string) bool {

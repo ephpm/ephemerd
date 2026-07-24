@@ -20,14 +20,14 @@ import (
 )
 
 const (
-	RunnerVersion        = "2.335.1"
-	CNIVersion           = "1.6.2"
-	ContainerdVersion    = "2.2.2"
-	RuncVersion          = "1.3.4"
-	AlpineVersion        = "3.21.3"
-	LinuxVirtVersion     = "6.12.83-r0"
-	GolangCILintVersion  = "2.11.4"
-	HugoVersion          = "0.160.1"
+	RunnerVersion       = "2.335.1"
+	CNIVersion          = "1.6.2"
+	ContainerdVersion   = "2.2.2"
+	RuncVersion         = "1.3.4"
+	AlpineVersion       = "3.21.3"
+	LinuxVirtVersion    = "6.12.83-r0"
+	GolangCILintVersion = "2.11.4"
+	HugoVersion         = "0.160.1"
 
 	// Alpine prunes superseded packages from dl-cdn.alpinelinux.org as soon
 	// as a new revision lands, so any pinned upstream URL goes 404 within
@@ -45,6 +45,73 @@ const (
 	vmEmbedDir     = "pkg/vm/embed"
 	toolBinDir     = "bin"
 )
+
+// pinnedSHA256 maps a downloaded artifact's exact release filename to its
+// SHA256 (hex, lower-case). Every artifact that is embedded into or executed
+// inside a runner VM — the GitHub Actions runner, CNI plugins, the containerd
+// distribution tarball, runc — MUST be listed here and fetched via
+// httpGetBytesVerified / downloadFileVerified, so a compromised or swapped
+// upstream breaks the build instead of shipping a trojaned binary as root to
+// every runner. Dev-host tooling (golangci-lint, hugo) is pinned too as
+// defense-in-depth.
+//
+// Hashes are the upstream-published checksums for the versions pinned in the
+// const block above:
+//   - runner:        release body "SHA" markers (github.com/actions/runner)
+//   - cni:           <asset>.tgz.sha256
+//   - containerd:    <asset>.tar.gz.sha256sum
+//   - runc:          runc.sha256sum (per-arch runc.<arch> lines)
+//   - golangci-lint: golangci-lint-<ver>-checksums.txt
+//   - hugo:          hugo_<ver>_checksums.txt
+//
+// When bumping any version constant, refresh the corresponding entries from the
+// upstream checksum source in the SAME change — a stale hash fails the build
+// loudly (which is the point), but it must be fixed, never removed.
+var pinnedSHA256 = map[string]string{
+	// GitHub Actions runner (actions/runner v2.335.1)
+	"actions-runner-linux-x64-2.335.1.tar.gz":   "4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf",
+	"actions-runner-linux-arm64-2.335.1.tar.gz": "6d1e85bfd1a506a8b17c1f1b9b57dba458ffed90898799aaa9f599520b0d9207",
+	"actions-runner-win-x64-2.335.1.zip":        "eb65c95277af42bcf3778a799c41359d224ba2a67b4de26b7cea1729b09c803d",
+	"actions-runner-osx-x64-2.335.1.tar.gz":     "b2fe57b2ae5b0bc1605f9fc0723c07eedf06167321d3478ce0440f15e5b0a010",
+	"actions-runner-osx-arm64-2.335.1.tar.gz":   "e1a9bc7a3661e06fa0b129d15c2064fe65dc81a431001d8958a9db1409b73769",
+
+	// CNI plugins (containernetworking/plugins v1.6.2)
+	"cni-plugins-linux-amd64-v1.6.2.tgz": "b8e811578fb66023f90d2e238d80cec3bdfca4b44049af74c374d4fae0f9c090",
+	"cni-plugins-linux-arm64-v1.6.2.tgz": "01e0e22acc7f7004e4588c1fe1871cc86d7ab562cd858e1761c4641d89ebfaa4",
+
+	// containerd distribution tarball (containerd/containerd v2.2.2) — the
+	// containerd-shim-runc-v2 binary is extracted from this.
+	"containerd-2.2.2-linux-amd64.tar.gz": "2c08c99cbde73b3388c6d5da68e0bcaebc70c9174f2b14d785695e4401b3ede0",
+	"containerd-2.2.2-linux-arm64.tar.gz": "cb102473d6e353beb604178879d51cc456da0cdf368d9437d8d404ed01baf674",
+
+	// runc (opencontainers/runc v1.3.4) — filenames are runc.<arch>.
+	"runc.amd64": "5966ca40b6187b30e33bfc299c5f1fe72e8c1aa01cf3fefdadf391668f47f103",
+	"runc.arm64": "d6dcab36d1b6af1b72c7f0662e5fcf446a291271ba6006532b95c4144e19d428",
+
+	// golangci-lint (golangci/golangci-lint v2.11.4) — dev-host tooling.
+	"golangci-lint-2.11.4-linux-amd64.tar.gz":  "200c5b7503f67b59a6743ccf32133026c174e272b930ee79aa2aa6f37aca7ef1",
+	"golangci-lint-2.11.4-linux-arm64.tar.gz":  "3bcfa2e6f3d32b2bf5cd75eaa876447507025e0303698633f722a05331988db4",
+	"golangci-lint-2.11.4-darwin-amd64.tar.gz": "c900d4048db75d1edfd550fd11cf6a9b3008e7caa8e119fcddbc700412d63e60",
+	"golangci-lint-2.11.4-darwin-arm64.tar.gz": "02db2a2dae8b26812e53b0688a6f617e3ef1f489790e829ea22862cf76945675",
+	"golangci-lint-2.11.4-windows-amd64.zip":   "4932cfca5e75bf60fe1c576edf459e5e809e6644664a068185d64b84af3fad9e",
+	"golangci-lint-2.11.4-windows-arm64.zip":   "fa90179d6377f224798b56bfa308dcd7d62bf28a7aa6889fb180f35b290e3413",
+
+	// Hugo extended (gohugoio/hugo v0.160.1) — dev-host docs tooling. macOS
+	// ships only a darwin-universal build (no darwin-<arch> asset), so the
+	// mac path is left unpinned; docs are built on Linux CI.
+	"hugo_extended_0.160.1_linux-amd64.tar.gz": "133adf4932c1b626b6fe6aa28d56791555abe3ceff167e03be534e8324c9ed39",
+	"hugo_extended_0.160.1_linux-arm64.tar.gz": "be4203d99a5b91446cd89af1e788aeb3c6210cbe78fab380a26be135a3f4ec59",
+	"hugo_extended_0.160.1_windows-amd64.zip":  "f5e342de1c9b22dc03318c14689cbc81ac9afec0c6f2080e0cf5a3aa03edbf6d",
+}
+
+// pinnedFor returns the pinned SHA256 for the given release filename. The bool
+// is false when no pin exists (e.g. an arch/OS combination we don't verify,
+// like the macOS-universal Hugo build); callers embedding into a VM should
+// treat a missing pin as a hard error.
+func pinnedFor(filename string) (string, bool) {
+	sha, ok := pinnedSHA256[filename]
+	return sha, ok
+}
 
 // All downloads all assets appropriate for the current OS.
 func All() {
@@ -100,7 +167,7 @@ func Runner() error {
 	filename := fmt.Sprintf("actions-runner-%s-%s-%s.%s", os_, arch, RunnerVersion, ext)
 	dest := filepath.Join(runnerEmbedDir, filename)
 	url := fmt.Sprintf("https://github.com/actions/runner/releases/download/v%s/%s", RunnerVersion, filename)
-	return downloadFile(url, dest)
+	return downloadPinnedAsset(filename, dest, url)
 }
 
 // Runnerlinux always downloads the Linux x64 runner (for embedding in Windows builds).
@@ -108,7 +175,7 @@ func Runnerlinux() error {
 	filename := fmt.Sprintf("actions-runner-linux-x64-%s.tar.gz", RunnerVersion)
 	dest := filepath.Join(runnerEmbedDir, filename)
 	url := fmt.Sprintf("https://github.com/actions/runner/releases/download/v%s/%s", RunnerVersion, filename)
-	return downloadFile(url, dest)
+	return downloadPinnedAsset(filename, dest, url)
 }
 
 // Runnerlinuxarm64 always downloads the Linux arm64 runner (for macOS embed cross-compile).
@@ -116,7 +183,7 @@ func Runnerlinuxarm64() error {
 	filename := fmt.Sprintf("actions-runner-linux-arm64-%s.tar.gz", RunnerVersion)
 	dest := filepath.Join(runnerEmbedDir, filename)
 	url := fmt.Sprintf("https://github.com/actions/runner/releases/download/v%s/%s", RunnerVersion, filename)
-	return downloadFile(url, dest)
+	return downloadPinnedAsset(filename, dest, url)
 }
 
 // Runnerwindows always downloads the Windows x64 runner.
@@ -124,7 +191,7 @@ func Runnerwindows() error {
 	filename := fmt.Sprintf("actions-runner-win-x64-%s.zip", RunnerVersion)
 	dest := filepath.Join(runnerEmbedDir, filename)
 	url := fmt.Sprintf("https://github.com/actions/runner/releases/download/v%s/%s", RunnerVersion, filename)
-	return downloadFile(url, dest)
+	return downloadPinnedAsset(filename, dest, url)
 }
 
 // Cni downloads the CNI plugins tarball (Linux only, no-op on other OS).
@@ -137,7 +204,7 @@ func Cni() error {
 	filename := fmt.Sprintf("cni-plugins-linux-%s-v%s.tgz", arch, CNIVersion)
 	dest := filepath.Join(cniEmbedDir, filename)
 	url := fmt.Sprintf("https://github.com/containernetworking/plugins/releases/download/v%s/%s", CNIVersion, filename)
-	return downloadFile(url, dest)
+	return downloadPinnedAsset(filename, dest, url)
 }
 
 // Cnilinux always downloads the Linux amd64 CNI plugins (for cross-compile embed).
@@ -145,7 +212,7 @@ func Cnilinux() error {
 	filename := fmt.Sprintf("cni-plugins-linux-amd64-v%s.tgz", CNIVersion)
 	dest := filepath.Join(cniEmbedDir, filename)
 	url := fmt.Sprintf("https://github.com/containernetworking/plugins/releases/download/v%s/%s", CNIVersion, filename)
-	return downloadFile(url, dest)
+	return downloadPinnedAsset(filename, dest, url)
 }
 
 // Cnilinuxarm64 downloads the Linux arm64 CNI plugins (for macOS embed cross-compile).
@@ -153,7 +220,7 @@ func Cnilinuxarm64() error {
 	filename := fmt.Sprintf("cni-plugins-linux-arm64-v%s.tgz", CNIVersion)
 	dest := filepath.Join(cniEmbedDir, filename)
 	url := fmt.Sprintf("https://github.com/containernetworking/plugins/releases/download/v%s/%s", CNIVersion, filename)
-	return downloadFile(url, dest)
+	return downloadPinnedAsset(filename, dest, url)
 }
 
 // Shim downloads containerd-shim-runc-v2 (extracted from tarball) and runc binary.
@@ -256,6 +323,15 @@ func Rootfs() error {
 		}
 	}
 
+	// TODO(security): pin real sha256 for the Alpine base minirootfs and each
+	// APK below. Unlike the GitHub-hosted artifacts, dl-cdn.alpinelinux.org
+	// prunes superseded revisions within weeks (the same reason linux-virt is
+	// mirrored + pinned via fetchLinuxVirtAPK), so pinning here requires first
+	// mirroring these assets to a deps-* release tag and pinning the mirrored
+	// bytes. Tracked for follow-up; not pinned in this PR because a wrong hash
+	// (or an un-mirrored pin that 404s) would break the rootfs build for
+	// everyone, which is worse than the current TOFU. These assets ARE embedded
+	// in the runner VM, so this remains a known gap. See the F2 report.
 	baseURL := fmt.Sprintf("https://dl-cdn.alpinelinux.org/alpine/v%s/releases/%s/alpine-minirootfs-%s-%s.tar.gz",
 		alpineMajorMinor(AlpineVersion), arch, AlpineVersion, arch)
 	fmt.Printf("  Downloading base Alpine minirootfs (%s)...\n", arch)
@@ -269,7 +345,7 @@ func Rootfs() error {
 		url := fmt.Sprintf("https://dl-cdn.alpinelinux.org/alpine/v%s/%s/%s/%s-%s.apk",
 			alpineMajorMinor(AlpineVersion), pkg.repo, arch, pkg.name, pkg.version)
 		fmt.Printf("  Downloading %s-%s.apk (%s)...\n", pkg.name, pkg.version, arch)
-		pkgData[i], err = httpGetBytes(url)
+		pkgData[i], err = httpGetBytes(url) // TODO(security): pin sha256 (see note above)
 		if err != nil {
 			return fmt.Errorf("downloading %s: %w", pkg.name, err)
 		}
@@ -291,7 +367,6 @@ var initrdPackages = []apkPkg{
 	{"libcom_err", "1.47.1-r1", "main"},
 	{"libeconf", "0.6.3-r0", "main"}, // required by libblkid at runtime
 }
-
 
 // Kernel downloads the Alpine linux-virt kernel and extracts vmlinuz.
 // Only needed on Darwin (Virtualization.framework); no-op on other OS.
@@ -379,11 +454,11 @@ var initrdKernelModules = []string{
 	"kernel/net/packet/af_packet.ko.gz", // required by udhcpc (AF_PACKET raw sockets)
 	"kernel/fs/fuse/fuse.ko.gz",
 	"kernel/fs/fuse/virtiofs.ko.gz",
-	"kernel/lib/crc16.ko.gz",      // ext4 dep
+	"kernel/lib/crc16.ko.gz",             // ext4 dep
 	"kernel/crypto/crc32c_generic.ko.gz", // ext4 dep (for metadata checksums)
-	"kernel/lib/libcrc32c.ko.gz",  // ext4 dep
-	"kernel/fs/mbcache.ko.gz",     // ext4 dep
-	"kernel/fs/jbd2/jbd2.ko.gz",   // ext4 dep
+	"kernel/lib/libcrc32c.ko.gz",         // ext4 dep
+	"kernel/fs/mbcache.ko.gz",            // ext4 dep
+	"kernel/fs/jbd2/jbd2.ko.gz",          // ext4 dep
 	"kernel/fs/ext4/ext4.ko.gz",
 	"kernel/fs/overlayfs/overlay.ko.gz", // containerd overlayfs snapshotter
 	// Netfilter + iptables/nftables — needed by CNI bridge + MASQUERADE
@@ -412,15 +487,15 @@ var initrdKernelModules = []string{
 	// not supported, missing kernel module" — iptables-restore is atomic, so
 	// the whole transaction is lost and no Service ClusterIP rules ever install.
 	"kernel/net/netfilter/xt_nat.ko.gz",
-	"kernel/net/netfilter/xt_conntrack.ko.gz", // iptables conntrack match extension
-	"kernel/net/netfilter/xt_comment.ko.gz",   // CNI uses --comment in NAT rules
-	"kernel/net/netfilter/xt_addrtype.ko.gz",  // CNI may use --addrtype matches
-	"kernel/net/netfilter/xt_mark.ko.gz",      // common iptables -m mark extension
-	"kernel/net/bridge/bridge.ko.gz",          // CNI bridge plugin needs bridge support
-	"kernel/drivers/net/veth.ko.gz",           // CNI bridge uses veth pairs to connect containers
-	"kernel/net/ipv4/netfilter/ipt_REJECT.ko.gz",   // iptables REJECT target
-	"kernel/net/netfilter/nft_reject.ko.gz",         // nf_tables reject support
-	"kernel/net/netfilter/nft_reject_inet.ko.gz",    // nf_tables inet reject
+	"kernel/net/netfilter/xt_conntrack.ko.gz",    // iptables conntrack match extension
+	"kernel/net/netfilter/xt_comment.ko.gz",      // CNI uses --comment in NAT rules
+	"kernel/net/netfilter/xt_addrtype.ko.gz",     // CNI may use --addrtype matches
+	"kernel/net/netfilter/xt_mark.ko.gz",         // common iptables -m mark extension
+	"kernel/net/bridge/bridge.ko.gz",             // CNI bridge plugin needs bridge support
+	"kernel/drivers/net/veth.ko.gz",              // CNI bridge uses veth pairs to connect containers
+	"kernel/net/ipv4/netfilter/ipt_REJECT.ko.gz", // iptables REJECT target
+	"kernel/net/netfilter/nft_reject.ko.gz",      // nf_tables reject support
+	"kernel/net/netfilter/nft_reject_inet.ko.gz", // nf_tables inet reject
 }
 
 // Initrd builds a minimal initramfs for the Linux VM on Darwin.
@@ -441,14 +516,17 @@ func Initrd() error {
 		return err
 	}
 
-	// Download APK packages for the initrd userspace
+	// Download APK packages for the initrd userspace.
+	// TODO(security): pin sha256 for these initrd APKs (same dl-cdn pruning
+	// constraint as the rootfs APKs — needs a mirror first; see the note in
+	// Rootfs and the F2 report).
 	pkgData := make([][]byte, len(initrdPackages))
 	var err error
 	for i, pkg := range initrdPackages {
 		url := fmt.Sprintf("https://dl-cdn.alpinelinux.org/alpine/v%s/%s/aarch64/%s-%s.apk",
 			alpineMajorMinor(AlpineVersion), pkg.repo, pkg.name, pkg.version)
 		fmt.Printf("  Downloading %s-%s.apk (initrd)...\n", pkg.name, pkg.version)
-		pkgData[i], err = httpGetBytes(url)
+		pkgData[i], err = httpGetBytes(url) // TODO(security): pin sha256 (see note above)
 		if err != nil {
 			return fmt.Errorf("downloading %s: %w", pkg.name, err)
 		}
@@ -718,13 +796,16 @@ func Initrdx86() error {
 	}
 
 	// Download APK packages for the initrd userspace (same as Darwin, x86_64 arch)
+	// TODO(security): pin sha256 for these initrd APKs (same dl-cdn pruning
+	// constraint as the rootfs APKs — needs a mirror first; see the note in
+	// Rootfs and the F2 report).
 	pkgData := make([][]byte, len(initrdPackages))
 	var err error
 	for i, pkg := range initrdPackages {
 		url := fmt.Sprintf("https://dl-cdn.alpinelinux.org/alpine/v%s/%s/x86_64/%s-%s.apk",
 			alpineMajorMinor(AlpineVersion), pkg.repo, pkg.name, pkg.version)
 		fmt.Printf("  Downloading %s-%s.apk (initrd x86_64)...\n", pkg.name, pkg.version)
-		pkgData[i], err = httpGetBytes(url)
+		pkgData[i], err = httpGetBytes(url) // TODO(security): pin sha256 (see note above)
 		if err != nil {
 			return fmt.Errorf("downloading %s: %w", pkg.name, err)
 		}
@@ -1922,7 +2003,11 @@ func Golangcilint() error {
 	url := fmt.Sprintf("https://github.com/golangci/golangci-lint/releases/download/v%s/%s", GolangCILintVersion, filename)
 	fmt.Printf("  Downloading golangci-lint %s...\n", GolangCILintVersion)
 
-	data, err := httpGetBytes(url)
+	want, ok := pinnedFor(filename)
+	if !ok {
+		return fmt.Errorf("no pinned sha256 for %q — add it to pinnedSHA256 (from golangci-lint-%s-checksums.txt)", filename, GolangCILintVersion)
+	}
+	data, err := httpGetBytesVerified(url, want)
 	if err != nil {
 		return fmt.Errorf("downloading golangci-lint: %w", err)
 	}
@@ -1995,7 +2080,19 @@ func Hugo() error {
 	url := fmt.Sprintf("https://github.com/gohugoio/hugo/releases/download/v%s/%s", HugoVersion, filename)
 	fmt.Printf("  Downloading hugo %s...\n", HugoVersion)
 
-	data, err := httpGetBytes(url)
+	// Hugo is dev-host docs tooling (never embedded in a runner VM). Verify the
+	// pinned Linux/Windows builds; macOS ships only a darwin-universal asset
+	// (no darwin-<arch> file), so there is no per-arch pin to check there.
+	var (
+		data []byte
+		err  error
+	)
+	if want, ok := pinnedFor(filename); ok {
+		data, err = httpGetBytesVerified(url, want)
+	} else {
+		fmt.Printf("  WARNING: no pinned sha256 for %q; downloading unverified (dev-host docs tooling only)\n", filename)
+		data, err = httpGetBytes(url)
+	}
 	if err != nil {
 		return fmt.Errorf("downloading hugo: %w", err)
 	}
@@ -2128,6 +2225,77 @@ func httpGetBytes(url string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
+// verifySHA256 checks that data hashes to want (hex, lower-case). An empty
+// want is a programming error (a pin was requested but not supplied) and is
+// rejected so we can never silently skip verification for a supposedly-pinned
+// artifact.
+func verifySHA256(data []byte, want, name string) error {
+	if want == "" {
+		return fmt.Errorf("%s: no pinned sha256 provided (refusing to use unverified download)", name)
+	}
+	got := fmt.Sprintf("%x", sha256.Sum256(data))
+	if got != want {
+		return fmt.Errorf("%s: sha256 mismatch: want %s, got %s", name, want, got)
+	}
+	return nil
+}
+
+// httpGetBytesVerified downloads url and fails hard unless its bytes match the
+// pinned want (hex sha256). Use for every artifact embedded into or executed
+// inside a runner VM — a compromised or swapped upstream must break the build,
+// not ship a trojaned binary to every runner.
+func httpGetBytesVerified(url, want string) ([]byte, error) {
+	data, err := httpGetBytes(url)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifySHA256(data, want, url); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// downloadPinnedAsset downloads a release asset to dest, looking up the pinned
+// SHA256 by the asset's filename and failing hard if no pin exists. Use for any
+// artifact fetched-and-embedded/executed in a runner VM: an unpinned asset is a
+// hole, so a missing pin is a build error, never a silent unverified download.
+func downloadPinnedAsset(filename, dest, url string) error {
+	want, ok := pinnedFor(filename)
+	if !ok {
+		return fmt.Errorf("no pinned sha256 for %q — add it to pinnedSHA256 before downloading (refusing unverified fetch of a VM-embedded artifact)", filename)
+	}
+	return downloadFileVerified(url, dest, want)
+}
+
+// downloadFileVerified downloads url to dest and verifies its SHA256 against
+// want before the bytes are persisted. Skips (without re-verifying) when dest
+// already exists, mirroring downloadFile — the integrity gate is at fetch time.
+// The download is staged to a temp file and only renamed into place after the
+// hash matches, so a mismatch never leaves a poisoned file behind.
+func downloadFileVerified(url, dest, want string) error {
+	if fileExists(dest) {
+		fmt.Printf("  %s already exists, skipping\n", dest)
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return err
+	}
+	fmt.Printf("  Downloading %s...\n", url)
+	data, err := httpGetBytesVerified(url, want)
+	if err != nil {
+		return err
+	}
+	tmp := dest + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, dest); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
 // linuxVirtMirrorURL returns the GitHub Releases mirror URL for the
 // linux-virt APK pinned at LinuxVirtVersion. arch is "aarch64" or "x86_64".
 // Note: GitHub Releases doesn't tolerate slashes in tag names (they 404
@@ -2210,20 +2378,24 @@ func downloadShimForArch(arch string) error {
 		return err
 	}
 
-	url := fmt.Sprintf("https://github.com/containerd/containerd/releases/download/v%s/containerd-%s-linux-%s.tar.gz",
-		ContainerdVersion, ContainerdVersion, arch)
+	tarballName := fmt.Sprintf("containerd-%s-linux-%s.tar.gz", ContainerdVersion, arch)
+	url := fmt.Sprintf("https://github.com/containerd/containerd/releases/download/v%s/%s",
+		ContainerdVersion, tarballName)
 	fmt.Printf("  Downloading containerd-shim-runc-v2 from containerd %s...\n", ContainerdVersion)
 
-	resp, err := http.Get(url)
+	want, ok := pinnedFor(tarballName)
+	if !ok {
+		return fmt.Errorf("no pinned sha256 for %q — add it to pinnedSHA256 before downloading the containerd shim", tarballName)
+	}
+	// Buffer + verify the whole tarball before extracting: the shim runs as
+	// root in every runner VM, so it must never be extracted from unverified
+	// bytes.
+	data, err := httpGetBytesVerified(url, want)
 	if err != nil {
 		return fmt.Errorf("download shim: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download shim: HTTP %d", resp.StatusCode)
-	}
 
-	gr, err := gzip.NewReader(resp.Body)
+	gr, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("gzip shim: %w", err)
 	}
@@ -2258,44 +2430,17 @@ func downloadRunc() error {
 
 func downloadRuncForArch(arch string) error {
 	dest := filepath.Join(shimEmbedDir, "runc")
-	url := fmt.Sprintf("https://github.com/opencontainers/runc/releases/download/v%s/runc.%s",
-		RuncVersion, arch)
-	if err := downloadFile(url, dest); err != nil {
+	assetName := fmt.Sprintf("runc.%s", arch)
+	url := fmt.Sprintf("https://github.com/opencontainers/runc/releases/download/v%s/%s",
+		RuncVersion, assetName)
+	want, ok := pinnedFor(assetName)
+	if !ok {
+		return fmt.Errorf("no pinned sha256 for %q — add it to pinnedSHA256 before downloading runc", assetName)
+	}
+	if err := downloadFileVerified(url, dest, want); err != nil {
 		return err
 	}
 	return os.Chmod(dest, 0o755)
-}
-
-// downloadFile downloads url to dest, skipping if the file already exists.
-func downloadFile(url, dest string) error {
-	if fileExists(dest) {
-		fmt.Printf("  %s already exists, skipping\n", dest)
-		return nil
-	}
-
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		return err
-	}
-
-	fmt.Printf("  Downloading %s...\n", url)
-	resp, err := http.Get(url)
-	if err != nil {
-		return fmt.Errorf("download %s: %w", dest, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download %s: HTTP %d", dest, resp.StatusCode)
-	}
-
-	f, err := os.Create(dest)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
 }
 
 func fileExists(path string) bool {
@@ -2363,4 +2508,3 @@ func alpineArch(goarch string) string {
 	}
 	return "x86_64"
 }
-

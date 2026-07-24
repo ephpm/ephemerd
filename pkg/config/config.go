@@ -31,7 +31,26 @@ type Config struct {
 	Runtime     RuntimeConfig     `toml:"runtime"`
 	Runner      RunnerConfig      `toml:"runner"`
 	Metrics     MetricsConfig     `toml:"metrics"`
+	Dispatch    DispatchConfig    `toml:"dispatch"`
 	Log         LogConfig         `toml:"log"`
+}
+
+// DispatchConfig configures the host<->VM dispatch gRPC channel. On Windows
+// (Hyper-V) and macOS (Vz) hosts, Linux jobs run inside a long-lived Linux VM
+// and the host dispatches Create/Wait/Destroy over gRPC. That surface can
+// spawn and kill jobs with a caller-supplied image, so it is authenticated
+// with a shared bearer token.
+type DispatchConfig struct {
+	// Token is the shared bearer token the host client presents and the in-VM
+	// dispatch server requires on every RPC (constant-time compared). It is
+	// delivered to the VM inside config.toml through the existing config-share
+	// channel, so both sides converge on the same value with no extra plumbing.
+	//
+	// Leave empty for the daemon to mint a 256-bit token on first run and
+	// persist it back into config.toml (see EnsureDispatchToken) — operators
+	// normally never set this by hand. Set it explicitly only to pin a known
+	// value (e.g. to rotate, or in a config baked read-only).
+	Token string `toml:"token"`
 }
 
 // GitHubTargets returns every configured GitHub target: the primary [github]
@@ -87,6 +106,11 @@ type MetricsConfig struct {
 	Path    string `toml:"path"`     // metrics path (default "/metrics")
 	TLSCert string `toml:"tls_cert"` // TLS certificate path (optional)
 	TLSKey  string `toml:"tls_key"`  // TLS private key path (optional)
+	// BindAddr is the interface the metrics listener binds to. The endpoint is
+	// unauthenticated, so it defaults to "127.0.0.1" (loopback only). Set to
+	// "0.0.0.0" to scrape from another host, and firewall the port and/or set
+	// tls_cert/tls_key when you do.
+	BindAddr string `toml:"bind_addr"`
 	// ContainerStatsInterval is how often per-container resource samples are
 	// taken (CPU, memory). Used both by the host's local sampler ticker and as
 	// the cadence the host requests from the in-VM Dispatch StreamContainerStats
@@ -374,6 +398,14 @@ type GitHubConfig struct {
 	Owner string   `toml:"owner"`
 	Repos []string `toml:"repos"`
 
+	// DispatchPolicy is an OPTIONAL defense-in-depth allowlist that gates which
+	// incoming workflow_job webhook events are allowed to dispatch a runner.
+	// It is IN ADDITION to (not a replacement for) GitHub's own "require
+	// approval for outside collaborators" setting, which remains the primary
+	// control against fork-PR abuse. Empty (the default) preserves today's
+	// behavior: any tracked repo with a self-hosted label dispatches.
+	DispatchPolicy DispatchPolicyConfig `toml:"dispatch_policy"`
+
 	// Job discovery: polling interval (default "30s")
 	PollInterval string `toml:"poll_interval"`
 
@@ -393,6 +425,30 @@ type GitHubConfig struct {
 	// this. Falls through to the runtime's host-matched servercore default
 	// (pkg/runtime/image_windows.go) when unset.
 	DefaultImageWindows string `toml:"default_image_windows"`
+}
+
+// DispatchPolicyConfig is an opt-in allowlist restricting which webhook jobs
+// may dispatch a runner. All fields default to "no restriction"; setting any
+// field narrows dispatch. It is a safety net layered under GitHub's outside-
+// collaborator approval gate, not a substitute for it.
+type DispatchPolicyConfig struct {
+	// AllowedRepos, when non-empty, restricts dispatch to jobs whose repository
+	// name is in this list. Empty means "all tracked repos" (current behavior).
+	// Repo names are matched exactly against the webhook's repository name (the
+	// same value used by [github].repos).
+	AllowedRepos []string `toml:"allowed_repos"`
+
+	// RequiredLabels, when non-empty, requires an incoming job to carry at
+	// least one of these labels (beyond the mandatory "self-hosted" gate)
+	// before it dispatches. Empty means "no extra label requirement". Use this
+	// to pin dispatch to jobs that opt in with a distinctive label an outside
+	// fork is unlikely to request (e.g. "ephemerd").
+	RequiredLabels []string `toml:"required_labels"`
+}
+
+// IsZero reports whether the policy imposes no restrictions (the default).
+func (d DispatchPolicyConfig) IsZero() bool {
+	return len(d.AllowedRepos) == 0 && len(d.RequiredLabels) == 0
 }
 
 // DefaultImageFor returns the provider-level default image for the given OS.
@@ -936,6 +992,59 @@ func Load(path string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// EnsureDispatchToken guarantees c.Dispatch.Token is set, minting a fresh token
+// and persisting it into the config file at path when it is currently empty.
+// The generated token is appended as a "[dispatch]" block so the operator's
+// existing content (and comments) are preserved; the persisted file then rides
+// into the Linux VM through the normal config-delivery channel, giving the host
+// client and the in-VM dispatch server the same shared secret.
+//
+// It is a no-op when a token is already set (whether from config or a prior
+// mint). Only the host that boots the VM needs to call this; the in-VM daemon
+// simply reads the token that was delivered inside config.toml.
+//
+// gen supplies the token bytes (crypto/rand-backed in production); injecting it
+// keeps this package free of a scheduler import and makes the persistence path
+// testable.
+func (c *Config) EnsureDispatchToken(path string, gen func() (string, error)) error {
+	if c.Dispatch.Token != "" {
+		return nil
+	}
+	tok, err := gen()
+	if err != nil {
+		return fmt.Errorf("generating dispatch token: %w", err)
+	}
+	if tok == "" {
+		return fmt.Errorf("dispatch token generator returned empty token")
+	}
+	c.Dispatch.Token = tok
+
+	// Persist so the value survives restarts and reaches the VM. A missing
+	// path (config loaded from defaults only) means there is nowhere durable to
+	// write; keep the in-memory token so the current process still works, but
+	// surface the situation to the caller's logs via the returned nil (no
+	// error — an ephemeral token is still better than none).
+	if path == "" {
+		return nil
+	}
+
+	block := fmt.Sprintf("\n[dispatch]\n# Auto-generated shared token for the host<->VM dispatch gRPC channel.\n# Delete this block to have ephemerd mint a new one on next start.\ntoken = %q\n", tok)
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("opening config to persist dispatch token: %w", err)
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("closing config after persisting dispatch token: %w", cerr)
+		}
+	}()
+	if _, err = f.WriteString(block); err != nil {
+		return fmt.Errorf("writing dispatch token to config: %w", err)
+	}
+	return nil
 }
 
 func (c *Config) validate() error {
