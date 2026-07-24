@@ -81,6 +81,7 @@ func main() {
 			statusCmd(),
 			drainCmd(),
 			jobsCmd(),
+			cacheCmd(),
 			configCheckCmd(),
 			crictlCmd(),
 			doctorCmd(),
