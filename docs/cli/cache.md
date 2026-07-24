@@ -27,6 +27,21 @@ ephemerd cache clear --all [--yes]
 | `artifacts` | `artifacts/` | OCI artifact layers extracted for macOS VM jobs (per job) | yes |
 | `vm` | `vm/` | VM images and per-job clones (macOS `base.img`, Linux VM, run dirs); the `embed/` assets are preserved | no |
 | `containerd` | `containerd/` | containerd content store, snapshots, and state (backs all images) | no |
+| `jobs` | `jobs/` | Per-job runner workdirs (`_work`, extracted php-sdk, dind sockets); in-flight job dirs are skipped | yes |
+
+Per-job runner workdirs persist under `jobs/<job-id>/` rather than being
+destroyed the instant a job ends (on Windows they were in fact leaking — see
+the note below), so a stale extraction such as a bad `php-sdk` can block a
+subsequent build. `cache clear jobs` clears them. It is safe to run while the
+daemon is up: the command asks the daemon for its currently running jobs (over
+the control socket) and skips those directories, removing only the leftovers.
+If the daemon is not running, nothing is in flight and every `jobs/*` dir is
+removed.
+
+> The underlying Windows leak — job workdirs that were never removed on job
+> completion — is fixed separately (per-job cleanup on completion plus a
+> startup sweep of orphaned dirs). `cache clear jobs` is the operator-facing
+> escape hatch for clearing any that predate that fix or survive a crash.
 
 The per-repo **dind image cache** is not in this list because it lives in
 containerd metadata namespaces (`ephemerd-dind-cache-*`), not a directory. It

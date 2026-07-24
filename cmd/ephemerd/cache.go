@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	apiv1 "github.com/ephpm/ephemerd/api/v1"
@@ -108,6 +109,18 @@ func managedCaches() []cacheEntry {
 			Rel:         "containerd",
 			Description: "containerd content store, snapshots, and state (backs all images)",
 			LiveSafe:    false,
+		},
+		{
+			Name: "jobs",
+			Rel:  "jobs",
+			Description: "Per-job runner workdirs (_work, extracted php-sdk, dind sockets); " +
+				"in-flight jobs are skipped",
+			// Live-safe, BUT clearing must skip the workdir of any job that is
+			// still running — see cacheClearCmd, which folds the running jobs'
+			// directory names into KeepDirs before calling clearCacheDir. The
+			// per-child path-root guard in clearCacheDir still applies, so a
+			// job dir is never removed from outside <data>/jobs/.
+			LiveSafe: true,
 		},
 	}
 }
@@ -279,6 +292,57 @@ func daemonRunning(ctx context.Context) bool {
 	return err == nil
 }
 
+// runningJobDirs returns the immediate child directory names under
+// <data>/jobs/ that belong to a job the daemon is CURRENTLY running, so
+// `cache clear jobs` can skip them. Each job's on-disk workdir is named after
+// its runner/container ID (RunnerEnv.ID), which the control API reports as the
+// job's Name (see scheduler.controlServer.toProto and dind.New, which roots
+// the per-job dir at <data>/jobs/<JobID>/).
+//
+// The set is queried from the running daemon via the control socket. If the
+// daemon is not reachable, there are no in-flight jobs by definition — every
+// jobs/* dir is a leftover from a previous run — so we return an empty set and
+// the caller clears them all. A control error (daemon up but ListJobs failed)
+// is surfaced so we fail safe rather than risk deleting a live job's dir.
+func runningJobDirs(ctx context.Context) (map[string]struct{}, error) {
+	cc, err := dialControl(ctx)
+	if err != nil {
+		// Daemon unreachable: nothing is running, so nothing to skip.
+		return map[string]struct{}{}, nil
+	}
+	defer func() { _ = cc.Close() }()
+
+	// A dial success does not guarantee the daemon is up (grpc.NewClient is
+	// lazy). Probe with Status first; if that fails the daemon is down and
+	// there are no running jobs to protect.
+	if _, err := cc.Status(ctx, &apiv1.StatusRequest{}); err != nil {
+		return map[string]struct{}{}, nil
+	}
+
+	resp, err := cc.ListJobs(ctx, &apiv1.ListJobsRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("listing running jobs to protect their workdirs: %w", err)
+	}
+	names := make(map[string]struct{}, len(resp.GetJobs()))
+	for _, j := range resp.GetJobs() {
+		if n := j.GetName(); n != "" {
+			names[n] = struct{}{}
+		}
+	}
+	return names, nil
+}
+
+// sortedKeys returns the keys of set in stable, sorted order. Used so the
+// jobs-cache skip list is deterministic (nice for logging/tests).
+func sortedKeys(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func cacheCmd() *cli.Command {
 	return &cli.Command{
 		Name:  "cache",
@@ -442,7 +506,23 @@ func cacheClearCmd() *cli.Command {
 				if err != nil {
 					return err
 				}
-				freed, err := clearCacheDir(configDir, root, c.KeepDirs)
+				keep := c.KeepDirs
+				// The jobs cache is live-safe, but an in-flight job's workdir
+				// must never be deleted out from under it. Fold the running
+				// jobs' directory names into the keep set so clearCacheDir
+				// skips exactly those children (its per-child path-root guard
+				// still governs everything it does remove).
+				if c.Name == "jobs" {
+					protected, perr := runningJobDirs(ctx)
+					if perr != nil {
+						return fmt.Errorf("clearing cache %q: %w", c.Name, perr)
+					}
+					if len(protected) > 0 {
+						keep = append(append([]string{}, c.KeepDirs...), sortedKeys(protected)...)
+						fmt.Printf("skipping %d in-flight job dir(s) under %q\n", len(protected), c.Name)
+					}
+				}
+				freed, err := clearCacheDir(configDir, root, keep)
 				if err != nil {
 					return fmt.Errorf("clearing cache %q: %w", c.Name, err)
 				}

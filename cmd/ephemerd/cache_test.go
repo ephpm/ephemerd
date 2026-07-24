@@ -236,6 +236,78 @@ func TestManagedCaches_UniqueNamesAndRels(t *testing.T) {
 	}
 }
 
+// TestManagedCaches_JobsEntry asserts the jobs cache is registered and
+// live-safe. The jobs dir (<data>/jobs/<id>/) accumulates per-job runner
+// workdirs — including the extracted php-sdk on Windows — and must be
+// clearable so a stale extraction can't block a build. It is live-safe
+// because clearing skips any in-flight job's dir (see below).
+func TestManagedCaches_JobsEntry(t *testing.T) {
+	c, ok := cacheByName("jobs")
+	if !ok {
+		t.Fatal("jobs cache should be registered")
+	}
+	if c.Rel != "jobs" {
+		t.Errorf("jobs Rel = %q, want %q", c.Rel, "jobs")
+	}
+	if !c.LiveSafe {
+		t.Error("jobs cache should be LiveSafe (clearable while the daemon runs)")
+	}
+}
+
+// TestClearCacheDir_SkipsRunningJobDir proves the running-job skip: a job dir
+// whose name is in the keep set (as cacheClearCmd folds running jobs' names in
+// via runningJobDirs) survives, while a leftover job dir is removed. This is
+// the exact mechanism that keeps `cache clear jobs` from deleting an in-flight
+// job's workdir.
+func TestClearCacheDir_SkipsRunningJobDir(t *testing.T) {
+	data := t.TempDir()
+	c, ok := cacheByName("jobs")
+	if !ok {
+		t.Fatal("jobs cache should be registered")
+	}
+	root, err := resolveCacheRoot(data, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const running = "ephemerd-github-ephpm-fast_shannon"
+	const leftover = "ephemerd-github-ephpm-stale_galileo"
+	// Simulate a running job's workdir (with an extracted php-sdk file) and a
+	// leftover from a previous run.
+	mkFile(t, filepath.Join(root, running, "_work", "php-sdk", "libphp.a"), 1234)
+	mkFile(t, filepath.Join(root, leftover, "_work", "php-sdk", "libphp.a"), 5678)
+
+	// cacheClearCmd computes keep = KeepDirs + sortedKeys(runningJobDirs()).
+	keep := append(append([]string{}, c.KeepDirs...), sortedKeys(map[string]struct{}{
+		running: {},
+	})...)
+
+	if _, err := clearCacheDir(data, root, keep); err != nil {
+		t.Fatalf("clearCacheDir: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(root, running)); err != nil {
+		t.Errorf("in-flight job dir %q must be preserved: %v", running, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, leftover)); !os.IsNotExist(err) {
+		t.Errorf("leftover job dir %q should have been removed, stat err = %v", leftover, err)
+	}
+}
+
+// TestSortedKeys_Deterministic proves the skip list is sorted and complete.
+func TestSortedKeys_Deterministic(t *testing.T) {
+	got := sortedKeys(map[string]struct{}{"c": {}, "a": {}, "b": {}})
+	want := []string{"a", "b", "c"}
+	if len(got) != len(want) {
+		t.Fatalf("sortedKeys len = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("sortedKeys[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func mustAbs(t *testing.T, p string) string {
 	t.Helper()
 	abs, err := filepath.Abs(p)
