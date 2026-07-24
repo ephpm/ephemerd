@@ -230,6 +230,13 @@ func (r *Runtime) CleanOrphans(ctx context.Context) error {
 		}
 	}
 
+	// Sweep leftover per-job workdirs from <data>/jobs/. Destroy removes each
+	// job's dir on completion, but a crash / SIGKILL of a previous ephemerd
+	// process (or a job dir left by a build that predates the per-job removal)
+	// skips that path. At startup no job is running yet, so every jobs/* dir is
+	// an orphan — pass an empty keep set.
+	CleanOrphanJobDirs(r.cfg.DataDir, nil, r.cfg.Log)
+
 	// Clean orphan snapshots that no longer have a container pointing to them.
 	// This catches snapshots left behind when a container create partially failed.
 	ss := "overlayfs"
@@ -1047,6 +1054,14 @@ func (r *Runtime) Destroy(ctx context.Context, env *RunnerEnv) error {
 			r.cfg.Log.Warn("failed to remove job runner dir", "id", env.ID, "path", env.RunnerDir, "error", err)
 		}
 	}
+
+	// Remove the per-job workdir <DataDir>/jobs/<id>/ in full. dind.Server.Stop
+	// (called above via env.Dind.Stop) only removes the docker/ subdir, leaving
+	// the parent jobs/<id>/ — plus the runner's _work tree and any extracted
+	// php-sdk — behind. On Windows those dirs were leaking indefinitely; this
+	// is the primary per-job cleanup that stops the leak. Retries to ride out a
+	// Windows sharing violation from the just-exited container's file handles.
+	removeJobWorkdir(r.cfg.DataDir, env.ID, r.cfg.Log)
 
 	r.cfg.Log.Info("runner environment destroyed", "id", env.ID)
 	return nil
