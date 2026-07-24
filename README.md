@@ -533,6 +533,7 @@ ephemerd logs           Tail the ephemerd system service logs
 ephemerd status         Show running jobs, health, uptime
 ephemerd drain          Stop accepting new jobs, wait for running jobs
 ephemerd jobs           List and manage running jobs (kill, logs, ssh — macOS only)
+ephemerd cache          Inspect and clear on-disk caches (list, clear)
 ephemerd config         Validate configuration
 ephemerd doctor         Check system readiness and clean up stale state
 ephemerd install        Install binary and register as a system service

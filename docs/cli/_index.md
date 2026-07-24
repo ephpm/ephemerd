@@ -20,6 +20,7 @@ The `ephemerd` binary uses `serve` as its default command. All commands accept t
 | [status](status) | Show running jobs and daemon health |
 | [drain](drain) | Gracefully drain the running daemon |
 | [jobs](jobs) | List and manage running jobs |
+| [cache](cache) | Inspect and clear ephemerd's on-disk caches |
 | [config](config) | Validate configuration file |
 | [doctor](doctor) | Check system readiness and clean up stale state |
 | [install](install) | Install ephemerd as a system service |
