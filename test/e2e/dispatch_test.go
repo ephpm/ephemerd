@@ -66,7 +66,11 @@ func TestE2E_Dispatch_RoundTrip(t *testing.T) {
 
 	// Start dispatch server on a random high port
 	port := 19000 + int(time.Now().UnixNano()%1000)
-	cleanup := scheduler.StartDispatchServer(port, rt, sharedLog)
+	_, cleanup := scheduler.StartDispatchServer(scheduler.DispatchServerConfig{
+		Port:    port,
+		Runtime: rt,
+		Log:     sharedLog,
+	})
 	defer cleanup()
 
 	// Give the server a moment to start
@@ -74,7 +78,7 @@ func TestE2E_Dispatch_RoundTrip(t *testing.T) {
 
 	// Connect client
 	addr := fmt.Sprintf("localhost:%d", port)
-	client, err := scheduler.NewDispatchClient(addr)
+	client, err := scheduler.NewDispatchClient(addr, "")
 	if err != nil {
 		t.Fatalf("NewDispatchClient(%s): %v", addr, err)
 	}
@@ -88,7 +92,7 @@ func TestE2E_Dispatch_RoundTrip(t *testing.T) {
 
 	// Create — uses default image with fake jitconfig, runner will fail immediately
 	t.Logf("dispatch Create: %s", containerID)
-	if err := client.Create(ctx, containerID, "", "fake-jit-config-dispatch"); err != nil {
+	if err := client.Create(ctx, containerID, "", "fake-jit-config-dispatch", "github", "owner/repo"); err != nil {
 		t.Fatalf("dispatch Create: %v", err)
 	}
 
@@ -125,12 +129,16 @@ func TestE2E_Dispatch_DestroyUnknownJob(t *testing.T) {
 	}
 
 	port := 19100 + int(time.Now().UnixNano()%1000)
-	cleanup := scheduler.StartDispatchServer(port, rt, sharedLog)
+	_, cleanup := scheduler.StartDispatchServer(scheduler.DispatchServerConfig{
+		Port:    port,
+		Runtime: rt,
+		Log:     sharedLog,
+	})
 	defer cleanup()
 
 	time.Sleep(500 * time.Millisecond)
 
-	client, err := scheduler.NewDispatchClient(fmt.Sprintf("localhost:%d", port))
+	client, err := scheduler.NewDispatchClient(fmt.Sprintf("localhost:%d", port), "")
 	if err != nil {
 		t.Fatalf("NewDispatchClient: %v", err)
 	}

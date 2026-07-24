@@ -84,7 +84,7 @@ func TestE2E_Windows_WSLDispatch(t *testing.T) {
 	t.Logf("dispatch address: %s", dispatchAddr)
 
 	// Connect dispatch client and do a round-trip
-	dispatchClient, err := scheduler.NewDispatchClient(dispatchAddr)
+	dispatchClient, err := scheduler.NewDispatchClient(dispatchAddr, "")
 	if err != nil {
 		t.Fatalf("NewDispatchClient(%s): %v", dispatchAddr, err)
 	}

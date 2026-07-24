@@ -238,6 +238,23 @@ type DispatchServerConfig struct {
 	StatsInterval      time.Duration // default 10s when zero
 	LinuxCPULimit      uint64        // 0 = unlimited
 	LinuxMemLimitBytes uint64        // 0 = unlimited
+
+	// Token is the shared bearer token the server requires on every RPC. When
+	// non-empty, unary + stream interceptors reject any call that does not
+	// present a matching token (constant-time compare). Empty disables auth —
+	// which should only happen in tests or misconfigured setups; production
+	// callers plumb a token from the shared data dir (see
+	// LoadOrCreateDispatchToken). The server logs loudly when it starts
+	// unauthenticated so the footgun is visible.
+	Token string
+
+	// BindAddr is the interface the listener binds to. Empty defaults to
+	// "0.0.0.0" so the Vz/Hyper-V host on the NAT side can reach it (a narrower
+	// bind is only safe when the host address is known; see the comment on
+	// StartDispatchServer). The token check protects the surface regardless of
+	// bind, so 0.0.0.0 is defense-in-depth-behind-auth rather than the sole
+	// control.
+	BindAddr string
 }
 
 // StartDispatchServer starts the dispatch gRPC server on the given TCP port
@@ -246,18 +263,47 @@ type DispatchServerConfig struct {
 // / UnregisterSampler so the local runtime can plumb its OnTaskStarted /
 // OnTaskDestroy hooks into the stats stream surface area.
 //
-// Binds to 0.0.0.0 so the host (outside the VM) can reach it. WSL on Windows
-// shares localhost with the host, so this used to be 127.0.0.1, but the same
-// process is now invoked from inside an Apple Vz VM where the host lives on
-// the NAT side and needs the listener exposed on the VM's external interface.
+// Binds to cfg.BindAddr (default 0.0.0.0) so the host (outside the VM) can
+// reach it. WSL on Windows shares localhost with the host, so this used to be
+// 127.0.0.1, but the same process is now invoked from inside an Apple Vz VM
+// where the host lives on the NAT side and needs the listener exposed on the
+// VM's external interface.
+//
+// The gRPC surface (CreateJob/WaitJob/DestroyJob/StreamContainerStats) exposes
+// container lifecycle control with a caller-supplied image + JIT config, so it
+// MUST NOT be reachable unauthenticated by anything sharing the VM's network
+// (notably job containers). When cfg.Token is set, every RPC is gated by a
+// constant-time bearer-token check via unary + stream interceptors. Operators
+// must additionally firewall the dispatch port off from job containers (the
+// worker installs bridge control-port rules for exactly this — see main.go
+// controlPorts).
 func StartDispatchServer(cfg DispatchServerConfig) (*DispatchServer, func()) {
-	lis, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", cfg.Port))
+	bindAddr := cfg.BindAddr
+	if bindAddr == "" {
+		bindAddr = "0.0.0.0"
+	}
+	lis, err := net.Listen("tcp", fmt.Sprintf("%s:%d", bindAddr, cfg.Port))
 	if err != nil {
-		cfg.Log.Error("dispatch: failed to listen", "port", cfg.Port, "error", err)
+		cfg.Log.Error("dispatch: failed to listen", "bind", bindAddr, "port", cfg.Port, "error", err)
 		return nil, func() {}
 	}
 
-	srv := grpc.NewServer()
+	var opts []grpc.ServerOption
+	if cfg.Token != "" {
+		opts = append(opts,
+			grpc.UnaryInterceptor(newAuthUnaryInterceptor(cfg.Token)),
+			grpc.StreamInterceptor(newAuthStreamInterceptor(cfg.Token)),
+		)
+		cfg.Log.Info("dispatch: token authentication enabled", "bind", bindAddr, "port", cfg.Port)
+	} else {
+		// No token means every process that can reach the port can spawn/kill
+		// jobs. This is only acceptable in tests; warn so a misconfigured
+		// production worker is visible in the logs.
+		cfg.Log.Warn("dispatch: starting WITHOUT authentication — any process that can reach the port can create/destroy jobs",
+			"bind", bindAddr, "port", cfg.Port)
+	}
+
+	srv := grpc.NewServer(opts...)
 	ds := NewDispatchServer(cfg.Runtime, cfg.Log, cfg.StatsInterval, cfg.LinuxCPULimit, cfg.LinuxMemLimitBytes)
 	apiv1.RegisterDispatchServer(srv, ds)
 
@@ -278,10 +324,21 @@ type DispatchClient struct {
 }
 
 // NewDispatchClient connects to the dispatch gRPC server at the given address.
-func NewDispatchClient(addr string) (*DispatchClient, error) {
-	conn, err := grpc.NewClient(addr,
+// When token is non-empty it is attached to every RPC via per-RPC credentials
+// so the server-side interceptor accepts the call; an empty token sends no
+// credential (used by tests against an unauthenticated fake server).
+//
+// The transport stays insecure (no TLS): the dispatch link is a host<->VM
+// loopback/NAT hop, and the bearer token — not the transport — authenticates
+// the caller.
+func NewDispatchClient(addr, token string) (*DispatchClient, error) {
+	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
+	}
+	if token != "" {
+		opts = append(opts, grpc.WithPerRPCCredentials(dispatchTokenCredentials{token: token}))
+	}
+	conn, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to dispatch server at %s: %w", addr, err)
 	}

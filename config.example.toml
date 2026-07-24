@@ -15,6 +15,14 @@ owner = "your-org"
 # If omitted, registers org-level runners available to all repos in the org.
 # repos = ["repo1", "repo2"]
 
+# OPTIONAL dispatch allowlist (defense-in-depth). This does NOT replace GitHub's
+# "Require approval for all outside collaborators" setting, which is the primary
+# control against fork-PR abuse of self-hosted runners — keep that enabled.
+# Both fields default to empty (no restriction = today's behavior).
+# [github.dispatch_policy]
+# allowed_repos   = ["repo1"]     # only dispatch for these repos
+# required_labels = ["ephemerd"]  # a job must carry one of these labels to dispatch
+
 [webhook]
 # Webhook-mode reconcile sweep: how often ephemerd re-runs the catch-up poll
 # as a LAST-RESORT backstop for genuinely dropped webhook deliveries. The
@@ -179,9 +187,21 @@ shutdown_timeout = "5m"
 # port = 9090
 # path = "/metrics"
 
+# Bind address. The metrics endpoint is UNAUTHENTICATED, so it binds to
+# 127.0.0.1 (loopback only) by default. To scrape from another host, set this
+# to "0.0.0.0" and firewall the port and/or enable TLS below.
+# bind_addr = "127.0.0.1"
+
 # Optional TLS for the metrics endpoint
 # tls_cert = "/etc/ephemerd/metrics.crt"
 # tls_key = "/etc/ephemerd/metrics.key"
+
+# [dispatch] configures the host<->VM gRPC dispatch channel used on Windows
+# (Hyper-V) and macOS (Vz) hosts to run Linux jobs inside a VM. A shared bearer
+# token authenticates every RPC. Leave unset: ephemerd auto-generates a token
+# on first run and persists it here. Set explicitly only to pin/rotate it.
+# [dispatch]
+# token = "..."
 
 [log]
 # Log level: debug, info, warn, error

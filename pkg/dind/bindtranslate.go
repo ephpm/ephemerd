@@ -77,6 +77,14 @@ func translateBindSource(src string, runnerBinds map[string]string, runnerRootfs
 		candidate := path.Join(runnerRootfsPath, cleaned)
 		switch info, err := os.Stat(candidate); {
 		case err == nil:
+			// SECURITY: os.Stat followed symlinks, so `candidate` may resolve
+			// outside runnerRootfsPath if the runner planted a symlink (e.g.
+			// `ln -s / esc`). Reject any source that escapes the rootfs before
+			// handing it to containerd as a bind mount — otherwise the sibling
+			// container gets the VM host's filesystem.
+			if err := ensureWithinRootfs(runnerRootfsPath, candidate); err != nil {
+				return bindResolution{}, fmt.Errorf("bind source %q rejected: %w", src, err)
+			}
 			if info.IsDir() || info.Mode().IsRegular() {
 				return bindResolution{HostPath: candidate}, nil
 			}
@@ -89,8 +97,22 @@ func translateBindSource(src string, runnerBinds map[string]string, runnerRootfs
 			// Real Docker creates the missing dir at create time and
 			// the workflow proceeds. Our dind has to do the same or
 			// every container: job 400s on the first lazy bind source.
+			//
+			// SECURITY: the source doesn't exist yet, but an ANCESTOR of it
+			// might be a symlink that escapes the rootfs — auto-mkdir would
+			// then create (and bind) a directory on the VM host FS. Verify the
+			// closest existing ancestor stays within the rootfs before
+			// creating anything.
+			if err := ensureAncestorWithinRootfs(runnerRootfsPath, candidate); err != nil {
+				return bindResolution{}, fmt.Errorf("bind source %q rejected: %w", src, err)
+			}
 			if mkErr := ensureBindSourceDir(candidate); mkErr != nil {
 				return bindResolution{}, fmt.Errorf("bind source %q could not be auto-created at %s: %w", src, candidate, mkErr)
+			}
+			// Re-check after creation: mkdir followed intermediate symlinks
+			// the same way stat would, so confirm the final path is contained.
+			if err := ensureWithinRootfs(runnerRootfsPath, candidate); err != nil {
+				return bindResolution{}, fmt.Errorf("bind source %q rejected after auto-create: %w", src, err)
 			}
 			return bindResolution{HostPath: candidate}, nil
 		default:
@@ -159,6 +181,71 @@ func ensureBindSourceDir(target string) error {
 		return fmt.Errorf("mkdir %s: %w", target, err)
 	}
 	return chownNewDirsLikeAncestor(newDirs, ancestor)
+}
+
+// ensureWithinRootfs verifies that candidate, after fully resolving symlinks,
+// stays inside runnerRootfsPath (also symlink-resolved). It defends against a
+// runner planting a symlink whose target escapes the rootfs onto the VM host
+// filesystem. candidate is expected to exist; a resolve failure is treated as
+// a rejection rather than a pass.
+func ensureWithinRootfs(runnerRootfsPath, candidate string) error {
+	realRoot, err := filepath.EvalSymlinks(runnerRootfsPath)
+	if err != nil {
+		return fmt.Errorf("resolving runner rootfs %s: %w", runnerRootfsPath, err)
+	}
+	realCandidate, err := filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return fmt.Errorf("resolving bind candidate %s: %w", candidate, err)
+	}
+	if !isWithin(realRoot, realCandidate) {
+		return fmt.Errorf("resolved path %s escapes runner rootfs %s", realCandidate, realRoot)
+	}
+	return nil
+}
+
+// ensureAncestorWithinRootfs verifies containment for a candidate that does not
+// exist yet: it walks up to the closest existing ancestor, resolves that
+// ancestor's symlinks, and confirms it is inside the rootfs. This catches a
+// symlinked intermediate directory before auto-mkdir would create (and bind) a
+// path on the VM host filesystem.
+func ensureAncestorWithinRootfs(runnerRootfsPath, candidate string) error {
+	realRoot, err := filepath.EvalSymlinks(runnerRootfsPath)
+	if err != nil {
+		return fmt.Errorf("resolving runner rootfs %s: %w", runnerRootfsPath, err)
+	}
+	ancestor := candidate
+	for {
+		resolved, err := filepath.EvalSymlinks(ancestor)
+		if err == nil {
+			if !isWithin(realRoot, resolved) {
+				return fmt.Errorf("closest existing ancestor %s (resolved %s) escapes runner rootfs %s", ancestor, resolved, realRoot)
+			}
+			return nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("resolving ancestor %s: %w", ancestor, err)
+		}
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			return fmt.Errorf("walked past root resolving ancestor of %s", candidate)
+		}
+		ancestor = parent
+	}
+}
+
+// isWithin reports whether target is root itself or lives underneath root.
+// Both arguments are expected to be cleaned, symlink-resolved absolute paths.
+// The separator-terminated prefix check prevents "/a/rootfs-evil" from
+// matching root "/a/rootfs".
+func isWithin(root, target string) bool {
+	if target == root {
+		return true
+	}
+	rootWithSep := root
+	if !strings.HasSuffix(rootWithSep, string(filepath.Separator)) {
+		rootWithSep += string(filepath.Separator)
+	}
+	return strings.HasPrefix(target, rootWithSep)
 }
 
 // matchBindPrefix returns the host source for the longest runnerBinds key

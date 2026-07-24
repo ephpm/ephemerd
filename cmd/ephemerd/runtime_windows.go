@@ -18,7 +18,7 @@ import (
 // Returns the native containerd client for Windows jobs and a function that
 // blocks until the Linux dispatch client is ready (nil if Linux VM is disabled
 // or failed to start).
-func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool, _ uint32, _ string, dindEnabled, dindAllowPrivileged bool, linuxVMCPUs uint, linuxVMMemoryMB uint64, linuxVMDiskSizeGB uint64) (*client.Client, func() (*scheduler.DispatchClient, *client.Client), func(), error) {
+func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool, _ uint32, _ string, dindEnabled, dindAllowPrivileged bool, linuxVMCPUs uint, linuxVMMemoryMB uint64, linuxVMDiskSizeGB uint64, dispatchToken string) (*client.Client, func() (*scheduler.DispatchClient, *client.Client), func(), error) {
 	// Start native containerd for Windows container jobs
 	ctrd, err := containerd.New(containerd.Config{
 		DataDir: dataDir,
@@ -33,6 +33,10 @@ func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool
 	if !linuxVMEnabled {
 		return ctrd.Client(), func() (*scheduler.DispatchClient, *client.Client) { return nil, nil }, cleanup, nil
 	}
+
+	// dispatchToken was minted + persisted into config.toml by the caller
+	// (EnsureDispatchToken) before we get here, so it also rides into the VM's
+	// config and the in-VM dispatch server requires the identical value.
 
 	// Boot the Linux VM in the background so we don't block Windows jobs.
 	// The WSL import + binary copy can take a while.
@@ -64,7 +68,7 @@ func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool
 		linuxVM = lvm
 
 		if addr := lvm.DispatchAddr(); addr != "" {
-			dc, err := scheduler.NewDispatchClient(addr)
+			dc, err := scheduler.NewDispatchClient(addr, dispatchToken)
 			if err != nil {
 				log.Warn("failed to connect dispatch client", "address", addr, "error", err)
 			} else {

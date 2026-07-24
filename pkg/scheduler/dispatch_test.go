@@ -13,7 +13,7 @@ func TestNewDispatchClient_ValidAddr(t *testing.T) {
 	addr, _, cleanup := startFakeDispatchServer(t, &fakeDispatchServer{})
 	defer cleanup()
 
-	c, err := NewDispatchClient(addr)
+	c, err := NewDispatchClient(addr, "")
 	if err != nil {
 		t.Fatalf("NewDispatchClient: %v", err)
 	}
@@ -29,7 +29,7 @@ func TestNewDispatchClient_ValidAddr(t *testing.T) {
 func TestNewDispatchClient_InvalidAddr(t *testing.T) {
 	// grpc.NewClient is lazy and accepts most strings; only blatantly
 	// invalid scheme syntax fails. Use one that will be rejected.
-	_, err := NewDispatchClient("://!!invalid//")
+	_, err := NewDispatchClient("://!!invalid//", "")
 	if err == nil {
 		t.Skip("grpc.NewClient is lazy; this URL doesn't fail parsing on this platform")
 	}
@@ -40,7 +40,7 @@ func TestDispatchClient_Create(t *testing.T) {
 	addr, _, cleanup := startFakeDispatchServer(t, impl)
 	defer cleanup()
 
-	c, err := NewDispatchClient(addr)
+	c, err := NewDispatchClient(addr, "")
 	if err != nil {
 		t.Fatalf("NewDispatchClient: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestDispatchClient_Create_PropagatesError(t *testing.T) {
 	addr, _, cleanup := startFakeDispatchServer(t, impl)
 	defer cleanup()
 
-	c, _ := NewDispatchClient(addr)
+	c, _ := NewDispatchClient(addr, "")
 	defer func() {
 		if err := c.Close(); err != nil {
 			t.Logf("close: %v", err)
@@ -114,7 +114,7 @@ func TestDispatchClient_Wait_Success(t *testing.T) {
 	addr, _, cleanup := startFakeDispatchServer(t, impl)
 	defer cleanup()
 
-	c, _ := NewDispatchClient(addr)
+	c, _ := NewDispatchClient(addr, "")
 	defer func() {
 		if err := c.Close(); err != nil {
 			t.Logf("close: %v", err)
@@ -137,7 +137,7 @@ func TestDispatchClient_Wait_NonZeroExit(t *testing.T) {
 	addr, _, cleanup := startFakeDispatchServer(t, impl)
 	defer cleanup()
 
-	c, _ := NewDispatchClient(addr)
+	c, _ := NewDispatchClient(addr, "")
 	defer func() {
 		if err := c.Close(); err != nil {
 			t.Logf("close: %v", err)
@@ -162,7 +162,7 @@ func TestDispatchClient_Wait_Error(t *testing.T) {
 	addr, _, cleanup := startFakeDispatchServer(t, impl)
 	defer cleanup()
 
-	c, _ := NewDispatchClient(addr)
+	c, _ := NewDispatchClient(addr, "")
 	defer func() {
 		if err := c.Close(); err != nil {
 			t.Logf("close: %v", err)
@@ -185,7 +185,7 @@ func TestDispatchClient_Destroy(t *testing.T) {
 	addr, _, cleanup := startFakeDispatchServer(t, impl)
 	defer cleanup()
 
-	c, _ := NewDispatchClient(addr)
+	c, _ := NewDispatchClient(addr, "")
 	defer func() {
 		if err := c.Close(); err != nil {
 			t.Logf("close: %v", err)
@@ -214,7 +214,7 @@ func TestDispatchClient_Destroy_PropagatesError(t *testing.T) {
 	addr, _, cleanup := startFakeDispatchServer(t, impl)
 	defer cleanup()
 
-	c, _ := NewDispatchClient(addr)
+	c, _ := NewDispatchClient(addr, "")
 	defer func() {
 		if err := c.Close(); err != nil {
 			t.Logf("close: %v", err)
@@ -234,7 +234,7 @@ func TestDispatchClient_Close_Idempotent(t *testing.T) {
 	addr, _, cleanup := startFakeDispatchServer(t, &fakeDispatchServer{})
 	defer cleanup()
 
-	c, _ := NewDispatchClient(addr)
+	c, _ := NewDispatchClient(addr, "")
 	if err := c.Close(); err != nil {
 		t.Errorf("first close: %v", err)
 	}

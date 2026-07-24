@@ -15,7 +15,7 @@ import (
 // a dispatch client to ephemerd-linux running inside the VM. Linux jobs run as
 // containers inside the VM, dispatched through the gRPC dispatch server so
 // they get full CNI networking (the raw containerd API skips CRI/CNI).
-func startContainerRuntime(dataDir string, log *slog.Logger, _ bool, _ uint32, _ string, _, dindAllowPrivileged bool, linuxVMCPUs uint, linuxVMMemoryMB uint64, linuxVMDiskSizeGB uint64) (*client.Client, func() (*scheduler.DispatchClient, *client.Client), func(), error) {
+func startContainerRuntime(dataDir string, log *slog.Logger, _ bool, _ uint32, _ string, _, dindAllowPrivileged bool, linuxVMCPUs uint, linuxVMMemoryMB uint64, linuxVMDiskSizeGB uint64, dispatchToken string) (*client.Client, func() (*scheduler.DispatchClient, *client.Client), func(), error) {
 	log.Info("macOS detected — booting Linux VM for container runtime")
 
 	linuxVM, err := vm.StartLinuxVM(vm.LinuxVMConfig{
@@ -32,7 +32,7 @@ func startContainerRuntime(dataDir string, log *slog.Logger, _ bool, _ uint32, _
 
 	var dispatchClient *scheduler.DispatchClient
 	if addr := linuxVM.DispatchAddr(); addr != "" {
-		dc, derr := scheduler.NewDispatchClient(addr)
+		dc, derr := scheduler.NewDispatchClient(addr, dispatchToken)
 		if derr != nil {
 			log.Warn("dispatch client failed — Linux jobs will not have CNI networking",
 				"address", addr, "error", derr)
