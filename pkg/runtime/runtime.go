@@ -37,6 +37,15 @@ const (
 // containerCapabilities is the minimum set of Linux capabilities for CI jobs.
 // Covers apt-get install, sudo, adduser, and service management.
 // Docker-in-Docker is not supported — use Kaniko or Buildah for image builds.
+//
+// CAP_MKNOD is deliberately absent. It lets a process create device nodes,
+// which is the first step of the classic "mknod a block device for the host
+// disk and read it raw" escape. The devices cgroup should deny access even if
+// creation succeeds, but there is no reason to rely on a single layer: no
+// mainstream distro package needs mknod at install time (dpkg ships static
+// /dev entries, and containers get their /dev from the runtime). If a package
+// is ever found to need it, add it back for that pool only rather than fleet
+// wide.
 var containerCapabilities = []string{
 	"CAP_CHOWN",            // dpkg chown on installed files
 	"CAP_DAC_OVERRIDE",     // write to dirs owned by other users
@@ -45,7 +54,6 @@ var containerCapabilities = []string{
 	"CAP_KILL",             // signal processes (postinst service restarts)
 	"CAP_SETGID",           // adduser/addgroup in maintainer scripts
 	"CAP_SETUID",           // setuid in maintainer scripts
-	"CAP_MKNOD",            // create device nodes (some packages)
 	"CAP_SYS_CHROOT",       // chroot in maintainer scripts
 	"CAP_NET_BIND_SERVICE", // bind to ports < 1024
 }
@@ -652,6 +660,10 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		oci.WithCapabilities(containerCapabilities),
 	}
 	opts = append(opts, seccompOpts()...)
+	// AppArmor covers what seccomp cannot: writes to /proc/sys and /sys are
+	// file operations, not syscalls, so no seccomp profile filters them.
+	// No-op where the host has no AppArmor (see apparmorOpts).
+	opts = append(opts, apparmorOpts()...)
 	opts = append(opts, rlimitsOpts(r.cfg.Rlimits)...)
 	switch {
 	case len(cfg.Entrypoint) > 0:
