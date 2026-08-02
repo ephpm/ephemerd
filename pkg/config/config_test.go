@@ -2042,6 +2042,67 @@ func TestResolvedAllowPrivileged_ExplicitFalseWins(t *testing.T) {
 	}
 }
 
+// Unlike allow_privileged, this one defaults ON — flipping it would break
+// `sudo apt-get install` in every existing workflow, so the tightening is
+// an explicit per-pool decision rather than a new default.
+func TestResolvedAllowNewPrivileges_DefaultsOn(t *testing.T) {
+	r := RuntimeConfig{}
+	if !r.ResolvedAllowNewPrivileges() {
+		t.Errorf("default ResolvedAllowNewPrivileges on GOOS=%s = false, want true (would break sudo fleet-wide)", goruntime.GOOS)
+	}
+}
+
+func TestResolvedAllowNewPrivileges_ExplicitFalseWins(t *testing.T) {
+	no := false
+	r := RuntimeConfig{AllowNewPrivileges: &no}
+	if r.ResolvedAllowNewPrivileges() {
+		t.Error("explicit allow_new_privileges=false should resolve false — a pool opting into hardening must actually get it")
+	}
+}
+
+func TestResolvedAllowNewPrivileges_ExplicitTrueWins(t *testing.T) {
+	yes := true
+	r := RuntimeConfig{AllowNewPrivileges: &yes}
+	if !r.ResolvedAllowNewPrivileges() {
+		t.Error("explicit allow_new_privileges=true should resolve true")
+	}
+}
+
+// The pointer form has to survive a real TOML round-trip: an omitted key
+// and an explicit `false` must be distinguishable after Load.
+func TestLoad_RuntimeAllowNewPrivileges(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_test123")
+
+	for _, tc := range []struct {
+		name     string
+		runtime  string
+		wantSet  bool
+		wantEval bool
+	}{
+		{"omitted", "", false, true},
+		{"explicit false", "[runtime]\nallow_new_privileges = false\n", true, false},
+		{"explicit true", "[runtime]\nallow_new_privileges = true\n", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			body := "[github]\nowner = \"testorg\"\n" + tc.runtime
+			if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load() error: %v", err)
+			}
+			if got := cfg.Runtime.AllowNewPrivileges != nil; got != tc.wantSet {
+				t.Errorf("AllowNewPrivileges set = %v, want %v", got, tc.wantSet)
+			}
+			if got := cfg.Runtime.ResolvedAllowNewPrivileges(); got != tc.wantEval {
+				t.Errorf("ResolvedAllowNewPrivileges() = %v, want %v", got, tc.wantEval)
+			}
+		})
+	}
+}
+
 func TestLoad_DindAllowPrivileged_OmittedUsesPlatformDefault(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "ghp_test123")
 	tmp := t.TempDir()
