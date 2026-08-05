@@ -10,6 +10,11 @@ service Control {
   rpc GetJob(GetJobRequest) returns (Job);
   rpc KillJob(KillJobRequest) returns (KillJobResponse);
   rpc GetJobLogs(GetJobLogsRequest) returns (stream LogChunk);
+  // Cordon stops the daemon from claiming new jobs without initiating
+  // shutdown; running jobs continue. Uncordon resumes claiming. Used by
+  // `ephemerd drain --wait` to empty the daemon before a restart.
+  rpc Cordon(CordonRequest) returns (CordonResponse);
+  rpc Uncordon(UncordonRequest) returns (UncordonResponse);
 }
 
 message StatusRequest {}
@@ -49,6 +54,18 @@ message KillJobRequest {
 }
 
 message KillJobResponse {}
+
+message CordonRequest {}
+
+message CordonResponse {
+  int32 active_jobs = 1; // jobs still running at the time of the cordon
+}
+
+message UncordonRequest {}
+
+message UncordonResponse {
+  int32 active_jobs = 1;
+}
 
 message GetJobLogsRequest {
   int64 id = 1;

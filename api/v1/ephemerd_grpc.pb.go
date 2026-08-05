@@ -24,6 +24,8 @@ const (
 	Control_GetJob_FullMethodName     = "/ephemerd.v1.Control/GetJob"
 	Control_KillJob_FullMethodName    = "/ephemerd.v1.Control/KillJob"
 	Control_GetJobLogs_FullMethodName = "/ephemerd.v1.Control/GetJobLogs"
+	Control_Cordon_FullMethodName     = "/ephemerd.v1.Control/Cordon"
+	Control_Uncordon_FullMethodName   = "/ephemerd.v1.Control/Uncordon"
 )
 
 // ControlClient is the client API for Control service.
@@ -35,6 +37,11 @@ type ControlClient interface {
 	GetJob(ctx context.Context, in *GetJobRequest, opts ...grpc.CallOption) (*Job, error)
 	KillJob(ctx context.Context, in *KillJobRequest, opts ...grpc.CallOption) (*KillJobResponse, error)
 	GetJobLogs(ctx context.Context, in *GetJobLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LogChunk], error)
+	// Cordon stops the daemon from claiming new jobs without initiating
+	// shutdown; running jobs continue. Uncordon resumes claiming. Used by
+	// `ephemerd drain --wait` to empty the daemon before a restart.
+	Cordon(ctx context.Context, in *CordonRequest, opts ...grpc.CallOption) (*CordonResponse, error)
+	Uncordon(ctx context.Context, in *UncordonRequest, opts ...grpc.CallOption) (*UncordonResponse, error)
 }
 
 type controlClient struct {
@@ -104,6 +111,26 @@ func (c *controlClient) GetJobLogs(ctx context.Context, in *GetJobLogsRequest, o
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Control_GetJobLogsClient = grpc.ServerStreamingClient[LogChunk]
 
+func (c *controlClient) Cordon(ctx context.Context, in *CordonRequest, opts ...grpc.CallOption) (*CordonResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CordonResponse)
+	err := c.cc.Invoke(ctx, Control_Cordon_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlClient) Uncordon(ctx context.Context, in *UncordonRequest, opts ...grpc.CallOption) (*UncordonResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UncordonResponse)
+	err := c.cc.Invoke(ctx, Control_Uncordon_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControlServer is the server API for Control service.
 // All implementations must embed UnimplementedControlServer
 // for forward compatibility.
@@ -113,6 +140,11 @@ type ControlServer interface {
 	GetJob(context.Context, *GetJobRequest) (*Job, error)
 	KillJob(context.Context, *KillJobRequest) (*KillJobResponse, error)
 	GetJobLogs(*GetJobLogsRequest, grpc.ServerStreamingServer[LogChunk]) error
+	// Cordon stops the daemon from claiming new jobs without initiating
+	// shutdown; running jobs continue. Uncordon resumes claiming. Used by
+	// `ephemerd drain --wait` to empty the daemon before a restart.
+	Cordon(context.Context, *CordonRequest) (*CordonResponse, error)
+	Uncordon(context.Context, *UncordonRequest) (*UncordonResponse, error)
 	mustEmbedUnimplementedControlServer()
 }
 
@@ -137,6 +169,12 @@ func (UnimplementedControlServer) KillJob(context.Context, *KillJobRequest) (*Ki
 }
 func (UnimplementedControlServer) GetJobLogs(*GetJobLogsRequest, grpc.ServerStreamingServer[LogChunk]) error {
 	return status.Error(codes.Unimplemented, "method GetJobLogs not implemented")
+}
+func (UnimplementedControlServer) Cordon(context.Context, *CordonRequest) (*CordonResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Cordon not implemented")
+}
+func (UnimplementedControlServer) Uncordon(context.Context, *UncordonRequest) (*UncordonResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Uncordon not implemented")
 }
 func (UnimplementedControlServer) mustEmbedUnimplementedControlServer() {}
 func (UnimplementedControlServer) testEmbeddedByValue()                 {}
@@ -242,6 +280,42 @@ func _Control_GetJobLogs_Handler(srv interface{}, stream grpc.ServerStream) erro
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Control_GetJobLogsServer = grpc.ServerStreamingServer[LogChunk]
 
+func _Control_Cordon_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CordonRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).Cordon(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_Cordon_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).Cordon(ctx, req.(*CordonRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Control_Uncordon_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UncordonRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).Uncordon(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_Uncordon_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).Uncordon(ctx, req.(*UncordonRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Control_ServiceDesc is the grpc.ServiceDesc for Control service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -264,6 +338,14 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "KillJob",
 			Handler:    _Control_KillJob_Handler,
+		},
+		{
+			MethodName: "Cordon",
+			Handler:    _Control_Cordon_Handler,
+		},
+		{
+			MethodName: "Uncordon",
+			Handler:    _Control_Uncordon_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
