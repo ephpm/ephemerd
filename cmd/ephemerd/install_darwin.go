@@ -26,6 +26,10 @@ func installService(binPath, dataDir string) error {
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!-- Exceeds the scheduler's shutdown_timeout (default 5m) so launchd
+         does not SIGKILL the daemon while it drains running jobs. -->
+    <key>ExitTimeOut</key>
+    <integer>360</integer>
     <key>StandardOutPath</key>
     <string>/var/log/ephemerd.log</string>
     <key>StandardErrorPath</key>

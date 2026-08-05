@@ -76,26 +76,41 @@ func (s *ephemerdService) Execute(_ []string, r <-chan svc.ChangeRequest, status
 			case svc.Interrogate:
 				status <- cr.CurrentStatus
 			case svc.Stop, svc.Shutdown:
-				status <- svc.Status{State: svc.StopPending}
 				if _, wErr := fmt.Fprintln(logFile, "ephemerd stopping"); wErr != nil {
 					slog.Warn("writing to service log", "error", wErr)
 				}
 				cancel()
-				// Wait for serve() to exit, but force-exit after 30s
-				// to avoid hanging the SCM indefinitely.
-				select {
-				case err := <-errCh:
-					if err != nil {
-						if _, wErr := fmt.Fprintf(logFile, "ephemerd shutdown error: %v\n", err); wErr != nil {
+				// Wait for serve() to drain: on shutdown the scheduler keeps
+				// running jobs alive up to its shutdown_timeout (default 5m)
+				// before force-killing them, so the SCM wait must exceed that.
+				// Send StopPending checkpoints while waiting so the SCM knows
+				// we're making progress; force-exit after 6m as a backstop.
+				const stopWait = 6 * time.Minute
+				const checkpointEvery = 10 * time.Second
+				var checkpoint uint32
+				status <- svc.Status{State: svc.StopPending, CheckPoint: checkpoint, WaitHint: uint32((2 * checkpointEvery).Milliseconds())}
+				forceExit := time.After(stopWait)
+				ticker := time.NewTicker(checkpointEvery)
+				defer ticker.Stop()
+				for {
+					select {
+					case err := <-errCh:
+						if err != nil {
+							if _, wErr := fmt.Fprintf(logFile, "ephemerd shutdown error: %v\n", err); wErr != nil {
+								slog.Warn("writing to service log", "error", wErr)
+							}
+						}
+						return false, 0
+					case <-ticker.C:
+						checkpoint++
+						status <- svc.Status{State: svc.StopPending, CheckPoint: checkpoint, WaitHint: uint32((2 * checkpointEvery).Milliseconds())}
+					case <-forceExit:
+						if _, wErr := fmt.Fprintf(logFile, "ephemerd shutdown timed out after %s, force exiting\n", stopWait); wErr != nil {
 							slog.Warn("writing to service log", "error", wErr)
 						}
-					}
-				case <-time.After(30 * time.Second):
-					if _, wErr := fmt.Fprintln(logFile, "ephemerd shutdown timed out after 30s, force exiting"); wErr != nil {
-						slog.Warn("writing to service log", "error", wErr)
+						return false, 0
 					}
 				}
-				return false, 0
 			}
 		}
 	}

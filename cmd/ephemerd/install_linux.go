@@ -28,7 +28,10 @@ Restart=on-failure
 RestartSec=5
 EnvironmentFile=-/etc/default/ephemerd
 KillMode=mixed
-TimeoutStopSec=300
+# Must exceed the scheduler's shutdown_timeout (default 5m): on SIGTERM the
+# daemon keeps running jobs alive up to that long before force-killing them,
+# and systemd must not SIGKILL the drain mid-flight.
+TimeoutStopSec=360
 
 [Install]
 WantedBy=multi-user.target
