@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"path/filepath"
 	goruntime "runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -149,6 +150,37 @@ func keyFor(event providers.JobEvent) jobKey {
 	return jobKey{Provider: name, JobID: event.JobID}
 }
 
+// labelSetKey returns a canonical identity for a job's label set — the
+// FUNGIBILITY CLASS the job belongs to.
+//
+// GitHub does not honor the pairing ephemerd creates when it registers a JIT
+// runner "for" a job: it hands a connected runner ANY queued job whose labels
+// the runner satisfies. So the unit that dispatch accounting must balance is
+// not the job id, it is the label set: N queued jobs sharing a label set are
+// served by N runners of that class, in whatever permutation GitHub picks.
+//
+// Labels are lowercased (GitHub matches case-insensitively), trimmed, emptied
+// entries dropped, sorted and deduped so that ["Linux","self-hosted"] and
+// ["self-hosted","linux","linux"] land in the same class. The separator is a
+// unit separator so it cannot occur inside a label.
+func labelSetKey(labels []string) string {
+	norm := make([]string, 0, len(labels))
+	for _, l := range labels {
+		l = strings.ToLower(strings.TrimSpace(l))
+		if l != "" {
+			norm = append(norm, l)
+		}
+	}
+	sort.Strings(norm)
+	uniq := make([]string, 0, len(norm))
+	for i, l := range norm {
+		if i == 0 || l != norm[i-1] {
+			uniq = append(uniq, l)
+		}
+	}
+	return strings.Join(uniq, "\x1f")
+}
+
 // Scheduler ties CI provider job events to container lifecycle.
 // When a job is queued, it provisions a runner environment.
 // When the job completes, it destroys the environment.
@@ -159,6 +191,7 @@ type Scheduler struct {
 	started      map[jobKey]time.Time      // jobs OBSERVED going in_progress/completed (webhook mode); the event-driven "satisfied" signal
 	pending      map[jobKey]struct{}       // jobs dispatched to a handler but not yet holding sem
 	attempts     map[jobKey]int            // provisioning passes per job, for zombie detection
+	jobLabels    map[jobKey]string         // fungibility class (labelSetKey) of every accepted job; pruned with seen
 	runners      map[string]*runnerBinding // dispatched runners by name; tracks observed job assignment
 	webhookMode  bool                      // true when job events arrive via webhooks (in_progress observable)
 	runCtx       context.Context           // scheduler root context (set once at Run start); used for event-driven re-dispatch
@@ -272,13 +305,22 @@ type runnerBinding struct {
 	bound        bool      // true once an in_progress event named this runner
 	dispatchedAt time.Time // when the runner was provisioned (orphan sweep)
 	observable   bool      // provider reports runner assignments (RunnerNameReporter)
+
+	// labelSet is the fungibility class this runner serves (labelSetKey of
+	// the dispatching job's labels). An unbound runner is a spare for its
+	// WHOLE class, not just for intentKey — the orphan sweep reconciles
+	// spares against class demand instead of reaping purely on intentKey.
+	labelSet string
 }
 
 // trackRunning files a provisioned runner's bookkeeping under its
 // dispatch-intent job key and opens a runner-name ledger entry so
 // in_progress / completed events can locate the runner by NAME
 // regardless of which job the platform actually assigned to it.
-func (s *Scheduler) trackRunning(key jobKey, rj *runningJob, provider providers.Provider) {
+//
+// labelSet is the dispatching job's fungibility class; it records what the
+// runner can still be useful for once its dispatch intent is discharged.
+func (s *Scheduler) trackRunning(key jobKey, rj *runningJob, provider providers.Provider, labelSet string) {
 	observable := false
 	if rnr, ok := provider.(providers.RunnerNameReporter); ok {
 		observable = rnr.ReportsRunnerNames()
@@ -290,6 +332,7 @@ func (s *Scheduler) trackRunning(key jobKey, rj *runningJob, provider providers.
 			intentKey:    key,
 			dispatchedAt: time.Now(),
 			observable:   observable,
+			labelSet:     labelSet,
 		}
 	}
 	s.mu.Unlock()
@@ -342,6 +385,7 @@ func New(cfg Config) *Scheduler {
 		started:      make(map[jobKey]time.Time),
 		pending:      make(map[jobKey]struct{}),
 		attempts:     make(map[jobKey]int),
+		jobLabels:    make(map[jobKey]string),
 		runners:      make(map[string]*runnerBinding),
 		sem:          make(chan struct{}, cfg.MaxConcurrent),
 		linuxSem:     make(chan struct{}, cfg.MaxConcurrent),
@@ -757,6 +801,11 @@ func (s *Scheduler) handleQueued(ctx context.Context, event providers.JobEvent) 
 
 	// Dedup: skip if we've already seen this job recently
 	s.mu.Lock()
+	// NOTE: deliberately NO "already observed running" early-out here. The
+	// fungibility check lives in admitDispatch, at the point of claiming, so
+	// that a fresh queued event is always allowed to re-enter the pipeline —
+	// if the platform says a job is queued, it may genuinely need a runner
+	// again. Rejecting here would suppress it for the whole started TTL.
 	if _, exists := s.running[key]; exists {
 		s.mu.Unlock()
 		log.Debug("ignoring duplicate queued event, job already running")
@@ -774,6 +823,9 @@ func (s *Scheduler) handleQueued(ctx context.Context, event providers.JobEvent) 
 	}
 	s.pending[key] = struct{}{}
 	s.seen[key] = time.Now()
+	// Record the job's fungibility class so the orphan sweep can tell whether
+	// a spare runner still has same-label work it could pick up.
+	s.jobLabels[key] = labelSetKey(event.Labels)
 
 	// Zombie guard: a job that keeps reaching provisioning but never runs to
 	// completion (GitHub lists it queued but never dispatches it) is skipped
@@ -838,6 +890,38 @@ func (s *Scheduler) handleQueued(ctx context.Context, event providers.JobEvent) 
 	s.handleLocalJob(ctx, event)
 }
 
+// admitDispatch is the last gate before a provisioning path claims a runner.
+// Every path calls it immediately after acquiring its concurrency slot, in
+// place of the bare pending-map cleanup it replaces. It always clears
+// pending[key]; it returns false when this dispatch must be ABANDONED.
+//
+// The window it closes is the one that produced the production livelock.
+// handleQueued accepts a job and hands it to a provisioning path, which then
+// blocks on the concurrency semaphore — on a max_concurrent = 1 node, for the
+// entire duration of whatever is already running. Meanwhile GitHub, which
+// treats same-label JIT runners as fungible, hands an ALREADY-DISPATCHED
+// runner this very job; it runs and completes. Nothing between "slot acquired"
+// and "claim" used to consult that, so the path would go on to register a
+// fresh JIT runner for a job that finished minutes ago. That runner never
+// binds, so no completed event ever tears it down, and it holds the only
+// concurrency slot until the orphan sweep's grace window expires.
+//
+// Returning false here is the "discharge": the sibling runner's execution
+// satisfied the job, so the pending dispatch for it is retired instead of
+// being converted into an orphan. The caller must release its concurrency
+// slot on false.
+func (s *Scheduler) admitDispatch(key jobKey) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.pending, key)
+	if !s.webhookMode {
+		// started is only populated from in_progress/completed webhooks.
+		return true
+	}
+	_, done := s.started[key]
+	return !done
+}
+
 // handleLinuxJob dispatches a Linux job to the Linux VM worker via gRPC.
 // The host registers the JIT runner (with Linux labels) and sends
 // Create/Wait/Destroy RPCs to the dispatch server running inside the VM
@@ -861,9 +945,12 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		unsee()
 		return
 	}
-	s.mu.Lock()
-	delete(s.pending, key)
-	s.mu.Unlock()
+	if !s.admitDispatch(key) {
+		log.Info("abandoning dispatch: job was observed running while this dispatch waited for a concurrency slot",
+			"detail", "same-label JIT runners are fungible; a sibling runner took this job, so provisioning now would create an orphan")
+		<-s.linuxSem
+		return
+	}
 
 	log.Info("provisioning Linux runner via dispatch")
 
@@ -917,7 +1004,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		cancel:     cancel,
 		dispatched: claim.RunnerName,
 		startedAt:  time.Now(),
-	}, event.Provider)
+	}, event.Provider, labelSetKey(event.Labels))
 
 	log.Info("Linux runner dispatched", "name", claim.RunnerName)
 
@@ -992,9 +1079,12 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		unsee()
 		return
 	}
-	s.mu.Lock()
-	delete(s.pending, key)
-	s.mu.Unlock()
+	if !s.admitDispatch(key) {
+		log.Info("abandoning dispatch: job was observed running while this dispatch waited for a concurrency slot",
+			"detail", "same-label JIT runners are fungible; a sibling runner took this job, so provisioning now would create an orphan")
+		<-s.macSem
+		return
+	}
 
 	log.Info("provisioning macOS VM runner for job")
 
@@ -1107,7 +1197,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		artifactsDir: artifactsDir,
 		macosVM:      macVM,
 		startedAt:    time.Now(),
-	}, event.Provider)
+	}, event.Provider, labelSetKey(event.Labels))
 
 	log.Info("macOS VM runner ready", "name", claim.RunnerName, "ip", ip)
 
@@ -1174,9 +1264,12 @@ func (s *Scheduler) handleNativeMacOSJob(ctx context.Context, event providers.Jo
 		unsee()
 		return
 	}
-	s.mu.Lock()
-	delete(s.pending, key)
-	s.mu.Unlock()
+	if !s.admitDispatch(key) {
+		log.Info("abandoning dispatch: job was observed running while this dispatch waited for a concurrency slot",
+			"detail", "same-label JIT runners are fungible; a sibling runner took this job, so provisioning now would create an orphan")
+		<-s.nativeMacSem
+		return
+	}
 
 	log.Info("provisioning native macOS runner for job")
 
@@ -1239,7 +1332,7 @@ func (s *Scheduler) handleNativeMacOSJob(ctx context.Context, event providers.Jo
 		cancel:       cancel,
 		nativeRunner: nr,
 		startedAt:    time.Now(),
-	}, event.Provider)
+	}, event.Provider, labelSetKey(event.Labels))
 
 	log.Info("native macOS runner started", "name", claim.RunnerName)
 
@@ -1303,9 +1396,12 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 		unsee()
 		return
 	}
-	s.mu.Lock()
-	delete(s.pending, key)
-	s.mu.Unlock()
+	if !s.admitDispatch(key) {
+		log.Info("abandoning dispatch: job was observed running while this dispatch waited for a concurrency slot",
+			"detail", "same-label JIT runners are fungible; a sibling runner took this job, so provisioning now would create an orphan")
+		<-s.sem
+		return
+	}
 
 	log.Info("provisioning runner for job")
 
@@ -1416,7 +1512,7 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 		cancel:       cancel,
 		artifactsDir: artifactsDir,
 		startedAt:    time.Now(),
-	}, event.Provider)
+	}, event.Provider, labelSetKey(event.Labels))
 
 	log.Info("runner environment ready", "name", claim.RunnerName)
 
@@ -1583,6 +1679,13 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event providers.JobEven
 	}
 	s.mu.Unlock()
 
+	// A job reaching a terminal state removes demand from its fungibility
+	// class, which can leave a same-label spare runner with nothing left to
+	// do. Reconcile now rather than waiting for the 5-minute sweep tick (and
+	// certainly rather than the orphan grace window). Deferred so it observes
+	// the teardown below; a no-op when the sweep is disabled or in poll mode.
+	defer s.sweepOrphanRunners()
+
 	if !exists {
 		return
 	}
@@ -1738,6 +1841,8 @@ func (s *Scheduler) cleanSeen() {
 			// Job stopped appearing in the queue (finished/cancelled) — reset
 			// its zombie counter so a future legitimate rerun starts fresh.
 			delete(s.attempts, id)
+			// The job is no longer demand for its fungibility class.
+			delete(s.jobLabels, id)
 		}
 	}
 	// Prune the started (satisfied) set. It must outlive the LONGEST runner in
@@ -1758,6 +1863,35 @@ func (s *Scheduler) cleanSeen() {
 	}
 }
 
+// orphanVictim is a runner the sweep has decided to tear down, already
+// unhooked from the bookkeeping maps. discharged distinguishes the two
+// reasons: false = never assigned anything within the grace window (the
+// original intent-keyed rule); true = its job ran on a same-label sibling
+// and no queued job in that label set needs it (the label-set rule).
+type orphanVictim struct {
+	name       string
+	key        jobKey
+	rj         *runningJob
+	discharged bool
+}
+
+// reapRunnerLocked unhooks a runner from the bookkeeping maps and returns it
+// for teardown. Caller holds s.mu. Returns ok=false when the ledger entry is
+// stale or no longer names this runner, in which case nothing is torn down.
+func (s *Scheduler) reapRunnerLocked(name string, rb *runnerBinding) (orphanVictim, bool) {
+	rj, ok := s.running[rb.intentKey]
+	if !ok {
+		// Stale ledger entry — the wait-goroutine already cleaned up.
+		delete(s.runners, name)
+		return orphanVictim{}, false
+	}
+	if rj.runnerName() != name {
+		return orphanVictim{}, false
+	}
+	s.untrackRunningLocked(rb.intentKey, rj)
+	return orphanVictim{name: name, key: rb.intentKey, rj: rj}, true
+}
+
 // sweepOrphanRunners destroys dispatched runners that were never
 // observed picking up a job within the configured grace window.
 //
@@ -1773,6 +1907,24 @@ func (s *Scheduler) cleanSeen() {
 // Safety: only runs in webhook mode (in poll mode there are no
 // in_progress events, so "never observed bound" is meaningless) and only
 // for runners dispatched via providers that report runner assignments.
+//
+// Two rules retire a runner:
+//
+//  1. Intent-keyed (original): unbound for longer than Grace. This is the
+//     backstop for a runner nothing ever wanted — it must stay, or a genuinely
+//     unassigned runner would leak forever.
+//
+//  2. Label-set (fungibility reconciliation): unbound, and the job it was
+//     dispatched for has since been OBSERVED running somewhere else, and its
+//     fungibility class has no queued job left that could still be handed to
+//     it. Such a runner is discharged — waiting out the grace window for it
+//     just burns a concurrency slot (90 minutes of one, on the max_concurrent
+//     = 1 macOS node where this was diagnosed).
+//
+// Rule 2 counts rather than guesses: spares in a class are allocated against
+// that class's uncovered queued jobs first, so a spare that GitHub can still
+// legitimately hand a sibling job is kept (and no second runner is dispatched
+// for that job), while genuine surplus is retired immediately.
 func (s *Scheduler) sweepOrphanRunners() {
 	if !s.cfg.OrphanSweep.Enabled {
 		return
@@ -1782,41 +1934,98 @@ func (s *Scheduler) sweepOrphanRunners() {
 		grace = defaultOrphanGrace
 	}
 
-	type victim struct {
-		name string
-		key  jobKey
-		rj   *runningJob
-	}
-	var victims []victim
+	var victims []orphanVictim
 
 	s.mu.Lock()
 	if !s.webhookMode {
 		s.mu.Unlock()
 		return
 	}
+
+	// Demand per fungibility class: jobs we accepted, have NOT observed
+	// running, and for which no live runner has been dispatched. Those are
+	// the jobs a spare same-label runner could still legitimately be handed
+	// by GitHub, so a spare covering one of them has not lost its purpose.
+	served := make(map[jobKey]struct{}, len(s.runners))
+	for _, rb := range s.runners {
+		served[rb.intentKey] = struct{}{}
+	}
+	demand := make(map[string]int)
+	for key := range s.seen {
+		if _, done := s.started[key]; done {
+			continue
+		}
+		if _, covered := served[key]; covered {
+			continue
+		}
+		if s.attempts[key] > maxProvisionAttempts {
+			// Undispatchable zombie: we have given up on it, so it is not
+			// demand and must not keep a spare runner alive.
+			continue
+		}
+		demand[s.jobLabels[key]]++
+	}
+
+	// spares are unbound runners whose dispatch intent has been DISCHARGED —
+	// the job they were brought up for was observed running elsewhere (a
+	// sibling runner or a peer daemon took it). They are still inside the
+	// grace window, so the intent-keyed rule alone would leave them idle for
+	// the whole window; the label-set rule retires the ones no queued job in
+	// their class can use.
+	type spare struct {
+		name string
+		rb   *runnerBinding
+	}
+	var spares []spare
+
 	for name, rb := range s.runners {
-		if rb.bound || !rb.observable || time.Since(rb.dispatchedAt) < grace {
+		if rb.bound || !rb.observable {
 			continue
 		}
-		rj, ok := s.running[rb.intentKey]
-		if !ok {
-			// Stale ledger entry — the wait-goroutine already cleaned up.
-			delete(s.runners, name)
+		if time.Since(rb.dispatchedAt) >= grace {
+			if v, ok := s.reapRunnerLocked(name, rb); ok {
+				victims = append(victims, v)
+			}
 			continue
 		}
-		if rj.runnerName() != name {
+		if _, discharged := s.started[rb.intentKey]; discharged {
+			spares = append(spares, spare{name: name, rb: rb})
+		}
+	}
+
+	// Allocate the class's remaining demand to the NEWEST spares (they have
+	// the most grace left to be picked up) and retire whatever is left over.
+	sort.Slice(spares, func(i, j int) bool {
+		return spares[i].rb.dispatchedAt.After(spares[j].rb.dispatchedAt)
+	})
+	for _, sp := range spares {
+		name, rb := sp.name, sp.rb
+		if demand[rb.labelSet] > 0 {
+			// Still the cheapest way to serve a queued same-label job:
+			// GitHub will hand this runner that job without us dispatching
+			// another one. Keep it and count it against the class.
+			demand[rb.labelSet]--
 			continue
 		}
-		s.untrackRunningLocked(rb.intentKey, rj)
-		victims = append(victims, victim{name: name, key: rb.intentKey, rj: rj})
+		if v, ok := s.reapRunnerLocked(name, rb); ok {
+			v.discharged = true
+			victims = append(victims, v)
+		}
 	}
 	s.mu.Unlock()
 
 	for _, v := range victims {
-		s.cfg.Log.Warn("destroying orphaned runner: dispatched but never assigned a job within the grace window",
-			"runner", v.name,
-			"dispatched_for_job", v.key.JobID,
-			"grace", grace)
+		if v.discharged {
+			s.cfg.Log.Info("retiring discharged runner: its job ran on a same-label sibling and no queued job in that label set needs it",
+				"runner", v.name,
+				"dispatched_for_job", v.key.JobID,
+				"detail", "same-label JIT runners are fungible; reconciled on the label set instead of waiting out the grace window")
+		} else {
+			s.cfg.Log.Warn("destroying orphaned runner: dispatched but never assigned a job within the grace window",
+				"runner", v.name,
+				"dispatched_for_job", v.key.JobID,
+				"grace", grace)
+		}
 		metrics.JobsActive.Dec()
 		v.rj.cancel()
 		if v.rj.macosVM != nil {
