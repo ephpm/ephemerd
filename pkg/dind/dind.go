@@ -30,6 +30,7 @@ import (
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/ephpm/ephemerd/pkg/buildkit"
 	"github.com/ephpm/ephemerd/pkg/networking"
@@ -605,7 +606,43 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	jobCtx := namespaces.WithNamespace(ctx, s.jobNamespace)
 
-	img, err := s.client.Pull(jobCtx, ref, client.WithPullUnpack)
+	// Now that every pull actually reaches a registry, this handler needs the
+	// resolver the push path has always had (see handleImagePush). Before,
+	// a ref cached in the shared namespace short-circuited before any network
+	// call, so the missing resolver only showed up for refs that were not
+	// cached — where containerd's default (anonymous, HTTPS-only) happened to
+	// work because they were public Docker Hub images.
+	//
+	// Two things it must supply:
+	//
+	//   Auth — credentials from the job's own `docker login`, so a private
+	//   image is pulled AS the job that asked for it. Anonymous pulls of a
+	//   private ref just 401.
+	//
+	//   PlainHTTP for localhost — Docker treats localhost registries as
+	//   insecure by default and so must we, or a registry on 127.0.0.1
+	//   (test harnesses, a sidecar registry in a job) is unreachable over
+	//   the resolver's default https.
+	// NewDockerAuthorizer, not config.ConfigureHosts — the latter produced
+	// double-scope query strings that Docker Hub 401s (see handleImagePush).
+	cfg, _ := s.resolveAuthForRef(r, ref)
+	authCreds := func(string) (string, string, error) {
+		if cfg.IdentityToken != "" {
+			return "", cfg.IdentityToken, nil
+		}
+		return cfg.Username, cfg.Password, nil
+	}
+	resolver := docker.NewResolver(docker.ResolverOptions{
+		Hosts: docker.ConfigureDefaultRegistries(
+			docker.WithAuthorizer(docker.NewDockerAuthorizer(docker.WithAuthCreds(authCreds))),
+			docker.WithPlainHTTP(docker.MatchLocalhost),
+		),
+	})
+
+	img, err := s.client.Pull(jobCtx, ref,
+		client.WithPullUnpack,
+		client.WithResolver(resolver),
+	)
 	if err != nil {
 		writeProgress(fmt.Sprintf("Error: %v", err))
 		return
