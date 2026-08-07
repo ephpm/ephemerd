@@ -86,6 +86,16 @@ type Config struct {
 	// process. Zero values fall back to the containerd default (1024).
 	// Applies on Linux only; ignored on Windows (HCS uses a different model).
 	Rlimits config.RuntimeRlimits
+	// AllowNewPrivileges permits privilege escalation via execve in the
+	// runner container (NoNewPrivileges=false), which is what makes
+	// `sudo` work. See config.RuntimeConfig.AllowNewPrivileges.
+	//
+	// NOTE: this is a resolved value — callers pass
+	// cfg.Runtime.ResolvedAllowNewPrivileges(), whose default is true.
+	// The zero value here is false, i.e. the hardened setting, so a
+	// construction site that forgets this field breaks `sudo` rather
+	// than silently loosening the sandbox.
+	AllowNewPrivileges bool
 	Network *networking.Manager
 	// WindowsMemoryBytes is the memory limit for Hyper-V isolated Windows
 	// runner containers. Zero leaves the OCI spec field unset, which gives
@@ -651,10 +661,6 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		oci.WithDefaultSpecForPlatform(targetPlatform),
 		oci.WithImageConfig(img),
 		oci.WithEnv(envVars),
-		// Allow sudo inside the container. The default OCI spec sets
-		// NoNewPrivileges=true which blocks privilege escalation, but
-		// jobs need sudo for apt-get install and similar operations.
-		oci.WithNewPrivileges,
 		// Restrict capabilities to the minimum needed for CI jobs.
 		// This covers apt-get install, adduser, sudo, and service management.
 		// Docker-in-Docker is not supported (no CAP_SYS_ADMIN/CAP_NET_ADMIN).
@@ -668,6 +674,9 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	// host has no usable AppArmor — see apparmorOpts for the fail-open
 	// rationale and the log line that reports it.
 	opts = append(opts, apparmorOpts(r.cfg.Log)...)
+	// Privilege escalation via execve — allowed by default so `sudo
+	// apt-get install` works. See config.RuntimeConfig.AllowNewPrivileges.
+	opts = append(opts, newPrivilegesOpts(r.cfg.AllowNewPrivileges)...)
 	opts = append(opts, rlimitsOpts(r.cfg.Rlimits)...)
 	switch {
 	case len(cfg.Entrypoint) > 0:

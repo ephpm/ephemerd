@@ -223,6 +223,47 @@ type ContainerdConfig struct {
 // like dind or networking.
 type RuntimeConfig struct {
 	Rlimits RuntimeRlimits `toml:"rlimits"`
+
+	// AllowNewPrivileges controls whether a process in the runner
+	// container may gain privileges through execve — i.e. whether setuid
+	// binaries and file capabilities take effect. When true the OCI spec
+	// carries NoNewPrivileges=false, which is what makes `sudo` work.
+	//
+	// Jobs generally need this: `sudo apt-get install` is routine in CI,
+	// and the stock actions-runner image expects it. That is why the
+	// default is true.
+	//
+	// SECURITY: the runner container already runs as root with a trimmed
+	// capability set (see runtime.containerCapabilities), so with
+	// NoNewPrivileges=false the seccomp and AppArmor profiles carry
+	// nearly all of the containment on their own. A pool that builds
+	// untrusted code — fork PRs especially — should set this to false and
+	// accept that `sudo` and `apt-get install` stop working there.
+	//
+	// This is NOT the same knob as dind's allow_privileged: that one
+	// gates what a *sibling* container launched through the fake Docker
+	// API may request, while this one applies to the runner container
+	// itself. See DindConfig.AllowPrivileged.
+	//
+	// Use the pointer form so a missing TOML key is distinguishable from
+	// an explicit `allow_new_privileges = false`. See
+	// ResolvedAllowNewPrivileges for the default policy.
+	AllowNewPrivileges *bool `toml:"allow_new_privileges"`
+}
+
+// ResolvedAllowNewPrivileges returns whether the runner container may
+// gain privileges through execve, applying the default when the operator
+// hasn't set the key explicitly.
+//
+// Default policy: true on all platforms — this preserves the behavior
+// ephemerd has always had. Unlike dind's allow_privileged, a secure-by
+// -default of false would break `sudo apt-get install` in every existing
+// workflow, so tightening it is an explicit operator decision per pool.
+func (r RuntimeConfig) ResolvedAllowNewPrivileges() bool {
+	if r.AllowNewPrivileges != nil {
+		return *r.AllowNewPrivileges
+	}
+	return true
 }
 
 // RuntimeRlimits sets POSIX resource limits (RLIMIT_*) on each runner
