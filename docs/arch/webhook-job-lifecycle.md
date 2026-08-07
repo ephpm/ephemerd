@@ -3,6 +3,11 @@
 > **Status: implemented.** See `pkg/scheduler/scheduler.go`
 > (`reprovisionIfStranded`, the `started` set, `handleInProgress`,
 > `handleCompleted`) and `pkg/scheduler/reprovision_test.go`.
+>
+> **Superseded in part.** The self-heal described below fixed the *demand*
+> side only and left a wasted dispatch behind every reassignment. See
+> [Second fix: reconcile on the label set](#second-fix-reconcile-on-the-label-set-not-the-job-id)
+> at the end of this document.
 
 ## Problem: fungible JIT runners strand jobs
 
@@ -167,3 +172,90 @@ extra, and — because it keys on observed execution rather than a poll snapshot
 — cannot double-provision a job that actually ran. Polling remains only for the
 residual case event-driven logic structurally cannot cover: a delivery that
 never arrived.
+
+## Second fix: reconcile on the label set, not the job id
+
+The self-heal above fixed the **demand** side — a job stranded by fungible
+reassignment gets re-dispatched instead of waiting out `seenTTL`. It never
+touched the **supply** side, and that is where the cost moved.
+
+Observed on the `max_concurrent = 1` macOS node: **266 orphan destroys** in
+`/var/log/ephemerd.log`, **50 orphans against 222 completions** in the last
+2000 lines (~18% of dispatches wasted), producing queue waits of **1–2.5 hours
+for jobs that run in 1–3 minutes**.
+
+### Mechanism
+
+`handleQueued` accepts a job and hands it to a provisioning path, which then
+blocks on the concurrency semaphore — at `max_concurrent = 1`, for the entire
+duration of whatever is already running. While it is blocked, GitHub hands that
+same job to an **already-dispatched** same-label runner, which runs it and
+exits. Nothing between "slot acquired" and "claim runner" consulted `started`,
+so when the slot finally freed, the path went on to register a fresh JIT runner
+**for a job that had already finished**.
+
+That runner is never assigned anything, so no `completed` event ever names it
+and no teardown path touches it. It holds the pool's only concurrency slot
+until the orphan sweep's grace window (`orphan_grace`, 90m in production)
+expires — then the sweep destroys it, its wait-goroutine fires
+`reprovisionIfStranded`, and the cycle repeats. Log timestamps
+15:24:48 → 15:44:48 → 16:59:48 → 17:19:48 are consecutive turns of that loop.
+
+The v0.1.4 self-heal made this *worse-shaped*, not better: it converted "job
+strands for ~10 min" into "job re-dispatches promptly, and the surplus runner
+orphans for the full grace window". Fewer stranded jobs, same wasted
+dispatches — and on a single-slot node the wasted dispatch is the binding
+constraint.
+
+### Root cause
+
+Dispatch accounting balanced on the **job id**. But a JIT runner is not bound
+to a job id — GitHub hands it any queued job whose labels it satisfies. The
+unit that must balance is the **label set**: N queued jobs sharing a label set
+are served by N runners of that class, in whatever permutation GitHub picks.
+
+### Fix
+
+`labelSetKey(labels)` canonicalizes a job's labels (lowercased, trimmed,
+sorted, deduped) into a **fungibility class**. `Scheduler.jobLabels` records the
+class of every accepted job; `runnerBinding.labelSet` records the class each
+dispatched runner serves.
+
+1. **`admitDispatch(key)`** — the last gate before claiming, called by all four
+   provisioning paths immediately after they acquire their concurrency slot.
+   It returns false when the job was observed running while the handler sat
+   blocked, so the dispatch is *discharged by the sibling's execution* instead
+   of becoming an orphan. The caller releases its slot, keeping
+   `max_concurrent` accounting correct.
+
+2. **Label-set reconciliation in `sweepOrphanRunners`** — an unbound runner
+   whose intent job ran elsewhere is a *spare*. Spares are allocated against
+   their class's uncovered queued jobs (newest first, most grace remaining);
+   surplus spares are retired immediately rather than waiting out the grace
+   window. `handleCompleted` triggers the reconciliation so it is event-driven
+   rather than waiting for the 5-minute sweep tick.
+
+The intent-keyed grace rule is **unchanged and still required**: a runner
+nothing ever wanted has no discharge signal, so only the grace window can reap
+it. Rule 3 is additive.
+
+### Deliberately conservative
+
+There is **no** "already observed running" early-out in `handleQueued`. The
+check lives only in `admitDispatch`, at the point of claiming. A fresh `queued`
+event is always allowed back into the pipeline: if the platform says a job is
+queued it may genuinely need a runner again, and rejecting it that early would
+suppress it for the whole `started` TTL (`JobTimeout + seenTTL`, or 6h when no
+job timeout is configured). Costing a briefly-held concurrency slot is the
+cheaper mistake.
+
+An idle spare does **not** suppress a pending dispatch for a *different*
+same-label job. Doing so would be the fully-balanced model, but it bets the
+second job's execution on GitHub assigning it to the spare; if that bet loses,
+the job strands with nothing left to re-dispatch it. Retiring surplus spares
+after the fact is strictly safe — it can waste a dispatch, never lose a job.
+
+### Interaction with the zombie cap
+
+A job over `maxProvisionAttempts` is not counted as class demand. We have given
+up on it, so it must not keep a spare runner alive indefinitely.
