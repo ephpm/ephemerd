@@ -179,7 +179,8 @@ jobs:
             fi
             return 0
           }
-          probe 192.168.11.10 8006 "Proxmox API"     || fail=1
+          probe 192.168.5.1 8006 "Proxmox coyotes"   || fail=1
+          probe 192.168.5.2 8006 "Proxmox kings"     || fail=1
           probe 192.168.12.113 8443 "Incus daemon"   || fail=1
           probe 192.168.10.45 3000 "Grafana"         || fail=1
           [ "$fail" -eq 0 ] || exit 1
@@ -239,7 +240,8 @@ jobs:
         shell: powershell
         run: |
           $fail = 0
-          foreach ($t in @(@('192.168.11.10',8006,'Proxmox API'),
+          foreach ($t in @(@('192.168.5.1',8006,'Proxmox coyotes'),
+                           @('192.168.5.2',8006,'Proxmox kings'),
                            @('192.168.12.113',8443,'Incus daemon'),
                            @('192.168.10.45',3000,'Grafana'))) {
             $r = Test-NetConnection -ComputerName $t[0] -Port $t[1] `
@@ -281,7 +283,8 @@ jobs:
         run: |
           set -u
           fail=0
-          for t in "192.168.11.10 8006 Proxmox" "192.168.12.113 8443 Incus" "192.168.10.45 3000 Grafana"; do
+          for t in "192.168.5.1 8006 Proxmox-coyotes" "192.168.5.2 8006 Proxmox-kings" \
+                   "192.168.12.113 8443 Incus" "192.168.10.45 3000 Grafana"; do
             set -- $t
             if nc -z -G 4 "$1" "$2" 2>/dev/null; then
               echo "FAIL: reached $3 at $1:$2"; fail=1
