@@ -225,7 +225,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	// Start container runtime.
 	// On Linux/Windows: embedded containerd runs in-process.
 	// On macOS: boot a Linux VM via Virtualization.framework, containerd runs inside it.
-	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.Enabled, containerdTCPPort, containerdTCPAddr, cfg.Dind.Enabled, cfg.Dind.ResolvedAllowPrivileged(), cfg.VM.Linux.CPUs, cfg.VM.Linux.MemoryMB, cfg.VM.Linux.DiskSizeGB, cfg.Dispatch.Token)
+	ctrdClient, waitDispatch, cleanup, err := startContainerRuntime(configDir, log, cfg.VM.Linux.ResolvedEnabled(), containerdTCPPort, containerdTCPAddr, cfg.Dind.Enabled, cfg.Dind.ResolvedAllowPrivileged(), cfg.VM.Linux.CPUs, cfg.VM.Linux.MemoryMB, cfg.VM.Linux.DiskSizeGB, cfg.Dispatch.Token)
 	if err != nil {
 		return fmt.Errorf("starting container runtime: %w", err)
 	}
@@ -667,6 +667,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		Providers:          activeProviders,
 		Artifacts:          artifactExtractor,
 		LinuxDispatcher:    linuxDispatcher,
+		LinuxJobsDisabled:  !cfg.VM.Linux.ResolvedEnabled() && runtime_.GOOS == "darwin",
 		DataDir:            configDir,
 		MaxConcurrent:      cfg.Runner.MaxConcurrent,
 		MaxMacOSVMs:        cfg.VM.MacOS.MaxConcurrent,

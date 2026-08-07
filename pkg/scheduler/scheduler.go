@@ -28,12 +28,18 @@ import (
 
 // Config for the scheduler.
 type Config struct {
-	Runtime           *runtime.Runtime
-	Providers         []providers.Provider
-	Artifacts         *artifacts.Extractor // OCI image layer extractor for macOS VM jobs (nil if not available)
-	LinuxDispatcher   *DispatchClient      // if non-nil, Linux jobs are dispatched to a Linux VM worker via gRPC
-	MacOSVMConfig     *vm.MacOSVMConfig    // if non-nil, macOS-native jobs are enabled (darwin only)
-	DataDir           string               // ephemerd data directory (used for artifact extraction paths)
+	Runtime         *runtime.Runtime
+	Providers       []providers.Provider
+	Artifacts       *artifacts.Extractor // OCI image layer extractor for macOS VM jobs (nil if not available)
+	LinuxDispatcher *DispatchClient      // if non-nil, Linux jobs are dispatched to a Linux VM worker via gRPC
+	// LinuxJobsDisabled makes canHandleJob refuse Linux-labeled jobs even on
+	// a host that could run them ([vm.linux] enabled = false on darwin). Used
+	// when a dedicated Linux box serves the same labels: without it, both
+	// daemons register a JIT runner per queued job and the loser's runner
+	// squats as an orphan until the grace sweep.
+	LinuxJobsDisabled bool
+	MacOSVMConfig     *vm.MacOSVMConfig // if non-nil, macOS-native jobs are enabled (darwin only)
+	DataDir           string            // ephemerd data directory (used for artifact extraction paths)
 	MaxConcurrent     int
 	MaxMacOSVMs       int // max concurrent macOS VMs (Vz limit; default auto-detected)
 	Labels            []string
@@ -802,8 +808,10 @@ func (s *Scheduler) canHandleJob(jobLabels []string) bool {
 		switch strings.ToLower(label) {
 		case "linux":
 			// Linux jobs run natively on Linux, via VM dispatch on Windows/macOS,
-			// or inside the embedded Linux VM on macOS.
-			osOK = goruntime.GOOS == "linux" || goruntime.GOOS == "darwin" || s.cfg.LinuxDispatcher != nil
+			// or inside the embedded Linux VM on macOS — unless the operator
+			// turned Linux serving off ([vm.linux] enabled = false).
+			osOK = (goruntime.GOOS == "linux" || goruntime.GOOS == "darwin" || s.cfg.LinuxDispatcher != nil) &&
+				!s.cfg.LinuxJobsDisabled
 		case "windows":
 			osOK = goruntime.GOOS == "windows"
 		case "macos", "macosx":
