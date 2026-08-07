@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	apiv1 "github.com/ephpm/ephemerd/api/v1"
 	"github.com/ephpm/ephemerd/pkg/config"
@@ -84,10 +85,34 @@ func statusCmd() *cli.Command {
 
 func drainCmd() *cli.Command {
 	return &cli.Command{
-		Name:        "drain",
-		Usage:       "Stop accepting new jobs and wait for running jobs to finish",
-		Description: "Sends SIGTERM to the running ephemerd daemon, triggering graceful drain.\nThe daemon will stop accepting new jobs and wait for running jobs to complete.",
+		Name:  "drain",
+		Usage: "Stop accepting new jobs and wait for running jobs to finish",
+		Description: "By default sends SIGTERM to the running ephemerd daemon: it stops claiming new jobs,\n" +
+			"keeps in-flight jobs running until they finish (or shutdown_timeout expires, default 5m),\n" +
+			"then exits. This command returns immediately; use 'ephemerd status' to monitor progress.\n" +
+			"\n" +
+			"With --wait no signal is sent. The daemon is cordoned over the control socket (it stops\n" +
+			"claiming new jobs but keeps serving) and this command polls until the active job count\n" +
+			"reaches zero or --timeout elapses (nonzero exit). Once drained, the daemon can be\n" +
+			"restarted without killing a single job, e.g.:\n" +
+			"\n" +
+			"    ephemerd drain --wait && systemctl restart ephemerd",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:  "wait",
+				Usage: "cordon via the control socket (no signal) and block until all running jobs finish",
+			},
+			&cli.DurationFlag{
+				Name:  "timeout",
+				Value: 45 * time.Minute,
+				Usage: "with --wait: give up after this long (exits nonzero, daemon stays cordoned)",
+			},
+		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Bool("wait") {
+				return drainWait(ctx, cmd.Duration("timeout"))
+			}
+
 			// Read PID file to find the running daemon
 			pidFile := filepath.Join(configDir, "ephemerd.pid")
 			pidData, err := os.ReadFile(pidFile)
@@ -123,6 +148,84 @@ func drainCmd() *cli.Command {
 
 			fmt.Println("The daemon will wait for running jobs to finish before exiting.")
 			fmt.Println("Use 'ephemerd status' to monitor progress.")
+			return nil
+		},
+	}
+}
+
+// drainWait cordons the daemon over the control socket — no signal, so the
+// daemon keeps running — then polls Status until no jobs remain or the
+// timeout elapses. Exit 0 means drained: a restart at that point kills
+// nothing. On timeout the daemon is left cordoned so the operator can
+// decide: restart anyway, or `ephemerd uncordon` to resume claiming.
+func drainWait(ctx context.Context, timeout time.Duration) (retErr error) {
+	cc, err := dialControl(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := cc.Close(); err != nil && retErr == nil {
+			retErr = fmt.Errorf("closing connection: %w", err)
+		}
+	}()
+
+	resp, err := cc.Cordon(ctx, &apiv1.CordonRequest{})
+	if err != nil {
+		return fmt.Errorf("cordon: %w", err)
+	}
+	fmt.Printf("Cordoned: daemon stopped claiming new jobs (%d active).\n", resp.ActiveJobs)
+	if resp.ActiveJobs == 0 {
+		fmt.Println("Drained: no active jobs.")
+		return nil
+	}
+
+	start := time.Now()
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("interrupted while waiting for drain (daemon stays cordoned): %w", ctx.Err())
+		case <-ticker.C:
+			st, err := cc.Status(ctx, &apiv1.StatusRequest{})
+			if err != nil {
+				return fmt.Errorf("status while draining: %w", err)
+			}
+			if st.ActiveJobs == 0 {
+				fmt.Printf("Drained: no active jobs (waited %s).\n", time.Since(start).Truncate(time.Second))
+				return nil
+			}
+			fmt.Printf("Waiting: %d active job(s), elapsed %s\n", st.ActiveJobs, time.Since(start).Truncate(time.Second))
+			if time.Now().After(deadline) {
+				return fmt.Errorf("drain timed out after %s with %d job(s) still running (daemon stays cordoned)", timeout, st.ActiveJobs)
+			}
+		}
+	}
+}
+
+func uncordonCmd() *cli.Command {
+	return &cli.Command{
+		Name:        "uncordon",
+		Usage:       "Resume claiming new jobs after a cordon or aborted drain",
+		Description: "Clears the draining flag set by 'ephemerd drain --wait' (or a timed-out drain),\nso the daemon starts claiming queued jobs again. Running jobs are unaffected.",
+		Action: func(ctx context.Context, cmd *cli.Command) (retErr error) {
+			cc, err := dialControl(ctx)
+			if err != nil {
+				return err
+			}
+			defer func() {
+				if err := cc.Close(); err != nil && retErr == nil {
+					retErr = fmt.Errorf("closing connection: %w", err)
+				}
+			}()
+
+			resp, err := cc.Uncordon(ctx, &apiv1.UncordonRequest{})
+			if err != nil {
+				return fmt.Errorf("uncordon: %w", err)
+			}
+			fmt.Printf("Uncordoned: daemon is claiming new jobs again (%d active).\n", resp.ActiveJobs)
 			return nil
 		},
 	}

@@ -87,6 +87,22 @@ func (c *controlServer) Status(ctx context.Context, req *apiv1.StatusRequest) (*
 	}, nil
 }
 
+// Cordon stops the scheduler from claiming new jobs without initiating
+// shutdown. Running jobs continue undisturbed. Used by `ephemerd drain
+// --wait`, which polls Status until ActiveJobs reaches zero.
+func (c *controlServer) Cordon(ctx context.Context, req *apiv1.CordonRequest) (*apiv1.CordonResponse, error) {
+	active := c.sched.Cordon()
+	c.log.Info("scheduler cordoned via grpc", "active_jobs", active)
+	return &apiv1.CordonResponse{ActiveJobs: int32(active)}, nil
+}
+
+// Uncordon resumes claiming after a Cordon (e.g. an aborted drain).
+func (c *controlServer) Uncordon(ctx context.Context, req *apiv1.UncordonRequest) (*apiv1.UncordonResponse, error) {
+	active := c.sched.Uncordon()
+	c.log.Info("scheduler uncordoned via grpc", "active_jobs", active)
+	return &apiv1.UncordonResponse{ActiveJobs: int32(active)}, nil
+}
+
 // findJob looks up a running job by its int64 ID. When multiple providers are
 // active, different providers could theoretically have the same job ID, so this
 // returns the first match. The gRPC proto will gain a provider field in Phase 2

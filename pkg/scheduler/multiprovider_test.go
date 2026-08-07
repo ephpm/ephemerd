@@ -154,8 +154,10 @@ func TestMultiProvider_HandleQueuedRoutesToCorrectProvider(t *testing.T) {
 	if !seen {
 		t.Error("event should be recorded in seen map with forgejo composite key")
 	}
-	if !pending {
-		t.Error("event should be recorded in pending map with forgejo composite key")
+	// The draining reject clears the pending stamp (it has no TTL and
+	// would block the job after Uncordon).
+	if pending {
+		t.Error("draining reject should clear the pending entry for the forgejo composite key")
 	}
 
 	if key.Provider != "forgejo" {

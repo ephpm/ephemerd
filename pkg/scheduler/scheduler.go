@@ -195,6 +195,8 @@ type Scheduler struct {
 	runners      map[string]*runnerBinding // dispatched runners by name; tracks observed job assignment
 	webhookMode  bool                      // true when job events arrive via webhooks (in_progress observable)
 	runCtx       context.Context           // scheduler root context (set once at Run start); used for event-driven re-dispatch
+	jobsCtx      context.Context           // detached parent for job runtimes; survives runCtx (signal) cancellation
+	jobsCancel   context.CancelFunc        // cancels jobsCtx; called by drain() once the wait/force-kill phase ends
 	mu           sync.Mutex
 	sem          chan struct{} // local/native job concurrency limiter
 	linuxSem     chan struct{} // Linux dispatch (VM) concurrency limiter
@@ -407,15 +409,83 @@ func New(cfg Config) *Scheduler {
 	return s
 }
 
+// bindContexts wires the scheduler's two lifecycle contexts from the run
+// context. runCtx is the signal-scoped context: everything that must stop
+// promptly on SIGTERM (polling, webhook server, reconcile loop, semaphore
+// waits, claim attempts) derives from it. jobsCtx is deliberately DETACHED
+// from runCtx's cancellation (values carry over via WithoutCancel): a job
+// that is already running keeps its lease across SIGTERM until drain()
+// either sees it finish or hits ShutdownTimeout and cancels jobsCtx.
+// Without this split, the signal cancels every in-flight job's context the
+// instant it arrives, and drain()'s wait loop "succeeds" only because the
+// cancellation already killed everything — drain becomes kill.
+//
+// Split from Run so tests can exercise the same wiring without the full
+// serve stack.
+func (s *Scheduler) bindContexts(ctx context.Context) {
+	jobsCtx, jobsCancel := context.WithCancel(context.WithoutCancel(ctx))
+	s.mu.Lock()
+	s.runCtx = ctx
+	s.jobsCtx = jobsCtx
+	s.jobsCancel = jobsCancel
+	s.mu.Unlock()
+}
+
+// jobContext returns the context bounding a single job's runtime, derived
+// from jobsCtx (not the signal-scoped run context — see bindContexts) and
+// capped at JobTimeout when configured. Every provisioning path uses this
+// for the create/wait phase of a runner.
+func (s *Scheduler) jobContext() (context.Context, context.CancelFunc) {
+	s.mu.Lock()
+	base := s.jobsCtx
+	s.mu.Unlock()
+	if base == nil {
+		// Handlers invoked without Run (tests): still never inherit a
+		// signal-scoped cancellation.
+		base = context.Background()
+	}
+	if s.cfg.JobTimeout > 0 {
+		return context.WithTimeout(base, s.cfg.JobTimeout)
+	}
+	return context.WithCancel(base)
+}
+
+// Cordon marks the scheduler as draining WITHOUT initiating shutdown: new
+// queued jobs are rejected while running jobs continue undisturbed. Returns
+// the number of jobs still running. Used by the Cordon RPC so
+// `ephemerd drain --wait` can stop claims first and only restart the daemon
+// once the active job count reaches zero.
+func (s *Scheduler) Cordon() int {
+	s.mu.Lock()
+	s.draining = true
+	count := len(s.running)
+	s.mu.Unlock()
+	metrics.Draining.Set(1)
+	return count
+}
+
+// Uncordon reverses Cordon: the scheduler resumes claiming queued jobs.
+// Returns the number of jobs currently running. Jobs whose queued events
+// were rejected while cordoned are picked up again by the next poll or
+// reconcile sweep once their seen entry expires (seenTTL).
+func (s *Scheduler) Uncordon() int {
+	s.mu.Lock()
+	s.draining = false
+	count := len(s.running)
+	s.mu.Unlock()
+	metrics.Draining.Set(0)
+	return count
+}
+
 // Run starts the scheduler. It discovers jobs via polling (default) or
 // webhooks (when TLS certs are configured), and manages runner lifecycle.
 func (s *Scheduler) Run(ctx context.Context) error {
-	// Record the root context for event-driven re-dispatch (reprovisionIfStranded).
-	// Set once here, before any events are processed or wait-goroutines spawned,
-	// so it carries no per-job/retry context values.
-	s.mu.Lock()
-	s.runCtx = ctx
-	s.mu.Unlock()
+	// Record the root context for event-driven re-dispatch (reprovisionIfStranded)
+	// and derive the detached jobs context. Set once here, before any events are
+	// processed or wait-goroutines spawned, so they carry no per-job/retry
+	// context values.
+	s.bindContexts(ctx)
+	defer s.jobsCancel()
 
 	events := make(chan providers.JobEvent, 32)
 
@@ -850,6 +920,11 @@ func (s *Scheduler) handleQueued(ctx context.Context, event providers.JobEvent) 
 	}
 
 	if s.draining {
+		// Drop the pending stamp: it has no TTL, so leaving it would
+		// permanently block this job from being handled after Uncordon.
+		// The seen entry stays (expires after seenTTL), so an uncordoned
+		// scheduler picks the job up again on a later poll/reconcile pass.
+		delete(s.pending, key)
 		s.mu.Unlock()
 		log.Info("rejecting job, scheduler is draining")
 		return
@@ -976,13 +1051,9 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		return
 	}
 
-	var jobCtx context.Context
-	var cancel context.CancelFunc
-	if s.cfg.JobTimeout > 0 {
-		jobCtx, cancel = context.WithTimeout(ctx, s.cfg.JobTimeout)
-	} else {
-		jobCtx, cancel = context.WithCancel(ctx)
-	}
+	// Derived from jobsCtx, not ctx: the job keeps running across SIGTERM
+	// until it finishes or drain() gives up (see bindContexts).
+	jobCtx, cancel := s.jobContext()
 
 	if err := s.cfg.LinuxDispatcher.Create(jobCtx, claim.RunnerName, image, claim.RunnerConfig, event.Provider.Name(), event.Repo); err != nil {
 		log.Error("dispatch create failed", "error", err)
@@ -1146,13 +1217,9 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		return
 	}
 
-	var jobCtx context.Context
-	var cancel context.CancelFunc
-	if s.cfg.JobTimeout > 0 {
-		jobCtx, cancel = context.WithTimeout(ctx, s.cfg.JobTimeout)
-	} else {
-		jobCtx, cancel = context.WithCancel(ctx)
-	}
+	// Derived from jobsCtx, not ctx: the job keeps running across SIGTERM
+	// until it finishes or drain() gives up (see bindContexts).
+	jobCtx, cancel := s.jobContext()
 
 	// Boot the VM
 	if err := macVM.Start(jobCtx); err != nil {
@@ -1303,13 +1370,9 @@ func (s *Scheduler) handleNativeMacOSJob(ctx context.Context, event providers.Jo
 	nr.SetSandboxStrict(s.cfg.NativeMacStrict)
 	nr.SetMaxProcesses(s.cfg.NativeMacMaxProcs)
 
-	var jobCtx context.Context
-	var cancel context.CancelFunc
-	if s.cfg.JobTimeout > 0 {
-		jobCtx, cancel = context.WithTimeout(ctx, s.cfg.JobTimeout)
-	} else {
-		jobCtx, cancel = context.WithCancel(ctx)
-	}
+	// Derived from jobsCtx, not ctx: the job keeps running across SIGTERM
+	// until it finishes or drain() gives up (see bindContexts).
+	jobCtx, cancel := s.jobContext()
 
 	// Start the runner
 	if err := nr.Start(jobCtx); err != nil {
@@ -1472,14 +1535,10 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 		return
 	}
 
-	// Create the runner environment with job timeout
-	var jobCtx context.Context
-	var cancel context.CancelFunc
-	if s.cfg.JobTimeout > 0 {
-		jobCtx, cancel = context.WithTimeout(ctx, s.cfg.JobTimeout)
-	} else {
-		jobCtx, cancel = context.WithCancel(ctx)
-	}
+	// Create the runner environment with job timeout.
+	// Derived from jobsCtx, not ctx: the job keeps running across SIGTERM
+	// until it finishes or drain() gives up (see bindContexts).
+	jobCtx, cancel := s.jobContext()
 	env, err := s.cfg.Runtime.Create(jobCtx, runtime.CreateConfig{
 		ID:         claim.RunnerName,
 		Image:      image,
@@ -1732,12 +1791,25 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event providers.JobEven
 
 // drain stops accepting new jobs and waits for running jobs to finish.
 // If jobs don't finish within ShutdownTimeout, they are force-killed.
+//
+// The wait is real: job contexts hang off jobsCtx, which the signal that
+// triggered this drain did NOT cancel (see bindContexts), so s.running
+// empties because jobs complete — their wait-goroutines see the runner
+// exit and untrack them — not because cancellation killed them. jobsCtx
+// is only canceled on the way out, after the wait or the force-kill.
 func (s *Scheduler) drain() {
 	s.mu.Lock()
 	s.draining = true
 	count := len(s.running)
+	jobsCancel := s.jobsCancel
 	s.mu.Unlock()
 	metrics.Draining.Set(1)
+
+	// Whichever way drain exits, release the job lease so nothing derived
+	// from jobsCtx outlives the daemon. Nil when Run was never started.
+	if jobsCancel != nil {
+		defer jobsCancel()
+	}
 
 	if count == 0 {
 		return

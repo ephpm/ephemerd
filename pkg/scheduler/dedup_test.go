@@ -128,10 +128,56 @@ func TestHandleQueued_AllowsExpiredSeen(t *testing.T) {
 // --- handleQueued: adds to pending before dispatch ---
 
 func TestHandleQueued_AddsToPending(t *testing.T) {
+	s := New(Config{Log: quietLogger(), MaxConcurrent: 1})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Fill the local sem so handleLocalJob blocks in its slot acquire,
+	// leaving the pending/seen stamps observable mid-dispatch.
+	s.sem <- struct{}{}
+
+	done := make(chan struct{})
+	go func() {
+		s.handleQueued(ctx, makeEvent(350, []string{"self-hosted"}))
+		close(done)
+	}()
+
+	// Wait until the dispatch has stamped pending (it does so before the
+	// sem acquire can block).
+	deadline := time.After(2 * time.Second)
+	for {
+		s.mu.Lock()
+		_, isPending := s.pending[jobKey{JobID: 350}]
+		_, isSeen := s.seen[jobKey{JobID: 350}]
+		s.mu.Unlock()
+		if isPending {
+			if !isSeen {
+				t.Error("job should be in seen after dedup check passes")
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("job never appeared in pending")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	// Unblock the handler (canceled ctx aborts the sem wait).
+	cancel()
+	<-done
+}
+
+// --- handleQueued: draining reject clears the pending stamp ---
+
+// A cordoned scheduler must not leave the job's pending entry behind:
+// pending has no TTL, so a leaked entry would block the job from ever
+// being handled after Uncordon. The seen entry stays (expires via
+// seenTTL) so the reject isn't re-logged on every poll.
+func TestHandleQueued_DrainingRejectClearsPending(t *testing.T) {
 	s := New(Config{Log: quietLogger()})
 	ctx := context.Background()
 
-	// draining stops execution after dedup but after pending/seen are stamped
 	s.draining = true
 
 	event := makeEvent(350, []string{"self-hosted"})
@@ -142,11 +188,11 @@ func TestHandleQueued_AddsToPending(t *testing.T) {
 	_, isSeen := s.seen[jobKey{JobID: 350}]
 	s.mu.Unlock()
 
-	if !isPending {
-		t.Error("job should be in pending after dedup check passes")
+	if isPending {
+		t.Error("draining reject must clear pending, or the job is blocked forever after Uncordon")
 	}
 	if !isSeen {
-		t.Error("job should be in seen after dedup check passes")
+		t.Error("job should remain in seen after a draining reject")
 	}
 }
 

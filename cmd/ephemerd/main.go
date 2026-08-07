@@ -80,6 +80,7 @@ func main() {
 			logsCmd(),
 			statusCmd(),
 			drainCmd(),
+			uncordonCmd(),
 			jobsCmd(),
 			cacheCmd(),
 			configCheckCmd(),
