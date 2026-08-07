@@ -364,10 +364,30 @@ func (v *VMConfig) CrossPlatformEnabled() bool {
 // LinuxVMToml configures the long-running Linux VM for Linux jobs
 // on Windows (Hyper-V) and macOS (Virtualization.framework) hosts.
 type LinuxVMToml struct {
-	Enabled    bool   `toml:"enabled"`      // enable Linux VM for cross-OS Linux jobs
+	// Enabled controls whether this host serves Linux jobs through the VM.
+	// Pointer so "not set" is distinguishable from an explicit choice: the
+	// platform default is preserved when omitted — ON for darwin (macOS has
+	// always booted the VM unconditionally), OFF for windows (the WSL VM has
+	// always been opt-in). Set `enabled = false` on a darwin host to stop it
+	// claiming Linux jobs — e.g. when a dedicated Linux box now serves the
+	// same labels and dual-claiming would orphan a runner per job. (The VM
+	// itself still boots on darwin for now; skipping the boot entirely is a
+	// separate change.)
+	Enabled    *bool  `toml:"enabled"`
 	CPUs       uint   `toml:"cpus"`         // virtual CPUs (default: 2)
 	MemoryMB   uint64 `toml:"memory_mb"`    // memory in MB (default: 2048)
 	DiskSizeGB uint64 `toml:"disk_size_gb"` // sparse disk size in GB (default: 50)
+}
+
+// ResolvedEnabled returns whether the host should serve Linux jobs via the
+// Linux VM, defaulting per platform when the key is not set: darwin true
+// (historical always-on), everything else false (windows is opt-in; on a
+// linux host the field is meaningless — jobs run natively).
+func (l *LinuxVMToml) ResolvedEnabled() bool {
+	if l.Enabled == nil {
+		return goruntime.GOOS == "darwin"
+	}
+	return *l.Enabled
 }
 
 // MacOSVMToml configures per-job macOS VMs. macOS jobs always run in a

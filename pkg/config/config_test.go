@@ -1658,8 +1658,11 @@ memory_mb = 16384
 		t.Fatalf("Load() error: %v", err)
 	}
 
-	if !cfg.VM.Linux.Enabled {
-		t.Error("VM.Linux.Enabled = false, want true")
+	if cfg.VM.Linux.Enabled == nil || !*cfg.VM.Linux.Enabled {
+		t.Error("VM.Linux.Enabled not bound to explicit true")
+	}
+	if !cfg.VM.Linux.ResolvedEnabled() {
+		t.Error("ResolvedEnabled() = false with explicit enabled = true")
 	}
 	if cfg.VM.Linux.CPUs != 4 {
 		t.Errorf("VM.Linux.CPUs = %d, want 4", cfg.VM.Linux.CPUs)
@@ -2014,6 +2017,86 @@ owner = "testorg"
 	resolved := cfg.Runtime.Rlimits.Resolved()
 	if resolved.Nofile != 1024 || resolved.Nproc != 1024 {
 		t.Errorf("Resolved() = %+v, want {1024, 1024}", resolved)
+	}
+}
+
+// --- LinuxVMToml.ResolvedEnabled ---
+
+func TestLinuxVMResolvedEnabled_DefaultIsPlatformBehavior(t *testing.T) {
+	// Unset must preserve historical behavior: darwin always booted the VM
+	// and served Linux jobs; windows treated the VM as opt-in (plain-bool
+	// zero was false). A changed default here silently flips whether a
+	// fleet's mac serves Linux jobs on upgrade.
+	l := LinuxVMToml{}
+	want := goruntime.GOOS == "darwin"
+	if got := l.ResolvedEnabled(); got != want {
+		t.Errorf("default ResolvedEnabled() on GOOS=%s = %v, want %v", goruntime.GOOS, got, want)
+	}
+}
+
+func TestLinuxVMResolvedEnabled_ExplicitFalseWins(t *testing.T) {
+	no := false
+	l := LinuxVMToml{Enabled: &no}
+	if l.ResolvedEnabled() {
+		t.Error("ResolvedEnabled() = true with explicit enabled = false")
+	}
+}
+
+func TestLinuxVMResolvedEnabled_ExplicitTrueWins(t *testing.T) {
+	yes := true
+	l := LinuxVMToml{Enabled: &yes}
+	if !l.ResolvedEnabled() {
+		t.Error("ResolvedEnabled() = false with explicit enabled = true")
+	}
+}
+
+func TestLoad_LinuxVMEnabled_OmittedIsNil(t *testing.T) {
+	// The key being absent must load as nil (platform default), not false —
+	// every existing darwin fleet config omits it and must keep serving
+	// Linux jobs after upgrade.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[github]
+owner = "test"
+token = "t"
+
+[vm.linux]
+cpus = 4
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.VM.Linux.Enabled != nil {
+		t.Errorf("Enabled ptr = %v, want nil when key omitted", *cfg.VM.Linux.Enabled)
+	}
+}
+
+func TestLoad_LinuxVMEnabled_ExplicitFalseBinds(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[github]
+owner = "test"
+token = "t"
+
+[vm.linux]
+enabled = false
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.VM.Linux.Enabled == nil {
+		t.Fatal("Enabled ptr is nil; TOML did not bind the explicit false")
+	}
+	if *cfg.VM.Linux.Enabled || cfg.VM.Linux.ResolvedEnabled() {
+		t.Error("explicit enabled = false did not resolve to disabled")
 	}
 }
 

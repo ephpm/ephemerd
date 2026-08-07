@@ -242,6 +242,23 @@ func TestCanHandleJob(t *testing.T) {
 	}
 }
 
+// LinuxJobsDisabled must beat every accept path — including a live
+// dispatcher — or a darwin host with [vm.linux] enabled=false keeps
+// double-claiming Linux jobs against the dedicated Linux box.
+func TestCanHandleJob_LinuxJobsDisabled(t *testing.T) {
+	s := New(Config{Log: testLogger(), LinuxJobsDisabled: true})
+	s.cfg.LinuxDispatcher = &DispatchClient{}
+
+	if s.canHandleJob([]string{"self-hosted", "linux"}) {
+		t.Error("linux job accepted despite LinuxJobsDisabled")
+	}
+	// Non-linux labels must be unaffected: on darwin macOS jobs keep
+	// flowing, and label-less jobs are still accepted.
+	if !s.canHandleJob([]string{"self-hosted", "x64"}) {
+		t.Error("non-OS-labeled job rejected; LinuxJobsDisabled must only gate linux")
+	}
+}
+
 func TestCanHandleJob_PlatformSpecific(t *testing.T) {
 	s := New(Config{Log: testLogger()})
 
