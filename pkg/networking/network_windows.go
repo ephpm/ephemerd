@@ -230,15 +230,9 @@ func (w *windowsNetworking) applyACLPolicies(endpoint *hcn.HostComputeEndpoint) 
 	})
 }
 
-func (w *windowsNetworking) installFirewallRules() error {
-	// ACL policies are applied per-endpoint in setup(), not globally
-	w.cfg.Log.Info("Windows ACL firewall policies configured per-endpoint")
-	return nil
-}
-
-func (w *windowsNetworking) removeFirewallRules() {
-	// ACL policies are removed when endpoints are deleted
-}
+// installFirewallRules and removeFirewallRules live in firewall_windows.go
+// (mirroring firewall_linux.go): the host-global Windows Firewall backstop
+// that complements the per-endpoint ACLs applied above.
 
 func (w *windowsNetworking) cleanup() {}
 
