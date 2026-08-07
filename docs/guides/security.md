@@ -53,11 +53,12 @@ Linux containers run with a minimal set of capabilities:
 | `CAP_KILL` | Signal processes (service restarts) |
 | `CAP_SETGID` | adduser/addgroup in package scripts |
 | `CAP_SETUID` | setuid in package scripts |
-| `CAP_MKNOD` | Create device nodes (some packages) |
 | `CAP_SYS_CHROOT` | chroot in package scripts |
 | `CAP_NET_BIND_SERVICE` | Bind to ports below 1024 |
 
-Notably absent are `CAP_SYS_ADMIN` (no mount, no BPF, no namespace manipulation), `CAP_NET_ADMIN` (no network reconfiguration), and `CAP_NET_RAW` (no raw sockets). This set covers `apt-get install`, `sudo`, `adduser`, and service management -- the operations CI jobs commonly need -- while blocking privilege escalation paths.
+Notably absent are `CAP_SYS_ADMIN` (no mount, no BPF, no namespace manipulation), `CAP_NET_ADMIN` (no network reconfiguration), `CAP_NET_RAW` (no raw sockets), and `CAP_MKNOD` (no creating device nodes). This set covers `apt-get install`, `sudo`, `adduser`, and service management -- the operations CI jobs commonly need -- while blocking privilege escalation paths.
+
+`CAP_MKNOD` is worth calling out because container runtimes commonly grant it. Without it a job cannot create a block device node for the host disk and read it raw. The container's device cgroup denies access to any such node anyway, so dropping the capability removes the reliance on that single layer rather than closing an otherwise-open hole. No package in the supported runner images needs it at install time.
 
 ## Seccomp Profiles
 
@@ -72,6 +73,50 @@ On Linux, containers run with containerd's default seccomp profile. This blocks 
 - `init_module`, `finit_module` -- no kernel module loading
 
 The profile allows all syscalls that standard CI operations need (process creation, file I/O, networking, signal handling).
+
+## AppArmor Profiles
+
+On Linux, ephemerd also confines job containers with a generated AppArmor profile named `ephemerd-default`, equivalent to what Docker installs as `docker-default`. Seccomp filters syscalls; AppArmor constrains file operations, which syscall filtering does not distinguish between. Among other things the profile denies:
+
+- Writes to most of `/proc/sys` and `/sys`
+- Writes to `/proc/sysrq-trigger`, and any access to `/proc/mem`, `/proc/kmem`, `/proc/kcore`
+- Access to `/sys/firmware` and `/sys/kernel/security`
+- `mount`, independently of the seccomp filter
+- `ptrace` of processes outside the container's own profile
+
+Two carve-outs are deliberate and inherited from the upstream template: `/sys/fs/cgroup/**` and `/proc/sys/kernel/shm*` remain writable, because containerized workloads legitimately need both.
+
+This is a defense-in-depth layer, not the only thing protecting kernel interfaces. The container's OCI spec already mounts `/sys` read-only, marks `/proc/sys` and `/proc/sysrq-trigger` read-only, masks `/proc/kcore` and friends, and installs a deny-all device cgroup. AppArmor is a fourth, independent layer behind those, seccomp, and the capability set.
+
+### Fail-open behavior
+
+AppArmor confinement is best-effort. If the host cannot enforce it, ephemerd logs the reason and starts the job **unconfined by AppArmor** rather than failing the job. Hard-failing would take an entire pool offline on any host that simply does not ship AppArmor -- a common case, since AppArmor is a Debian/Ubuntu/SUSE feature and is absent or disabled on RHEL-family hosts, which use SELinux instead. Every other layer (seccomp, capabilities, read-only mounts, device cgroup, namespaces) still applies.
+
+Confinement is skipped when any of the following is true:
+
+- The kernel has AppArmor disabled (`/sys/module/apparmor/parameters/enabled` is not `Y`)
+- securityfs is not mounted at `/sys/kernel/security/apparmor`
+- `apparmor_parser` is not installed
+- Loading the profile fails
+- The profile is present but loaded in `complain` mode, which logs violations instead of blocking them
+
+### Checking whether your jobs are confined
+
+ephemerd logs one line whenever confinement status changes -- not once per job, so a healthy node prints it once, when it creates its first job container, and then stays quiet. Confined:
+
+```
+level=INFO msg="job containers are AppArmor confined" profile=ephemerd-default mode=enforce
+```
+
+Unconfined, with the specific reason:
+
+```
+level=WARN msg="job containers are running WITHOUT AppArmor confinement; seccomp, capability limits and the read-only /proc,/sys mounts still apply" profile=ephemerd-default reason="apparmor_parser is not installed or not in PATH"
+```
+
+If you see the `WARN`, install the `apparmor` and `apparmor-utils` packages and restart ephemerd. On a host that is confined, `aa-status` lists `ephemerd-default` in enforce mode.
+
+Note that the profile is loaded into the kernel at runtime and is not persisted to `/etc/apparmor.d`. Reloading AppArmor (`systemctl reload apparmor`) or upgrading the apparmor package drops it; ephemerd detects this before the next container starts and reloads the profile automatically.
 
 ## No Host Access
 

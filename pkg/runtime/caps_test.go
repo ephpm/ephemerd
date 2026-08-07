@@ -29,26 +29,9 @@ func TestContainerCapabilities_NoDuplicates(t *testing.T) {
 	}
 }
 
-func TestContainerCapabilities_ContainsRequiredCaps(t *testing.T) {
-	required := []string{
-		"CAP_NET_BIND_SERVICE",
-		"CAP_SETUID",
-		"CAP_SETGID",
-		"CAP_CHOWN",
-		"CAP_SYS_CHROOT",
-	}
-
-	capSet := make(map[string]bool, len(containerCapabilities))
-	for _, cap := range containerCapabilities {
-		capSet[cap] = true
-	}
-
-	for _, req := range required {
-		if !capSet[req] {
-			t.Errorf("required capability %q is missing from containerCapabilities", req)
-		}
-	}
-}
+// The required-capability assertion lives in hardening_test.go
+// (TestContainerCapabilities_KeepsRequired), next to the dangerous-capability
+// list it is the mirror image of. Keeping a second copy here let the two drift.
 
 func TestContainerCapabilities_NoEmptyStrings(t *testing.T) {
 	for i, cap := range containerCapabilities {

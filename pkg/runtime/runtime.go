@@ -37,6 +37,16 @@ const (
 // containerCapabilities is the minimum set of Linux capabilities for CI jobs.
 // Covers apt-get install, sudo, adduser, and service management.
 // Docker-in-Docker is not supported — use Kaniko or Buildah for image builds.
+//
+// CAP_MKNOD is deliberately absent. It lets a process create device nodes,
+// which is the first step of the classic "mknod a block device for the host
+// disk and read it raw" escape. containerd's default spec already installs a
+// deny-all device cgroup, so a node created this way would not be usable
+// anyway — dropping the capability just removes the reliance on that single
+// layer. No package in our supported runner images needs mknod at install time
+// (containers get their /dev from the runtime); a handful of packages
+// elsewhere in the distro archive do, so if one is ever found to need it, add
+// it back for that pool only rather than fleet wide.
 var containerCapabilities = []string{
 	"CAP_CHOWN",            // dpkg chown on installed files
 	"CAP_DAC_OVERRIDE",     // write to dirs owned by other users
@@ -45,7 +55,6 @@ var containerCapabilities = []string{
 	"CAP_KILL",             // signal processes (postinst service restarts)
 	"CAP_SETGID",           // adduser/addgroup in maintainer scripts
 	"CAP_SETUID",           // setuid in maintainer scripts
-	"CAP_MKNOD",            // create device nodes (some packages)
 	"CAP_SYS_CHROOT",       // chroot in maintainer scripts
 	"CAP_NET_BIND_SERVICE", // bind to ports < 1024
 }
@@ -652,6 +661,13 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		oci.WithCapabilities(containerCapabilities),
 	}
 	opts = append(opts, seccompOpts()...)
+	// AppArmor is an additional, independent layer over what the default spec
+	// above already does (read-only /proc/sys and /sys, masked /proc paths,
+	// deny-all device cgroup) and over seccomp. It constrains file operations,
+	// which syscall filtering does not distinguish between. No-op where the
+	// host has no usable AppArmor — see apparmorOpts for the fail-open
+	// rationale and the log line that reports it.
+	opts = append(opts, apparmorOpts(r.cfg.Log)...)
 	opts = append(opts, rlimitsOpts(r.cfg.Rlimits)...)
 	switch {
 	case len(cfg.Entrypoint) > 0:
