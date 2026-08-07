@@ -36,8 +36,10 @@ import (
 )
 
 // sharedNamespace is the containerd namespace used by ephemerd for runner
-// containers and cached base images. DinD image pulls check here first
-// before pulling into the per-job namespace.
+// containers and their snapshots. dind reads it when it has to resolve the
+// runner's rootfs (bind translation, docker cp), never as an image cache:
+// containerd content and snapshots are per-namespace, so an image handle
+// obtained here is not usable from a job namespace. See handleImagePull.
 const sharedNamespace = "ephemerd"
 
 // Server is a per-job fake Docker daemon.
@@ -570,23 +572,43 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 
 	writeProgress(fmt.Sprintf("Pulling from %s", fromImage))
 
-	// Check the shared ephemerd namespace first — common base images
-	// (node:20, ubuntu:24.04, etc.) are cached there across all jobs.
+	// Always pull into the per-job namespace, even when the same ref is
+	// already present in the shared "ephemerd" namespace (where the runtime
+	// puts runner images).
+	//
+	// An earlier version short-circuited on client.GetImage(sharedCtx, ref)
+	// and reused that handle. That cannot work: containerd's content store
+	// and snapshotter are both namespaced. A blob committed in namespace A
+	// gets a bucket only under A, and metadata.contentStore.checkAccess
+	// refuses any read from namespace B — so the Image record this handler
+	// registered in the job namespace pointed at a manifest/config the job
+	// namespace could not read. The failure surfaced later, at
+	// /containers/create, as
+	//
+	//	creating container: content digest sha256:<config>: not found
+	//
+	// because client.WithNewSnapshot has to read the image config to
+	// compute the rootfs chain ID. Snapshots are namespaced too, so even
+	// with the content resolvable there would be no parent snapshot to
+	// prepare from in the job namespace.
+	//
+	// The re-pull is cheaper than it looks: containerd's default bolt
+	// content sharing policy is "shared", so opening a writer for a digest
+	// that is already in the backing content store short-circuits (see
+	// metadata.contentStore.Writer + remotes.Fetch's ws.Offset == desc.Size
+	// branch) and no layer bytes cross the network. What it does cost is a
+	// registry resolve round-trip and a per-namespace unpack — the same
+	// cost every image that was not in the shared namespace already paid.
+	//
+	// Pulling per job is also what keeps private-registry images isolated
+	// to the job that asked for them.
 	ctx := r.Context()
-	sharedCtx := namespaces.WithNamespace(ctx, sharedNamespace)
 	jobCtx := namespaces.WithNamespace(ctx, s.jobNamespace)
 
-	img, err := s.client.GetImage(sharedCtx, ref)
-	if err == nil {
-		writeProgress("Using cached image from shared namespace")
-	} else {
-		// Not in shared namespace — pull into the per-job namespace.
-		// This keeps private registry images isolated to this job.
-		img, err = s.client.Pull(jobCtx, ref, client.WithPullUnpack)
-		if err != nil {
-			writeProgress(fmt.Sprintf("Error: %v", err))
-			return
-		}
+	img, err := s.client.Pull(jobCtx, ref, client.WithPullUnpack)
+	if err != nil {
+		writeProgress(fmt.Sprintf("Error: %v", err))
+		return
 	}
 
 	size, _ := img.Size(jobCtx)

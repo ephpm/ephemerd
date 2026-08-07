@@ -228,7 +228,7 @@ Per-job namespace: "ephemerd/dind/{jobID}"
   └── Containers created via fake socket (docker run)
 ```
 
-**Image pull read-through**: when a job does `docker pull node:20`, the fake socket checks the shared `ephemerd` namespace first. If the image exists there (pulled by ephemerd for runner containers), it's referenced directly — no redundant pull. Private registry images that aren't in the shared namespace are pulled into the per-job namespace, invisible to other jobs.
+**Image pull read-through** (removed — see `pkg/dind.handleImagePull`): the fake socket used to check the shared `ephemerd` namespace first and reference a hit directly. That never worked. containerd's content store and snapshotter are both namespaced, so an image handle from the shared namespace is unreadable from the per-job namespace and `docker create` failed with `content digest sha256:…: not found`. Every `docker pull` now pulls into the per-job namespace; the blobs are not re-downloaded (containerd's default `shared` content sharing policy short-circuits the ingest), and private registry images stay invisible to other jobs.
 
 **Build isolation**: `docker build` output goes into a per-job `containers/storage` root at `<DataDir>/jobs/<JobID>/docker/buildah-store/`. This is completely isolated from other jobs and from containerd's store.
 
