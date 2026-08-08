@@ -95,9 +95,14 @@ jobs:
                    /var/lib/ephemerd/containerd/containerd.sock; do
             if [ -r "$p" ]; then echo "FAIL: readable from job: $p"; fail=1; fi
           done
-          # PID 1's root would be the host's / on a shared namespace.
-          if ls /proc/1/root/ >/dev/null 2>&1; then
-            echo "FAIL: /proc/1/root is traversable"; fail=1
+          # /proc/1/root is only an escape if the PID namespace is SHARED with
+          # the host — then PID 1 is the host init and /proc/1/root is the host
+          # /. With a private PID namespace (the correct case) PID 1 is the
+          # container's own init and /proc/1/root is its own rootfs, which is
+          # traversable and harmless. So check what it POINTS AT, not whether it
+          # opens: a host marker visible through it means the namespace leaked.
+          if [ -e /proc/1/root/var/lib/ephemerd/config.toml ]; then
+            echo "FAIL: host root visible via /proc/1/root (shared PID namespace)"; fail=1
           fi
           # A host bind mounted anywhere obvious.
           if mount | grep -qE ' on /(host|hostfs|mnt/host) '; then
