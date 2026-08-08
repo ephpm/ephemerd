@@ -201,6 +201,153 @@ jobs:
             echo "SKIP: no /actions-runner mount"
           fi
 
+  # Active breakout attempts, aimed at the v0.1.6 hardening specifically.
+  # Where the `linux` job checks doors are locked, this job walks up and
+  # rattles the handles — each step tries a concrete escape technique and
+  # fails if the technique WORKS. Kept separate so a regression here reads
+  # as "an escape opened up" rather than "a policy check drifted".
+  breakout:
+    name: Breakout attempts (linux ${{ matrix.arch }})
+    runs-on: [self-hosted, linux, "${{ matrix.arch }}"]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - name: NoNewPrivileges — a setuid binary must not escalate (#128)
+        run: |
+          set -u
+          # #128 sets no_new_privs. With it, executing a setuid-root binary
+          # gains NO privileges — the classic in-container privilege step-up
+          # is dead. Prove it: make a setuid-root helper that reports euid,
+          # then run it as a normal user. euid must stay non-zero.
+          command -v gcc >/dev/null 2>&1 || { echo "SKIP: no compiler"; exit 0; }
+          # Only meaningful if we are root and can create a setuid file at all.
+          [ "$(id -u)" = "0" ] || { echo "SKIP: not uid 0, cannot stage setuid test"; exit 0; }
+          d=$(mktemp -d)
+          cat > "$d/euid.c" <<'EOF'
+          #include <stdio.h>
+          #include <unistd.h>
+          int main(){ printf("%d\n",(int)geteuid()); return 0; }
+          EOF
+          gcc -o "$d/euid" "$d/euid.c" || { echo "SKIP: compile failed"; exit 0; }
+          chown 0:0 "$d/euid"; chmod 4755 "$d/euid"
+          useradd -M -s /bin/sh probe 2>/dev/null || true
+          got=$(su probe -c "$d/euid" 2>/dev/null || echo err)
+          echo "setuid helper reported euid=$got"
+          if [ "$got" = "0" ]; then
+            echo "FAIL: setuid-root binary escalated to euid 0 — no_new_privs not enforced"
+            exit 1
+          fi
+          echo "OK: no_new_privs blocks setuid escalation"
+
+      - name: AppArmor must actually deny, not just be attached (#124)
+        run: |
+          set -u
+          if [ ! -e /sys/module/apparmor ] && [ ! -d /sys/kernel/security/apparmor ]; then
+            echo "SKIP: host has no AppArmor"; exit 0
+          fi
+          prof=$(cat /proc/self/attr/current 2>/dev/null || echo unknown)
+          case "$prof" in unconfined*|unknown) echo "SKIP: not confined ($prof)"; exit 0;; esac
+          fail=0
+          # The confined profile should refuse raw mount and writes to kernel
+          # tunables even when the syscall filter would let them through.
+          if mount -t tmpfs none /mnt 2>/dev/null; then
+            echo "FAIL: mount(2) succeeded under AppArmor confinement"; umount /mnt 2>/dev/null; fail=1
+          fi
+          if echo c 2>/dev/null > /proc/sysrq-trigger; then
+            echo "FAIL: wrote to /proc/sysrq-trigger"; fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: AppArmor denies mount + kernel-tunable writes ($prof)"
+
+      - name: cgroup release_agent escape must be impossible
+        run: |
+          set -u
+          # The canonical container escape: write a host path into a cgroup's
+          # release_agent, then trip an empty-cgroup notification to run it on
+          # the host. Every prerequisite must be missing.
+          fail=0
+          for ra in /sys/fs/cgroup/release_agent \
+                    /sys/fs/cgroup/*/release_agent \
+                    /sys/fs/cgroup/memory/release_agent; do
+            [ -e "$ra" ] || continue
+            if echo /tmp/x 2>/dev/null > "$ra"; then
+              echo "FAIL: wrote release_agent at $ra"; fail=1
+            fi
+          done
+          # Even mounting a fresh cgroup to get a writable release_agent must
+          # fail (needs CAP_SYS_ADMIN + no AppArmor block).
+          d=$(mktemp -d)
+          if mount -t cgroup -o rdma cgroup "$d" 2>/dev/null; then
+            echo "FAIL: mounted a fresh cgroup hierarchy"; umount "$d" 2>/dev/null; fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: release_agent escape blocked"
+
+      - name: core_pattern host-code-exec escape must be blocked
+        run: |
+          set -u
+          # Writing "|/host/binary" to core_pattern makes the kernel run that
+          # binary (on the host) on the next crash. /proc/sys must be read-only.
+          if echo '|/tmp/pwn' 2>/dev/null > /proc/sys/kernel/core_pattern; then
+            echo "FAIL: wrote /proc/sys/kernel/core_pattern"; exit 1
+          fi
+          echo "OK: core_pattern not writable"
+
+      - name: Regaining capabilities via a new user namespace must fail
+        run: |
+          set -u
+          # unshare -Ur creates a userns where the caller is 'root' with a
+          # full capability set *inside that namespace* — the modern path to
+          # CAP_SYS_ADMIN for mount-based escapes. seccomp/AppArmor/sysctl
+          # should stop it, or stop what it enables. If unshare itself is
+          # blocked, that's the strongest outcome.
+          if ! command -v unshare >/dev/null 2>&1; then echo "SKIP: no unshare"; exit 0; fi
+          out=$(unshare -Urm --propagation private sh -c 'mount -t tmpfs none /mnt && echo MOUNTED' 2>&1 || true)
+          echo "$out" | head -2
+          if echo "$out" | grep -q MOUNTED; then
+            echo "FAIL: userns gave a working mount(2) — CAP_SYS_ADMIN regained"
+            exit 1
+          fi
+          echo "OK: user namespace does not yield a usable mount"
+
+      - name: Kernel log and message ring must not leak the host
+        run: |
+          set -u
+          fail=0
+          # dmesg / kmsg leak host kernel addresses and activity across the
+          # tenancy boundary; both should be denied without CAP_SYSLOG.
+          if dd if=/dev/kmsg bs=1 count=1 >/dev/null 2>&1; then
+            echo "FAIL: /dev/kmsg readable"; fail=1
+          fi
+          if command -v dmesg >/dev/null 2>&1 && dmesg >/dev/null 2>&1; then
+            echo "FAIL: dmesg readable"; fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: kernel log not readable"
+
+      - name: The containerd socket must not be reachable from a job
+        run: |
+          set -u
+          # Direct access to containerd's socket is game over — a job could
+          # create a privileged container next to itself. It lives in the
+          # ephemerd data dir on the host, which must not be bind-mounted in.
+          fail=0
+          for s in /run/containerd/containerd.sock \
+                   /var/lib/ephemerd/containerd/containerd.sock \
+                   /run/ephemerd/containerd.sock; do
+            if [ -S "$s" ]; then echo "FAIL: containerd socket present: $s"; fail=1; fi
+          done
+          # And the dind shim's own docker socket must not expose the daemon
+          # namespace (docker info Server should be the ephemerd shim, if any).
+          if command -v docker >/dev/null 2>&1; then
+            srv=$(docker info --format '{{.ServerVersion}}' 2>/dev/null || echo none)
+            echo "docker server: $srv"
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: no containerd socket in the job"
+
   windows:
     name: Containment (windows x64)
     runs-on: [self-hosted, windows, x64]
