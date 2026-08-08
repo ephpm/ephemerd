@@ -74,6 +74,7 @@ func statusCmd() *cli.Command {
 				"max_concurrent": resp.MaxConcurrent,
 				"draining":       resp.Draining,
 				"uptime":         resp.Uptime,
+				"version":        resp.Version,
 			}
 
 			pretty, _ := json.MarshalIndent(data, "", "  ")

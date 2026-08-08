@@ -1,9 +1,48 @@
 # `ephemerd upgrade`: In-Place Binary Update
 
-> **Status: proposal.** Not implemented. Scoping document — design,
-> tradeoffs, and a work breakdown. Cost estimates are based on adjacent
-> tooling (Tailscale's `tailscale update`, k0s `k0sctl apply`, Docker
-> CE upgrade flows) and are best-guess until prototyped.
+> **Status: first implementation landed.** A CLI (`ephemerd upgrade
+> --version vX.Y.Z`) and a streaming control-plane RPC
+> (`Control.Upgrade`) now drive an in-place, drain-safe, checksum-verified
+> self-upgrade over the daemon's own outbound HTTPS. The sections below are
+> the original scoping proposal and remain useful for the tradeoffs; the
+> shipped v1 differs in a few deliberate ways, summarized here:
+>
+> - **Explicit version only, no channels.** The daemon never resolves
+>   "latest" — a version is required on every call. On a CI fleet, implicit
+>   latest means one bad release takes down every node at once. Channel
+>   config (`stable`/`main`/`pinned`) is deferred.
+> - **Delivery is inverted to "command, not bytes".** The RPC carries a
+>   small "go to vX.Y.Z" command; the daemon downloads + verifies the
+>   release asset itself. This is what lets mayfly drive an upgrade without
+>   pushing an ~1 GB zip through a hypervisor guest-agent exec channel
+>   (which times out at ~2 min) and works identically on Proxmox/Incus/bare
+>   metal.
+> - **Drain reuses #132's cordon.** The Upgrade path cordons the scheduler
+>   and waits for `ActiveJobs()` to reach zero (bounded), the same signal
+>   `ephemerd drain --wait` polls.
+> - **Per-OS swap.** Linux/macOS rename-into-place; Windows uses the
+>   rename-the-running-exe trick (the canonical path and the service
+>   binPath are unchanged, so no `sc config` / ImagePath edit). Old binary
+>   kept as `<name>.old` for rollback.
+> - **Restart hand-off.** The RPC streams `UPGRADE_STATE_RESTARTING` and
+>   returns BEFORE the detached service restart fires, so the caller sees a
+>   clean stream end (not a broken pipe it might misread as failure) and
+>   then polls `Status` — which now reports `version` — until the new
+>   binary is live.
+>
+> **What mayfly must call:** `Control.Upgrade(UpgradeRequest{target_version:
+> "vX.Y.Z"})`, consume the `UpgradeProgress` stream until
+> `UPGRADE_STATE_RESTARTING` (or `UPGRADE_STATE_UP_TO_DATE` for a no-op, or
+> `UPGRADE_STATE_FAILED`), then poll `Control.Status` until
+> `StatusResponse.version == target`. Optional fields: `url_override`
+> (mirror/air-gap), `drain_timeout_seconds`, `no_drain`, `force`.
+>
+> ---
+>
+> **Original status: proposal.** Scoping document — design, tradeoffs, and a
+> work breakdown. Cost estimates are based on adjacent tooling (Tailscale's
+> `tailscale update`, k0s `k0sctl apply`, Docker CE upgrade flows) and are
+> best-guess until prototyped.
 
 ## Context
 

@@ -15,6 +15,16 @@ service Control {
   // `ephemerd drain --wait` to empty the daemon before a restart.
   rpc Cordon(CordonRequest) returns (CordonResponse);
   rpc Uncordon(UncordonRequest) returns (UncordonResponse);
+  // Upgrade replaces the running daemon's own binary with a specific
+  // published release, then restarts the service into it. The daemon
+  // downloads and checksum-verifies the release asset over its own
+  // outbound HTTPS (provider-agnostic, no exec/size limit), drains
+  // running jobs first, swaps the binary, and restarts. Progress is
+  // streamed so the caller can watch state transitions; the final
+  // message is UPGRADE_STATE_RESTARTING, sent BEFORE the service
+  // restarts, after which the caller polls Status until the reported
+  // version matches the target. See docs/arch/upgrade-command.md.
+  rpc Upgrade(UpgradeRequest) returns (stream UpgradeProgress);
 }
 
 message StatusRequest {}
@@ -25,6 +35,11 @@ message StatusResponse {
   int32 max_concurrent = 3;
   bool draining = 4;
   string uptime = 5;
+  // version is the running daemon's build version (the value stamped into
+  // `ephemerd --version`). Empty on daemons built before this field existed.
+  // The upgrade flow polls this after a restart to confirm the new binary
+  // came up on the target version.
+  string version = 6;
 }
 
 message ListJobsRequest {}
@@ -74,6 +89,50 @@ message GetJobLogsRequest {
 
 message LogChunk {
   bytes data = 1;
+}
+
+message UpgradeRequest {
+  // target_version is REQUIRED, e.g. "v0.1.7". The daemon never resolves
+  // "latest" on its own: on a CI fleet an implicit latest would let one bad
+  // release take down every node at once. Must be an explicit release tag.
+  string target_version = 1;
+  // url_override optionally replaces the release base URL
+  // (https://github.com/ephpm/ephemerd/releases/download/<tag>). When set,
+  // the archive is fetched from <url_override>/<asset> and the checksums from
+  // <url_override>/checksums.txt. For testing and air-gapped mirrors.
+  string url_override = 2;
+  // drain_timeout_seconds bounds the wait for running jobs to finish before
+  // the swap. 0 -> server default. On timeout the upgrade aborts and the node
+  // keeps running the OLD binary (it is left uncordoned).
+  int32 drain_timeout_seconds = 3;
+  // no_drain skips the cordon/drain step (operator override for an emergency
+  // upgrade). Running jobs are interrupted by the restart.
+  bool no_drain = 4;
+  // force re-installs the target even if the daemon already reports it.
+  bool force = 5;
+}
+
+enum UpgradeState {
+  UPGRADE_STATE_UNSPECIFIED = 0;
+  UPGRADE_STATE_PREFLIGHT = 1;   // validating request, resolving install path
+  UPGRADE_STATE_UP_TO_DATE = 2;  // already on target; no-op success, stream ends
+  UPGRADE_STATE_DRAINING = 3;    // cordoned, waiting for running jobs to finish
+  UPGRADE_STATE_DOWNLOADING = 4; // fetching the release archive
+  UPGRADE_STATE_VERIFYING = 5;   // checksum-verifying the downloaded archive
+  UPGRADE_STATE_STAGING = 6;     // extracting + probing the new binary
+  UPGRADE_STATE_SWAPPING = 7;    // replacing the on-disk binary (old kept as .old)
+  UPGRADE_STATE_RESTARTING = 8;  // new binary in place; service restart scheduled
+  UPGRADE_STATE_FAILED = 9;      // aborted; node still on the old binary
+}
+
+message UpgradeProgress {
+  UpgradeState state = 1;
+  string message = 2;
+  string current_version = 3;
+  string target_version = 4;
+  int32 active_jobs = 5;        // populated during DRAINING
+  int64 bytes_downloaded = 6;   // populated during DOWNLOADING
+  int64 bytes_total = 7;        // total asset size if known (else 0)
 }
 
 // Dispatch is a lightweight job dispatch service used by the in-VM

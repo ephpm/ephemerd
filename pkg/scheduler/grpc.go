@@ -10,6 +10,7 @@ import (
 	"time"
 
 	apiv1 "github.com/ephpm/ephemerd/api/v1"
+	"github.com/ephpm/ephemerd/pkg/upgrade"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -84,7 +85,79 @@ func (c *controlServer) Status(ctx context.Context, req *apiv1.StatusRequest) (*
 		MaxConcurrent: int32(c.sched.cfg.MaxConcurrent),
 		Draining:      draining,
 		Uptime:        time.Since(c.sched.startTime).Truncate(time.Second).String(),
+		Version:       c.sched.cfg.Version,
 	}, nil
+}
+
+// Upgrade downloads a specific published release, verifies its checksum,
+// drains running jobs, swaps the daemon's own binary, and restarts the
+// service into it — all over the daemon's own outbound HTTPS. Progress is
+// streamed; see pkg/upgrade for the sequence and per-OS swap strategy.
+//
+// The last message sent is UPGRADE_STATE_RESTARTING, emitted BEFORE the
+// detached restart fires, so the caller (mayfly / the CLI) sees a clean
+// stream end and then polls Status until the reported version matches the
+// target. A running-daemon restart is a hand-off: this stream must not be
+// mistaken for a failure just because it ends when the process goes down.
+func (c *controlServer) Upgrade(req *apiv1.UpgradeRequest, stream grpc.ServerStreamingServer[apiv1.UpgradeProgress]) error {
+	emit := func(p upgrade.Progress) {
+		if err := stream.Send(progressToProto(p)); err != nil {
+			c.log.Debug("upgrade: sending progress", "error", err)
+		}
+	}
+	opts := upgrade.RunOptions{
+		TargetVersion:   req.TargetVersion,
+		CurrentVersion:  c.sched.cfg.Version,
+		BaseURLOverride: req.UrlOverride,
+		NoDrain:         req.NoDrain,
+		Force:           req.Force,
+		DrainTimeout:    time.Duration(req.DrainTimeoutSeconds) * time.Second,
+		Drainer:         c.sched,
+		Log:             c.log.With("component", "upgrade"),
+	}
+	c.log.Info("upgrade requested via grpc", "target", req.TargetVersion, "no_drain", req.NoDrain, "force", req.Force)
+	if err := upgrade.Run(stream.Context(), opts, emit); err != nil {
+		return status.Errorf(codes.Internal, "upgrade: %v", err)
+	}
+	return nil
+}
+
+// progressToProto maps an upgrade.Progress onto the wire enum/message.
+func progressToProto(p upgrade.Progress) *apiv1.UpgradeProgress {
+	return &apiv1.UpgradeProgress{
+		State:           upgradeStateToProto(p.State),
+		Message:         p.Message,
+		CurrentVersion:  p.CurrentVersion,
+		TargetVersion:   p.TargetVersion,
+		ActiveJobs:      int32(p.ActiveJobs),
+		BytesDownloaded: p.BytesDownloaded,
+		BytesTotal:      p.BytesTotal,
+	}
+}
+
+func upgradeStateToProto(s upgrade.State) apiv1.UpgradeState {
+	switch s {
+	case upgrade.StatePreflight:
+		return apiv1.UpgradeState_UPGRADE_STATE_PREFLIGHT
+	case upgrade.StateUpToDate:
+		return apiv1.UpgradeState_UPGRADE_STATE_UP_TO_DATE
+	case upgrade.StateDraining:
+		return apiv1.UpgradeState_UPGRADE_STATE_DRAINING
+	case upgrade.StateDownloading:
+		return apiv1.UpgradeState_UPGRADE_STATE_DOWNLOADING
+	case upgrade.StateVerifying:
+		return apiv1.UpgradeState_UPGRADE_STATE_VERIFYING
+	case upgrade.StateStaging:
+		return apiv1.UpgradeState_UPGRADE_STATE_STAGING
+	case upgrade.StateSwapping:
+		return apiv1.UpgradeState_UPGRADE_STATE_SWAPPING
+	case upgrade.StateRestarting:
+		return apiv1.UpgradeState_UPGRADE_STATE_RESTARTING
+	case upgrade.StateFailed:
+		return apiv1.UpgradeState_UPGRADE_STATE_FAILED
+	default:
+		return apiv1.UpgradeState_UPGRADE_STATE_UNSPECIFIED
+	}
 }
 
 // Cordon stops the scheduler from claiming new jobs without initiating
