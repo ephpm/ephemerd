@@ -11,49 +11,363 @@ import (
 	"strings"
 )
 
-// Host-side egress firewall for Windows job containers.
+// Egress firewall for Windows job containers.
 //
 // Two layers restrict what a Windows job can reach:
 //
 //  1. Per-endpoint HNS ACL policies (applyACLPolicies in network_windows.go) —
 //     VFP rules on the container's vSwitch port, applied in setup().
-//  2. The host-global Windows Defender Firewall rules installed here.
+//  2. The Hyper-V firewall rules installed here, programmed with
+//     New-NetFirewallHyperVRule and scoped to the container VMCreatorId.
 //
 // Layer 2 exists because layer 1 alone left the fleet reachable in practice:
 // the containment suite (.github/workflows/containment.yml, "Fleet management
 // planes must be unreachable") reached the Incus daemon and Grafana from a
 // Hyper-V-isolated job (#135), so per-endpoint vSwitch ACLs cannot be the only
-// line of defense. Every container flow is routed and NATed by the host
-// network stack (WinNAT), so host firewall rules sit in that path regardless
-// of what the vSwitch port enforces — and, like the Linux FORWARD chain, they
-// are host-global: one rule set covers every endpoint, including stale ones
-// leaked by a crashed run. HNS network-level ACLs were considered instead but
-// rejected: they use the same VFP enforcement point as the endpoint ACLs that
-// just failed, and they cannot express "this range minus the gateway".
+// line of defense.
 //
-// Windows Firewall has no rule ordering and a Block rule always overrides an
-// Allow rule, so the Linux pattern "allow the gateway above the RFC1918 deny"
-// cannot be ported literally. Instead the container subnet — which contains
-// the NAT gateway (DNS, the default route, module-proxy GatewayPorts) and the
-// other containers — is subtracted from each blocked range up front
-// (subtractCIDR), so it never appears in any block rule. Blocking the gateway
-// would brick all container networking: DNS and outbound NAT both go through
-// it.
+// Why NOT the host Windows Defender Firewall (the netsh approach of #136).
+// #136 installed host MPSSVC rules scoped localip=<container subnet>, on the
+// theory that Windows Firewall would see the container's source IP on the
+// WinNAT-forwarded flow. On real hardware it does not: the host firewall
+// (WFP/MPSSVC) evaluates the forwarded container->LAN traffic POST-NAT at the
+// host endpoint, where the source is the host's own LAN address, so a rule
+// scoped to the 10.88/16 container source matches nothing. Verified against a
+// live v0.1.6 Windows node: every management-plane probe still succeeded. The
+// host firewall is the wrong enforcement point for NATed container egress.
 //
-// The outbound blocks are scoped localip=<container subnet>: forwarded
-// container traffic is evaluated pre-NAT with its container source address,
-// so the host's own traffic (sourced from the host LAN address) can never
-// match — a mis-scoped rule here must degrade to a no-op, never to cutting
-// the fleet host off its own management LAN.
+// The Hyper-V firewall filters at the container's vNIC boundary, BEFORE NAT,
+// where the packet still carries the container's own address — the correct
+// enforcement point for Hyper-V-isolated Windows containers. Rules are scoped
+// by -VMCreatorId so they apply to container ports, not to the host or to
+// unrelated Hyper-V workloads (regular Hyper-V VMs are not filtered by the
+// Hyper-V firewall at all; it governs container-class workloads — WSL, Windows
+// Sandbox, and Windows containers).
+//
+// Gateway safety (identical reasoning to #136, and to firewall_linux.go).
+// The container subnet contains the NAT gateway (DNS, the default route,
+// module-proxy GatewayPorts) and the other containers. Blocking the gateway
+// would brick all container networking. Rather than rely on Hyper-V firewall
+// rule-priority ordering (allow-above-deny) to rescue the gateway — an
+// unverified semantic, and unverified assumptions are exactly what sank #136 —
+// the container subnet is subtracted from every blocked range up front
+// (subtractCIDR), so the gateway and the container-to-container range never
+// appear inside any Block rule in the first place. Everything outside the
+// blocked ranges — the internet, including GitHub/Docker Hub/registries — is
+// untouched: the creator's default outbound action stays Allow and only
+// RFC1918 + link-local is denied.
 //
 // IPv4 only, deliberately: the HCN NAT network is IPv4-only (no v6 IPAM), so
-// containers have no IPv6 path, and a host-wide v6 link-local block without a
-// container-source scope would break the HOST's neighbor discovery.
+// containers have no IPv6 path.
 
-// firewallRulePrefix names every host-firewall rule ephemerd installs so the
-// set is findable (netsh advfirewall firewall show rule name=all | findstr
-// ephemerd-egress) and removable on Cleanup.
+// firewallRulePrefix names every rule ephemerd installs — Hyper-V firewall
+// rules and the netsh fallback rules alike — so the set is findable and
+// removable on Cleanup.
 const firewallRulePrefix = "ephemerd-egress"
+
+// wslVMCreatorID is the well-known Hyper-V firewall VMCreatorId for the Windows
+// Subsystem for Linux (documented by Microsoft). WSL is not an ephemerd job
+// container, so it is excluded from egress filtering — narrowing the blast
+// radius to the container runtime's own creator(s).
+const wslVMCreatorID = "{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}"
+
+// -------------------------------------------------------------------------
+// Hyper-V firewall (primary path)
+// -------------------------------------------------------------------------
+
+// hyperVRule is one New-NetFirewallHyperVRule invocation. Kept as structured
+// fields (rather than a flat argv) so both the rendered PowerShell command and
+// the unit tests derive from the same source, and so array-valued parameters
+// (-RemoteAddresses, -RemotePorts) render as real PowerShell arrays.
+type hyperVRule struct {
+	name        string   // -Name; unique, ephemerd-prefixed; used for idempotent remove-before-add and Cleanup
+	displayName string   // -DisplayName; mandatory, human-facing
+	direction   string   // -Direction (Outbound)
+	action      string   // -Action (Block)
+	vmCreatorID string   // -VMCreatorId '{GUID}'
+	protocol    string   // -Protocol; "" omits it (matches Any)
+	remoteAddrs []string // -RemoteAddresses; addresses/CIDRs/ranges; empty omits it (matches Any)
+	remotePorts []string // -RemotePorts; empty omits it (matches Any)
+}
+
+// psQuote single-quotes a value for PowerShell, doubling embedded quotes.
+func psQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// psArray renders a slice as a PowerShell array literal of quoted strings
+// ('a','b'), so a string[] parameter receives distinct elements rather than one
+// comma-joined string.
+func psArray(vals []string) string {
+	q := make([]string, len(vals))
+	for i, v := range vals {
+		q[i] = psQuote(v)
+	}
+	return strings.Join(q, ",")
+}
+
+// command renders the New-NetFirewallHyperVRule command that creates the rule.
+func (r hyperVRule) command() string {
+	var b strings.Builder
+	b.WriteString("New-NetFirewallHyperVRule")
+	b.WriteString(" -Name " + psQuote(r.name))
+	b.WriteString(" -DisplayName " + psQuote(r.displayName))
+	b.WriteString(" -Direction " + r.direction)
+	b.WriteString(" -Action " + r.action)
+	b.WriteString(" -VMCreatorId " + psQuote(r.vmCreatorID))
+	if r.protocol != "" {
+		b.WriteString(" -Protocol " + r.protocol)
+	}
+	if len(r.remoteAddrs) > 0 {
+		b.WriteString(" -RemoteAddresses " + psArray(r.remoteAddrs))
+	}
+	if len(r.remotePorts) > 0 {
+		b.WriteString(" -RemotePorts " + psArray(r.remotePorts))
+	}
+	return b.String()
+}
+
+// removeCommand renders the idempotent delete for this rule by name.
+func (r hyperVRule) removeCommand() string {
+	return "Remove-NetFirewallHyperVRule -Name " + psQuote(r.name) + " -ErrorAction SilentlyContinue"
+}
+
+// creatorTag reduces a VMCreatorId GUID to a short, filesystem-safe token
+// (first 8 hex digits, lowercased) used to keep rule names unique per creator
+// when more than one container creator is present.
+func creatorTag(vmCreatorID string) string {
+	var b strings.Builder
+	for _, r := range vmCreatorID {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'f':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'F':
+			b.WriteRune(r + ('a' - 'A'))
+		}
+		if b.Len() >= 8 {
+			break
+		}
+	}
+	if b.Len() == 0 {
+		return "any"
+	}
+	return b.String()
+}
+
+// hyperVEgressRules returns the Hyper-V firewall rule set for one container
+// VMCreatorId: an outbound Block for every denied range (with the container
+// subnet — and thus the gateway — carved out) plus one outbound Block per
+// control port for container->gateway control-plane traffic.
+//
+// Exposed as a pure function (no side effects) so tests can assert the exact
+// rule set without invoking PowerShell.
+func hyperVEgressRules(vmCreatorID, subnet, gateway string, controlPorts []int) ([]hyperVRule, error) {
+	tag := creatorTag(vmCreatorID)
+	var rules []hyperVRule
+
+	// Outbound RFC1918 + link-local blocks. subtractCIDR removes the container
+	// subnet from any overlapping range so the gateway (DNS/NAT/default route)
+	// and the container-to-container range never appear inside a Block. The
+	// internet is never in these ranges, so it is left fully open.
+	for _, cidr := range egressBlockedCIDRs {
+		remote, err := subtractCIDR(cidr, subnet)
+		if err != nil {
+			return nil, fmt.Errorf("computing blocked ranges for %s: %w", cidr, err)
+		}
+		if len(remote) == 0 {
+			continue // fully covered by the container subnet
+		}
+		rules = append(rules, hyperVRule{
+			name:        fmt.Sprintf("%s-%s-block-%s", firewallRulePrefix, tag, strings.ReplaceAll(cidr, "/", "_")),
+			displayName: "ephemerd egress block " + cidr,
+			direction:   "Outbound",
+			action:      "Block",
+			vmCreatorID: vmCreatorID,
+			remoteAddrs: remote,
+		})
+	}
+
+	// Control-plane blocks: container -> gateway on the ephemerd control ports
+	// (containerd, dispatch gRPC, debug exec). Intentionally narrow — the
+	// gateway address, one TCP port each — so DNS (53), NAT, and the other
+	// gateway services stay reachable. Mirrors controlPlaneInputRules on Linux;
+	// evaluated Outbound here because the Hyper-V firewall filters at the
+	// container vNIC, where container->gateway is egress.
+	for _, port := range controlPorts {
+		rules = append(rules, hyperVRule{
+			name:        fmt.Sprintf("%s-%s-control-%d", firewallRulePrefix, tag, port),
+			displayName: fmt.Sprintf("ephemerd egress block control tcp/%d", port),
+			direction:   "Outbound",
+			action:      "Block",
+			vmCreatorID: vmCreatorID,
+			protocol:    "TCP",
+			remoteAddrs: []string{gateway},
+			remotePorts: []string{strconv.Itoa(port)},
+		})
+	}
+
+	return rules, nil
+}
+
+// powershellArgs wraps a script for non-interactive execution.
+func powershellArgs(script string) []string {
+	return []string{"-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script}
+}
+
+// powershell runs a PowerShell script, returning combined output on error.
+func powershell(script string) error {
+	out, err := exec.Command("powershell", powershellArgs(script)...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("powershell: %w: %s", err, out)
+	}
+	return nil
+}
+
+// powershellOutput runs a PowerShell script and returns its stdout.
+func powershellOutput(script string) (string, error) {
+	out, err := exec.Command("powershell", powershellArgs(script)...).Output()
+	if err != nil {
+		return "", fmt.Errorf("powershell: %w", err)
+	}
+	return string(out), nil
+}
+
+// hyperVFirewallAvailable reports whether the Hyper-V firewall cmdlets exist on
+// this host. They ship with Windows 11 22H2 / Windows Server 2025 and are
+// absent on older builds, where the netsh fallback is used instead.
+func hyperVFirewallAvailable() bool {
+	return powershell("if (Get-Command New-NetFirewallHyperVRule -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }") == nil
+}
+
+// discoverContainerVMCreators returns the VMCreatorIds of the Hyper-V firewall
+// VM creators present on the host, excluding WSL. On a Windows container host
+// the remaining creator(s) are the container runtime's, which is what job
+// containers run under. Returns an empty slice (not an error) when no creators
+// are registered yet.
+func discoverContainerVMCreators() ([]string, error) {
+	out, err := powershellOutput("Get-NetFirewallHyperVVMCreator | Select-Object -ExpandProperty VMCreatorId")
+	if err != nil {
+		return nil, err
+	}
+	var creators []string
+	for _, line := range strings.Split(out, "\n") {
+		id := strings.TrimSpace(line)
+		if id == "" {
+			continue
+		}
+		if strings.EqualFold(id, wslVMCreatorID) {
+			continue // not an ephemerd job container
+		}
+		creators = append(creators, id)
+	}
+	return creators, nil
+}
+
+// enableHyperVFirewallScript ensures the Hyper-V firewall is enabled for a
+// creator with permissive defaults: internet, the gateway (DNS/NAT), and
+// host<->container control traffic all stay open, and only our explicit Block
+// rules restrict RFC1918. Without this the rules would exist but not enforce on
+// a creator whose firewall was never enabled. Best-effort — logged, not fatal.
+func enableHyperVFirewallScript(creator string) string {
+	return fmt.Sprintf(
+		"Set-NetFirewallHyperVVMSetting -Name %s -Enabled True -DefaultInboundAction Allow -DefaultOutboundAction Allow -ErrorAction Stop",
+		psQuote(creator),
+	)
+}
+
+// removeByPrefixScript deletes every Hyper-V firewall rule ephemerd installed,
+// across all creators, matched by the ephemerd- name prefix. Catches stale
+// rules leaked by a crashed run as well as the current set.
+func removeByPrefixScript() string {
+	return fmt.Sprintf(
+		"Get-NetFirewallHyperVRule | Where-Object { $_.Name -like '%s-*' } | Remove-NetFirewallHyperVRule -ErrorAction SilentlyContinue",
+		firewallRulePrefix,
+	)
+}
+
+func (w *windowsNetworking) installFirewallRules() error {
+	// Degrade gracefully at every step: a host that cannot program the
+	// Hyper-V firewall must never fail daemon startup. It falls back to the
+	// netsh host-firewall rules (weaker, but better than nothing on builds
+	// without the Hyper-V firewall) or, failing that, to the per-endpoint HNS
+	// ACLs already applied in setup().
+	if !hyperVFirewallAvailable() {
+		w.cfg.Log.Warn("New-NetFirewallHyperVRule unavailable on this host; falling back to netsh host-firewall rules")
+		return w.installNetshFirewallRules()
+	}
+
+	creators, err := discoverContainerVMCreators()
+	if err != nil {
+		w.cfg.Log.Warn("failed to enumerate Hyper-V firewall VM creators; falling back to netsh host-firewall rules", "error", err)
+		return w.installNetshFirewallRules()
+	}
+	if len(creators) == 0 {
+		w.cfg.Log.Warn("no container Hyper-V firewall VM creator registered yet; falling back to netsh host-firewall rules")
+		return w.installNetshFirewallRules()
+	}
+
+	// init() always creates the HCN network on DefaultSubnet with
+	// defaultGateway (cfg.Subnet is not consulted on Windows), so the firewall
+	// must match those.
+	installed := 0
+	for _, creator := range creators {
+		rules, err := hyperVEgressRules(creator, DefaultSubnet, defaultGateway, w.cfg.ControlPorts)
+		if err != nil {
+			w.cfg.Log.Warn("failed to build Hyper-V firewall rules", "creator", creator, "error", err)
+			continue
+		}
+
+		if err := powershell(enableHyperVFirewallScript(creator)); err != nil {
+			w.cfg.Log.Warn("failed to enable Hyper-V firewall for creator (rules may not enforce)", "creator", creator, "error", err)
+		}
+
+		for _, r := range rules {
+			// Idempotent: remove any rule carrying this name from a previous
+			// run before adding, so re-running install never duplicates.
+			_ = powershell(r.removeCommand())
+
+			w.cfg.Log.Info("adding Hyper-V firewall rule", "rule", r.name, "creator", creator)
+			if err := powershell(r.command()); err != nil {
+				// Non-fatal: one failed rule degrades to the remaining rules
+				// plus the per-endpoint ACLs, never to refusing to start.
+				w.cfg.Log.Warn("failed to add Hyper-V firewall rule", "rule", r.name, "error", err)
+				continue
+			}
+			installed++
+		}
+	}
+
+	w.cfg.Log.Info("Hyper-V firewall rules installed", "rules", installed, "creators", len(creators))
+	return nil
+}
+
+func (w *windowsNetworking) removeFirewallRules() {
+	// Always attempt to remove the netsh fallback rules too — harmless if they
+	// were never installed — so a host that switched paths between runs does
+	// not leak the other path's rules.
+	w.removeNetshFirewallRules()
+
+	if !hyperVFirewallAvailable() {
+		return
+	}
+	// Remove by prefix: catches every ephemerd rule across all creators,
+	// including stale ones, without needing to recompute per-creator names.
+	if err := powershell(removeByPrefixScript()); err != nil {
+		w.cfg.Log.Debug("failed to remove Hyper-V firewall rules", "error", err)
+	}
+}
+
+// -------------------------------------------------------------------------
+// netsh host firewall (fallback for hosts without the Hyper-V firewall)
+// -------------------------------------------------------------------------
+//
+// Retained only as a degraded fallback for Windows builds that lack
+// New-NetFirewallHyperVRule (pre-Server 2025 / Windows 11 22H2). On such hosts
+// these host-global rules are strictly better than nothing, even though — as
+// #136 proved on Server 2025 — the host firewall evaluates NATed container
+// egress post-NAT and cannot match on the container source. The outbound
+// blocks are scoped localip=<container subnet> so a mis-scoped rule degrades to
+// a no-op rather than cutting the host off its own management LAN.
 
 func netsh(args ...string) error {
 	out, err := exec.Command("netsh", args...).CombinedOutput()
@@ -63,9 +377,9 @@ func netsh(args ...string) error {
 	return nil
 }
 
-// winFirewallRule is one host-firewall rule: its unique name (used for the
-// idempotent delete-before-add and for removal on Cleanup) and the key=value
-// spec that creates it.
+// winFirewallRule is one netsh host-firewall rule: its unique name (used for
+// the idempotent delete-before-add and for removal on Cleanup) and the
+// key=value spec that creates it.
 type winFirewallRule struct {
 	name string
 	spec []string
@@ -81,21 +395,16 @@ func (r winFirewallRule) deleteArgs() []string {
 	return []string{"advfirewall", "firewall", "delete", "rule", "name=" + r.name}
 }
 
-// hostFirewallRules returns the full host-firewall rule set for the given
-// container subnet, gateway, and control-plane ports: outbound blocks for
-// every denied range (with the container subnet carved out) plus inbound
-// blocks for container→gateway traffic on the control ports.
+// hostFirewallRules returns the netsh fallback rule set for the given container
+// subnet, gateway, and control-plane ports: outbound blocks for every denied
+// range (with the container subnet carved out) plus inbound blocks for
+// container->gateway traffic on the control ports.
 //
 // Exposed as a pure function (no side effects) so tests can assert the exact
 // rule set without invoking netsh.
 func hostFirewallRules(subnet, gateway string, controlPorts []int) ([]winFirewallRule, error) {
 	var rules []winFirewallRule
 
-	// Outbound RFC1918 + link-local blocks. The container subnet is subtracted
-	// from any overlapping range (see the ordering note above: an allow rule
-	// cannot outrank a block rule, so the gateway and the container-to-container
-	// range must never appear inside a blocked range in the first place).
-	// Everything outside these ranges — the internet — is untouched.
 	for _, cidr := range egressBlockedCIDRs {
 		remote, err := subtractCIDR(cidr, subnet)
 		if err != nil {
@@ -118,12 +427,6 @@ func hostFirewallRules(subnet, gateway string, controlPorts []int) ([]winFirewal
 		})
 	}
 
-	// Inbound control-plane blocks: container subnet → gateway on the ephemerd
-	// control ports (containerd, dispatch gRPC, debug exec). Intentionally
-	// narrow — source = container subnet, destination = gateway, one TCP port
-	// each — so DNS (53) and NAT stay intact. Mirrors controlPlaneInputRules
-	// on Linux; traffic addressed to the gateway IP terminates at the host, so
-	// the outbound blocks above never see it.
 	for _, port := range controlPorts {
 		rules = append(rules, winFirewallRule{
 			name: fmt.Sprintf("%s-control-%d", firewallRulePrefix, port),
@@ -143,10 +446,10 @@ func hostFirewallRules(subnet, gateway string, controlPorts []int) ([]winFirewal
 	return rules, nil
 }
 
-// subtractCIDR removes exclude from cidr and renders the remainder in netsh
-// remoteip syntax: the original CIDR when the two do not overlap, otherwise up
-// to two "start-end" ranges. Returns an empty slice when exclude covers cidr
-// entirely. IPv4 only — the HCN NAT network has no IPv6 IPAM.
+// subtractCIDR removes exclude from cidr and renders the remainder in
+// address-range syntax: the original CIDR when the two do not overlap,
+// otherwise up to two "start-end" ranges. Returns an empty slice when exclude
+// covers cidr entirely. IPv4 only — the HCN NAT network has no IPv6 IPAM.
 func subtractCIDR(cidr, exclude string) ([]string, error) {
 	clo, chi, err := v4Range(cidr)
 	if err != nil {
@@ -195,47 +498,40 @@ func u32ToIP(v uint32) string {
 	return net.IPv4(byte(v>>24), byte(v>>16), byte(v>>8), byte(v)).String()
 }
 
-func (w *windowsNetworking) installFirewallRules() error {
-	// init() always creates the HCN network on DefaultSubnet with
-	// defaultGateway (cfg.Subnet is not consulted on Windows), so the firewall
-	// must match those, not cfg.Subnet.
+func (w *windowsNetworking) installNetshFirewallRules() error {
 	rules, err := hostFirewallRules(DefaultSubnet, defaultGateway, w.cfg.ControlPorts)
 	if err != nil {
-		return fmt.Errorf("building host firewall rules: %w", err)
+		w.cfg.Log.Warn("building netsh host firewall rules", "error", err)
+		return nil
 	}
 
 	for _, r := range rules {
 		// Idempotent: delete any rule carrying this name from a previous run
-		// before adding, so re-running install never accumulates duplicates.
-		// netsh delete removes every rule matching the name; "no rules match"
-		// on a fresh host is expected and ignored.
+		// before adding. netsh delete removes every rule matching the name;
+		// "no rules match" on a fresh host is expected and ignored.
 		_ = netsh(r.deleteArgs()...)
 
-		w.cfg.Log.Info("adding firewall rule", "rule", r.name)
+		w.cfg.Log.Info("adding netsh firewall rule", "rule", r.name)
 		if err := netsh(r.addArgs()...); err != nil {
-			// Callers treat this as a warning, not fatal (see
-			// cmd/ephemerd/main.go): a host where the daemon lacks the
-			// privilege to program the firewall degrades to the per-endpoint
-			// ACLs instead of refusing to start.
-			return fmt.Errorf("adding firewall rule %s: %w", r.name, err)
+			// Non-fatal: degrade to the per-endpoint ACLs rather than refusing
+			// to start.
+			w.cfg.Log.Warn("failed to add netsh firewall rule", "rule", r.name, "error", err)
 		}
 	}
 
-	w.cfg.Log.Info("host firewall rules installed", "rules", len(rules))
+	w.cfg.Log.Info("netsh host firewall rules installed", "rules", len(rules))
 	return nil
 }
 
-func (w *windowsNetworking) removeFirewallRules() {
-	// Recompute the same deterministic rule set install built and delete each
-	// rule by name. Best-effort, like the Linux removal path.
+func (w *windowsNetworking) removeNetshFirewallRules() {
 	rules, err := hostFirewallRules(DefaultSubnet, defaultGateway, w.cfg.ControlPorts)
 	if err != nil {
-		w.cfg.Log.Debug("failed to rebuild firewall rule set for removal", "error", err)
+		w.cfg.Log.Debug("failed to rebuild netsh firewall rule set for removal", "error", err)
 		return
 	}
 	for _, r := range rules {
 		if err := netsh(r.deleteArgs()...); err != nil {
-			w.cfg.Log.Debug("failed to remove firewall rule", "rule", r.name, "error", err)
+			w.cfg.Log.Debug("failed to remove netsh firewall rule", "rule", r.name, "error", err)
 		}
 	}
 }
