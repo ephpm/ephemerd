@@ -76,6 +76,16 @@ import (
 // overlayfs:
 //
 //	sudo go test -tags containers_image_openpgp -run TestImagePull_Shared -v ./pkg/dind/
+//
+// Setting EPHEMERD_TEST_REQUIRE_MOUNT=1 turns the tier-two skip into a
+// failure, for anywhere the unpack coverage is meant to be guaranteed.
+//
+// Making the skip visible needs care: `go test ./...` buffers a package's
+// output and prints it only when the package fails, so on a green run nothing
+// a skipping test writes — t.Log, t.Skip's reason, even a raw write to stderr
+// — reaches the log. That is why .github/workflows/ci.yml has a separate
+// "Privileged-test coverage report" step that re-runs just this test with -v.
+// Keep them together: if this test is renamed, rename it there too.
 func TestImagePull_SharedNamespaceHitIsUsableFromJobNamespace(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping pull e2e in short mode")
@@ -90,17 +100,9 @@ func TestImagePull_SharedNamespaceHitIsUsableFromJobNamespace(t *testing.T) {
 	// and anywhere else the capability and the uid disagree.
 	mountErr := probeMountPrivilege(t)
 	canUnpack := mountErr == nil
-	if !canUnpack {
-		// go test is not verbose in CI (`mage test` runs plain `go test`), so
-		// t.Log alone would make this degradation invisible on a green run.
-		// Say it on stderr, which the CI log does capture.
-		fmt.Fprintf(os.Stderr,
-			"[pull-e2e] DEGRADED: cannot mount(2) here (%v) — skipping "+
-				"image_is_usable_from_job_namespace. Only the registry-was-contacted "+
-				"assertion runs; it still fails on the pre-fix code, but nothing here "+
-				"proves the pulled image is usable. Run as root on a Linux host with "+
-				"overlayfs for the full test.\n", mountErr)
-		t.Logf("mount(2) unavailable (%v); tier two will skip", mountErr)
+	if !canUnpack && os.Getenv(requireMountEnv) != "" {
+		t.Fatalf("%s is set, so the unpack tier must run, but this environment "+
+			"cannot mount(2): %v", requireMountEnv, mountErr)
 	}
 
 	const (
@@ -277,9 +279,11 @@ func TestImagePull_SharedNamespaceHitIsUsableFromJobNamespace(t *testing.T) {
 	t.Run("image_is_usable_from_job_namespace", func(t *testing.T) {
 		if !canUnpack {
 			t.Skipf("requires overlayfs mount privileges (CAP_SYS_ADMIN); this "+
-				"environment cannot mount(2): %v — run `sudo go test -tags "+
-				"containers_image_openpgp -run TestImagePull_Shared ./pkg/dind/` "+
-				"on a Linux host with overlayfs to exercise it", mountErr)
+				"environment cannot mount(2): %v\n"+
+				"        to run it:   sudo go test -tags containers_image_openpgp "+
+				"-run TestImagePull_Shared -v ./pkg/dind/\n"+
+				"        to forbid the skip (fail instead): set %s=1",
+				mountErr, requireMountEnv)
 		}
 
 		jobCtx := namespaces.WithNamespace(context.Background(), s.jobNamespace)
@@ -320,6 +324,12 @@ func TestImagePull_SharedNamespaceHitIsUsableFromJobNamespace(t *testing.T) {
 		}
 	})
 }
+
+// requireMountEnv turns the tier-two skip into a failure. Set it anywhere the
+// unpack coverage is supposed to be guaranteed (a privileged runner, a release
+// checklist) so a host that quietly lost the privilege is reported instead of
+// silently dropping the assertion.
+const requireMountEnv = "EPHEMERD_TEST_REQUIRE_MOUNT"
 
 // probeMountPrivilege reports nil when this process can perform the mount(2)
 // call containerd's differ needs to unpack a layer, and the mount error
