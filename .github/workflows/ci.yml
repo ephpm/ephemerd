@@ -29,6 +29,19 @@ jobs:
       - name: Lint, test & build
         run: mage ci
 
+      # `mage test` runs `go test ./...`, which buffers each package's output
+      # and prints it only on failure — so a test that skips part of itself on
+      # a green run says so to nobody. This step exists purely to put that on
+      # the record: it re-runs the dind pull regression test verbosely and
+      # prints either a PASS for both its tiers or the SKIP reason for the one
+      # that needs mount(2), which this unprivileged runner cannot do. See the
+      # "Privilege requirements" section on the test.
+      - name: Privileged-test coverage report (dind pull e2e)
+        run: |
+          go test -tags containers_image_openpgp -count=1 \
+            -run TestImagePull_SharedNamespaceHitIsUsableFromJobNamespace \
+            -v ./pkg/dind/
+
       - name: E2E — GitHub provider (fake server)
         run: mage e2egithub
 
