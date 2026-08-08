@@ -28,7 +28,7 @@ func swapBinary(installPath, stagedPath string) (backup string, err error) {
 	if err := os.Rename(stagedPath, installPath); err != nil {
 		// Roll the backup back so we don't leave the node with no binary.
 		if rbErr := os.Rename(backup, installPath); rbErr != nil {
-			return "", fmt.Errorf("installing new binary: %w (and rollback failed: %v — binary is at %s)", err, rbErr, backup)
+			return "", fmt.Errorf("installing new binary: %w (and rollback failed: %w — binary is at %s)", err, rbErr, backup)
 		}
 		return "", fmt.Errorf("installing new binary: %w (rolled back)", err)
 	}
