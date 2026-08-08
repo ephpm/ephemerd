@@ -9,6 +9,8 @@ import (
 
 	apiv1 "github.com/ephpm/ephemerd/api/v1"
 	"github.com/ephpm/ephemerd/pkg/providers"
+	"github.com/ephpm/ephemerd/pkg/upgrade"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	grpcStatus "google.golang.org/grpc/status"
 )
@@ -163,6 +165,96 @@ func TestStatus_Draining(t *testing.T) {
 	}
 	if !resp.Draining {
 		t.Error("Draining should be true")
+	}
+}
+
+func TestStatus_Version(t *testing.T) {
+	s := New(Config{Version: "v0.1.7", Log: silentLogger()})
+	cs := &controlServer{sched: s, log: silentLogger()}
+
+	resp, err := cs.Status(context.Background(), &apiv1.StatusRequest{})
+	if err != nil {
+		t.Fatalf("Status() error: %v", err)
+	}
+	if resp.Version != "v0.1.7" {
+		t.Errorf("Version = %q, want v0.1.7", resp.Version)
+	}
+}
+
+// --- Upgrade tests ---
+
+// fakeUpgradeStream is a minimal server stream that captures Send calls. Only
+// Send and Context are exercised by the Upgrade handler.
+type fakeUpgradeStream struct {
+	grpc.ServerStreamingServer[apiv1.UpgradeProgress]
+	ctx  context.Context
+	sent []*apiv1.UpgradeProgress
+}
+
+func (f *fakeUpgradeStream) Send(p *apiv1.UpgradeProgress) error {
+	f.sent = append(f.sent, p)
+	return nil
+}
+
+func (f *fakeUpgradeStream) Context() context.Context {
+	if f.ctx != nil {
+		return f.ctx
+	}
+	return context.Background()
+}
+
+// TestUpgrade_UpToDateNoOp drives the real handler: when the daemon already
+// runs the target version the RPC streams UP_TO_DATE and returns without
+// touching the network or the binary.
+func TestUpgrade_UpToDateNoOp(t *testing.T) {
+	s := New(Config{Version: "v0.1.7", Log: silentLogger()})
+	cs := &controlServer{sched: s, log: silentLogger()}
+
+	stream := &fakeUpgradeStream{}
+	err := cs.Upgrade(&apiv1.UpgradeRequest{TargetVersion: "v0.1.7"}, stream)
+	if err != nil {
+		t.Fatalf("Upgrade() error: %v", err)
+	}
+	if len(stream.sent) == 0 {
+		t.Fatal("expected at least one progress message")
+	}
+	last := stream.sent[len(stream.sent)-1]
+	if last.State != apiv1.UpgradeState_UPGRADE_STATE_UP_TO_DATE {
+		t.Errorf("final state = %v, want UP_TO_DATE", last.State)
+	}
+}
+
+// TestUpgrade_RejectsNonTag confirms the handler surfaces a gRPC error for a
+// non-tag target with no url override (never resolve "latest").
+func TestUpgrade_RejectsNonTag(t *testing.T) {
+	s := New(Config{Version: "v0.1.6", Log: silentLogger()})
+	cs := &controlServer{sched: s, log: silentLogger()}
+
+	err := cs.Upgrade(&apiv1.UpgradeRequest{TargetVersion: "latest"}, &fakeUpgradeStream{})
+	if err == nil {
+		t.Fatal("expected error for non-tag target")
+	}
+	if st, ok := grpcStatus.FromError(err); !ok || st.Code() != codes.Internal {
+		t.Errorf("error = %v, want gRPC Internal", err)
+	}
+}
+
+func TestUpgradeStateToProto_AllStates(t *testing.T) {
+	cases := map[upgrade.State]apiv1.UpgradeState{
+		upgrade.StatePreflight:   apiv1.UpgradeState_UPGRADE_STATE_PREFLIGHT,
+		upgrade.StateUpToDate:    apiv1.UpgradeState_UPGRADE_STATE_UP_TO_DATE,
+		upgrade.StateDraining:    apiv1.UpgradeState_UPGRADE_STATE_DRAINING,
+		upgrade.StateDownloading: apiv1.UpgradeState_UPGRADE_STATE_DOWNLOADING,
+		upgrade.StateVerifying:   apiv1.UpgradeState_UPGRADE_STATE_VERIFYING,
+		upgrade.StateStaging:     apiv1.UpgradeState_UPGRADE_STATE_STAGING,
+		upgrade.StateSwapping:    apiv1.UpgradeState_UPGRADE_STATE_SWAPPING,
+		upgrade.StateRestarting:  apiv1.UpgradeState_UPGRADE_STATE_RESTARTING,
+		upgrade.StateFailed:      apiv1.UpgradeState_UPGRADE_STATE_FAILED,
+	}
+	for in, want := range cases {
+		if got := upgradeStateToProto(in); got != want {
+			t.Errorf("upgradeStateToProto(%v) = %v, want %v", in, got, want)
+		}
 	}
 }
 

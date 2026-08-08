@@ -26,6 +26,7 @@ const (
 	Control_GetJobLogs_FullMethodName = "/ephemerd.v1.Control/GetJobLogs"
 	Control_Cordon_FullMethodName     = "/ephemerd.v1.Control/Cordon"
 	Control_Uncordon_FullMethodName   = "/ephemerd.v1.Control/Uncordon"
+	Control_Upgrade_FullMethodName    = "/ephemerd.v1.Control/Upgrade"
 )
 
 // ControlClient is the client API for Control service.
@@ -42,6 +43,16 @@ type ControlClient interface {
 	// `ephemerd drain --wait` to empty the daemon before a restart.
 	Cordon(ctx context.Context, in *CordonRequest, opts ...grpc.CallOption) (*CordonResponse, error)
 	Uncordon(ctx context.Context, in *UncordonRequest, opts ...grpc.CallOption) (*UncordonResponse, error)
+	// Upgrade replaces the running daemon's own binary with a specific
+	// published release, then restarts the service into it. The daemon
+	// downloads and checksum-verifies the release asset over its own
+	// outbound HTTPS (provider-agnostic, no exec/size limit), drains
+	// running jobs first, swaps the binary, and restarts. Progress is
+	// streamed so the caller can watch state transitions; the final
+	// message is UPGRADE_STATE_RESTARTING, sent BEFORE the service
+	// restarts, after which the caller polls Status until the reported
+	// version matches the target. See docs/arch/upgrade-command.md.
+	Upgrade(ctx context.Context, in *UpgradeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[UpgradeProgress], error)
 }
 
 type controlClient struct {
@@ -131,6 +142,25 @@ func (c *controlClient) Uncordon(ctx context.Context, in *UncordonRequest, opts 
 	return out, nil
 }
 
+func (c *controlClient) Upgrade(ctx context.Context, in *UpgradeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[UpgradeProgress], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Control_ServiceDesc.Streams[1], Control_Upgrade_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[UpgradeRequest, UpgradeProgress]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Control_UpgradeClient = grpc.ServerStreamingClient[UpgradeProgress]
+
 // ControlServer is the server API for Control service.
 // All implementations must embed UnimplementedControlServer
 // for forward compatibility.
@@ -145,6 +175,16 @@ type ControlServer interface {
 	// `ephemerd drain --wait` to empty the daemon before a restart.
 	Cordon(context.Context, *CordonRequest) (*CordonResponse, error)
 	Uncordon(context.Context, *UncordonRequest) (*UncordonResponse, error)
+	// Upgrade replaces the running daemon's own binary with a specific
+	// published release, then restarts the service into it. The daemon
+	// downloads and checksum-verifies the release asset over its own
+	// outbound HTTPS (provider-agnostic, no exec/size limit), drains
+	// running jobs first, swaps the binary, and restarts. Progress is
+	// streamed so the caller can watch state transitions; the final
+	// message is UPGRADE_STATE_RESTARTING, sent BEFORE the service
+	// restarts, after which the caller polls Status until the reported
+	// version matches the target. See docs/arch/upgrade-command.md.
+	Upgrade(*UpgradeRequest, grpc.ServerStreamingServer[UpgradeProgress]) error
 	mustEmbedUnimplementedControlServer()
 }
 
@@ -175,6 +215,9 @@ func (UnimplementedControlServer) Cordon(context.Context, *CordonRequest) (*Cord
 }
 func (UnimplementedControlServer) Uncordon(context.Context, *UncordonRequest) (*UncordonResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Uncordon not implemented")
+}
+func (UnimplementedControlServer) Upgrade(*UpgradeRequest, grpc.ServerStreamingServer[UpgradeProgress]) error {
+	return status.Error(codes.Unimplemented, "method Upgrade not implemented")
 }
 func (UnimplementedControlServer) mustEmbedUnimplementedControlServer() {}
 func (UnimplementedControlServer) testEmbeddedByValue()                 {}
@@ -316,6 +359,17 @@ func _Control_Uncordon_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Control_Upgrade_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(UpgradeRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ControlServer).Upgrade(m, &grpc.GenericServerStream[UpgradeRequest, UpgradeProgress]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Control_UpgradeServer = grpc.ServerStreamingServer[UpgradeProgress]
+
 // Control_ServiceDesc is the grpc.ServiceDesc for Control service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -352,6 +406,11 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "GetJobLogs",
 			Handler:       _Control_GetJobLogs_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "Upgrade",
+			Handler:       _Control_Upgrade_Handler,
 			ServerStreams: true,
 		},
 	},

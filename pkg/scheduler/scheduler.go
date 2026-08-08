@@ -40,6 +40,7 @@ type Config struct {
 	LinuxJobsDisabled bool
 	MacOSVMConfig     *vm.MacOSVMConfig // if non-nil, macOS-native jobs are enabled (darwin only)
 	DataDir           string            // ephemerd data directory (used for artifact extraction paths)
+	Version           string            // daemon build version (from main.version); surfaced via Status and used by the Upgrade RPC
 	MaxConcurrent     int
 	MaxMacOSVMs       int // max concurrent macOS VMs (Vz limit; default auto-detected)
 	Labels            []string
@@ -481,6 +482,16 @@ func (s *Scheduler) Uncordon() int {
 	s.mu.Unlock()
 	metrics.Draining.Set(0)
 	return count
+}
+
+// ActiveJobs returns the number of jobs currently running. Used by the
+// Upgrade RPC (via the upgrade.Drainer interface) to wait for the scheduler
+// to drain to idle after a Cordon, the same signal `ephemerd drain --wait`
+// polls over the control socket.
+func (s *Scheduler) ActiveJobs() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.running)
 }
 
 // Run starts the scheduler. It discovers jobs via polling (default) or
