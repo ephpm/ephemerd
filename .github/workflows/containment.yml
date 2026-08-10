@@ -357,14 +357,6 @@ jobs:
     name: Containment (windows x64)
     runs-on: [self-hosted, windows, x64]
     steps:
-      - name: TEMP hold — keep the container endpoint alive for HNS inspection
-        shell: powershell
-        run: |
-          $me = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -like '10.88.*' }).IPAddress
-          $g = Test-NetConnection 192.168.10.45 -Port 3000 -InformationLevel Quiet -WarningAction SilentlyContinue
-          Write-Host "container ip=$me  grafana-reachable=$g"
-          Start-Sleep -Seconds 180
-
       - name: Hyper-V isolation must be active
         shell: powershell
         run: |
