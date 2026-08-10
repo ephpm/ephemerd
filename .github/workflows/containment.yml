@@ -357,30 +357,6 @@ jobs:
     name: Containment (windows x64)
     runs-on: [self-hosted, windows, x64]
     steps:
-      - name: TEMP in-container WFP block via BFE/MpsSvc (mechanism test)
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Continue'
-          # The container's firewall service was not running (WFP dest-IP block
-          # earlier failed with RPC 1753). Try to start the Base Filtering Engine
-          # and MpsSvc, then add an outbound dest-IP block for RFC1918 (minus the
-          # NAT subnet 10.88.0.0/16). This settles whether ANY in-container WFP
-          # filter can stop the planes.
-          foreach ($svc in 'BFE','mpssvc') {
-            try { Start-Service $svc -ErrorAction Stop; Write-Host "$svc => $((Get-Service $svc).Status)" }
-            catch { Write-Host "$svc start FAILED: $($_.Exception.Message)" }
-          }
-          try {
-            $ranges = @('10.0.0.0-10.87.255.255','10.89.0.0-10.255.255.255',
-                        '172.16.0.0/12','192.168.0.0/16','169.254.0.0/16')
-            New-NetFirewallRule -DisplayName 'ephemerd-egress-block' -Direction Outbound `
-              -Action Block -RemoteAddress $ranges -Enabled True | Out-Null
-            Set-NetFirewallProfile -All -Enabled True -DefaultInboundAction Allow `
-              -DefaultOutboundAction Allow -ErrorAction SilentlyContinue
-            Write-Host "firewall rule added; profiles:"
-            Get-NetFirewallProfile | Format-Table Name,Enabled -AutoSize
-          } catch { Write-Host "firewall rule FAILED: $($_.Exception.Message)" }
-
       - name: Hyper-V isolation must be active
         shell: powershell
         run: |
