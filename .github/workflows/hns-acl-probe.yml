@@ -1,0 +1,36 @@
+name: HNS ACL probe
+
+# Scratch harness for proving container egress can be blocked at the HNS/VFP
+# layer. A Windows job reaches a management IP (baseline), holds while an
+# operator injects an RFC1918-block ACL onto its container endpoint from the
+# host, then re-tests. If the post-injection reach flips to false, the switch
+# (pre-NAT) ACL is the working enforcement point. Dispatch-only; delete after.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: [self-hosted, windows, x64]
+    steps:
+      - name: Baseline reach (before ACL)
+        shell: powershell
+        run: |
+          $g = Test-NetConnection 192.168.10.45 -Port 3000 -InformationLevel Quiet -WarningAction SilentlyContinue
+          $i = Test-NetConnection 192.168.12.113 -Port 8443 -InformationLevel Quiet -WarningAction SilentlyContinue
+          $me = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -like '10.88.*' }).IPAddress
+          Write-Host "container ip=$me  baseline grafana=$g incus=$i"
+
+      - name: Hold for ACL injection (240s)
+        shell: powershell
+        run: Start-Sleep -Seconds 240
+
+      - name: Reach after ACL
+        shell: powershell
+        run: |
+          $g = Test-NetConnection 192.168.10.45 -Port 3000 -InformationLevel Quiet -WarningAction SilentlyContinue
+          $i = Test-NetConnection 192.168.12.113 -Port 8443 -InformationLevel Quiet -WarningAction SilentlyContinue
+          $pub = Test-NetConnection 1.1.1.1 -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue
+          Write-Host "AFTER: grafana=$g incus=$i  internet(1.1.1.1)=$pub"
+          if ($g -or $i) { Write-Host 'RESULT: RFC1918 STILL REACHABLE'; exit 1 }
+          if (-not $pub) { Write-Host 'RESULT: internet also broke (too broad)'; exit 1 }
+          Write-Host 'RESULT: RFC1918 BLOCKED, internet intact'
