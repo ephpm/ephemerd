@@ -29,6 +29,15 @@ type Config struct {
 	// dispatch server listening on the bridge).
 	ControlPorts []int
 
+	// L2BridgeEgress, HostNIC, PublicDNS, and ExtraAllowedCIDRs configure the
+	// Windows L2Bridge egress path (see network_windows.go). They are ignored
+	// on Linux/macOS. When L2BridgeEgress is false (the default), Windows uses
+	// the HNS NAT network and these fields are unused.
+	L2BridgeEgress    bool
+	HostNIC           string
+	PublicDNS         []string
+	ExtraAllowedCIDRs []string
+
 	Log *slog.Logger
 }
 

@@ -263,12 +263,16 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		controlPorts := []int{int(containerdTCPPort), int(containerdTCPPort) + 1, int(containerdTCPPort) + 2}
 
 		net, err := networking.New(networking.Config{
-			DataDir:      configDir,
-			Subnet:       cfg.Network.Subnet,
-			MTU:          cfg.Network.MTU,
-			CNIBinDir:    cm.Dir(),
-			ControlPorts: controlPorts,
-			Log:          log,
+			DataDir:           configDir,
+			Subnet:            cfg.Network.Subnet,
+			MTU:               cfg.Network.MTU,
+			CNIBinDir:         cm.Dir(),
+			ControlPorts:      controlPorts,
+			L2BridgeEgress:    cfg.Network.L2BridgeEgress,
+			HostNIC:           cfg.Network.HostNIC,
+			PublicDNS:         cfg.Network.PublicDNS,
+			ExtraAllowedCIDRs: cfg.Network.ExtraAllowedDestinations,
+			Log:               log,
 		})
 		if err != nil {
 			return fmt.Errorf("initializing networking: %w", err)
@@ -427,12 +431,16 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 
 	// Initialize container networking
 	net, err := networking.New(networking.Config{
-		DataDir:      configDir,
-		Subnet:       cfg.Network.Subnet,
-		MTU:          cfg.Network.MTU,
-		CNIBinDir:    cm.Dir(),
-		GatewayPorts: gatewayPorts,
-		Log:          log,
+		DataDir:           configDir,
+		Subnet:            cfg.Network.Subnet,
+		MTU:               cfg.Network.MTU,
+		CNIBinDir:         cm.Dir(),
+		GatewayPorts:      gatewayPorts,
+		L2BridgeEgress:    cfg.Network.L2BridgeEgress,
+		HostNIC:           cfg.Network.HostNIC,
+		PublicDNS:         cfg.Network.PublicDNS,
+		ExtraAllowedCIDRs: cfg.Network.ExtraAllowedDestinations,
+		Log:               log,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing networking: %w", err)

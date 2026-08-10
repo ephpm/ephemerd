@@ -15,7 +15,18 @@ import (
 const (
 	networkName    = "ephemerd"
 	defaultGateway = "10.88.0.1"
+
+	// l2BridgeNetworkName is the HNS network created on the L2Bridge egress
+	// path. It is deliberately distinct from networkName so a host that
+	// previously ran the NAT path (network "ephemerd") does not collide with,
+	// or get mistaken for, the L2Bridge network.
+	l2BridgeNetworkName = "ephemerd-l2bridge"
 )
+
+// defaultPublicDNS is the DNS resolver list handed to L2Bridge containers when
+// Config.PublicDNS is empty. Public resolvers so container DNS never needs the
+// LAN router — which the egress ACLs block along with the rest of RFC1918.
+var defaultPublicDNS = []string{"1.1.1.1", "8.8.8.8"}
 
 type windowsNetworking struct {
 	cfg     Config
@@ -29,6 +40,12 @@ func newPlatformNetworking() platformNetworking {
 
 func (w *windowsNetworking) init(cfg Config) error {
 	w.cfg = cfg
+
+	// L2Bridge egress path (opt-in). NAT stays the default: only a pool that
+	// explicitly sets L2BridgeEgress reaches VFP-enforced egress filtering.
+	if cfg.L2BridgeEgress {
+		return w.initL2Bridge(cfg)
+	}
 
 	// Check if network already exists (from previous run)
 	existing, err := hcn.GetNetworkByName(networkName)
@@ -77,16 +94,98 @@ func (w *windowsNetworking) init(cfg Config) error {
 	return nil
 }
 
+// publicDNS returns the configured public resolver list, or the built-in
+// default when none is configured.
+func (w *windowsNetworking) publicDNS() []string {
+	if len(w.cfg.PublicDNS) > 0 {
+		return w.cfg.PublicDNS
+	}
+	return defaultPublicDNS
+}
+
+// initL2Bridge creates (or adopts) the L2Bridge HNS network bound to the
+// configured host NIC. Unlike the NAT network, this puts containers on a
+// VFP-managed vSwitch port so the per-endpoint Switch ACLs applied in setup()
+// actually enforce.
+//
+// IPAM is DHCP: the network declares NO static subnet or routes, so HNS does
+// not pin an address and the container's vNIC leases its IP, default gateway,
+// and (LAN) DNS from the LAN DHCP server. DNS is overridden to the public
+// resolvers at the network and endpoint level so the container never needs the
+// LAN router for name resolution — the egress ACLs block the router.
+func (w *windowsNetworking) initL2Bridge(cfg Config) error {
+	if cfg.HostNIC == "" {
+		// Fail closed: without an uplink NIC the bridge has no path off-host,
+		// and silently falling back to NAT would defeat the egress guarantee
+		// the operator opted into.
+		return fmt.Errorf("L2Bridge egress enabled but no host_nic configured (set network.host_nic to the host adapter name to bridge onto)")
+	}
+
+	if existing, err := hcn.GetNetworkByName(l2BridgeNetworkName); err == nil {
+		w.network = existing
+		cfg.Log.Info("HCN L2Bridge network found", "name", l2BridgeNetworkName, "id", existing.Id, "host_nic", cfg.HostNIC)
+		return nil
+	}
+
+	adapterPol, err := json.Marshal(hcn.NetAdapterNameNetworkPolicySetting{
+		NetworkAdapterName: cfg.HostNIC,
+	})
+	if err != nil {
+		return fmt.Errorf("marshaling NetAdapterName policy for %q: %w", cfg.HostNIC, err)
+	}
+
+	network := &hcn.HostComputeNetwork{
+		Name: l2BridgeNetworkName,
+		Type: hcn.L2Bridge,
+		// No Ipams: DHCP IPAM. HNS does not assign an address; the container
+		// vNIC DHCPs on the LAN for its IP, gateway, and default route.
+		Policies: []hcn.NetworkPolicy{
+			{
+				Type:     hcn.NetAdapterName, // binds the L2Bridge to the physical NIC
+				Settings: adapterPol,
+			},
+		},
+		Dns: hcn.Dns{
+			ServerList: w.publicDNS(),
+		},
+		SchemaVersion: hcn.SchemaVersion{
+			Major: 2,
+			Minor: 0,
+		},
+	}
+
+	created, err := network.Create()
+	if err != nil {
+		return fmt.Errorf("creating HCN L2Bridge network on %q: %w", cfg.HostNIC, err)
+	}
+	w.network = created
+
+	cfg.Log.Info("HCN L2Bridge network created", "name", l2BridgeNetworkName, "id", created.Id, "host_nic", cfg.HostNIC)
+	return nil
+}
+
 func (w *windowsNetworking) setup(ctx context.Context, id string, netns string) (*SetupResult, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Create endpoint on the network
+	// DNS: on L2Bridge, hand the container the configured PUBLIC resolvers so
+	// name resolution goes to the internet (permitted by the low-precedence
+	// allow-any ACL) and never to the LAN router (blocked by the RFC1918 ACLs).
+	// On NAT, DNS is the gateway's forwarder as before.
+	dnsServers := []string{"8.8.8.8", "8.8.4.4"}
+	if w.cfg.L2BridgeEgress {
+		dnsServers = w.publicDNS()
+	}
+
+	// Create endpoint on the network. On the L2Bridge path we deliberately set
+	// NO IpConfigurations so the container leases its address, gateway, and
+	// default route from the LAN DHCP server (DHCP IPAM). On NAT, HNS assigns
+	// from the NAT subnet as before.
 	endpoint := &hcn.HostComputeEndpoint{
 		Name:               id + "-ep",
 		HostComputeNetwork: w.network.Id,
 		Dns: hcn.Dns{
-			ServerList: []string{"8.8.8.8", "8.8.4.4"},
+			ServerList: dnsServers,
 		},
 		SchemaVersion: hcn.SchemaVersion{
 			Major: 2,
@@ -106,6 +205,12 @@ func (w *windowsNetworking) setup(ctx context.Context, id string, netns string) 
 	// RFC1918 services, and link-local metadata endpoints. Fail CLOSED: tear
 	// down the endpoint we just created and refuse the job rather than start a
 	// container we cannot firewall.
+	//
+	// The ACLs are applied to the endpoint BEFORE the container is started
+	// (setup runs ahead of task creation), and the L2Bridge rule set is STATIC
+	// — it does not depend on the leased gateway or DNS (DNS is public, the
+	// router gets no allow) — so there is no post-lease window in which the
+	// container has LAN connectivity but no filters.
 	if err := w.applyACLPolicies(created); err != nil {
 		if delErr := created.Delete(); delErr != nil {
 			w.cfg.Log.Warn("failed to delete endpoint after ACL failure", "id", id, "error", delErr)
@@ -216,11 +321,161 @@ func buildEgressBlockPolicies() ([]hcn.EndpointPolicy, error) {
 	return policies, nil
 }
 
-// applyACLPolicies blocks container traffic to RFC 1918 and link-local ranges.
-// The full rule set is built up front and applied atomically; any failure is
-// returned so the caller (setup) can treat it as fatal for the job.
+// VFP Switch-ACL precedence for the L2Bridge egress model. VFP evaluates ACLs
+// by Priority, LOWER number = HIGHER precedence (evaluated first, first match
+// wins). The ladder is: DHCP allow (top) > operator carve-outs > RFC1918 block
+// > allow-any (bottom). The two allow-any rules at the bottom are what stop the
+// port from default-denying everything — VFP is default-DENY the moment any
+// ACL is present.
+const (
+	// aclPriorityDHCP lets the container lease/renew even with the rest of
+	// RFC1918 blocked. Above the block so the DHCP server (which lives on the
+	// LAN, inside a blocked supernet) stays reachable.
+	aclPriorityDHCP uint16 = 90
+	// aclPriorityExtraAllow carves configured destinations out ABOVE the
+	// RFC1918 block. Unused by default (no carve-outs) — reserved for future
+	// operator-allowed destinations.
+	aclPriorityExtraAllow uint16 = 95
+	// aclPriorityBlock denies the RFC1918 + link-local supernets, whole. No
+	// gateway/own-subnet carve-out: on L2Bridge the container is a LAN peer,
+	// so carving the subnet would expose the management plane and the router.
+	aclPriorityBlock uint16 = 100
+	// aclPriorityAllowAny permits everything not blocked above (the internet)
+	// and, crucially, inbound return traffic. Lowest precedence.
+	aclPriorityAllowAny uint16 = 65500
+)
+
+// aclAnyProtocol matches any IP protocol in an HNS ACL ("256"), used for the
+// allow-any and block rules per the proven metal run. The DHCP rules use UDP.
+const (
+	aclAnyProtocol = "256"
+	aclUDPProtocol = "17"
+)
+
+// marshalACL serializes one AclPolicySetting into an EndpointPolicy, failing
+// closed on a marshal error (a rule we cannot serialize is a rule we cannot
+// enforce; never skip it and continue with a weaker set).
+func marshalACL(acl hcn.AclPolicySetting) (hcn.EndpointPolicy, error) {
+	settings, err := json.Marshal(acl)
+	if err != nil {
+		return hcn.EndpointPolicy{}, fmt.Errorf("marshaling ACL %+v: %w", acl, err)
+	}
+	return hcn.EndpointPolicy{Type: hcn.ACL, Settings: settings}, nil
+}
+
+// buildL2BridgeEgressACLPolicies constructs the router-safe VFP Switch-ACL set
+// for an L2Bridge endpoint. It is a pure function (no HCN calls) so the exact
+// emitted policy set — actions, directions, remotes, protocols, priorities — is
+// unit-testable. Fails closed on any marshal error.
+//
+// The model matches the Linux end-state (firewall_linux.go): block ALL of
+// 10/8, 172.16/12, 192.168/16, 169.254/16 — including the LAN router and the
+// container's own subnet — and permit only the internet. DNS is handled out of
+// band (public resolvers on the endpoint), so unlike Linux there is no DNS or
+// gateway carve-out here, and no container-to-container allow (that would be
+// LAN access, which we block). extraAllowed carves additional CIDRs out above
+// the block for future use; empty (the default) reproduces the strict posture.
+func buildL2BridgeEgressACLPolicies(extraAllowed []string) ([]hcn.EndpointPolicy, error) {
+	var policies []hcn.EndpointPolicy
+	add := func(acl hcn.AclPolicySetting) error {
+		p, err := marshalACL(acl)
+		if err != nil {
+			return err
+		}
+		policies = append(policies, p)
+		return nil
+	}
+
+	// Tier: DHCP. Allow UDP to/from the BOOTP/DHCP ports so the container can
+	// obtain and renew its lease even though the DHCP server sits inside a
+	// blocked supernet. Out matches the request (dst 67), In matches the reply
+	// (dst 68); no address scope (the DHCP server is discovered).
+	if err := add(hcn.AclPolicySetting{
+		Protocols:   aclUDPProtocol,
+		Action:      hcn.ActionTypeAllow,
+		Direction:   hcn.DirectionTypeOut,
+		RemotePorts: "67,68",
+		RuleType:    hcn.RuleTypeSwitch,
+		Priority:    aclPriorityDHCP,
+	}); err != nil {
+		return nil, err
+	}
+	if err := add(hcn.AclPolicySetting{
+		Protocols:  aclUDPProtocol,
+		Action:     hcn.ActionTypeAllow,
+		Direction:  hcn.DirectionTypeIn,
+		LocalPorts: "67,68",
+		RuleType:   hcn.RuleTypeSwitch,
+		Priority:   aclPriorityDHCP,
+	}); err != nil {
+		return nil, err
+	}
+
+	// Tier: operator carve-outs (future use). Allowed ABOVE the block so a
+	// listed destination wins. Empty by default.
+	for _, cidr := range extraAllowed {
+		if err := add(hcn.AclPolicySetting{
+			Protocols:       aclAnyProtocol,
+			Action:          hcn.ActionTypeAllow,
+			Direction:       hcn.DirectionTypeOut,
+			RemoteAddresses: cidr,
+			RuleType:        hcn.RuleTypeSwitch,
+			Priority:        aclPriorityExtraAllow,
+		}); err != nil {
+			return nil, err
+		}
+	}
+
+	// Tier: block the RFC1918 + link-local supernets, whole. No carve-out.
+	for _, cidr := range egressBlockedCIDRs {
+		if err := add(hcn.AclPolicySetting{
+			Protocols:       aclAnyProtocol,
+			Action:          hcn.ActionTypeBlock,
+			Direction:       hcn.DirectionTypeOut,
+			RemoteAddresses: cidr,
+			RuleType:        hcn.RuleTypeSwitch,
+			Priority:        aclPriorityBlock,
+		}); err != nil {
+			return nil, err
+		}
+	}
+
+	// Tier: allow-any Out AND In (lowest precedence). BOTH are mandatory:
+	// without them the port default-denies everything (internet included), and
+	// the INBOUND allow is required or TCP return traffic (SYN-ACK) is dropped
+	// and even permitted destinations fail.
+	for _, dir := range []hcn.DirectionType{hcn.DirectionTypeOut, hcn.DirectionTypeIn} {
+		if err := add(hcn.AclPolicySetting{
+			Protocols:       aclAnyProtocol,
+			Action:          hcn.ActionTypeAllow,
+			Direction:       dir,
+			RemoteAddresses: "0.0.0.0/0",
+			RuleType:        hcn.RuleTypeSwitch,
+			Priority:        aclPriorityAllowAny,
+		}); err != nil {
+			return nil, err
+		}
+	}
+
+	return policies, nil
+}
+
+// applyACLPolicies applies the per-endpoint egress ACLs. On the L2Bridge path
+// it applies the router-safe VFP ladder (buildL2BridgeEgressACLPolicies); on
+// NAT it applies the existing block-only set (buildEgressBlockPolicies), which
+// is left untouched so the default NAT path behaves exactly as before. The full
+// rule set is built up front and applied atomically; any failure is returned so
+// the caller (setup) can treat it as fatal for the job.
 func (w *windowsNetworking) applyACLPolicies(endpoint *hcn.HostComputeEndpoint) error {
-	policies, err := buildEgressBlockPolicies()
+	var (
+		policies []hcn.EndpointPolicy
+		err      error
+	)
+	if w.cfg.L2BridgeEgress {
+		policies, err = buildL2BridgeEgressACLPolicies(w.cfg.ExtraAllowedCIDRs)
+	} else {
+		policies, err = buildEgressBlockPolicies()
+	}
 	if err != nil {
 		return err
 	}

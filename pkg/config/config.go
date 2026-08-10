@@ -215,6 +215,35 @@ func (w *WebhookConfig) ResolvedReconcileInterval() time.Duration {
 type NetworkConfig struct {
 	Subnet string `toml:"subnet"` // container subnet (auto-selected if empty)
 	MTU    int    `toml:"mtu"`    // bridge MTU (auto-detected from host if 0)
+
+	// L2BridgeEgress opts a Windows pool into L2Bridge container networking
+	// with VFP-enforced egress filtering, instead of the default HNS NAT.
+	// NAT cannot software-filter Windows container egress (VFP does not engage
+	// on a NAT network); L2Bridge puts the container on a VFP-managed vSwitch
+	// port so per-endpoint ACLs actually enforce. Windows only; ignored on
+	// Linux/macOS. Default false — NAT stays the default and this flag flips
+	// nothing until an operator opts a pool in.
+	L2BridgeEgress bool `toml:"l2bridge_egress"`
+
+	// HostNIC is the host network adapter name the L2Bridge binds onto
+	// (e.g. "Ethernet"). REQUIRED when L2BridgeEgress is true — the bridge
+	// has no uplink without it. There is no default: the correct NIC name is
+	// host-specific (do not assume "Ethernet 2", which was a spike's
+	// hot-added test NIC). Ignored when L2BridgeEgress is false.
+	HostNIC string `toml:"host_nic"`
+
+	// PublicDNS is the DNS resolver list handed to L2Bridge containers. Public
+	// resolvers keep container DNS off the LAN router (which the egress ACLs
+	// block along with the rest of RFC1918). Empty falls back to a built-in
+	// public default (1.1.1.1, 8.8.8.8). Only consulted on the L2Bridge path.
+	PublicDNS []string `toml:"public_dns"`
+
+	// ExtraAllowedDestinations are additional CIDRs permitted through the
+	// L2Bridge egress ACLs at a precedence ABOVE the RFC1918 block (so a
+	// listed destination wins over the block). Reserved for future use —
+	// default empty, which reproduces the strict Linux end-state (no RFC1918
+	// carve-outs at all). Only consulted on the L2Bridge path.
+	ExtraAllowedDestinations []string `toml:"extra_allowed_destinations"`
 }
 
 type ContainerdConfig struct {
