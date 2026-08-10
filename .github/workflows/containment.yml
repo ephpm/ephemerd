@@ -357,12 +357,29 @@ jobs:
     name: Containment (windows x64)
     runs-on: [self-hosted, windows, x64]
     steps:
-      - name: TEMP diagnostic hold (revert after Phase 1)
+      - name: TEMP route-layer RFC1918 blackhole (mechanism test)
         shell: powershell
         run: |
-          Write-Host "holding container alive for host-side endpoint inspection"
-          Start-Sleep -Seconds 300
-          Write-Host "hold complete"
+          $ErrorActionPreference = 'Stop'
+          $ip = Get-NetIPAddress -AddressFamily IPv4 |
+                  Where-Object { $_.IPAddress -like '10.88.*' } | Select-Object -First 1
+          $ifIndex = $ip.InterfaceIndex
+          Write-Host "container ip=$($ip.IPAddress) ifIndex=$ifIndex"
+          # Dead, on-link next hop: in-subnet (so it resolves on-link) but no host
+          # answers ARP for it, so packets routed via it are dropped by the
+          # container's own IP stack. Public traffic keeps the 0.0.0.0/0 route.
+          $dead = '10.88.255.254'
+          foreach ($p in @('10.0.0.0/8','172.16.0.0/12','192.168.0.0/16','169.254.0.0/16')) {
+            New-NetRoute -DestinationPrefix $p -InterfaceIndex $ifIndex -NextHop $dead `
+              -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null
+            Write-Host "blackholed $p via $dead"
+          }
+          # 10.88.0.0/16 stays on-link (more specific than 10/8) so gateway/DNS
+          # (10.88.0.1) and container-to-container traffic survive.
+          Get-NetRoute -AddressFamily IPv4 |
+            Where-Object { $_.DestinationPrefix -in `
+              '10.0.0.0/8','172.16.0.0/12','192.168.0.0/16','169.254.0.0/16','10.88.0.0/16','0.0.0.0/0' } |
+            Format-Table DestinationPrefix,NextHop,RouteMetric,InterfaceIndex -AutoSize
 
       - name: Hyper-V isolation must be active
         shell: powershell
