@@ -286,6 +286,19 @@ func removeByPrefixScript() string {
 }
 
 func (w *windowsNetworking) installFirewallRules() error {
+	// Metal-verified reality (Windows Server 2025 / build 26100, WinNAT NAT
+	// network, Hyper-V-isolated containers): NONE of the layers below actually
+	// enforce. The Hyper-V firewall registers no container VMCreator (so its
+	// rules never install), the netsh host rules evaluate NATed egress post-NAT
+	// and cannot filter forwarded traffic, and the per-endpoint HNS ACLs are
+	// inert because VFP is not enforcing on the NAT switch. This is left in
+	// place (harmless, and correct on any future host where VFP or the Hyper-V
+	// firewall does enforce) but the operator must NOT rely on it for
+	// containment on this host class. See windowsEgressNotEnforced.
+	w.cfg.Log.Warn("windows container egress filtering is best-effort and NOT "+
+		"enforced on WinNAT + Hyper-V-isolated hosts; use an upstream VLAN for "+
+		"real containment", "detail", windowsEgressNotEnforced)
+
 	// Degrade gracefully at every step: a host that cannot program the
 	// Hyper-V firewall must never fail daemon startup. It falls back to the
 	// netsh host-firewall rules (weaker, but better than nothing on builds

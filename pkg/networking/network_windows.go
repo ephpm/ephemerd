@@ -17,6 +17,13 @@ const (
 	defaultGateway = "10.88.0.1"
 )
 
+// windowsEgressNotEnforced is the one-line pointer emitted with the startup and
+// per-container WARNs so the reason egress is not contained in software is
+// discoverable from the logs alone. The full metal-verified analysis (which
+// mechanisms were tried and why each failed on WinNAT + Hyper-V isolation) lives
+// in the setup() comment and in the fix/windows-egress-enforce PR.
+const windowsEgressNotEnforced = "WinNAT+Hyper-V-isolated job containers have no enforceable per-container egress filter (VFP not enforcing on the NAT switch; host firewall does not filter forwarded/NATed traffic; Hyper-V firewall registers no VMCreator); contain egress at an upstream VLAN"
+
 type windowsNetworking struct {
 	cfg     Config
 	network *hcn.HostComputeNetwork
@@ -99,19 +106,41 @@ func (w *windowsNetworking) setup(ctx context.Context, id string, netns string) 
 		return nil, fmt.Errorf("creating HCN endpoint for %s: %w", id, err)
 	}
 
-	// Apply ACL policies to block private network access. This is the ONLY
-	// egress restriction on Windows (there is no global firewall backstop —
-	// installFirewallRules is a no-op), so a failure here means the container
-	// would otherwise run with unrestricted egress to the host LAN, other
-	// RFC1918 services, and link-local metadata endpoints. Fail CLOSED: tear
-	// down the endpoint we just created and refuse the job rather than start a
-	// container we cannot firewall.
+	// Apply the RFC1918 block ACLs to the endpoint. Fail CLOSED on an *apply*
+	// error: if HNS rejects the policy request we tear the endpoint down rather
+	// than proceed. The apply succeeding, however, does NOT mean egress is
+	// enforced — see the WARN below and windowsEgressNotEnforced.
 	if err := w.applyACLPolicies(created); err != nil {
 		if delErr := created.Delete(); delErr != nil {
 			w.cfg.Log.Warn("failed to delete endpoint after ACL failure", "id", id, "error", delErr)
 		}
-		return nil, fmt.Errorf("applying egress ACL policies for %s (refusing to start unfirewalled): %w", id, err)
+		return nil, fmt.Errorf("applying egress ACL policies for %s: %w", id, err)
 	}
+
+	// HARD TRUTH, verified on metal (Windows Server 2025, build 26100, HNS NAT
+	// network, Hyper-V-isolated job containers): the ACLs applied above are
+	// STORED on the endpoint but NOT ENFORCED. A live-endpoint inspection
+	// confirmed all four Block/Out/Switch ACLs present while the containment
+	// suite still reached every management plane (Proxmox, Incus, Grafana).
+	//
+	// Root cause: on a WinNAT `nat` network the VFP switch-extension datapath is
+	// not enforcing on the switch ports (every vfpctrl port/NAT operation fails
+	// with "cannot find the file specified"), so RuleType=Switch (VFP) ACLs are
+	// inert. And container→LAN egress is *forwarded+SNATed* by the host, a path
+	// the host Windows Firewall does not filter (it governs host-terminated
+	// traffic, not routing) — which is also why the #136 netsh rules and the
+	// #140 Hyper-V-firewall rules (Get-NetFirewallHyperVVMCreator /
+	// Get-NetFirewallHyperVPort are empty even with a live container) never bit.
+	//
+	// There is therefore NO per-container software egress filter available on
+	// this host class. Real containment must come from OUTSIDE the box — put the
+	// Windows runner's container-egress path on an isolated VLAN whose upstream
+	// router denies RFC1918. This WARN exists so the daemon never silently
+	// implies a containment it does not provide. See windowsEgressNotEnforced.
+	w.cfg.Log.Warn("windows container egress is NOT enforced on this host class "+
+		"(WinNAT + Hyper-V isolation): RFC1918 block ACLs are applied but inert; "+
+		"containment depends on an upstream/VLAN control, not ephemerd",
+		"id", id, "endpoint", created.Id, "detail", windowsEgressNotEnforced)
 
 	// Create an HCN network namespace and attach the endpoint.
 	// Hyper-V isolated containers (runhcs) require a pre-existing namespace
