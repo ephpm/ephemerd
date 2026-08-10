@@ -357,6 +357,13 @@ jobs:
     name: Containment (windows x64)
     runs-on: [self-hosted, windows, x64]
     steps:
+      - name: TEMP diagnostic hold (revert after Phase 1)
+        shell: powershell
+        run: |
+          Write-Host "holding container alive for host-side endpoint inspection"
+          Start-Sleep -Seconds 300
+          Write-Host "hold complete"
+
       - name: Hyper-V isolation must be active
         shell: powershell
         run: |
@@ -402,6 +409,19 @@ jobs:
           }
           if ($fail) { exit 1 }
           Write-Host "OK: management planes unreachable"
+
+      - name: The internet must still be reachable
+        shell: powershell
+        run: |
+          # The egress restriction must deny RFC1918 WITHOUT cutting the job
+          # off the internet — jobs still pull from GitHub, registries, and
+          # package mirrors. 1.1.1.1 is a stable public anchor; if this fails
+          # the block is over-broad (a default-deny that ate the default route)
+          # rather than a targeted RFC1918 deny.
+          $r = Test-NetConnection -ComputerName 1.1.1.1 -Port 443 `
+                 -InformationLevel Quiet -WarningAction SilentlyContinue
+          if (-not $r) { Write-Host "FAIL: internet (1.1.1.1:443) unreachable — egress over-blocked"; exit 1 }
+          Write-Host "OK: internet still reachable"
 
   macos:
     name: Containment (macos arm64)
