@@ -357,26 +357,29 @@ jobs:
     name: Containment (windows x64)
     runs-on: [self-hosted, windows, x64]
     steps:
-      - name: TEMP loopback blackhole RFC1918 (mechanism test)
+      - name: TEMP in-container WFP block via BFE/MpsSvc (mechanism test)
         shell: powershell
         run: |
           $ErrorActionPreference = 'Continue'
-          # Classic Windows blackhole: route the denied ranges via 127.0.0.1.
-          # No ARP is involved (loopback), so the NAT gateway's proxy-ARP cannot
-          # rescue them the way it did the dead-on-link-next-hop attempt. The
-          # container's own NAT subnet 10.88.0.0/16 stays on-link (more specific
-          # than 10/8), so the gateway 10.88.0.1 (DNS/NAT/default route) and
-          # container-to-container traffic survive; the 0.0.0.0/0 route keeps the
-          # public internet reachable.
-          cmd /c "route add 10.0.0.0 mask 255.0.0.0 127.0.0.1 metric 1"
-          cmd /c "route add 172.16.0.0 mask 255.240.0.0 127.0.0.1 metric 1"
-          cmd /c "route add 192.168.0.0 mask 255.255.0.0 127.0.0.1 metric 1"
-          cmd /c "route add 169.254.0.0 mask 255.255.0.0 127.0.0.1 metric 1"
-          Write-Host "=== routing table (relevant rows) ==="
-          Get-NetRoute -AddressFamily IPv4 |
-            Where-Object { $_.DestinationPrefix -in `
-              '10.0.0.0/8','172.16.0.0/12','192.168.0.0/16','169.254.0.0/16','10.88.0.0/16','0.0.0.0/0' } |
-            Format-Table DestinationPrefix,NextHop,RouteMetric,InterfaceIndex -AutoSize
+          # The container's firewall service was not running (WFP dest-IP block
+          # earlier failed with RPC 1753). Try to start the Base Filtering Engine
+          # and MpsSvc, then add an outbound dest-IP block for RFC1918 (minus the
+          # NAT subnet 10.88.0.0/16). This settles whether ANY in-container WFP
+          # filter can stop the planes.
+          foreach ($svc in 'BFE','mpssvc') {
+            try { Start-Service $svc -ErrorAction Stop; Write-Host "$svc => $((Get-Service $svc).Status)" }
+            catch { Write-Host "$svc start FAILED: $($_.Exception.Message)" }
+          }
+          try {
+            $ranges = @('10.0.0.0-10.87.255.255','10.89.0.0-10.255.255.255',
+                        '172.16.0.0/12','192.168.0.0/16','169.254.0.0/16')
+            New-NetFirewallRule -DisplayName 'ephemerd-egress-block' -Direction Outbound `
+              -Action Block -RemoteAddress $ranges -Enabled True | Out-Null
+            Set-NetFirewallProfile -All -Enabled True -DefaultInboundAction Allow `
+              -DefaultOutboundAction Allow -ErrorAction SilentlyContinue
+            Write-Host "firewall rule added; profiles:"
+            Get-NetFirewallProfile | Format-Table Name,Enabled -AutoSize
+          } catch { Write-Host "firewall rule FAILED: $($_.Exception.Message)" }
 
       - name: Hyper-V isolation must be active
         shell: powershell
