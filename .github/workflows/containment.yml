@@ -357,29 +357,28 @@ jobs:
     name: Containment (windows x64)
     runs-on: [self-hosted, windows, x64]
     steps:
-      - name: TEMP route-layer RFC1918 blackhole (mechanism test)
+      - name: TEMP in-container firewall RFC1918 block (mechanism test)
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $ip = Get-NetIPAddress -AddressFamily IPv4 |
-                  Where-Object { $_.IPAddress -like '10.88.*' } | Select-Object -First 1
-          $ifIndex = $ip.InterfaceIndex
-          Write-Host "container ip=$($ip.IPAddress) ifIndex=$ifIndex"
-          # Dead, on-link next hop: in-subnet (so it resolves on-link) but no host
-          # answers ARP for it, so packets routed via it are dropped by the
-          # container's own IP stack. Public traffic keeps the 0.0.0.0/0 route.
-          $dead = '10.88.255.254'
-          foreach ($p in @('10.0.0.0/8','172.16.0.0/12','192.168.0.0/16','169.254.0.0/16')) {
-            New-NetRoute -DestinationPrefix $p -InterfaceIndex $ifIndex -NextHop $dead `
-              -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null
-            Write-Host "blackholed $p via $dead"
-          }
-          # 10.88.0.0/16 stays on-link (more specific than 10/8) so gateway/DNS
-          # (10.88.0.1) and container-to-container traffic survive.
-          Get-NetRoute -AddressFamily IPv4 |
-            Where-Object { $_.DestinationPrefix -in `
-              '10.0.0.0/8','172.16.0.0/12','192.168.0.0/16','169.254.0.0/16','10.88.0.0/16','0.0.0.0/0' } |
-            Format-Table DestinationPrefix,NextHop,RouteMetric,InterfaceIndex -AutoSize
+          Write-Host "=== firewall profiles BEFORE ==="
+          Get-NetFirewallProfile | Format-Table Name,Enabled,DefaultInboundAction,DefaultOutboundAction -AutoSize
+          # Block RFC1918 + link-local as OUTBOUND destinations, carving out the
+          # container's own NAT subnet 10.88.0.0/16 (gateway 10.88.0.1 = DNS/NAT/
+          # default route, plus container-to-container). Everything public keeps
+          # the default Allow. This filters at the container's OWN WFP, on the
+          # destination address, before the host NAT — independent of routing/ARP.
+          $ranges = @('10.0.0.0-10.87.255.255','10.89.0.0-10.255.255.255',
+                      '172.16.0.0/12','192.168.0.0/16','169.254.0.0/16')
+          New-NetFirewallRule -DisplayName 'ephemerd-egress-block' -Direction Outbound `
+            -Action Block -RemoteAddress $ranges -Enabled True -Profile Any | Out-Null
+          Write-Host "added outbound block rule for RFC1918 (minus 10.88.0.0/16)"
+          # Ensure the profiles actually enforce; keep inbound/outbound defaults
+          # permissive so only our explicit block bites.
+          Set-NetFirewallProfile -All -Enabled True `
+            -DefaultInboundAction Allow -DefaultOutboundAction Allow -ErrorAction SilentlyContinue
+          Write-Host "=== firewall profiles AFTER ==="
+          Get-NetFirewallProfile | Format-Table Name,Enabled,DefaultInboundAction,DefaultOutboundAction -AutoSize
 
       - name: Hyper-V isolation must be active
         shell: powershell
