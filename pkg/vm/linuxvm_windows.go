@@ -524,6 +524,15 @@ func (l *hypervLinuxVM) createAndBootVM() error {
 	//   /dev/sda as root and find init there, which fails on an unformatted VHDX.
 	// - 8250_core: enable serial UART for console output via named pipe
 	// - ephemerd.*: custom params parsed by our init script
+	// - apparmor=1 security=apparmor: turn on the AppArmor LSM. The Alpine
+	//   linux-virt kernel ships AppArmor compiled in but disabled at boot
+	//   (its CONFIG_LSM omits apparmor), so without this the in-VM ephemerd's
+	//   apparmorOpts fails open and Linux job containers run unconfined —
+	//   unlike native Linux hosts. apparmor=1 flips the module's enabled
+	//   parameter; security=apparmor appends apparmor to the LSM order (there
+	//   is no lsm= on this cmdline, so security= is honored, not superseded).
+	//   The init script mounts securityfs so the profile can be loaded. Keep
+	//   this in sync with the darwin sidecar (linuxvm_darwin.go).
 	// The dind* params are redundant when the host's config.toml rides in
 	// via the initrd tail (the in-VM ephemerd reads the same [dind]
 	// section the host does). Kept as a fallback for the no-config path —
@@ -538,7 +547,8 @@ func (l *hypervLinuxVM) createAndBootVM() error {
 	cmdline := fmt.Sprintf(
 		"rdinit=/init ephemerd.containerd_port=%d ephemerd.root_disk=/dev/sda%s "+
 			"pci=off brd.rd_nr=0 pmtmr=0 nr_cpus=%d "+
-			"8250_core.nr_uarts=1 8250_core.skip_txen_test=1 console=ttyS0,115200",
+			"8250_core.nr_uarts=1 8250_core.skip_txen_test=1 console=ttyS0,115200 "+
+			"apparmor=1 security=apparmor",
 		l.cfg.ContainerdPort, dindFlag, l.cfg.CPUs,
 	)
 

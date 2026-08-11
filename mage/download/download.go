@@ -284,8 +284,17 @@ type apkPkg struct {
 }
 
 // Packages to pre-install in the rootfs, pinned to Alpine 3.21.3.
-// These are the transitive dependencies of gcompat and iptables.
+// These are the transitive dependencies of gcompat and iptables, plus
+// apparmor (for apparmor_parser) and its libintl dependency.
 // Update versions when bumping AlpineVersion.
+//
+// AppArmor: the in-VM ephemerd confines job containers with the generated
+// "ephemerd-default" profile, which containerd's contrib/apparmor loads by
+// exec'ing apparmor_parser. Ship the parser (apparmor) and the libintl.so.8
+// it links against. apparmor_parser does NOT link libapparmor, and the
+// generated profile is self-contained on this minimal rootfs (no
+// /etc/apparmor.d abstractions to #include), so nothing else is required.
+// See pkg/runtime/apparmor.go and the securityfs mount in the init script.
 var rootfsPackages = []apkPkg{
 	{"musl-obstack", "1.2.3-r2", "main"},
 	{"libucontext", "1.3.2-r0", "main"},
@@ -294,6 +303,8 @@ var rootfsPackages = []apkPkg{
 	{"libnftnl", "1.2.8-r0", "main"},
 	{"libxtables", "1.8.11-r1", "main"},
 	{"iptables", "1.8.11-r1", "main"},
+	{"libintl", "0.22.5-r0", "main"},
+	{"apparmor", "3.1.7-r4", "main"},
 }
 
 // Rootfs builds a custom Alpine rootfs with gcompat and iptables pre-installed.
@@ -1227,6 +1238,14 @@ mkdir -p /newroot/sys/fs/cgroup
 mount -t cgroup2 none /newroot/sys/fs/cgroup || \
     echo "ephemerd-init: WARNING: cgroup2 mount failed"
 
+# securityfs holds AppArmor's interface (/sys/kernel/security/apparmor). The
+# kernel creates the /sys/kernel/security mountpoint but does not mount
+# securityfs on it; without this the in-VM ephemerd cannot read the loaded-
+# profile list or load the ephemerd-default profile, so job containers run
+# unconfined. Requires apparmor=1 on the kernel cmdline (see linuxvm_darwin.go).
+mount -t securityfs none /newroot/sys/kernel/security 2>/dev/null || \
+    echo "ephemerd-init: WARNING: securityfs mount failed (AppArmor confinement unavailable)"
+
 # Mount virtio-fs share at the final location
 mount -t virtiofs "$SHARE_TAG" /newroot/mnt/ephemerd || \
     echo "ephemerd-init: WARNING: could not mount virtio-fs share"
@@ -1689,6 +1708,14 @@ mkdir -p /newroot/sys/fs/cgroup
 mount -t cgroup2 none /newroot/sys/fs/cgroup || \
     echo "ephemerd-init: WARNING: cgroup2 mount failed"
 
+# securityfs holds AppArmor's interface (/sys/kernel/security/apparmor). The
+# kernel creates the /sys/kernel/security mountpoint but does not mount
+# securityfs on it; without this the in-VM ephemerd cannot read the loaded-
+# profile list or load the ephemerd-default profile, so job containers run
+# unconfined. Requires apparmor=1 on the kernel cmdline (see linuxvm_windows.go).
+mount -t securityfs none /newroot/sys/kernel/security 2>/dev/null || \
+    echo "ephemerd-init: WARNING: securityfs mount failed (AppArmor confinement unavailable)"
+
 export PATH=/usr/bin:/usr/sbin:/bin:/sbin
 export HOME=/root
 
@@ -1958,6 +1985,16 @@ func buildRootfsTarball(dest string, baseData []byte, pkgData [][]byte, packages
 		}
 	}
 
+	// Ship the AppArmor 3.0 ABI file the generated ephemerd-default profile
+	// includes via "abi <abi/3.0>,". Without it apparmor_parser fails the load
+	// and job containers fall back to unconfined. See apparmorABI30.
+	if terr := appendApparmorABI(tw); terr != nil {
+		_ = tw.Close()
+		_ = gw.Close()
+		_ = f.Close()
+		return fmt.Errorf("writing apparmor abi: %w", terr)
+	}
+
 	if err = tw.Close(); err != nil {
 		_ = gw.Close()
 		_ = f.Close()
@@ -1973,6 +2010,34 @@ func buildRootfsTarball(dest string, baseData []byte, pkgData [][]byte, packages
 
 	fmt.Printf("  Created %s\n", dest)
 	return nil
+}
+
+// appendApparmorABI writes /etc/apparmor.d/abi/3.0 into the rootfs tar so
+// apparmor_parser can resolve the "abi <abi/3.0>," include at the top of the
+// generated ephemerd-default profile. The content is CR-stripped in case the
+// source file was checked out with CRLF endings (core.autocrlf), which
+// apparmor_parser would otherwise reject.
+func appendApparmorABI(tw *tar.Writer) error {
+	abi := []byte(strings.ReplaceAll(apparmorABI30, "\r\n", "\n"))
+	for _, d := range []string{"etc/apparmor.d/", "etc/apparmor.d/abi/"} {
+		if err := tw.WriteHeader(&tar.Header{
+			Name:     d,
+			Typeflag: tar.TypeDir,
+			Mode:     0o755,
+		}); err != nil {
+			return err
+		}
+	}
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "etc/apparmor.d/abi/3.0",
+		Typeflag: tar.TypeReg,
+		Mode:     0o644,
+		Size:     int64(len(abi)),
+	}); err != nil {
+		return err
+	}
+	_, err := tw.Write(abi)
+	return err
 }
 
 // Golangcilint downloads golangci-lint to ./bin/.
