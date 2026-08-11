@@ -241,8 +241,17 @@ func (l *darwinLinuxVM) boot() error {
 	bootLoader, err := vz.NewLinuxBootLoader(
 		l.kernelPath(),
 		vz.WithInitrd(l.initrdPath()),
+		// apparmor=1 security=apparmor turns on the AppArmor LSM in the guest.
+		// The Alpine linux-virt kernel ships AppArmor compiled in but disabled
+		// at boot (its CONFIG_LSM omits apparmor), so without this the in-VM
+		// ephemerd's apparmorOpts fails open and Linux job containers run
+		// unconfined — unlike native Linux hosts. There is no lsm= here, so
+		// security=apparmor is honored (not superseded). The init script mounts
+		// securityfs so the profile can be loaded. Keep in sync with the
+		// Windows sidecar (linuxvm_windows.go).
 		vz.WithCommandLine(fmt.Sprintf(
-			"console=hvc0 root=/dev/vda rw ephemerd.containerd_port=%d ephemerd.share_tag=ephemerd",
+			"console=hvc0 root=/dev/vda rw ephemerd.containerd_port=%d ephemerd.share_tag=ephemerd "+
+				"apparmor=1 security=apparmor",
 			l.cfg.ContainerdPort,
 		)),
 	)
