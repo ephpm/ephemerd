@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ephpm/ephemerd/pkg/artifacts"
+	"github.com/ephpm/ephemerd/pkg/cacheprune"
 	"github.com/ephpm/ephemerd/pkg/metrics"
 	"github.com/ephpm/ephemerd/pkg/names"
 	"github.com/ephpm/ephemerd/pkg/native"
@@ -39,8 +40,15 @@ type Config struct {
 	// squats as an orphan until the grace sweep.
 	LinuxJobsDisabled bool
 	MacOSVMConfig     *vm.MacOSVMConfig // if non-nil, macOS-native jobs are enabled (darwin only)
-	DataDir           string            // ephemerd data directory (used for artifact extraction paths)
-	Version           string            // daemon build version (from main.version); surfaced via Status and used by the Upgrade RPC
+	// CachePruner reclaims disk held by daemon-managed caches (BuildKit's
+	// build cache, the containerd image store) on demand, through the
+	// manager that owns each one. Backs the PruneCache RPC that
+	// `ephemerd cache clear` uses so an operator no longer has to stop the
+	// daemon and delete directories. Nil makes PruneCache return
+	// Unimplemented.
+	CachePruner       cacheprune.Interface
+	DataDir           string // ephemerd data directory (used for artifact extraction paths)
+	Version           string // daemon build version (from main.version); surfaced via Status and used by the Upgrade RPC
 	MaxConcurrent     int
 	MaxMacOSVMs       int // max concurrent macOS VMs (Vz limit; default auto-detected)
 	Labels            []string

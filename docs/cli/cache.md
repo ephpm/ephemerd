@@ -45,9 +45,31 @@ removed.
 
 The per-repo **dind image cache** is not in this list because it lives in
 containerd metadata namespaces (`ephemerd-dind-cache-*`), not a directory. It
-is pruned automatically by the running daemon on the `cache_prune_interval`
-schedule (see [configuration](../getting-started/configuration/)) and is
-surfaced by `cache list` only as a note.
+is pruned automatically by the running daemon (see
+[configuration](../getting-started/configuration/)) and is surfaced by
+`cache list` only as a note.
+
+## Clearing goes through the running daemon
+
+`cache clear buildkit` and `cache clear containerd` no longer delete
+directories. They ask the running daemon to prune through the manager that
+owns each cache: BuildKit's own cache manager for the build cache, and the
+image collector for the containerd image store.
+
+This is not a nicety. BuildKit's bbolt cache DB holds its own references to
+the snapshots behind every cache record, so removing the directory — or the
+containerd image records and leases — behind its back leaves those snapshots
+pinned. The sweep reports bytes freed and the disk does not move. It also
+means the caches can now be cleared **without stopping the daemon**, and that
+nothing a running job holds is touched.
+
+Every other cache still uses the filesystem sweep, with the same live-safety
+rules as before.
+
+`--offline` forces the old filesystem behavior for every target. It is an
+escape hatch for a daemon that is up but unresponsive; it may not actually
+reclaim the BuildKit cache, and it can leave BuildKit's index pointing at
+content that is gone, so prefer stopping the daemon first when using it.
 
 ## List caches
 

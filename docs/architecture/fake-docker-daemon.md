@@ -149,13 +149,17 @@ This relies on never setting the `containerd.io/namespace.shareable` label on ca
 
 ### Cache pruning
 
-A goroutine started in worker-mode walks every `ephemerd-dind-cache-*` namespace on a fixed interval and evicts Image records whose `last-accessed` label is older than the configured threshold. Configuration:
+Cache size is bounded by **disk pressure**, not by age. `pkg/imagegc` samples free space every `[image_gc].check_interval` and, when a watermark is crossed, evicts least-recently-used Image records — from the `ephemerd-dind-cache-*` namespaces, the main `ephemerd` runtime namespace and the shared `buildkit` namespace alike — until it is back under the low watermark. See [configuration](../getting-started/configuration/#image_gc).
+
+A separate goroutine still walks every `ephemerd-dind-cache-*` namespace on `cache_prune_interval` to reap cache namespaces left with no image records, and applies the **optional** `cache_max_age` backstop when one is configured:
 
 ```toml
 [dind]
-  cache_prune_interval = "24h"   # how often the sweeper wakes up
-  cache_max_age        = "168h"  # 7 days — LRU threshold
+  cache_prune_interval = "24h"   # how often the reaper wakes up
+  cache_max_age        = "0"     # optional age backstop; 0 = off (default)
 ```
+
+`cache_max_age` previously defaulted to `168h` and was the only eviction ephemerd performed. It now defaults to off: evicting by age discards a warm cache while the disk is half empty and forces re-downloads.
 
 After eviction, containerd's content GC reclaims any blob no longer referenced by an Image record in any namespace. Cache namespaces left empty after a prune pass are removed entirely so unused-repo metadata doesn't accumulate.
 

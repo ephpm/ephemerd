@@ -27,6 +27,7 @@ const (
 	Control_Cordon_FullMethodName     = "/ephemerd.v1.Control/Cordon"
 	Control_Uncordon_FullMethodName   = "/ephemerd.v1.Control/Uncordon"
 	Control_Upgrade_FullMethodName    = "/ephemerd.v1.Control/Upgrade"
+	Control_PruneCache_FullMethodName = "/ephemerd.v1.Control/PruneCache"
 )
 
 // ControlClient is the client API for Control service.
@@ -53,6 +54,15 @@ type ControlClient interface {
 	// restarts, after which the caller polls Status until the reported
 	// version matches the target. See docs/arch/upgrade-command.md.
 	Upgrade(ctx context.Context, in *UpgradeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[UpgradeProgress], error)
+	// PruneCache reclaims disk inside the RUNNING daemon, through the same
+	// cache managers that own the data: BuildKit's own prune for the build
+	// cache (deleting its containerd records directly leaves the snapshots
+	// pinned by BuildKit's cache DB and frees nothing), dead jobs' scoped
+	// build records, and the disk-pressure image collector. This is what
+	// `ephemerd cache clear buildkit|containerd` calls, replacing an
+	// offline `rm -rf` of the data directory that required stopping the
+	// daemon and could not tell in-use data from garbage.
+	PruneCache(ctx context.Context, in *PruneCacheRequest, opts ...grpc.CallOption) (*PruneCacheResponse, error)
 }
 
 type controlClient struct {
@@ -161,6 +171,16 @@ func (c *controlClient) Upgrade(ctx context.Context, in *UpgradeRequest, opts ..
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Control_UpgradeClient = grpc.ServerStreamingClient[UpgradeProgress]
 
+func (c *controlClient) PruneCache(ctx context.Context, in *PruneCacheRequest, opts ...grpc.CallOption) (*PruneCacheResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PruneCacheResponse)
+	err := c.cc.Invoke(ctx, Control_PruneCache_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControlServer is the server API for Control service.
 // All implementations must embed UnimplementedControlServer
 // for forward compatibility.
@@ -185,6 +205,15 @@ type ControlServer interface {
 	// restarts, after which the caller polls Status until the reported
 	// version matches the target. See docs/arch/upgrade-command.md.
 	Upgrade(*UpgradeRequest, grpc.ServerStreamingServer[UpgradeProgress]) error
+	// PruneCache reclaims disk inside the RUNNING daemon, through the same
+	// cache managers that own the data: BuildKit's own prune for the build
+	// cache (deleting its containerd records directly leaves the snapshots
+	// pinned by BuildKit's cache DB and frees nothing), dead jobs' scoped
+	// build records, and the disk-pressure image collector. This is what
+	// `ephemerd cache clear buildkit|containerd` calls, replacing an
+	// offline `rm -rf` of the data directory that required stopping the
+	// daemon and could not tell in-use data from garbage.
+	PruneCache(context.Context, *PruneCacheRequest) (*PruneCacheResponse, error)
 	mustEmbedUnimplementedControlServer()
 }
 
@@ -218,6 +247,9 @@ func (UnimplementedControlServer) Uncordon(context.Context, *UncordonRequest) (*
 }
 func (UnimplementedControlServer) Upgrade(*UpgradeRequest, grpc.ServerStreamingServer[UpgradeProgress]) error {
 	return status.Error(codes.Unimplemented, "method Upgrade not implemented")
+}
+func (UnimplementedControlServer) PruneCache(context.Context, *PruneCacheRequest) (*PruneCacheResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PruneCache not implemented")
 }
 func (UnimplementedControlServer) mustEmbedUnimplementedControlServer() {}
 func (UnimplementedControlServer) testEmbeddedByValue()                 {}
@@ -370,6 +402,24 @@ func _Control_Upgrade_Handler(srv interface{}, stream grpc.ServerStream) error {
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Control_UpgradeServer = grpc.ServerStreamingServer[UpgradeProgress]
 
+func _Control_PruneCache_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PruneCacheRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).PruneCache(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_PruneCache_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).PruneCache(ctx, req.(*PruneCacheRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Control_ServiceDesc is the grpc.ServiceDesc for Control service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -400,6 +450,10 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Uncordon",
 			Handler:    _Control_Uncordon_Handler,
+		},
+		{
+			MethodName: "PruneCache",
+			Handler:    _Control_PruneCache_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

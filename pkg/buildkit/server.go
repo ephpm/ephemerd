@@ -66,6 +66,12 @@ type Config struct {
 	// default network providers already work.
 	Network *networking.Manager
 
+	// GC bounds the on-disk build cache. The zero value produces NO prune
+	// rules, which is how BuildKit reads "never garbage-collect" — see
+	// GCConfig for what that cost us in production. Callers should pass a
+	// configured policy.
+	GC GCConfig
+
 	// Log receives structured logging from the buildkit server.
 	Log *slog.Logger
 }
@@ -113,6 +119,17 @@ func NewServer(ctx context.Context, cfg Config) (*Server, error) {
 
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return nil, fmt.Errorf("buildkit: create data dir: %w", err)
+	}
+
+	if policy := cfg.GC.PruneInfo(); len(policy) == 0 {
+		cfg.Log.Warn("buildkit: no GC policy configured — the build cache will grow without bound")
+	} else {
+		cfg.Log.Info("buildkit: cache GC policy active",
+			"rules", len(policy),
+			"reserved_bytes", cfg.GC.ReservedBytes,
+			"max_used_bytes", cfg.GC.MaxUsedBytes,
+			"min_free_bytes", cfg.GC.MinFreeBytes,
+			"keep_duration", cfg.GC.KeepDuration)
 	}
 
 	sessMgr, err := session.NewManager()
@@ -233,6 +250,80 @@ func (s *Server) Client(ctx context.Context) (*client.Client, error) {
 func (s *Server) SessionManager() *session.Manager {
 	return s.session
 }
+
+// ContainerdNamespace reports the containerd namespace build results and
+// cache records land in. Exposed so per-job teardown (pkg/dind) can find
+// and remove that job's build artifacts without hard-coding "buildkit".
+func (s *Server) ContainerdNamespace() string {
+	return s.cfg.ContainerdNamespace
+}
+
+// Prune runs BuildKit's cache prune through its own cache manager and
+// returns the number of bytes released.
+//
+// It must go through BuildKit rather than deleting containerd records
+// directly: BuildKit's bbolt cache DB keeps its own references to the
+// snapshots backing each cache record, so containerd-level deletion leaves
+// the snapshots pinned and reclaims nothing. (Confirmed the hard way on a
+// production node — image records and leases were gone and the space did
+// not come back until the snapshots were removed too.)
+//
+// rule is a single BuildKit prune rule. The zero rule prunes everything not
+// currently in use (a full `docker builder prune`); passing
+// GCConfig.PruneInfo()'s bounding rule performs the same bounded collection
+// the worker does automatically, on demand.
+//
+// BuildKit's Prune RPC takes one rule per call, so callers wanting a
+// multi-rule policy applied should call this once per rule.
+func (s *Server) Prune(ctx context.Context, rule client.PruneInfo) (int64, error) {
+	c, err := s.Client(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("buildkit: dial in-process controller: %w", err)
+	}
+	defer func() {
+		if cerr := c.Close(); cerr != nil {
+			s.cfg.Log.Warn("closing buildkit client", "error", cerr)
+		}
+	}()
+
+	ch := make(chan client.UsageInfo, 32)
+	var released int64
+	done := make(chan struct{})
+	go func() {
+		for ui := range ch {
+			released += ui.Size
+		}
+		close(done)
+	}()
+
+	opts := []client.PruneOption{
+		client.WithKeepOpt(rule.KeepDuration, rule.ReservedSpace, rule.MaxUsedSpace, rule.MinFreeSpace),
+		pruneFilter(rule.Filter),
+	}
+	if rule.All {
+		opts = append(opts, client.PruneAll)
+	}
+
+	err = c.Prune(ctx, ch, opts...)
+	close(ch)
+	<-done
+	if err != nil {
+		return released, fmt.Errorf("buildkit: prune: %w", err)
+	}
+	return released, nil
+}
+
+// pruneFilter sets the record-type filter on a prune request. The buildkit
+// client package has no exported option for it (only WithKeepOpt and
+// PruneAll), so we supply our own implementation of its PruneOption
+// interface.
+func pruneFilter(filter []string) client.PruneOption {
+	return pruneOptionFunc(func(pi *client.PruneInfo) { pi.Filter = filter })
+}
+
+type pruneOptionFunc func(*client.PruneInfo)
+
+func (f pruneOptionFunc) SetPruneOption(pi *client.PruneInfo) { f(pi) }
 
 // Close signals the Controller to shut down gracefully, stops the in-process
 // gRPC server, and releases worker resources. Safe to call multiple times.

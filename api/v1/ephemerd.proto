@@ -25,6 +25,42 @@ service Control {
   // restarts, after which the caller polls Status until the reported
   // version matches the target. See docs/arch/upgrade-command.md.
   rpc Upgrade(UpgradeRequest) returns (stream UpgradeProgress);
+  // PruneCache reclaims disk inside the RUNNING daemon, through the same
+  // cache managers that own the data: BuildKit's own prune for the build
+  // cache (deleting its containerd records directly leaves the snapshots
+  // pinned by BuildKit's cache DB and frees nothing), dead jobs' scoped
+  // build records, and the disk-pressure image collector. This is what
+  // `ephemerd cache clear buildkit|containerd` calls, replacing an
+  // offline `rm -rf` of the data directory that required stopping the
+  // daemon and could not tell in-use data from garbage.
+  rpc PruneCache(PruneCacheRequest) returns (PruneCacheResponse);
+}
+
+message PruneCacheRequest {
+  // targets names the caches to prune ("buildkit", "containerd"). Empty
+  // prunes every daemon-managed cache.
+  repeated string targets = 1;
+  // all drops even cache that the configured retention policy would keep
+  // (BuildKit's reserved floor). Off by default: the point of the cache is
+  // to stay warm, and a full drop trades disk for network on the next job.
+  bool all = 2;
+}
+
+message PruneCacheResponse {
+  repeated PruneCacheResult results = 1;
+}
+
+message PruneCacheResult {
+  // name is the cache that was pruned, matching `ephemerd cache list`.
+  string name = 1;
+  // bytes_freed is the space reclaimed, where the underlying manager
+  // reports it. 0 means "unknown", not necessarily "nothing".
+  int64 bytes_freed = 2;
+  // records_removed counts the metadata records dropped (image records,
+  // cache entries).
+  int64 records_removed = 3;
+  // error is non-empty when this target failed; other targets still ran.
+  string error = 4;
 }
 
 message StatusRequest {}

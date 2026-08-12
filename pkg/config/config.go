@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	goruntime "runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,6 +28,8 @@ type Config struct {
 	Network     NetworkConfig     `toml:"network"`
 	VM          VMConfig          `toml:"vm"`
 	Dind        DindConfig        `toml:"dind"`
+	BuildKit    BuildKitConfig    `toml:"buildkit"`
+	ImageGC     ImageGCConfig     `toml:"image_gc"`
 	ModuleProxy ModuleProxyConfig `toml:"module_proxy"`
 	Runtime     RuntimeConfig     `toml:"runtime"`
 	Runner      RunnerConfig      `toml:"runner"`
@@ -309,12 +312,21 @@ type DindConfig struct {
 	// disable pruning entirely. Default 24h.
 	CachePruneInterval time.Duration `toml:"cache_prune_interval"`
 
-	// CacheMaxAge is the eviction threshold for cached image records:
+	// CacheMaxAge is an OPTIONAL age backstop for cached image records:
 	// any record whose ephemerd.io/last-accessed label (or UpdatedAt as
 	// fallback) is older than this gets removed on the next prune pass.
 	// Containerd's content GC then reclaims the unreferenced blobs.
-	// Set to 0 to disable eviction (only empty-namespace cleanup runs).
-	// Default 168h (7 days).
+	//
+	// BEHAVIOR CHANGE: this used to default to 168h (7 days) and was the
+	// only image eviction mechanism ephemerd had. It now defaults to 0
+	// (disabled), because disk pressure — not age — is the correct
+	// trigger: evicting a warm cache while the disk is half empty just
+	// forces re-downloads. See [image_gc], which supersedes this for
+	// both the dind cache namespaces and the main runtime namespace.
+	//
+	// An explicit value is still honored, and still applies only to the
+	// ephemerd-dind-cache-* namespaces. Empty cache namespaces are
+	// reaped on every prune pass regardless of this setting.
 	CacheMaxAge time.Duration `toml:"cache_max_age"`
 
 	// AllowPrivileged controls whether `docker run --privileged` (or
@@ -364,13 +376,194 @@ func (d *DindConfig) DindCachePruneInterval() time.Duration {
 	return d.CachePruneInterval
 }
 
-// DindCacheMaxAge returns the eviction threshold with the default applied
-// when unset (or set to 0).
+// DindCacheMaxAge returns the optional age backstop for dind cache
+// namespaces. Zero means disabled, which is now the default — see
+// DindConfig.CacheMaxAge for why. A negative value is also treated as
+// disabled so a typo cannot evict everything.
 func (d *DindConfig) DindCacheMaxAge() time.Duration {
-	if d.CacheMaxAge == 0 {
-		return 7 * 24 * time.Hour
+	if d.CacheMaxAge < 0 {
+		return 0
 	}
 	return d.CacheMaxAge
+}
+
+// ImageGCConfig configures disk-pressure-triggered container image garbage
+// collection.
+//
+// Model (kubelet's): disk pressure is the TRIGGER, least-recently-used is
+// the ORDER. Collection starts when usage crosses a high watermark and
+// evicts LRU-first until a distinctly lower low watermark is reached, then
+// stops. Two watermarks rather than one line is what prevents thrashing at
+// the boundary.
+//
+// Two independent trigger arms exist and the more conservative one wins:
+// a percentage (high_watermark_percent) and an absolute floor
+// (min_free_gb). Neither is safe alone — 15% free of a 1 TB node is 150 GB
+// and evicting there is pointless, while 15% free of a 100 GB node is
+// 15 GB, which three concurrent jobs writing ~5 GB of container layers each
+// can eat between ticks. Size min_free_gb relative to
+// runner.max_concurrent times the expected per-job writable layer.
+//
+// Scope is the main "ephemerd" runtime namespace AND the per-repo
+// "ephemerd-dind-cache-*" namespaces. Images referenced by an existing
+// container, and the node's configured runner images, are never evicted.
+type ImageGCConfig struct {
+	// Enabled toggles collection. Nil = default true; operators disable
+	// by explicitly setting enabled = false.
+	Enabled *bool `toml:"enabled"`
+
+	// CheckInterval is how often disk usage is sampled. The sample is one
+	// statfs-class syscall (microseconds), so this can be short. Default
+	// 60s. Set to 0 to disable the periodic sweep — the pre-pull headroom
+	// check still runs.
+	CheckInterval time.Duration `toml:"check_interval"`
+
+	// HighWatermarkPercent is the disk used-percentage at which a
+	// collection pass triggers. Default 85. Set to 0 to disable the
+	// percentage arm and rely on min_free_gb alone.
+	HighWatermarkPercent float64 `toml:"high_watermark_percent"`
+
+	// LowWatermarkPercent is the used-percentage a triggered pass evicts
+	// down to. Default 70. Must be below HighWatermarkPercent; a value at
+	// or above it degrades to single-threshold behavior.
+	LowWatermarkPercent float64 `toml:"low_watermark_percent"`
+
+	// MinFreeGB is the absolute free-space floor, in GiB, below which a
+	// pass triggers regardless of percentage. Default 20. Set to 0 to
+	// disable the absolute arm.
+	MinFreeGB uint64 `toml:"min_free_gb"`
+
+	// TargetFreeGB is the free space, in GiB, a pass triggered by
+	// MinFreeGB evicts back up to. Defaults to twice MinFreeGB, mirroring
+	// the default 85%/70% percentage gap. Values below MinFreeGB are
+	// clamped up to it.
+	TargetFreeGB uint64 `toml:"target_free_gb"`
+
+	// MaxAge is an OPTIONAL age backstop applied to every collected
+	// namespace: records idle longer than this are evicted whether or not
+	// the disk is under pressure. Default 0 (disabled) — age is
+	// deliberately NOT the primary mechanism, because evicting a warm
+	// cache while the disk is half empty just forces re-downloads.
+	MaxAge time.Duration `toml:"max_age"`
+}
+
+// ImageGCEnabled reports whether image garbage collection runs. Default true.
+func (i *ImageGCConfig) ImageGCEnabled() bool {
+	if i.Enabled != nil {
+		return *i.Enabled
+	}
+	return true
+}
+
+// ImageGCCheckInterval returns the sampling interval, defaulting to 60s.
+// A negative value is treated as 0 (periodic sweep off).
+func (i *ImageGCConfig) ImageGCCheckInterval() time.Duration {
+	if i.CheckInterval == 0 {
+		return 60 * time.Second
+	}
+	if i.CheckInterval < 0 {
+		return 0
+	}
+	return i.CheckInterval
+}
+
+// ImageGCHighWatermarkPercent returns the trigger percentage, defaulting to
+// 85. Out-of-range values fall back to the default rather than failing
+// startup — a misconfigured watermark should not stop the node collecting.
+func (i *ImageGCConfig) ImageGCHighWatermarkPercent() float64 {
+	if i.HighWatermarkPercent < 0 || i.HighWatermarkPercent > 100 {
+		return 85
+	}
+	if i.HighWatermarkPercent == 0 {
+		// An explicit 0 is indistinguishable from "unset" in TOML for a
+		// float, so treat it as unset. Operators who want the
+		// percentage arm off should raise min_free_gb instead.
+		return 85
+	}
+	return i.HighWatermarkPercent
+}
+
+// ImageGCLowWatermarkPercent returns the stop percentage, defaulting to 70.
+// A value at or above the high watermark is clamped to it by the collector.
+func (i *ImageGCConfig) ImageGCLowWatermarkPercent() float64 {
+	if i.LowWatermarkPercent <= 0 || i.LowWatermarkPercent > 100 {
+		return 70
+	}
+	return i.LowWatermarkPercent
+}
+
+// ImageGCMinFreeBytes returns the absolute floor in bytes, defaulting to
+// 20 GiB.
+func (i *ImageGCConfig) ImageGCMinFreeBytes() uint64 {
+	gb := i.MinFreeGB
+	if gb == 0 {
+		gb = 20
+	}
+	return gb * 1024 * 1024 * 1024
+}
+
+// ImageGCTargetFreeBytes returns the absolute target in bytes, defaulting to
+// twice the floor.
+func (i *ImageGCConfig) ImageGCTargetFreeBytes() uint64 {
+	if i.TargetFreeGB > 0 {
+		return i.TargetFreeGB * 1024 * 1024 * 1024
+	}
+	return 2 * i.ImageGCMinFreeBytes()
+}
+
+// ImageGCMaxAge returns the optional age backstop. Zero (the default) and
+// any negative value mean disabled.
+func (i *ImageGCConfig) ImageGCMaxAge() time.Duration {
+	if i.MaxAge < 0 {
+		return 0
+	}
+	return i.MaxAge
+}
+
+// PinnedRunnerImages returns every image ref this node is configured to run
+// runners from: the [runner] default, every per-repo [runner.images.<repo>]
+// entry, and each provider's per-OS defaults.
+//
+// The image GC treats these as never-evictable. Dropping one guarantees a
+// re-pull on the very next job of that shape, which is exactly the network
+// thrash pressure-triggered GC exists to avoid; they are also the images
+// most likely to look "stale" to an LRU sweep on a node that has been busy
+// with third-party container: images.
+//
+// Refs are returned in a stable order with duplicates removed.
+func (c *Config) PinnedRunnerImages() []string {
+	var out []string
+	seen := map[string]struct{}{}
+	add := func(refs ...string) {
+		for _, r := range refs {
+			if r == "" {
+				continue
+			}
+			if _, ok := seen[r]; ok {
+				continue
+			}
+			seen[r] = struct{}{}
+			out = append(out, r)
+		}
+	}
+
+	add(c.Runner.DefaultImage)
+	for _, byOS := range c.Runner.Images {
+		for _, ref := range byOS {
+			add(ref)
+		}
+	}
+	for _, g := range c.GitHubTargets() {
+		add(g.DefaultImageFor("linux"), g.DefaultImageFor("windows"))
+	}
+	add(c.Forgejo.DefaultImageFor("linux"), c.Forgejo.DefaultImageFor("windows"), c.Forgejo.JobImage)
+	add(c.Gitea.DefaultImageFor("linux"), c.Gitea.DefaultImageFor("windows"), c.Gitea.JobImage)
+	add(c.GitLab.DefaultImageFor("linux"), c.GitLab.DefaultImageFor("windows"))
+
+	// A per-repo images map iterates in random order; sort so the log
+	// line and any test assertion are stable.
+	sort.Strings(out)
+	return out
 }
 
 // ModuleProxyConfig configures the Go module caching proxy.
