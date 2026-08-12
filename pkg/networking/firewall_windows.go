@@ -44,6 +44,20 @@ import (
 // Hyper-V firewall at all; it governs container-class workloads — WSL, Windows
 // Sandbox, and Windows containers).
 //
+// Why NOT a host-side WFP filter at IPFORWARD_V4 (the Linux FORWARD analogue).
+// Tempting, since firewall_linux.go enforces in FORWARD. It was built and driven
+// on a live Server 2025 node (a pure-Go tailscale/wf spike, no callout driver)
+// and does not work: the container's forwarded + SNAT'd egress is never
+// classified at ANY host IPv4 WFP layer — not IPFORWARD_V4, not
+// INBOUND_IPPACKET_V4 (arrival-interface scoped or not), not OUTBOUND_IPPACKET_V4
+// (dest-only, post-NAT). Positive controls prove WFP itself is enforced on the
+// host (blocking the host's own 1.1.1.1 at ALE and OUTBOUND both worked), so the
+// packets simply travel the Hyper-V vSwitch/HNS datapath, out-of-band of the
+// host tcpip.sys WFP hooks (Get-NetNat is empty and per-interface Forwarding is
+// Disabled). Full evidence: docs/arch/windows-egress-wfp-investigation.md.
+// The definitive fix for this stack is network-level: an isolated VLAN whose
+// uplink denies RFC1918, not a host-side software filter.
+//
 // Gateway safety (identical reasoning to #136, and to firewall_linux.go).
 // The container subnet contains the NAT gateway (DNS, the default route,
 // module-proxy GatewayPorts) and the other containers. Blocking the gateway
