@@ -908,8 +908,78 @@ cleanup = false
 	if cfg.ModuleProxy.Upstream != "https://goproxy.io" {
 		t.Errorf("ModuleProxy.Upstream = %q, want %q", cfg.ModuleProxy.Upstream, "https://goproxy.io")
 	}
-	if cfg.ModuleProxy.Cleanup {
-		t.Error("ModuleProxy.Cleanup = true, want false")
+	if cfg.ModuleProxy.CleanupEnabled() {
+		t.Error("ModuleProxy.CleanupEnabled() = true, want false (cleanup = false was set explicitly)")
+	}
+}
+
+// TestModuleProxyCleanupDefault pins that an unset cleanup still defaults to
+// true — the pointer field must not change existing behavior, only make an
+// explicit false actually take effect.
+func TestModuleProxyCleanupDefault(t *testing.T) {
+	var m ModuleProxyConfig
+	if !m.CleanupEnabled() {
+		t.Error("ModuleProxy.CleanupEnabled() = false when unset, want true")
+	}
+}
+
+// --- CargoProxy config ---
+
+func TestLoad_CargoProxyConfig(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[github]
+token = "ghp_test"
+owner = "org"
+
+[cargo_proxy]
+enabled = true
+port = 9100
+upstream = "https://index.example.test"
+rustup_upstream = "https://static.example.test"
+index_ttl = "5m"
+cleanup = true
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	if !cfg.CargoProxy.Enabled {
+		t.Error("CargoProxy.Enabled = false, want true")
+	}
+	if cfg.CargoProxy.Port != 9100 {
+		t.Errorf("CargoProxy.Port = %d, want 9100", cfg.CargoProxy.Port)
+	}
+	if cfg.CargoProxy.Upstream != "https://index.example.test" {
+		t.Errorf("CargoProxy.Upstream = %q", cfg.CargoProxy.Upstream)
+	}
+	if cfg.CargoProxy.RustupUpstream != "https://static.example.test" {
+		t.Errorf("CargoProxy.RustupUpstream = %q", cfg.CargoProxy.RustupUpstream)
+	}
+	if cfg.CargoProxy.IndexTTL != 5*time.Minute {
+		t.Errorf("CargoProxy.IndexTTL = %v, want 5m", cfg.CargoProxy.IndexTTL)
+	}
+	if !cfg.CargoProxy.CleanupEnabled() {
+		t.Error("CargoProxy.CleanupEnabled() = false, want true")
+	}
+}
+
+// TestCargoProxyDefaults pins the defaults that matter: the proxy is opt-in,
+// and — unlike the Go module proxy — its cache is NOT wiped on shutdown. A
+// pull-through cache that empties itself on every restart saves nothing.
+func TestCargoProxyDefaults(t *testing.T) {
+	var c CargoProxyConfig
+	if c.Enabled {
+		t.Error("CargoProxy.Enabled = true when unset, want false (opt-in)")
+	}
+	if c.CleanupEnabled() {
+		t.Error("CargoProxy.CleanupEnabled() = true when unset, want false")
 	}
 }
 
@@ -2397,12 +2467,12 @@ func TestResolvedReconcileInterval(t *testing.T) {
 		in   string
 		want time.Duration
 	}{
-		{"", 30 * time.Minute},         // default (backstop only; event-driven self-heal is primary)
-		{"2m", 2 * time.Minute},        // custom
-		{"90s", 90 * time.Second},      // custom
-		{"garbage", 30 * time.Minute},  // unparseable -> default
-		{"0s", 0},                      // explicit disable
-		{"-1m", 0},                     // negative -> disabled
+		{"", 30 * time.Minute},        // default (backstop only; event-driven self-heal is primary)
+		{"2m", 2 * time.Minute},       // custom
+		{"90s", 90 * time.Second},     // custom
+		{"garbage", 30 * time.Minute}, // unparseable -> default
+		{"0s", 0},                     // explicit disable
+		{"-1m", 0},                    // negative -> disabled
 	}
 	for _, c := range cases {
 		w := &WebhookConfig{ReconcileInterval: c.in}

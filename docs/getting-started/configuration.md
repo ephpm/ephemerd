@@ -117,6 +117,21 @@ max_concurrent = 4                   # max simultaneous jobs
 # cache_prune_interval = "24h"       # how often the per-repo image cache pruner runs
 # cache_max_age        = "168h"      # evict cached image records inactive longer than this (7 days)
 
+# --- Package caching proxies --------------------------------------------------
+# [module_proxy]
+# enabled  = false                   # run a GOPROXY on the bridge gateway
+# port     = 8082                    # listen port
+# upstream = "https://proxy.golang.org"
+# cleanup  = true                    # wipe the cache on shutdown
+
+# [cargo_proxy]
+# enabled         = false            # pull-through cache for crates.io + rustup
+# port            = 8083             # listen port
+# upstream        = "https://index.crates.io"
+# rustup_upstream = "https://static.rust-lang.org"
+# index_ttl       = "10m"            # sparse-index revalidation interval
+# cleanup         = false            # keep the cache across restarts
+
 # --- Metrics ------------------------------------------------------------------
 [metrics]
 # enabled = false                    # expose Prometheus /metrics endpoint
@@ -283,6 +298,57 @@ The cache namespace persists across jobs and across ephemerd restarts. Per-job s
 **Pruning.** Every `cache_prune_interval`, dind walks each `ephemerd-dind-cache-*` namespace and evicts Image records whose `ephemerd.io/last-accessed` label is older than `cache_max_age`. Cache namespaces left empty after eviction are removed entirely. Records pre-dating the label fall back to the record's `UpdatedAt` timestamp so a deploy that introduces the cache feature doesn't nuke pre-existing records on first prune.
 
 **Disabling caching.** Setting `cache_max_age = "0"` disables eviction (the cache grows unbounded — useful for debugging but not recommended in production). Setting `cache_prune_interval = "0"` disables the pruner goroutine entirely; equivalent to "keep everything forever, even empty namespaces."
+
+### `[module_proxy]`
+
+Go module caching proxy. ephemerd runs a single GOPROXY on the bridge gateway and injects `GOPROXY=http://<gateway>:<port>|direct` into every job container, so repeated `go mod download` runs hit the local disk cache instead of `proxy.golang.org`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Run the Go module proxy |
+| `port` | integer | `8082` | Listen port on the bridge gateway |
+| `upstream` | string | `"https://proxy.golang.org"` | Fetched from on a cache miss |
+| `cleanup` | boolean | `true` | Wipe the cache directory on shutdown. Set `false` to keep it across restarts. |
+
+Immutable module files (`.info`, `.mod`, `.zip`) are cached; mutable endpoints (`@latest`, `@v/list`) and `sumdb` requests pass through. The `|direct` separator means the go command falls back to the origin on **any** proxy error, so a broken cache slows a build rather than failing it.
+
+### `[cargo_proxy]`
+
+Cargo/crates caching proxy — the Rust counterpart to `[module_proxy]`. One HTTP server on the bridge gateway serves three routes:
+
+| Route | Upstream | Caching |
+|---|---|---|
+| `/index/…` | `upstream` (sparse registry index) | **Mutable** — served from cache for `index_ttl`, then revalidated with a conditional GET |
+| `/crates/{name}/{version}/download` | the registry's own `dl` template | **Immutable** — cached permanently, never refetched |
+| `/rustup/…` | `rustup_upstream` | Dated artifacts (`dist/YYYY-MM-DD/…`) immutable; channel manifests revalidated on `index_ttl` |
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Run the Cargo proxy |
+| `port` | integer | `8083` | Listen port on the bridge gateway |
+| `upstream` | string | `"https://index.crates.io"` | Sparse registry index |
+| `rustup_upstream` | string | `"https://static.rust-lang.org"` | Toolchain distribution server |
+| `index_ttl` | duration | `"10m"` | How long a cached index entry is served before revalidation. A negative value revalidates on every request. |
+| `cleanup` | boolean | `false` | Wipe the cache on shutdown. Defaults to **false**, unlike `[module_proxy]` — a pull-through cache that empties itself on every restart saves nothing. |
+
+**How jobs pick it up — no workflow changes required.**
+
+- **rustup** reads its mirror from the environment, so ephemerd injects `RUSTUP_DIST_SERVER`.
+- **Cargo does not.** Source replacement (`[source.crates-io] replace-with`) is the only mechanism Cargo offers for redirecting crates.io, and it is read **exclusively from config files** — `CARGO_SOURCE_*` environment variables are silently ignored. ephemerd therefore generates a `.cargo/config.toml` under `<data-dir>/cargo/` and bind-mounts it **read-only** at the container's filesystem root (`/.cargo`, or `C:\.cargo` on Windows). Cargo searches the current directory and *every ancestor* for `.cargo/config.toml`, so a file at the root applies to any workspace path a job checks out — no knowledge of the checkout location, the job user's home, or the image's `CARGO_HOME` is needed, and `CARGO_HOME` itself is left untouched so it stays writable.
+
+A repository that ships its own `.cargo/config.toml` still wins: Cargo prefers config closer to the workspace.
+
+**Fail-open behaviour.** A cache must never turn a registry hiccup into a red CI job, so failures degrade in three layers:
+
+1. If the proxy does not start, nothing is injected and no mount is added — jobs go straight to crates.io.
+2. If an upstream is unreachable or returns 5xx and a cached copy exists, the **stale copy is served** with a warning.
+3. If nothing is cached, crate and rustup downloads are answered with a `307` redirect to the real origin, so the job fetches it directly (slower, uncached) instead of failing.
+
+Genuine `404`s are passed through as `404` — a nonexistent crate version must stay distinguishable from an outage.
+
+**Scope.** The mount lands in the runner container. Jobs that run their steps inside a *further* container (a `container:` image spawned via Docker-in-Docker) do not inherit it.
+
+**Cache location.** Cached content lives at `<data-dir>/cache/cargo/` and is visible to `ephemerd cache list` / `ephemerd cache clear cargo`. The generated container config lives at `<data-dir>/cargo/` — deliberately outside the cache root, so clearing the cache cannot pull the mounted config out from under a running job.
 
 ### `[metrics]`
 

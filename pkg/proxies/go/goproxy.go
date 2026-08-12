@@ -28,10 +28,10 @@ import (
 
 // Config for the Go module caching proxy.
 type Config struct {
-	CacheDir   string       // on-disk cache directory
-	Upstream   string       // upstream proxy URL (default: https://proxy.golang.org)
-	ListenAddr string       // address to listen on (e.g., "10.88.0.1:8082")
-	Cleanup    bool         // wipe cache dir on Stop
+	CacheDir   string // on-disk cache directory
+	Upstream   string // upstream proxy URL (default: https://proxy.golang.org)
+	ListenAddr string // address to listen on (e.g., "10.88.0.1:8082")
+	Cleanup    bool   // wipe cache dir on Stop
 	Log        *slog.Logger
 }
 
@@ -68,9 +68,13 @@ func (p *Proxy) Start() error {
 		return fmt.Errorf("creating cache dir: %w", err)
 	}
 
-	ln, err := net.Listen("tcp", p.cfg.ListenAddr)
+	// proxies.Listen (not net.Listen): the bridge gateway IP does not exist
+	// yet at daemon boot — CNI creates the ephemerd0 bridge with the first
+	// job container — so a direct bind fails with EADDRNOTAVAIL and the
+	// proxy silently never starts. See proxies.Listen for the full story.
+	ln, err := proxies.Listen(p.cfg.ListenAddr, p.cfg.Log)
 	if err != nil {
-		return fmt.Errorf("listening on %s: %w", p.cfg.ListenAddr, err)
+		return err
 	}
 	p.listener = ln
 
@@ -123,10 +127,28 @@ func (p *Proxy) Addr() string {
 }
 
 // EnvVars returns the environment variables to inject into job containers.
+//
+// The advertised address is the CONFIGURED one (the bridge gateway), not
+// p.Addr(): when the listener falls back to the wildcard, Addr() reports
+// "[::]:8082", which is meaningless inside a container.
+//
+// The "|" separator (not ",") is what makes this fail open. With ",direct"
+// the go command only falls through to the origin on 404/410 — a proxy that
+// is down, wedged, or returning 5xx hard-fails the build. With "|direct" it
+// falls through on ANY error, so a broken cache degrades to a slower build
+// instead of a red job.
 func (p *Proxy) EnvVars() []string {
 	return []string{
-		"GOPROXY=http://" + p.Addr() + ",direct",
+		"GOPROXY=http://" + p.advertiseAddr() + "|direct",
 	}
+}
+
+// advertiseAddr is the address containers should use to reach this proxy.
+func (p *Proxy) advertiseAddr() string {
+	if p.cfg.ListenAddr != "" {
+		return p.cfg.ListenAddr
+	}
+	return p.Addr()
 }
 
 // Name returns the proxy name for logging.

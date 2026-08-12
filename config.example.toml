@@ -203,6 +203,36 @@ shutdown_timeout = "5m"
 # [dispatch]
 # token = "..."
 
+# Go module caching proxy. Runs a GOPROXY on the bridge gateway and injects
+# GOPROXY into every job container, so `go mod download` hits the local cache
+# instead of proxy.golang.org on each build.
+# [module_proxy]
+# enabled  = false
+# port     = 8082                            # listen port on the bridge gateway
+# upstream = "https://proxy.golang.org"      # fetched from on a cache miss
+# cleanup  = true                            # wipe the cache on shutdown
+
+# Cargo/crates caching proxy. A pull-through cache for the crates.io sparse
+# index, .crate tarballs, and rustup toolchain artifacts.
+#
+# Jobs need no workflow changes: rustup is pointed at the proxy with
+# RUSTUP_DIST_SERVER, and Cargo with a generated .cargo/config.toml that
+# ephemerd bind-mounts read-only at the container's filesystem root. A repo
+# that ships its own .cargo/config.toml still wins.
+#
+# Fails open: if the proxy does not start, nothing is injected and jobs go
+# straight to crates.io. If an upstream is unreachable, cached data is served
+# stale and uncached downloads are redirected to the origin.
+# [cargo_proxy]
+# enabled         = false
+# port            = 8083                          # listen port on the bridge gateway
+# upstream        = "https://index.crates.io"     # sparse registry index
+# rustup_upstream = "https://static.rust-lang.org" # toolchain distribution
+# index_ttl       = "10m"                         # index revalidation interval;
+#                                                 # .crate tarballs are immutable
+#                                                 # and cached permanently
+# cleanup         = false                         # keep the cache across restarts
+
 [log]
 # Log level: debug, info, warn, error
 level = "info"
