@@ -108,11 +108,26 @@ func (w *windowsNetworking) publicDNS() []string {
 // VFP-managed vSwitch port so the per-endpoint Switch ACLs applied in setup()
 // actually enforce.
 //
-// IPAM is DHCP: the network declares NO static subnet or routes, so HNS does
-// not pin an address and the container's vNIC leases its IP, default gateway,
-// and (LAN) DNS from the LAN DHCP server. DNS is overridden to the public
-// resolvers at the network and endpoint level so the container never needs the
-// LAN router for name resolution — the egress ACLs block the router.
+// DNS is overridden to the public resolvers at the network and endpoint level
+// so the container never needs the LAN router for name resolution — the egress
+// ACLs block the router.
+//
+// UNRESOLVED — IPAM. This declares NO Ipams, intending the container's vNIC to
+// DHCP on the LAN. HNS does not support that: on metal (Server 2025 26100)
+// Create() fails outright with
+//
+//	hcnCreateNetwork failed in Win32: The network does not have a subnet for
+//	this endpoint. (0x803b0005) / ErrorCode 2151350277
+//
+// so no L2Bridge network, endpoint, or container can be created at all while
+// this path is taken. An L2Bridge network requires an Ipam subnet with a
+// default route; with one present HNS assigns endpoint addresses itself (no
+// IpConfigurations needed) and the rest of this path — endpoint creation,
+// namespace attach, and the egress ACL ladder — was verified working on metal.
+//
+// Adopting that means ephemerd hands containers addresses out of the real LAN
+// subnet, which needs a range the LAN's DHCP server will not also hand out.
+// That allocation decision is why this is not simply switched over here.
 func (w *windowsNetworking) initL2Bridge(cfg Config) error {
 	if cfg.HostNIC == "" {
 		// Fail closed: without an uplink NIC the bridge has no path off-host,
@@ -137,8 +152,8 @@ func (w *windowsNetworking) initL2Bridge(cfg Config) error {
 	network := &hcn.HostComputeNetwork{
 		Name: l2BridgeNetworkName,
 		Type: hcn.L2Bridge,
-		// No Ipams: DHCP IPAM. HNS does not assign an address; the container
-		// vNIC DHCPs on the LAN for its IP, gateway, and default route.
+		// No Ipams. See the UNRESOLVED note above: HNS rejects this
+		// (0x803b0005) — an L2Bridge network must carry a subnet.
 		Policies: []hcn.NetworkPolicy{
 			{
 				Type:     hcn.NetAdapterName, // binds the L2Bridge to the physical NIC
@@ -198,18 +213,21 @@ func (w *windowsNetworking) setup(ctx context.Context, id string, netns string) 
 		return nil, fmt.Errorf("creating HCN endpoint for %s: %w", id, err)
 	}
 
-	// Apply ACL policies to block private network access. This is the ONLY
-	// egress restriction on Windows (there is no global firewall backstop —
-	// installFirewallRules is a no-op), so a failure here means the container
-	// would otherwise run with unrestricted egress to the host LAN, other
-	// RFC1918 services, and link-local metadata endpoints. Fail CLOSED: tear
-	// down the endpoint we just created and refuse the job rather than start a
-	// container we cannot firewall.
+	// Apply ACL policies to block private network access. These are the only
+	// egress restriction that actually enforces on this path: installFirewallRules
+	// is NOT a no-op (firewall_windows.go programs Hyper-V firewall rules), but
+	// those rules are built for the NAT subnet — hyperVEgressRules is called with
+	// DefaultSubnet/defaultGateway — so on L2Bridge, where the container holds a
+	// LAN address, they match nothing. A failure here therefore means the
+	// container would run with unrestricted egress to the host LAN, other RFC1918
+	// services, and link-local metadata endpoints. Fail CLOSED: tear down the
+	// endpoint we just created and refuse the job rather than start a container we
+	// cannot firewall.
 	//
 	// The ACLs are applied to the endpoint BEFORE the container is started
 	// (setup runs ahead of task creation), and the L2Bridge rule set is STATIC
-	// — it does not depend on the leased gateway or DNS (DNS is public, the
-	// router gets no allow) — so there is no post-lease window in which the
+	// — it does not depend on the gateway or DNS (DNS is public, the
+	// router gets no allow) — so there is no window in which the
 	// container has LAN connectivity but no filters.
 	if err := w.applyACLPolicies(created); err != nil {
 		if delErr := created.Delete(); delErr != nil {
@@ -323,15 +341,16 @@ func buildEgressBlockPolicies() ([]hcn.EndpointPolicy, error) {
 
 // VFP Switch-ACL precedence for the L2Bridge egress model. VFP evaluates ACLs
 // by Priority, LOWER number = HIGHER precedence (evaluated first, first match
-// wins). The ladder is: DHCP allow (top) > operator carve-outs > RFC1918 block
-// > allow-any (bottom). The two allow-any rules at the bottom are what stop the
-// port from default-denying everything — VFP is default-DENY the moment any
-// ACL is present.
+// wins). The ladder is: operator carve-outs (top) > RFC1918 block > allow-any
+// (bottom). The two allow-any rules at the bottom are what stop the port from
+// default-denying everything — VFP is default-DENY the moment any ACL is
+// present.
+//
+// Every rule in this ladder is address-scoped. See the note in
+// buildL2BridgeEgressACLPolicies: mixing in a port-scoped rule with no address
+// scope (the removed UDP 67/68 DHCP allows) blackholes the entire port on
+// metal.
 const (
-	// aclPriorityDHCP lets the container lease/renew even with the rest of
-	// RFC1918 blocked. Above the block so the DHCP server (which lives on the
-	// LAN, inside a blocked supernet) stays reachable.
-	aclPriorityDHCP uint16 = 90
 	// aclPriorityExtraAllow carves configured destinations out ABOVE the
 	// RFC1918 block. Unused by default (no carve-outs) — reserved for future
 	// operator-allowed destinations.
@@ -345,12 +364,9 @@ const (
 	aclPriorityAllowAny uint16 = 65500
 )
 
-// aclAnyProtocol matches any IP protocol in an HNS ACL ("256"), used for the
-// allow-any and block rules per the proven metal run. The DHCP rules use UDP.
-const (
-	aclAnyProtocol = "256"
-	aclUDPProtocol = "17"
-)
+// aclAnyProtocol matches any IP protocol in an HNS ACL ("256"). Every rule in
+// the ladder uses it, per the proven metal run.
+const aclAnyProtocol = "256"
 
 // marshalACL serializes one AclPolicySetting into an EndpointPolicy, failing
 // closed on a marshal error (a rule we cannot serialize is a rule we cannot
@@ -386,30 +402,30 @@ func buildL2BridgeEgressACLPolicies(extraAllowed []string) ([]hcn.EndpointPolicy
 		return nil
 	}
 
-	// Tier: DHCP. Allow UDP to/from the BOOTP/DHCP ports so the container can
-	// obtain and renew its lease even though the DHCP server sits inside a
-	// blocked supernet. Out matches the request (dst 67), In matches the reply
-	// (dst 68); no address scope (the DHCP server is discovered).
-	if err := add(hcn.AclPolicySetting{
-		Protocols:   aclUDPProtocol,
-		Action:      hcn.ActionTypeAllow,
-		Direction:   hcn.DirectionTypeOut,
-		RemotePorts: "67,68",
-		RuleType:    hcn.RuleTypeSwitch,
-		Priority:    aclPriorityDHCP,
-	}); err != nil {
-		return nil, err
-	}
-	if err := add(hcn.AclPolicySetting{
-		Protocols:  aclUDPProtocol,
-		Action:     hcn.ActionTypeAllow,
-		Direction:  hcn.DirectionTypeIn,
-		LocalPorts: "67,68",
-		RuleType:   hcn.RuleTypeSwitch,
-		Priority:   aclPriorityDHCP,
-	}); err != nil {
-		return nil, err
-	}
+	// NO DHCP tier. An earlier revision allowed UDP 67/68 (Out with
+	// RemotePorts, In with LocalPorts, no address scope) at a precedence above
+	// the block, so a lease/renew could survive the RFC1918 deny. On metal
+	// those two rules BLACKHOLE THE PORT: with them present nothing egresses at
+	// all — not the internet, not even a destination carved out by an explicit
+	// higher-precedence Allow.
+	//
+	// Measured on mfl-win-amd64-101 (Server 2025 26100), same endpoint, same
+	// code path, only these two rules varying:
+	//
+	//	blocks + allow-any + DHCP rules -> ALL probes fail (1.1.1.1, 8.8.8.8,
+	//	                                   DNS, and every RFC1918 target)
+	//	blocks + allow-any              -> exactly the intended posture:
+	//	                                   Grafana/Incus/Proxmox/router/host
+	//	                                   blocked, 1.1.1.1 + 8.8.8.8 + DNS +
+	//	                                   public HTTPS all reachable
+	//
+	// HNS accepts the rules (ApplyPolicy returns success) but the resulting VFP
+	// rule set drops everything, so this fails CLOSED rather than open — it
+	// breaks jobs instead of leaking. Port-scoped ACLs carrying no address
+	// scope must not be mixed into this ladder.
+	//
+	// Nothing here needs DHCP: the endpoint is addressed by HNS IPAM, not by a
+	// DHCP client in the container.
 
 	// Tier: operator carve-outs (future use). Allowed ABOVE the block so a
 	// listed destination wins. Empty by default.

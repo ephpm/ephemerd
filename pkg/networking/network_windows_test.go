@@ -82,7 +82,6 @@ func TestL2BridgeEgressACLPolicies_LadderShape(t *testing.T) {
 
 	var (
 		allowAnyOut, allowAnyIn bool
-		dhcpOut, dhcpIn         bool
 		blockedSupernets        = map[string]hcn.AclPolicySetting{}
 	)
 	for _, a := range acls {
@@ -93,16 +92,6 @@ func TestL2BridgeEgressACLPolicies_LadderShape(t *testing.T) {
 		case a.Action == hcn.ActionTypeAllow && a.RemoteAddresses == "0.0.0.0/0" && a.Direction == hcn.DirectionTypeIn:
 			allowAnyIn = true
 			assertACL(t, "allow-any-in", a, aclAnyProtocol, aclPriorityAllowAny)
-		case a.Action == hcn.ActionTypeAllow && a.Protocols == aclUDPProtocol && a.Direction == hcn.DirectionTypeOut:
-			dhcpOut = true
-			if a.RemotePorts != "67,68" || a.Priority != aclPriorityDHCP {
-				t.Errorf("dhcp-out = %+v, want RemotePorts 67,68 priority %d", a, aclPriorityDHCP)
-			}
-		case a.Action == hcn.ActionTypeAllow && a.Protocols == aclUDPProtocol && a.Direction == hcn.DirectionTypeIn:
-			dhcpIn = true
-			if a.LocalPorts != "67,68" || a.Priority != aclPriorityDHCP {
-				t.Errorf("dhcp-in = %+v, want LocalPorts 67,68 priority %d", a, aclPriorityDHCP)
-			}
 		case a.Action == hcn.ActionTypeBlock:
 			blockedSupernets[a.RemoteAddresses] = a
 		}
@@ -110,9 +99,6 @@ func TestL2BridgeEgressACLPolicies_LadderShape(t *testing.T) {
 
 	if !allowAnyOut || !allowAnyIn {
 		t.Errorf("missing mandatory allow-any rule: out=%v in=%v (both required or the port default-denies / drops SYN-ACK)", allowAnyOut, allowAnyIn)
-	}
-	if !dhcpOut || !dhcpIn {
-		t.Errorf("missing DHCP allow: out=%v in=%v", dhcpOut, dhcpIn)
 	}
 
 	// Every RFC1918 + link-local supernet must be blocked, whole, Out, at the
@@ -143,15 +129,12 @@ func TestL2BridgeEgressACLPolicies_NoGatewayOrSubnetCarveOut(t *testing.T) {
 
 	for _, a := range acls {
 		// The only allows permitted with default (empty) extraAllowed are the
-		// two allow-any (0.0.0.0/0) rules and the two DHCP rules (no address).
+		// two allow-any (0.0.0.0/0) rules.
 		if a.Action != hcn.ActionTypeAllow {
 			continue
 		}
-		if a.Protocols == aclUDPProtocol {
-			continue // DHCP allow — no address scope
-		}
 		if a.RemoteAddresses != "0.0.0.0/0" {
-			t.Errorf("unexpected allow carve-out to %q (only 0.0.0.0/0 and DHCP allows are permitted with no extra-allowed configured)", a.RemoteAddresses)
+			t.Errorf("unexpected allow carve-out to %q (only 0.0.0.0/0 is permitted with no extra-allowed configured)", a.RemoteAddresses)
 		}
 	}
 
@@ -165,15 +148,33 @@ func TestL2BridgeEgressACLPolicies_NoGatewayOrSubnetCarveOut(t *testing.T) {
 	}
 }
 
-// TestL2BridgeEgressACLPolicies_Precedence pins the priority ladder: DHCP and
-// operator carve-outs must sit ABOVE the RFC1918 block (lower number = higher
+// TestL2BridgeEgressACLPolicies_Precedence pins the priority ladder: operator
+// carve-outs must sit ABOVE the RFC1918 block (lower number = higher
 // precedence), which must sit above the allow-any floor.
 func TestL2BridgeEgressACLPolicies_Precedence(t *testing.T) {
-	if !(aclPriorityDHCP < aclPriorityBlock &&
-		aclPriorityExtraAllow < aclPriorityBlock &&
+	if !(aclPriorityExtraAllow < aclPriorityBlock &&
 		aclPriorityBlock < aclPriorityAllowAny) {
-		t.Fatalf("priority ladder broken: dhcp=%d extra=%d block=%d allowany=%d (want dhcp,extra < block < allowany)",
-			aclPriorityDHCP, aclPriorityExtraAllow, aclPriorityBlock, aclPriorityAllowAny)
+		t.Fatalf("priority ladder broken: extra=%d block=%d allowany=%d (want extra < block < allowany)",
+			aclPriorityExtraAllow, aclPriorityBlock, aclPriorityAllowAny)
+	}
+}
+
+// TestL2BridgeEgressACLPolicies_EveryRuleIsAddressScoped is a regression guard
+// for the metal finding that motivated removing the DHCP allows: a Switch ACL
+// carrying only a port scope (no RemoteAddresses/LocalAddresses) blackholes the
+// entire VFP port. HNS accepts such a rule, then nothing egresses at all — not
+// the internet, not even an explicitly allowed destination. Keep every rule in
+// this ladder address-scoped.
+func TestL2BridgeEgressACLPolicies_EveryRuleIsAddressScoped(t *testing.T) {
+	for _, extra := range [][]string{nil, {"203.0.113.0/24"}} {
+		for _, a := range decodeACLs(t, mustBuildL2Bridge(t, extra)) {
+			if a.RemoteAddresses == "" && a.LocalAddresses == "" {
+				t.Errorf("ACL with no address scope: %+v (blackholes the whole port on metal)", a)
+			}
+			if a.RemotePorts != "" || a.LocalPorts != "" {
+				t.Errorf("port-scoped ACL in the L2Bridge ladder: %+v", a)
+			}
+		}
 	}
 }
 
