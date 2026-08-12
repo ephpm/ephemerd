@@ -181,6 +181,45 @@ shutdown_timeout = "5m"
 # cpus = 2
 # memory_mb = 2048
 
+# BuildKit build cache bounds.
+#
+# BuildKit only garbage-collects when its worker is given a GC policy.
+# Without one the shared "buildkit" containerd namespace grows forever:
+# every `docker build` adds cache records, snapshots and leases that nothing
+# releases. These defaults keep the cache WARM BUT BOUNDED — pruning harder
+# would just move the cost onto the network.
+# [buildkit]
+# gc_enabled                 = true
+# gc_reserved_gb             = 5       # never collected, even when idle
+# gc_max_used_gb             = 25      # hard ceiling
+# gc_min_free_gb             = 20      # collect to keep this much disk free
+# gc_keep_duration           = "168h"  # 7 days
+# gc_ephemeral_keep_duration = "48h"   # build contexts, cache mounts, git checkouts
+# gc_ephemeral_max_used_gb   = 2
+
+# Disk-pressure image garbage collection.
+#
+# Disk pressure is the TRIGGER, least-recently-used is the ORDER (kubelet's
+# model). A pass starts at the high watermark and evicts LRU-first until the
+# low watermark, then stops — two watermarks so it can't thrash at the line.
+# The percentage and the absolute floor are independent triggers and the
+# more conservative one wins: 15% of a 1 TB disk is 150 GB (pointless to
+# collect), 15% of a 100 GB disk is 15 GB (three concurrent jobs can eat
+# that between ticks). Size min_free_gb against max_concurrent x expected
+# per-job layer size.
+#
+# Never evicted: images a running container references, the configured
+# runner images (evicting those forces an immediate re-pull), and any live
+# job's build output.
+# [image_gc]
+# enabled                = true
+# check_interval         = "60s"  # one statfs per tick, never a directory walk
+# high_watermark_percent = 85
+# low_watermark_percent  = 70
+# min_free_gb            = 20
+# target_free_gb         = 40     # defaults to 2x min_free_gb
+# max_age                = "0"    # optional age backstop; off by default
+
 [metrics]
 # Enable Prometheus metrics endpoint. Disabled by default.
 # enabled = true

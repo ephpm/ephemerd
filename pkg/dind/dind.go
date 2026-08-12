@@ -326,6 +326,18 @@ func (s *Server) Stop() {
 		CleanupJobNamespace(context.Background(), s.client, s.jobNamespace, s.log)
 	}
 
+	// Clean up this job's build output in the SHARED buildkit namespace.
+	// CleanupJobNamespace above only covers the per-job dind namespace;
+	// `docker build` results land in the one shared "buildkit" namespace
+	// under a job-scoped name that, because the job ID is unique, nothing
+	// ever overwrites or removes. Left alone they accumulate one set of
+	// records per job forever, and their gc.flat leases pin the content
+	// against containerd's GC — the mechanism behind a 44 GB / 49-dead-job
+	// pile-up observed in production.
+	if s.client != nil && s.buildkit != nil {
+		CleanupJobBuildRecords(context.Background(), s.client, s.buildkit.ContainerdNamespace(), s.jobID, s.log)
+	}
+
 	if s.server != nil {
 		if err := s.server.Shutdown(context.Background()); err != nil {
 			s.log.Debug("shutting down fake docker server", "error", err)

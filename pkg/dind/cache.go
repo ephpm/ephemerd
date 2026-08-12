@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/client"
-	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/errdefs"
+	"github.com/ephpm/ephemerd/pkg/imagegc"
 )
 
 // DindCacheNamespacePrefix prefixes every per-repo image cache namespace.
@@ -33,7 +33,10 @@ const DindCacheNamespacePrefix = "ephemerd-dind-cache-"
 // LastAccessedLabel records the most recent time an Image record in a cache
 // namespace was touched (pull or container-create). The pruner uses this
 // for LRU eviction. RFC3339-formatted, UTC.
-const LastAccessedLabel = "ephemerd.io/last-accessed"
+//
+// Aliased to pkg/imagegc, which owns the label now that the same LRU key is
+// stamped on the main "ephemerd" runtime namespace too.
+const LastAccessedLabel = imagegc.LastAccessedLabel
 
 // CacheNamespace returns the containerd namespace name used to cache image
 // metadata for a given (provider, repo) pair. Both inputs are sanitized so
@@ -136,36 +139,32 @@ func MirrorImageToCache(ctx context.Context, c *client.Client, jobNS, cacheNS, i
 // from the container-create path when a job references an image that's
 // already in the cache (no pull happens, but the image is in use). Silently
 // no-ops if the image isn't in the cache.
+//
+// Delegates to imagegc.Touch, which does the same thing for the main
+// runtime namespace — one writer for the LRU key.
 func RefreshLastAccessed(ctx context.Context, c *client.Client, cacheNS, imageName string, log *slog.Logger) {
-	if c == nil || cacheNS == "" || imageName == "" {
-		return
-	}
-	cacheCtx := namespaces.WithNamespace(ctx, cacheNS)
-	img, err := c.ImageService().Get(cacheCtx, imageName)
-	if err != nil {
-		if !errdefs.IsNotFound(err) {
-			log.Debug("dind cache: refresh get", "image", imageName, "cache", cacheNS, "error", err)
-		}
-		return
-	}
-	if img.Labels == nil {
-		img.Labels = map[string]string{}
-	}
-	img.Labels[LastAccessedLabel] = time.Now().UTC().Format(time.RFC3339)
-	if _, err := c.ImageService().Update(cacheCtx, img, "labels"); err != nil {
-		log.Debug("dind cache: refresh update", "image", imageName, "cache", cacheNS, "error", err)
-	}
+	imagegc.Touch(ctx, c, cacheNS, imageName, log)
 }
 
 // CachePrune walks every per-repo cache namespace and evicts Image records
-// whose LastAccessedLabel (or CreatedAt fallback for records pre-dating the
-// label) is older than maxAge. Empty cache namespaces are deleted entirely.
+// whose LastAccessedLabel (or UpdatedAt fallback for records pre-dating the
+// label) is older than maxAge, then deletes any cache namespace left empty.
 // Containerd's content GC reclaims the unreferenced blobs after this runs.
+//
+// maxAge <= 0 skips eviction and runs only the empty-namespace reap. That is
+// now the default: age is an optional backstop, and disk-pressure-triggered
+// LRU collection (pkg/imagegc, wired from [image_gc]) is the primary
+// mechanism for keeping these namespaces bounded. Keeping the reap
+// unconditional means a node that disables the age backstop still doesn't
+// accumulate one stale metadata bucket per repo that ever ran a job.
+//
+// The candidate listing, protection and ordering all come from pkg/imagegc
+// so this path and the pressure collector cannot drift apart.
 //
 // Returns nil and logs warnings on partial failures — the next pass will
 // retry whatever didn't clean up this time.
 func CachePrune(ctx context.Context, c *client.Client, maxAge time.Duration, log *slog.Logger) error {
-	if c == nil || maxAge <= 0 {
+	if c == nil {
 		return nil
 	}
 	all, err := c.NamespaceService().List(ctx)
@@ -173,44 +172,50 @@ func CachePrune(ctx context.Context, c *client.Client, maxAge time.Duration, log
 		return fmt.Errorf("list namespaces: %w", err)
 	}
 
-	cutoff := time.Now().UTC().Add(-maxAge)
-	totalEvicted := 0
-	namespacesPruned := 0
-
+	var cacheNS []string
 	for _, ns := range all {
-		if !strings.HasPrefix(ns, DindCacheNamespacePrefix) {
-			continue
+		if strings.HasPrefix(ns, DindCacheNamespacePrefix) {
+			cacheNS = append(cacheNS, ns)
 		}
-		nsCtx := namespaces.WithNamespace(ctx, ns)
-		imgs, ierr := c.ImageService().List(nsCtx)
-		if ierr != nil {
-			log.Warn("cache prune: list images", "namespace", ns, "error", ierr)
-			continue
-		}
-		evicted := 0
-		for _, img := range imgs {
-			ts := imageLastAccessed(img)
-			if ts.IsZero() || ts.After(cutoff) {
-				continue
-			}
-			if derr := c.ImageService().Delete(nsCtx, img.Name); derr != nil && !errdefs.IsNotFound(derr) {
-				log.Warn("cache prune: delete image",
-					"namespace", ns, "image", img.Name, "error", derr)
-				continue
-			}
-			evicted++
-		}
-		if evicted > 0 {
-			log.Info("cache prune: evicted images",
-				"namespace", ns, "count", evicted, "max_age", maxAge)
-		}
-		totalEvicted += evicted
+	}
+	if len(cacheNS) == 0 {
+		return nil
+	}
 
-		// If the cache namespace is now empty, drop the metadata bucket
-		// too so it doesn't accumulate one stale bucket per repo that
-		// ever ran a job, even if the repo itself goes idle.
+	totalEvicted := 0
+	if maxAge > 0 {
+		// Never evict an image some container still references, even
+		// here: the age backstop has no idea what is in flight.
+		running, rerr := imagegc.RunningImageRefs(ctx, c, log)
+		if rerr != nil {
+			return fmt.Errorf("listing running container images: %w", rerr)
+		}
+		protected := imagegc.ProtectedSet(nil, running)
+
+		cands, cerr := imagegc.ListCandidates(ctx, c, cacheNS, log)
+		if cerr != nil {
+			return fmt.Errorf("listing cache image records: %w", cerr)
+		}
+		aged := imagegc.PlanByAge(cands, protected, time.Now().UTC().Add(-maxAge))
+		totalEvicted = imagegc.Evict(ctx, c, aged, false, log, nil)
+		if totalEvicted > 0 {
+			log.Info("cache prune: evicted images",
+				"count", totalEvicted, "max_age", maxAge)
+		}
+	}
+
+	// Drop the metadata bucket of any cache namespace left with no image
+	// records, so it doesn't accumulate one stale bucket per repo that
+	// ever ran a job, even if the repo itself goes idle.
+	namespacesPruned := 0
+	for _, ns := range cacheNS {
+		nsCtx := namespaces.WithNamespace(ctx, ns)
 		remaining, lerr := c.ImageService().List(nsCtx)
-		if lerr == nil && len(remaining) == 0 {
+		if lerr != nil {
+			log.Warn("cache prune: list images", "namespace", ns, "error", lerr)
+			continue
+		}
+		if len(remaining) == 0 {
 			CleanupJobNamespace(ctx, c, ns, log)
 			namespacesPruned++
 		}
@@ -221,17 +226,4 @@ func CachePrune(ctx context.Context, c *client.Client, maxAge time.Duration, log
 			"images_evicted", totalEvicted, "namespaces_pruned", namespacesPruned)
 	}
 	return nil
-}
-
-// imageLastAccessed returns the timestamp the image was last used. Prefers
-// the LastAccessedLabel; falls back to img.UpdatedAt for records that pre-
-// date the label (so existing caches don't get nuked on the first prune
-// after this code lands).
-func imageLastAccessed(img images.Image) time.Time {
-	if ts := img.Labels[LastAccessedLabel]; ts != "" {
-		if t, err := time.Parse(time.RFC3339, ts); err == nil {
-			return t.UTC()
-		}
-	}
-	return img.UpdatedAt.UTC()
 }

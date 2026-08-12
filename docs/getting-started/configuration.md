@@ -114,8 +114,28 @@ max_concurrent = 4                   # max simultaneous jobs
 # --- Docker-in-Docker --------------------------------------------------------
 [dind]
 # enabled = false                    # mount fake Docker socket into containers
-# cache_prune_interval = "24h"       # how often the per-repo image cache pruner runs
-# cache_max_age        = "168h"      # evict cached image records inactive longer than this (7 days)
+# cache_prune_interval = "24h"       # how often empty per-repo cache namespaces are reaped
+# cache_max_age        = "0"         # OPTIONAL age backstop for the dind cache (0 = off; see [image_gc])
+
+# --- BuildKit build cache -----------------------------------------------------
+[buildkit]
+# gc_enabled                   = true    # bound the build cache (leave on)
+# gc_reserved_gb               = 5       # never collected, even when idle (warm floor)
+# gc_max_used_gb               = 25      # hard ceiling on total build cache
+# gc_min_free_gb               = 20      # collect to keep at least this much disk free
+# gc_keep_duration             = "168h"  # collect records idle longer than this, above the floor
+# gc_ephemeral_keep_duration   = "48h"   # cheap-to-rebuild records (contexts, cache mounts, git checkouts)
+# gc_ephemeral_max_used_gb     = 2
+
+# --- Disk-pressure image GC ---------------------------------------------------
+[image_gc]
+# enabled                 = true   # evict container images when the disk fills
+# check_interval          = "60s"  # one statfs per tick; cheap
+# high_watermark_percent  = 85     # start collecting at this disk usage
+# low_watermark_percent   = 70     # collect down to this, then stop
+# min_free_gb             = 20     # absolute floor; triggers regardless of percentage
+# target_free_gb          = 40     # free space a floor-triggered pass restores (default 2x min_free_gb)
+# max_age                 = "0"    # OPTIONAL age backstop across all namespaces (0 = off)
 
 # --- Metrics ------------------------------------------------------------------
 [metrics]
@@ -265,8 +285,10 @@ Docker-in-Docker support. When `enabled`, every job sees `/var/run/docker.sock` 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Mount a fake Docker socket (`/var/run/docker.sock`) into job containers |
-| `cache_prune_interval` | duration | `"24h"` | How often the per-repo image cache pruner runs. Set to `"0"` to disable pruning. |
-| `cache_max_age` | duration | `"168h"` (7d) | Evict cached image records whose `ephemerd.io/last-accessed` label is older than this. Containerd's content GC reclaims the now-unreferenced blobs. |
+| `cache_prune_interval` | duration | `"24h"` | How often the per-repo cache reaper runs. It removes cache namespaces left with no image records, and applies `cache_max_age` when that is set. `"0"` disables the loop. |
+| `cache_max_age` | duration | `"0"` (off) | **Optional** age backstop: evict cached image records whose `ephemerd.io/last-accessed` label is older than this. |
+
+> **Behavior change.** `cache_max_age` used to default to `"168h"` and was the only image eviction ephemerd performed. It now defaults to **off**. Disk pressure — not age — is the trigger; see [`[image_gc]`](#image_gc). Age-based eviction throws away a warm cache while the disk is half empty and forces re-downloads, which is the opposite of what a bandwidth-constrained node needs. An explicit `cache_max_age` is still honored and still applies only to the `ephemerd-dind-cache-*` namespaces.
 
 **Per-repo image cache.** Each (provider, repo) pair gets its own long-lived containerd namespace named `ephemerd-dind-cache-<provider>-<sanitized-repo>`. Examples:
 
@@ -282,7 +304,53 @@ The cache namespace persists across jobs and across ephemerd restarts. Per-job s
 
 **Pruning.** Every `cache_prune_interval`, dind walks each `ephemerd-dind-cache-*` namespace and evicts Image records whose `ephemerd.io/last-accessed` label is older than `cache_max_age`. Cache namespaces left empty after eviction are removed entirely. Records pre-dating the label fall back to the record's `UpdatedAt` timestamp so a deploy that introduces the cache feature doesn't nuke pre-existing records on first prune.
 
-**Disabling caching.** Setting `cache_max_age = "0"` disables eviction (the cache grows unbounded — useful for debugging but not recommended in production). Setting `cache_prune_interval = "0"` disables the pruner goroutine entirely; equivalent to "keep everything forever, even empty namespaces."
+**Disabling caching.** Setting `cache_prune_interval = "0"` disables the reaper goroutine entirely; equivalent to "keep everything forever, even empty namespaces." Cache size itself is bounded by `[image_gc]`, not by this loop.
+
+### `[buildkit]`
+
+Bounds the embedded BuildKit solver's on-disk build cache.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `gc_enabled` | boolean | `true` | Garbage-collect the build cache. `false` restores the old unbounded behavior. |
+| `gc_reserved_gb` | integer | `5` | Cache never collected, even when idle — the warm floor. |
+| `gc_max_used_gb` | integer | `25` | Hard ceiling; anything above it is collected regardless of age. |
+| `gc_min_free_gb` | integer | `20` | Collect whatever is needed to keep this much disk free, overriding the floor. Matches `[image_gc].min_free_gb`. |
+| `gc_keep_duration` | duration | `"168h"` (7d) | Age past which records are collected once usage exceeds the floor. |
+| `gc_ephemeral_keep_duration` | duration | `"48h"` | Age limit for cheaply reproducible records (local build contexts, `RUN --mount=cache` mounts, git checkouts). |
+| `gc_ephemeral_max_used_gb` | integer | `2` | Ceiling for those same records. |
+
+> **Why this table exists.** BuildKit only garbage-collects when its worker is given a GC policy — its controller is literally `if len(policy) > 0 { prune }`. ephemerd never supplied one, so every `docker build` in every CI job added cache records, snapshots and `containerd.io/gc.flat` leases to the shared `buildkit` containerd namespace that nothing ever released. A production node accumulated 76 image records, 302 snapshots and 481 leases — roughly 44 GB of a 116 GB disk — across 49 dead jobs over two and a half weeks, and that is what filled the disk until QEMU froze the VM.
+
+Separately, each job's `docker build` output is exported into that shared namespace under a name scoped by the job's unique ID (`build.ephemerd.local/<job-id>/<tag>`), so concurrent jobs cannot race on the same tag. Because the ID is never reused, those records are garbage the moment the job ends. They are removed at job teardown and swept periodically for jobs lost to a crash.
+
+### `[image_gc]`
+
+Disk-pressure-triggered container image garbage collection, covering the `buildkit` namespace, the main `ephemerd` runtime namespace, and the per-repo `ephemerd-dind-cache-*` namespaces.
+
+**Disk pressure is the trigger; least-recently-used is the order** — kubelet's model. Collection starts when a watermark is crossed and evicts LRU-first until a distinctly lower one is reached, then stops. Two watermarks rather than one line is what prevents thrashing at the boundary.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `true` | Run image garbage collection. |
+| `check_interval` | duration | `"60s"` | How often disk usage is sampled. One `statfs`/`GetDiskFreeSpaceExW` call — microseconds, never a directory walk. `"0"` disables the periodic sweep; the pre-pull check still runs. |
+| `high_watermark_percent` | float | `85` | Disk used-percentage at which a pass triggers. |
+| `low_watermark_percent` | float | `70` | Used-percentage a triggered pass evicts down to. |
+| `min_free_gb` | integer | `20` | Absolute free-space floor; triggers regardless of percentage. |
+| `target_free_gb` | integer | `2 x min_free_gb` | Free space a floor-triggered pass restores. |
+| `max_age` | duration | `"0"` (off) | Optional age backstop across every collected namespace. |
+
+**Two trigger arms, most conservative wins.** Neither is safe alone. 15% free of a 1 TB node is 150 GB and evicting there is pointless churn; 15% free of a 100 GB node is 15 GB, which three concurrent jobs writing ~5 GB of container layers each can consume between ticks. Size `min_free_gb` relative to `runner.max_concurrent` times the expected per-job writable layer.
+
+**Never evicted.** Images referenced by any existing container in any namespace; the node's configured runner images (`[runner].default_image`, every `[runner.images.<repo>]` entry, and each provider's `default_image_*`) — dropping one of those guarantees a re-pull on the very next job; and any live job's BuildKit export records, which no container references and so would otherwise look unused.
+
+**Trigger points.** The `check_interval` timer, and inline before pulling an image or creating a runner environment. The timer alone loses a race a single job can win: one multi-gigabyte toolchain pull can cross the high watermark well inside a 60s tick.
+
+**Failsafe.** If a pass evicts everything it is allowed to and usage is still above the high watermark, the remainder is live data, not cache. ephemerd logs that at ERROR with the numbers and then suppresses further passes for 30 minutes rather than spinning.
+
+**LRU key.** Eviction order comes from the `ephemerd.io/last-accessed` label, refreshed on pull, import and container start. Records pre-dating the label fall back to containerd's `UpdatedAt`, so a node upgrading into this feature sorts sanely instead of treating everything as never-used.
+
+**Orphan sweep.** The same timer runs a job-safe orphan sweep (leftover per-job runner-dir copies, job workdirs, and container snapshots with no owning container). This previously ran only at startup, so a long-lived daemon accumulated them for its entire uptime.
 
 ### `[metrics]`
 
