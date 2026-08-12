@@ -91,6 +91,7 @@ func main() {
 			doctorCmd(),
 			installCmd(),
 			uninstallCmd(),
+			restartHelperCmd(),
 		},
 	}
 

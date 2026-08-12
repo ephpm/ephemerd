@@ -1,10 +1,31 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
+
+	"github.com/ephpm/ephemerd/pkg/upgrade"
 )
+
+// serviceRestart restarts the service through the SCM directly: stop, WAIT
+// for STOPPED, then start.
+//
+// `ephemerd restart` used to issue `sc.exe stop` immediately followed by
+// `sc.exe start`, but `sc stop` only posts the control and returns — so the
+// start raced the stop and failed with ERROR_SERVICE_CANNOT_ACCEPT_CTRL
+// whenever the daemon took more than an instant to shut down. It drains jobs
+// and containerd on the way out, so it always does.
+func serviceRestart() error {
+	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	if err := upgrade.RestartService(context.Background(), "ephemerd", upgrade.RestartOptions{}, log); err != nil {
+		return fmt.Errorf("restarting ephemerd: %w", err)
+	}
+	fmt.Println("ephemerd restarted")
+	return nil
+}
 
 func serviceAction(action string) error {
 	out, err := exec.Command("sc.exe", action, "ephemerd").CombinedOutput()

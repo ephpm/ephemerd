@@ -446,6 +446,22 @@ func (s *Scheduler) bindContexts(ctx context.Context) {
 	s.mu.Unlock()
 }
 
+// shutdownCh returns a channel closed when the daemon starts going down
+// (runCtx cancelled by SIGTERM or by the Windows SCM stop handler). The
+// Upgrade RPC hands it to pkg/upgrade so the restart supervisor can tell
+// "the restart I asked for is taking effect" from "the restart never
+// happened" without racing a slow-but-healthy shutdown. Nil-safe: a
+// scheduler that was never Run reports a channel that never closes.
+func (s *Scheduler) shutdownCh() <-chan struct{} {
+	s.mu.Lock()
+	ctx := s.runCtx
+	s.mu.Unlock()
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Done()
+}
+
 // jobContext returns the context bounding a single job's runtime, derived
 // from jobsCtx (not the signal-scoped run context — see bindContexts) and
 // capped at JobTimeout when configured. Every provisioning path uses this

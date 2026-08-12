@@ -5,6 +5,10 @@ import (
 	"os/exec"
 )
 
+// serviceRestart restarts the unit. systemd's own restart verb already
+// sequences stop-then-start correctly, so there is nothing to add here.
+func serviceRestart() error { return serviceAction("restart") }
+
 func serviceAction(action string) error {
 	out, err := exec.Command("systemctl", action, "ephemerd").CombinedOutput()
 	if err != nil {
