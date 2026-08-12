@@ -341,7 +341,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		// absent entirely), so a VM that stayed up for days accumulated
 		// every image it ever pulled.
 		if interval := cfg.ImageGC.ImageGCCheckInterval(); interval > 0 {
-			go runNodeDiskSweeper(ctx, imageGC, rt, ctrdClient, interval, log)
+			go runNodeDiskSweeper(ctx, imageGC, rt, ctrdClient, interval, newBrokenChainRepair(cfg), log)
 		}
 
 		// Clean up dind per-job namespaces left by jobs that didn't shut
@@ -555,7 +555,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	// flight (it deletes every container in the namespace); SweepOrphans is
 	// the job-safe subset and runs on this timer instead.
 	if interval := cfg.ImageGC.ImageGCCheckInterval(); interval > 0 {
-		go runNodeDiskSweeper(ctx, imageGC, rt, ctrdClient, interval, log)
+		go runNodeDiskSweeper(ctx, imageGC, rt, ctrdClient, interval, newBrokenChainRepair(cfg), log)
 	}
 
 	// Host-local per-container sampler registry. Only used for native
@@ -987,7 +987,7 @@ func buildkitGCConfig(cfg *config.Config) buildkit.GCConfig {
 //
 // Errors from one pass are logged and the loop continues; the next tick
 // retries.
-func runNodeDiskSweeper(ctx context.Context, gc *imagegc.Collector, rt *runtime.Runtime, c *containerdclient.Client, interval time.Duration, log *slog.Logger) {
+func runNodeDiskSweeper(ctx context.Context, gc *imagegc.Collector, rt *runtime.Runtime, c *containerdclient.Client, interval time.Duration, repair brokenChainRepair, log *slog.Logger) {
 	log = log.With("component", "node-disk-sweeper", "interval", interval)
 	log.Info("starting node disk sweeper")
 	ticker := time.NewTicker(interval)
@@ -1005,6 +1005,11 @@ func runNodeDiskSweeper(ctx context.Context, gc *imagegc.Collector, rt *runtime.
 				}
 			}
 			sweepDeadBuildRecords(passCtx, c, log)
+			// Correctness repair, not capacity policy — so it runs on
+			// every tick whether or not image GC is enabled, and before
+			// the collector, which would otherwise plan against records
+			// that cannot be used anyway. See #149.
+			dind.SweepBrokenImageChains(passCtx, c, repair.namespaces, repair.snapshotter, repair.pinned, log)
 			if gc != nil {
 				if _, err := gc.Collect(passCtx); err != nil {
 					log.Warn("image gc pass failed", "error", err)
@@ -1012,6 +1017,28 @@ func runNodeDiskSweeper(ctx context.Context, gc *imagegc.Collector, rt *runtime.
 			}
 			cancel()
 		}
+	}
+}
+
+// brokenChainRepair parameterises the sweeper's image ↔ snapshot repair pass:
+// which namespaces to scan, which snapshotter holds the layers, and which
+// refs must never be evicted even when their chain looks broken.
+type brokenChainRepair struct {
+	namespaces  []string
+	snapshotter string
+	pinned      []string
+}
+
+// newBrokenChainRepair describes the repair pass for this node.
+//
+// Scope matches the image GC's, plus the per-job dind namespaces: a job
+// namespace that outlives its job (one did on the production node — see #149)
+// can hold broken records just as easily, and nothing else revisits it.
+func newBrokenChainRepair(cfg *config.Config) brokenChainRepair {
+	return brokenChainRepair{
+		namespaces:  []string{runtime.Namespace, buildkitNamespace},
+		snapshotter: buildkit.DefaultSnapshotter(),
+		pinned:      cfg.PinnedRunnerImages(),
 	}
 }
 

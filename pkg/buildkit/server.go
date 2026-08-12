@@ -17,7 +17,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/ephpm/ephemerd/pkg/networking"
 	"github.com/moby/buildkit/cache/remotecache"
@@ -82,7 +84,27 @@ type Config struct {
 // Client() method; the client dials an in-process bufconn listener that the
 // Controller serves on, so no network socket is exposed.
 type Server struct {
-	cfg        Config
+	cfg Config
+
+	// healer remembers which dangling snapshots have already been repaired
+	// and how hard, so a recurrence escalates instead of looping. See
+	// heal.go.
+	healer Healer
+
+	// mu guards core. Readers (Build, Client, Prune) hold it only long
+	// enough to take the pointer, never for the duration of a solve: a
+	// Rebuild must not have to wait out a multi-hour build before it can
+	// replace a store it already knows is corrupt.
+	mu   sync.RWMutex
+	core *serverCore
+
+	once sync.Once
+}
+
+// serverCore is everything that is discarded and rebuilt when the BuildKit
+// metadata store has to be reconstructed. Grouping it means Rebuild swaps one
+// pointer rather than mutating half a dozen fields under a lock.
+type serverCore struct {
 	controller *control.Controller
 	session    *session.Manager
 	workers    *worker.Controller
@@ -92,9 +114,18 @@ type Server struct {
 	grpcServ  *grpc.Server
 	grpcErrCh chan error
 
-	// stop is closed by Close to signal graceful shutdown to the Controller.
+	// stop is closed on shutdown to signal graceful stop to the Controller.
 	stop chan struct{}
-	once sync.Once
+}
+
+// close tears down one core. Safe to call on a core whose gRPC server has
+// already stopped.
+func (c *serverCore) close() {
+	if c == nil {
+		return
+	}
+	close(c.stop)
+	c.grpcServ.GracefulStop()
 }
 
 // NewServer constructs and initializes an embedded BuildKit server. The
@@ -117,6 +148,17 @@ func NewServer(ctx context.Context, cfg Config) (*Server, error) {
 		cfg.Log = slog.Default()
 	}
 
+	core, err := newCore(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{cfg: cfg, core: core}, nil
+}
+
+// newCore constructs the solver and everything under it against whatever is
+// currently on disk at cfg.DataDir. Split out of NewServer so Rebuild can run
+// it a second time after quarantining a corrupt metadata store.
+func newCore(ctx context.Context, cfg Config) (*serverCore, error) {
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return nil, fmt.Errorf("buildkit: create data dir: %w", err)
 	}
@@ -219,8 +261,7 @@ func NewServer(ctx context.Context, cfg Config) (*Server, error) {
 		close(grpcErrCh)
 	}()
 
-	return &Server{
-		cfg:        cfg,
+	return &serverCore{
 		controller: ctrl,
 		session:    sessMgr,
 		workers:    workerCtrl,
@@ -231,13 +272,109 @@ func NewServer(ctx context.Context, cfg Config) (*Server, error) {
 	}, nil
 }
 
+// current returns the live core. Callers take the pointer under the read lock
+// and then use it unlocked, so a concurrent Rebuild is never blocked by an
+// in-flight solve.
+func (s *Server) current() *serverCore {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.core
+}
+
+// DefaultSnapshotter is the containerd snapshotter this platform's BuildKit
+// worker uses when Config.Snapshotter is empty. Exported because the node's
+// image ↔ snapshot repair pass needs the same name to build the
+// `containerd.io/gc.ref.snapshot.<snapshotter>` label key, and it must agree
+// with the solver even on nodes where BuildKit never started.
+func DefaultSnapshotter() string { return defaultSnapshotter() }
+
+// Healer exposes the per-daemon repair-escalation state. See heal.go.
+func (s *Server) Healer() *Healer { return &s.healer }
+
+// Snapshotter reports the containerd snapshotter the solver's worker uses.
+// Callers repairing the image ↔ snapshot relationship need it to build the
+// `containerd.io/gc.ref.snapshot.<snapshotter>` label key.
+func (s *Server) Snapshotter() string { return s.cfg.Snapshotter }
+
+// DataDir reports where BuildKit's cache metadata lives.
+func (s *Server) DataDir() string { return s.cfg.DataDir }
+
+// PruneAll drops every build-cache record not currently in use — the
+// equivalent of `docker builder prune -af`, but executed against the SHARED
+// host-side store rather than the namespaced view a job can reach.
+//
+// This is the cheap rung of the repair ladder: a stale record naming a
+// snapshot containerd no longer has is unreferenced by definition (the build
+// that would have referenced it just failed), so a full prune clears it.
+func (s *Server) PruneAll(ctx context.Context) (int64, error) {
+	return s.Prune(ctx, client.PruneInfo{All: true})
+}
+
+// Rebuild discards BuildKit's cache metadata store and reconstructs the
+// solver against the live containerd.
+//
+// WHEN THIS IS THE RIGHT ANSWER. BuildKit's bbolt store is a DERIVED view of
+// containerd: every record in it describes a snapshot and content that
+// containerd owns. When the two disagree and a prune cannot reconcile them,
+// the derived view is the one that is wrong, and there is no supported API to
+// delete one bad record from it. Throwing the whole store away costs cache
+// warmth — the next few builds re-pull and re-run their layers — and costs
+// nothing else, because containerd still holds every blob and snapshot that is
+// genuinely live. That is a far better trade than the status quo, which is
+// every build on the node failing until someone logs in and does this by hand.
+//
+// The old store is MOVED, not deleted, so the corruption can still be
+// examined; one previous quarantine is kept and older ones are removed, so a
+// node that keeps tripping this cannot fill its disk with evidence.
+//
+// In-flight solves against the old controller fail when its gRPC server stops.
+// They were failing anyway — that is why we are here.
+func (s *Server) Rebuild(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	old := s.core
+	if old != nil {
+		old.close()
+	}
+
+	quarantine, err := quarantineDir(s.cfg.DataDir, time.Now())
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(s.cfg.DataDir, quarantine); err != nil {
+		return fmt.Errorf("buildkit: quarantine metadata store %s: %w", s.cfg.DataDir, err)
+	}
+	pruneOldQuarantines(filepath.Dir(s.cfg.DataDir), quarantine, s.cfg.Log)
+
+	core, err := newCore(ctx, s.cfg)
+	if err != nil {
+		// Put the old store back: a broken cache is still better than no
+		// solver at all, and the next build will retry the repair.
+		if rerr := os.Rename(quarantine, s.cfg.DataDir); rerr != nil {
+			s.cfg.Log.Error("buildkit: could not restore the quarantined metadata store",
+				"quarantine", quarantine, "data_dir", s.cfg.DataDir, "error", rerr)
+		}
+		return fmt.Errorf("buildkit: rebuild solver: %w", err)
+	}
+	s.core = core
+
+	s.cfg.Log.Warn("buildkit: metadata store rebuilt after a dangling-snapshot failure; the build cache is cold",
+		"data_dir", s.cfg.DataDir, "quarantined_to", quarantine)
+	return nil
+}
+
 // Client returns a buildkit client.Client connected to the in-process
 // Controller via bufconn. The returned Client is not safe for concurrent
 // use across different callers — construct one per request/goroutine and
 // Close it when done.
 func (s *Server) Client(ctx context.Context) (*client.Client, error) {
+	core := s.current()
+	if core == nil {
+		return nil, fmt.Errorf("buildkit: server is closed")
+	}
 	dialer := func(ctx context.Context, _ string) (net.Conn, error) {
-		return s.bufnet.DialContext(ctx)
+		return core.bufnet.DialContext(ctx)
 	}
 	return client.New(ctx, "ephemerd-buildkit",
 		client.WithContextDialer(dialer),
@@ -248,7 +385,10 @@ func (s *Server) Client(ctx context.Context) (*client.Client, error) {
 // SessionManager exposes the session manager so callers (pkg/dind) can
 // hijack incoming POST /session HTTP streams into session gRPC.
 func (s *Server) SessionManager() *session.Manager {
-	return s.session
+	if core := s.current(); core != nil {
+		return core.session
+	}
+	return nil
 }
 
 // ContainerdNamespace reports the containerd namespace build results and
@@ -329,10 +469,51 @@ func (f pruneOptionFunc) SetPruneOption(pi *client.PruneInfo) { f(pi) }
 // gRPC server, and releases worker resources. Safe to call multiple times.
 func (s *Server) Close() error {
 	s.once.Do(func() {
-		close(s.stop)
-		s.grpcServ.GracefulStop()
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.core.close()
+		s.core = nil
 	})
 	return nil
+}
+
+// quarantineDirPrefix names the directories Rebuild moves a corrupt BuildKit
+// metadata store to. Kept adjacent to the store, not inside it, so the fresh
+// store starts empty.
+const quarantineDirPrefix = "_quarantine-buildkit-"
+
+// quarantineDir picks the path to move a corrupt store to. Pure apart from
+// the caller-supplied clock, so the naming is testable.
+func quarantineDir(dataDir string, now time.Time) (string, error) {
+	base := filepath.Base(dataDir)
+	parent := filepath.Dir(dataDir)
+	if base == "." || base == string(filepath.Separator) || parent == dataDir {
+		return "", fmt.Errorf("buildkit: refusing to quarantine implausible data dir %q", dataDir)
+	}
+	return filepath.Join(parent, fmt.Sprintf("%s%d", quarantineDirPrefix, now.UTC().Unix())), nil
+}
+
+// pruneOldQuarantines removes every quarantine directory in parent except
+// keep. A node that trips this repeatedly must not accumulate copies of a
+// broken store — the disk pressure that follows would be a worse bug than the
+// one being repaired.
+func pruneOldQuarantines(parent, keep string, log *slog.Logger) {
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), quarantineDirPrefix) {
+			continue
+		}
+		path := filepath.Join(parent, e.Name())
+		if path == keep {
+			continue
+		}
+		if err := os.RemoveAll(path); err != nil && log != nil {
+			log.Warn("buildkit: removing a previous quarantined store failed", "path", path, "error", err)
+		}
+	}
 }
 
 // Build performs a Docker-style build using the embedded BuildKit solver.

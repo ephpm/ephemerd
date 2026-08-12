@@ -382,6 +382,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.handleVersion(w, r)
 	case path == "/info":
 		s.handleInfo(w, r)
+	case path == "/system/df" && r.Method == http.MethodGet:
+		s.handleSystemDF(w, r)
 	case path == "/images/json" && r.Method == http.MethodGet:
 		s.handleImageList(w, r)
 	case path == "/images/create" && r.Method == http.MethodPost:
