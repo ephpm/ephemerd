@@ -40,9 +40,9 @@ func TestGCConfig_PruneInfo(t *testing.T) {
 			wantRules: 0,
 		},
 		{
-			name:      "full config renders the ephemeral rule then the overall rule",
+			name:      "full config renders ephemeral, age, then the unconditional size bound",
 			cfg:       full,
-			wantRules: 2,
+			wantRules: 3,
 			check: func(t *testing.T, rules []pruneRule) {
 				if !reflect.DeepEqual(rules[0].filter, ephemeralFilters) {
 					t.Errorf("rule 0 filter = %v, want the ephemeral type filter", rules[0].filter)
@@ -59,15 +59,43 @@ func TestGCConfig_PruneInfo(t *testing.T) {
 				if rules[1].keep != 7*24*time.Hour {
 					t.Errorf("rule 1 keep = %v, want 168h", rules[1].keep)
 				}
+				// The whole point of the third rule: BuildKit treats
+				// KeepDuration as an exemption, so a rule carrying one
+				// cannot enforce a ceiling on recent records.
+				if rules[2].keep != 0 {
+					t.Errorf("rule 2 keep = %v, want 0 — a KeepDuration here exempts every recent record from the ceiling", rules[2].keep)
+				}
+				if len(rules[2].filter) != 0 {
+					t.Errorf("rule 2 filter = %v, want unfiltered", rules[2].filter)
+				}
+				if rules[2].reserved != 5*gib || rules[2].maxUsed != 25*gib || rules[2].minFree != 20*gib {
+					t.Errorf("rule 2 bounds = %d/%d/%d, want 5/25/20 GiB", rules[2].reserved, rules[2].maxUsed, rules[2].minFree)
+				}
 			},
 		},
 		{
 			name:      "only the overall arm configured",
 			cfg:       GCConfig{MaxUsedBytes: 10 * gib},
-			wantRules: 1,
+			wantRules: 2,
 			check: func(t *testing.T, rules []pruneRule) {
 				if len(rules[0].filter) != 0 {
 					t.Errorf("expected the unfiltered rule, got filter %v", rules[0].filter)
+				}
+				if rules[1].keep != 0 || rules[1].maxUsed != 10*gib {
+					t.Errorf("rule 1 = keep %v maxUsed %d, want the unconditional 10 GiB bound", rules[1].keep, rules[1].maxUsed)
+				}
+			},
+		},
+		{
+			// An age-only policy has nothing to bound, so it must NOT
+			// grow a size rule with all-zero bounds (which BuildKit reads
+			// as "no cap" and would make the rule a no-op anyway).
+			name:      "keep duration alone renders one rule, no size bound",
+			cfg:       GCConfig{KeepDuration: time.Hour},
+			wantRules: 1,
+			check: func(t *testing.T, rules []pruneRule) {
+				if rules[0].keep != time.Hour {
+					t.Errorf("rule 0 keep = %v, want 1h", rules[0].keep)
 				}
 			},
 		},
@@ -86,7 +114,7 @@ func TestGCConfig_PruneInfo(t *testing.T) {
 			// only when the node is actually tight.
 			name:      "min free alone is a valid policy",
 			cfg:       GCConfig{MinFreeBytes: 20 * gib},
-			wantRules: 1,
+			wantRules: 2,
 		},
 	}
 

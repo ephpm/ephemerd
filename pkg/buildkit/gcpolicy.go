@@ -70,9 +70,27 @@ var ephemeralFilters = []string{"type==source.local,type==exec.cachemount,type==
 // is exactly the "never collect" state that caused the leak; callers that
 // want a bounded cache must supply a non-zero bound.
 //
-// Rules are evaluated in order and the two are complementary: the first
-// keeps ephemeral records from ever becoming a large share of the cache,
-// the second bounds the cache as a whole.
+// Rules are evaluated in order and are complementary: the first keeps
+// ephemeral records from ever becoming a large share of the cache, the
+// second ages records out, and the third is the unconditional size bound.
+//
+// THE THIRD RULE IS LOAD-BEARING AND MUST NOT CARRY A KeepDuration.
+// BuildKit applies KeepDuration as an absolute exemption within a rule —
+// cache/manager.go's pruneOnce skips every record whose lastUsedAt is
+// newer than now-KeepDuration BEFORE it looks at MaxUsedSpace. So a rule
+// that sets both an age and a size bound does not mean "collect anything
+// over the cap, and additionally anything older than the age"; it means
+// "collect only records older than the age, and only once over the cap".
+// With the default 168h that leaves a week's worth of build cache
+// completely exempt from the ceiling, which on a node that rebuilds the
+// same images several times a day is indistinguishable from having no
+// ceiling at all. Measured in a Linux VM against a real containerd +
+// BuildKit: 18 builds of a unique 200 MB layer with reserved=1 GiB,
+// max_used=2 GiB and keep_duration=168h grew the cache to 4.4 GB and
+// climbing; the identical workload with the size bound applied
+// unconditionally settled at 2.1 GB. BuildKit's own DefaultGCPolicy has
+// the same shape — its last two rules carry no KeepDuration for exactly
+// this reason.
 func (g GCConfig) PruneInfo() []bkclient.PruneInfo {
 	if g.Disabled {
 		return nil
@@ -88,9 +106,19 @@ func (g GCConfig) PruneInfo() []bkclient.PruneInfo {
 		})
 	}
 
-	if g.ReservedBytes > 0 || g.MaxUsedBytes > 0 || g.MinFreeBytes > 0 || g.KeepDuration > 0 {
+	sized := g.ReservedBytes > 0 || g.MaxUsedBytes > 0 || g.MinFreeBytes > 0
+
+	if sized || g.KeepDuration > 0 {
 		out = append(out, bkclient.PruneInfo{
 			KeepDuration:  g.KeepDuration,
+			ReservedSpace: g.ReservedBytes,
+			MaxUsedSpace:  g.MaxUsedBytes,
+			MinFreeSpace:  g.MinFreeBytes,
+		})
+	}
+
+	if sized {
+		out = append(out, bkclient.PruneInfo{
 			ReservedSpace: g.ReservedBytes,
 			MaxUsedSpace:  g.MaxUsedBytes,
 			MinFreeSpace:  g.MinFreeBytes,
