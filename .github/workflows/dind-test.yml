@@ -57,9 +57,11 @@ jobs:
       - name: Write a Dockerfile with a package-install stage
         run: |
           mkdir -p /tmp/ctx149
+          # debian:12-slim + a plain apt-get stage, mirroring the shape of the
+          # ephpm release build that #149 was filed against.
           cat > /tmp/ctx149/Dockerfile <<'DOCKERFILE'
-          FROM alpine:3.20
-          RUN apk add --no-cache curl
+          FROM debian:12-slim
+          RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
           RUN echo "ephemerd-149" > /marker
           DOCKERFILE
 
