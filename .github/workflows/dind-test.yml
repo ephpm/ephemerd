@@ -1,10 +1,20 @@
 name: dind-test
 on:
   workflow_dispatch:
+    inputs:
+      only:
+        # Running one job at a time matters when investigating the shared
+        # BuildKit store: three same-label jobs make the scheduler retire and
+        # re-dispatch runners underneath a long build, which is indistinguishable
+        # from the build itself failing.
+        description: "Run one job in isolation (docker-ping, docker-cli, docker-build). Empty runs all."
+        required: false
+        default: ""
 
 jobs:
   docker-ping:
     runs-on: [self-hosted, linux, x64]
+    if: inputs.only == '' || inputs.only == 'docker-ping'
     steps:
       - name: Check docker socket exists
         run: test -S /var/run/docker.sock && echo "docker.sock exists"
@@ -26,6 +36,7 @@ jobs:
 
   docker-cli:
     runs-on: [self-hosted, linux, x64]
+    if: inputs.only == '' || inputs.only == 'docker-cli'
     steps:
       - name: Install Docker CLI
         run: |
@@ -49,6 +60,7 @@ jobs:
   # when a build resolves a layer through BuildKit's own cache metadata.
   docker-build:
     runs-on: [self-hosted, linux, x64]
+    if: inputs.only == '' || inputs.only == 'docker-build'
     steps:
       - name: Install Docker CLI
         run: |
