@@ -29,6 +29,11 @@ type fakeDrainer struct {
 
 func (f *fakeDrainer) Cordon() int   { atomic.AddInt32(&f.cordoned, 1); return f.ActiveJobs() }
 func (f *fakeDrainer) Uncordon() int { atomic.AddInt32(&f.uncordoned, 1); return 0 }
+
+// wasCordoned and uncordonCount read the counters safely from tests whose
+// assertions race the restart supervisor's goroutine.
+func (f *fakeDrainer) wasCordoned() bool  { return atomic.LoadInt32(&f.cordoned) > 0 }
+func (f *fakeDrainer) uncordonCount() int { return int(atomic.LoadInt32(&f.uncordoned)) }
 func (f *fakeDrainer) ActiveJobs() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

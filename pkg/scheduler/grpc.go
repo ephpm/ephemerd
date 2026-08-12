@@ -113,6 +113,7 @@ func (c *controlServer) Upgrade(req *apiv1.UpgradeRequest, stream grpc.ServerStr
 		Force:           req.Force,
 		DrainTimeout:    time.Duration(req.DrainTimeoutSeconds) * time.Second,
 		Drainer:         c.sched,
+		Shutdown:        c.sched.shutdownCh(),
 		Log:             c.log.With("component", "upgrade"),
 	}
 	c.log.Info("upgrade requested via grpc", "target", req.TargetVersion, "no_drain", req.NoDrain, "force", req.Force)

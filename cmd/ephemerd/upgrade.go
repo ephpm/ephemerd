@@ -53,8 +53,14 @@ func upgradeCmd() *cli.Command {
 				Usage: "give up if running jobs don't finish within this long (upgrade aborts, node stays on old binary)",
 			},
 			&cli.DurationFlag{
-				Name:  "restart-timeout",
-				Value: 3 * time.Minute,
+				Name: "restart-timeout",
+				// Longer than the daemon's own restart supervision (~3m: two
+				// attempts behind a 90s watchdog each), so by the time this
+				// gives up the daemon has already decided whether the restart
+				// landed and has un-cordoned itself if it did not. That makes
+				// the "accepting jobs" line in the failure message true rather
+				// than a snapshot taken mid-decision.
+				Value: 5 * time.Minute,
 				Usage: "how long to wait after RESTARTING for the new version to come up",
 			},
 		},
@@ -147,6 +153,7 @@ func pollForVersion(ctx context.Context, target string, timeout time.Duration) e
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
+	var last *apiv1.StatusResponse
 	for {
 		select {
 		case <-ctx.Done():
@@ -155,25 +162,73 @@ func pollForVersion(ctx context.Context, target string, timeout time.Duration) e
 			cc, err := dialControl(ctx)
 			if err != nil {
 				if time.Now().After(deadline) {
-					return fmt.Errorf("timed out waiting for daemon to come back up: %w", err)
+					return incompleteUpgradeError(target, timeout, nil, err)
 				}
 				continue
 			}
 			resp, err := cc.Status(ctx, &apiv1.StatusRequest{})
 			_ = cc.Close()
-			if err == nil && upgrade.SameVersion(resp.Version, target) {
-				fmt.Printf("Upgraded: daemon is running %s.\n", resp.Version)
-				return nil
+			if err == nil {
+				last = resp
+				if upgrade.SameVersion(resp.Version, target) {
+					fmt.Printf("Upgraded: daemon is running %s.\n", resp.Version)
+					return nil
+				}
 			}
 			if time.Now().After(deadline) {
-				got := "unknown"
-				if err == nil && resp.Version != "" {
-					got = resp.Version
-				}
-				return fmt.Errorf("timed out after %s waiting for %s (daemon reports %q); check `ephemerd status` and `ephemerd logs`", timeout, target, got)
+				return incompleteUpgradeError(target, timeout, last, err)
 			}
 		}
 	}
+}
+
+// incompleteUpgradeError spells out the state the node is actually in when
+// the restart never lands, because the previous message ("timed out ...
+// daemon reports v0.1.7") described the symptom and left the two facts that
+// matter unsaid: the binary on disk WAS replaced, and the node may or may not
+// still be taking jobs.
+//
+// It deliberately does NOT auto-roll-back. The new binary is the one thing
+// here that has been proven good — checksum-verified and `--version`-probed
+// before the swap — while the thing that failed is the service-manager
+// hand-off, which a rollback does not fix. Worse, rolling back races a
+// restart that may still be in flight: on the v0.1.8 incident the SCM stop
+// landed 6m34s after the swap, so an auto-rollback at the 3m mark would have
+// undone a restart that was about to succeed and left the node running old
+// code with a newer .old beside it. Leaving the verified binary staged means
+// the very next restart — automatic or manual — completes the upgrade. What
+// must never persist is the cordon, and the daemon now clears that itself.
+func incompleteUpgradeError(target string, timeout time.Duration, last *apiv1.StatusResponse, dialErr error) error {
+	running := "unreachable"
+	accepting := "UNKNOWN — the daemon is not answering the control socket"
+	if last != nil {
+		if last.Version != "" {
+			running = last.Version
+		} else {
+			running = "unknown"
+		}
+		if last.Draining {
+			accepting = "NO — the node is DRAINED and still running the old binary"
+		} else {
+			accepting = "yes — the node is accepting jobs on the old binary"
+		}
+	}
+	msg := fmt.Sprintf(`upgrade INCOMPLETE after %s
+
+  %s IS installed on disk (the previous binary was kept beside it as ephemerd.exe.old),
+  but the service did NOT restart into it.
+
+  daemon reports:  %s
+  accepting jobs:  %s
+
+  finish the upgrade:  %s
+  or roll back:        stop the service, restore the .old binary over the installed one, start it
+  then verify:         ephemerd status   (and ephemerd logs for why the restart stalled)`,
+		timeout, target, running, accepting, upgrade.ManualRestartHint())
+	if dialErr != nil && last == nil {
+		msg += fmt.Sprintf("\n\n  last control-socket error: %v", dialErr)
+	}
+	return errors.New(msg)
 }
 
 func printUpgradeProgress(p *apiv1.UpgradeProgress) {

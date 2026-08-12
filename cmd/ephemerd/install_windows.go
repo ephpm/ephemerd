@@ -32,11 +32,29 @@ func installService(binPath, dataDir string) error {
 		fmt.Printf("  warning: could not set service description: %s\n", string(out))
 	}
 
-	// Set recovery: restart on failure after 5 seconds
+	// Set recovery: restart on failure, backing off 5s → 30s → 60s. The SCM
+	// repeats the LAST action for every subsequent failure until the reset
+	// window elapses, so this retries forever at one minute rather than
+	// giving up after three tries.
 	out, err = exec.Command("sc.exe", "failure", "ephemerd",
-		"reset=", "86400", "actions=", "restart/5000/restart/5000/restart/5000").CombinedOutput()
+		"reset=", "86400", "actions=", "restart/5000/restart/30000/restart/60000").CombinedOutput()
 	if err != nil {
 		fmt.Printf("  warning: could not set recovery options: %s\n", string(out))
+	}
+
+	// Apply those recovery actions to CLEAN stops that report a non-zero exit
+	// code too, not only to a process that dies without telling the SCM.
+	//
+	// This is why the node came back from a hard reset with the service
+	// Stopped despite start=delayed-auto: when serve() fails at boot (the
+	// Hyper-V/containerd stack is commonly not ready yet on a cold start) the
+	// service handler reports SERVICE_STOPPED with exit code 1, which the SCM
+	// treats by default as a deliberate stop and does not recover from. With
+	// the flag set, that same exit re-triggers the restart ladder above and
+	// the node heals itself instead of sitting idle until someone notices.
+	out, err = exec.Command("sc.exe", "failureflag", "ephemerd", "1").CombinedOutput()
+	if err != nil {
+		fmt.Printf("  warning: could not set recovery failure flag: %s\n", string(out))
 	}
 
 	// Create env file equivalent — Windows uses the system environment
