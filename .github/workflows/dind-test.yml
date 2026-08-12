@@ -42,3 +42,29 @@ jobs:
 
       - name: Docker images shows alpine
         run: docker images | grep alpine
+
+  # Exercises the path that broke in #149: a real `docker build` against the
+  # SHARED host-side BuildKit store. Kept in the dind smoke workflow because
+  # the failure it guards against is invisible to unit tests — it only appears
+  # when a build resolves a layer through BuildKit's own cache metadata.
+  docker-build:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Install Docker CLI
+        run: |
+          apk add --no-cache docker-cli || apt-get update && apt-get install -y docker.io || true
+
+      - name: Write a Dockerfile with a package-install stage
+        run: |
+          mkdir -p /tmp/ctx149
+          cat > /tmp/ctx149/Dockerfile <<'DOCKERFILE'
+          FROM alpine:3.20
+          RUN apk add --no-cache curl
+          RUN echo "ephemerd-149" > /marker
+          DOCKERFILE
+
+      - name: docker build
+        run: docker build -t ephemerd-149-check:latest /tmp/ctx149
+
+      - name: docker system df
+        run: docker system df
