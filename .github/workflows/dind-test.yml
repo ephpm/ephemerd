@@ -63,8 +63,14 @@ jobs:
           RUN echo "ephemerd-149" > /marker
           DOCKERFILE
 
+      # DOCKER_BUILDKIT=0 forces the classic POST /build path, which is what
+      # ephemerd implements — the request lands on its own embedded BuildKit
+      # solver and the SHARED host-side store. Left to itself the CLI hands
+      # the build to buildx's docker-container driver, which tries to launch a
+      # privileged buildkit container (denied on this host) and would never
+      # touch the store this job is here to exercise.
       - name: docker build
-        run: docker build -t ephemerd-149-check:latest /tmp/ctx149
+        run: DOCKER_BUILDKIT=0 docker build -t ephemerd-149-check:latest /tmp/ctx149
 
       - name: docker system df
         run: docker system df
