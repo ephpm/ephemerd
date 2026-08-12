@@ -26,6 +26,13 @@ linters:
         linters:
           - errorlint
           - bodyclose
+      # The cargo proxy tests route every request through a get() helper that
+      # reads the body and closes it in a defer. bodyclose tracks the
+      # *http.Response the helper returns, not what the helper does with it,
+      # so it flags all 30-odd call sites. Same reasoning as localtunnel above.
+      - path: "pkg/proxies/cargo/.*_test\\.go"
+        linters:
+          - bodyclose
       - path: "api/v1"
         linters:
           - errorlint
