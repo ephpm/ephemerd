@@ -61,6 +61,7 @@ Each job gets its own fake daemon instance (`pkg/dind/dind.go`). The daemon main
 | `GET /info` | Returns minimal system info with image count | Done |
 | `GET /images/json` | Lists images from the in-memory store | Done |
 | `POST /images/create` | Pulls images via containerd, stores in memory map | Done |
+| `GET /system/df` | Reports the job's images and containers; `BuildCache` is an explicit empty set (the shared host-side cache is out of a job's reach by design) | Done |
 
 ### Planned Endpoints
 
@@ -165,6 +166,60 @@ After eviction, containerd's content GC reclaims any blob no longer referenced b
 
 Image records pre-dating the `last-accessed` label fall back to the record's `UpdatedAt` timestamp on first prune, so introducing this feature doesn't nuke pre-existing caches.
 
+### Repairing a poisoned shared build store
+
+BuildKit keeps a **second source of truth** about containerd snapshots. Its bbolt
+metadata under `<data_dir>/buildkit` records, per cache record, the containerd
+snapshot key backing it — the record's own ID for exec layers, and the layer
+**chain ID** for pulled layers, which is the same key space containerd's image
+unpacker uses. On the next build BuildKit hands that key straight to
+`Snapshotter.Prepare` as the parent without checking it exists.
+
+So if a snapshot is removed from containerd *behind BuildKit's back* — `ctr -n
+buildkit snapshots rm` during an incident, a restored containerd data dir, a
+crash between a lease delete and a metadata clear — every subsequent build fails
+identically and forever with:
+
+```
+failed to solve: failed to prepare <id>: parent snapshot <id> does not exist: not found
+```
+
+Nothing a job can do fixes this. `docker builder prune` only reaches the job's
+namespaced view, images in the shared namespace cannot be evicted from a job by
+design, and the store lives on the host. On the production Linux runner this
+failed six consecutive release attempts until someone logged into the node
+(#149).
+
+Three mechanisms now make that failure self-limiting:
+
+1. **Exports pin their own layers.** `POST /build` sets `unpack=true` on the
+   image export, which is what makes BuildKit write the
+   `containerd.io/gc.ref.snapshot.<snapshotter>` label onto the config blob. That
+   label is the *only* edge containerd's GC follows from an image record to its
+   layers. Without it — the previous behaviour — an exported record's layers were
+   pinned by nothing but BuildKit's cache leases, so once BuildKit had a GC
+   policy those leases could be collected and leave a resolvable image record
+   with no rootfs. Unpacking is near-free straight after a build: containerd's
+   `rootfs.ApplyLayer` returns early for any chain ID the snapshotter already has.
+
+2. **Auto-heal with one retry.** When a solve fails with the dangling-snapshot
+   signature, ephemerd repairs the shared store host-side and re-runs the build
+   once, so the job that discovered the problem is the one that gets to succeed.
+   The repair escalates per snapshot key: first evict any image record naming the
+   missing chain plus a full `PruneAll` of the shared build cache; if the same key
+   comes back, quarantine `<data_dir>/buildkit` and rebuild the solver against the
+   live containerd; if it comes back again, fail loudly rather than loop. The
+   quarantined store is moved, not deleted, and only the most recent one is kept.
+
+3. **Background sweep.** The node disk sweeper walks image records on every tick,
+   follows each one's `gc.ref.snapshot` label and evicts records whose chain the
+   snapshotter no longer has — a broken record is worse than no record, because
+   its presence is what stops the next pull fetching a clean copy. This runs
+   whether or not `[image_gc]` is enabled: it is a correctness repair, not a
+   capacity policy, and a node with GC turned off is exactly the node most likely
+   to be carrying a broken store. Pinned runner images and images referenced by a
+   live container are reported rather than evicted.
+
 ## Enabling
 
 Enable with `dind.enabled = true` in config or the `--dind` flag on `serve`:
@@ -184,6 +239,10 @@ Enable with `dind.enabled = true` in config or the `--dind` flag on `serve`:
 | `pkg/dind/containers.go` | Container lifecycle, `last-accessed` refresh on container-create |
 | `pkg/dind/cleanup.go` | Per-job namespace cleanup (containers, images, leases, snapshots leaf-first, content, namespace) + boot-time stale sweep |
 | `pkg/dind/cache.go` | Per-repo cache namespace name derivation + sanitization, mirror helper, last-accessed refresh, periodic prune |
+| `pkg/dind/buildheal.go` | Detects a poisoned shared build store, repairs it and retries the build; background broken-chain sweep |
+| `pkg/dind/systemdf.go` | `GET /system/df` |
+| `pkg/buildkit/heal.go` | Dangling-snapshot error signature + the repair escalation ladder (pure) |
+| `pkg/imagegc/refs.go` | Image record → snapshot chain resolution and broken-chain planning |
 | `pkg/dind/dind_test.go` | Tests for health and image endpoints |
 | `pkg/dind/cleanup_test.go` | Tests covering full namespace teardown + stale-sweep prefix filter |
 | `pkg/dind/cache_test.go` | Tests covering cross-provider isolation, sanitization invariants, mirror + refresh + prune lifecycle |
