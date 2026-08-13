@@ -256,6 +256,36 @@ func (c *Client) RemoveRunner(ctx context.Context, repo string, runnerID int64) 
 	return nil
 }
 
+// RunnerBusy reports whether a self-hosted runner is currently executing
+// a job, from GitHub's own per-runner `busy` flag.
+//
+// Uses the org-level or repo-level API depending on configuration, the
+// same way RemoveRunner does — a JIT runner registered at the org level
+// is not addressable through the repo endpoint.
+//
+// A runner that has already deregistered itself (404) is reported as not
+// busy: an ephemeral runner removes itself after finishing its job, so
+// "gone" is the strongest possible evidence that nothing is running on
+// it. Every other error is returned to the caller, which must treat it as
+// "could not determine" rather than as idle.
+func (c *Client) RunnerBusy(ctx context.Context, repo string, runnerID int64) (bool, error) {
+	var runner *gh.Runner
+	var resp *gh.Response
+	var err error
+	if c.IsOrgLevel() {
+		runner, resp, err = c.client.Actions.GetOrganizationRunner(ctx, c.cfg.Owner, runnerID)
+	} else {
+		runner, resp, err = c.client.Actions.GetRunner(ctx, c.cfg.Owner, repo, runnerID)
+	}
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			return false, nil
+		}
+		return false, fmt.Errorf("reading runner %d: %w", runnerID, err)
+	}
+	return runner.GetBusy(), nil
+}
+
 // FetchJobImage fetches the workflow run's job definition and reads the
 // container image declared in the job's `container:` field. This requires an
 // extra API call per job but lets users specify the image directly in their

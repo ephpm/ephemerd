@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+
+	"github.com/ephpm/ephemerd/pkg/runnerbusy"
 )
 
 // serviceUserMu serializes service user creation across concurrent job starts.
@@ -404,6 +406,13 @@ func (r *Runner) Start(ctx context.Context) error {
 	)
 
 	return nil
+}
+
+// BusyState reports whether this runner is executing a job right now,
+// from the host's process table rather than from webhook history. The
+// scheduler uses it to veto teardown of a live job — see pkg/runnerbusy.
+func (r *Runner) BusyState(ctx context.Context) (runnerbusy.State, error) {
+	return runnerbusy.ProcessGroupBusy(ctx, r.pgid)
 }
 
 // Wait blocks until the runner process exits and returns its exit code.

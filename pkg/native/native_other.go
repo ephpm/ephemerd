@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+
+	"github.com/ephpm/ephemerd/pkg/runnerbusy"
 )
 
 // Runner is a stub on non-darwin platforms.
@@ -37,3 +39,8 @@ func (r *Runner) Wait() (int, error) {
 
 // Stop is a stub on non-darwin platforms.
 func (r *Runner) Stop() {}
+
+// BusyState is a stub on non-darwin platforms.
+func (r *Runner) BusyState(ctx context.Context) (runnerbusy.State, error) {
+	return runnerbusy.ProcessGroupBusy(ctx, 0)
+}
