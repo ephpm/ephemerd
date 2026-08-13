@@ -104,6 +104,9 @@ func (l *linuxNetworking) teardown(ctx context.Context, id string, netns string)
 	return nil
 }
 
+// hostAddr: no L2Bridge on Linux — the generic subnet derivation applies.
+func (l *linuxNetworking) hostAddr() string { return "" }
+
 func (l *linuxNetworking) cleanup() {
 	log := l.cfg.Log
 

@@ -51,3 +51,6 @@ func (d *darwinNetworking) removeFirewallRules() {}
 func (d *darwinNetworking) cleanup()             {}
 
 func cleanStaleBridge(_ *slog.Logger) {} // no-op on macOS
+
+// hostAddr: no L2Bridge on macOS — the generic subnet derivation applies.
+func (d *darwinNetworking) hostAddr() string { return "" }

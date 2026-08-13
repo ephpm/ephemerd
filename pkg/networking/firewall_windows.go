@@ -3,9 +3,7 @@
 package networking
 
 import (
-	"encoding/binary"
 	"fmt"
-	"net"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -299,7 +297,120 @@ func removeByPrefixScript() string {
 	)
 }
 
+// -------------------------------------------------------------------------
+// L2Bridge host-firewall backstop
+// -------------------------------------------------------------------------
+//
+// On the L2Bridge path the primary egress enforcement is the per-endpoint VFP
+// ACL ladder (buildL2BridgeEgressACLPolicies), which was proven on metal. The
+// Hyper-V firewall blocks installed for NAT are deliberately NOT reused there:
+// hyperVEgressRules subtracts the container subnet from every blocked range, and
+// on L2Bridge the container subnet IS the management LAN — the subtraction would
+// carve the management plane straight back out of the deny.
+//
+// What the host firewall CAN do here, and could not on NAT, is match on the
+// container's source address. #136 established that host MPSSVC rules cannot
+// filter NATed container egress, because the host sees that traffic post-NAT
+// with its own address as the source. L2Bridge does not NAT: a container's
+// packet reaches the host carrying the container's own pool address, as ordinary
+// inbound LAN traffic. So an INBOUND rule scoped remoteip=<ip_pool> matches
+// exactly the job containers and nothing else.
+//
+// That is used for one job: closing the control-plane ports back off after the
+// VFP ladder's host /32 allow opens the host (AllowHostAccess). The allow has to
+// be address-scoped — a port-scoped Switch ACL blackholes the entire VFP port —
+// so the port precision lives here instead.
+
+// l2BridgeControlPlaneRules returns the inbound host-firewall blocks for
+// container -> ephemerd control-plane traffic on the L2Bridge path: one rule per
+// control port, scoped to the host address on the bridged LAN and to the source
+// range containers are allocated from.
+//
+// Pure (no side effects) so the exact rule set is unit-testable without netsh.
+func l2BridgeControlPlaneRules(hostIP, ipPool string, controlPorts []int) []winFirewallRule {
+	if hostIP == "" || ipPool == "" {
+		return nil
+	}
+	rules := make([]winFirewallRule, 0, len(controlPorts))
+	for _, port := range controlPorts {
+		rules = append(rules, winFirewallRule{
+			name: fmt.Sprintf("%s-l2b-control-%d", firewallRulePrefix, port),
+			spec: []string{
+				"dir=in",
+				"action=block",
+				"protocol=TCP",
+				"localip=" + hostIP,
+				"localport=" + strconv.Itoa(port),
+				"remoteip=" + ipPool,
+				"profile=any",
+				"enable=yes",
+			},
+		})
+	}
+	return rules
+}
+
+// installL2BridgeFirewallRules programs the L2Bridge backstop. Best-effort like
+// the rest of installFirewallRules: the VFP ladder is the enforcement point and
+// a host that cannot program netsh must not fail daemon startup.
+func (w *windowsNetworking) installL2BridgeFirewallRules() error {
+	if w.plan == nil {
+		return nil
+	}
+	rules := l2BridgeControlPlaneRules(w.plan.HostIP, w.plan.PoolSpec, w.cfg.ControlPorts)
+	if len(rules) == 0 {
+		w.cfg.Log.Info("L2Bridge egress: no control ports to fence off at the host firewall")
+		return nil
+	}
+	for _, r := range rules {
+		_ = netsh(r.deleteArgs()...) // idempotent: clear any rule of this name first
+		w.cfg.Log.Info("adding L2Bridge control-plane firewall rule", "rule", r.name)
+		if err := netsh(r.addArgs()...); err != nil {
+			w.cfg.Log.Warn("failed to add L2Bridge control-plane firewall rule", "rule", r.name, "error", err)
+		}
+	}
+	w.cfg.Log.Info("L2Bridge control-plane firewall rules installed", "rules", len(rules))
+	return nil
+}
+
+// removeL2BridgeFirewallRules deletes the backstop rules by name.
+func (w *windowsNetworking) removeL2BridgeFirewallRules() {
+	if w.plan == nil {
+		return
+	}
+	for _, r := range l2BridgeControlPlaneRules(w.plan.HostIP, w.plan.PoolSpec, w.cfg.ControlPorts) {
+		if err := netsh(r.deleteArgs()...); err != nil {
+			w.cfg.Log.Debug("failed to remove L2Bridge control-plane firewall rule", "rule", r.name, "error", err)
+		}
+	}
+}
+
+// defaultGatewayForAdapter returns the IPv4 default-route next hop reachable via
+// the named adapter, used to fill in network.gateway when the operator has not
+// pinned it. The lowest-metric route wins, matching what Windows itself would
+// pick. Returns an empty string (no error) when the adapter has no default
+// route, which the caller turns into a "set network.gateway" message.
+func defaultGatewayForAdapter(name string) (string, error) {
+	out, err := powershellOutput(fmt.Sprintf(
+		"(Get-NetRoute -InterfaceAlias %s -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue "+
+			"| Sort-Object -Property RouteMetric | Select-Object -First 1).NextHop",
+		psQuote(name),
+	))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
 func (w *windowsNetworking) installFirewallRules() error {
+	// L2Bridge: the VFP ACL ladder is the enforcement point. Installing the NAT
+	// Hyper-V/netsh rule set here would be worse than useless — it is scoped to
+	// the 10.88/16 NAT subnet (matches nothing) and its subtract-the-container-
+	// subnet logic would carve the management LAN out of the deny.
+	if w.cfg.L2BridgeEgress {
+		return w.installL2BridgeFirewallRules()
+	}
+
 	// Degrade gracefully at every step: a host that cannot program the
 	// Hyper-V firewall must never fail daemon startup. It falls back to the
 	// netsh host-firewall rules (weaker, but better than nothing on builds
@@ -356,9 +467,10 @@ func (w *windowsNetworking) installFirewallRules() error {
 }
 
 func (w *windowsNetworking) removeFirewallRules() {
-	// Always attempt to remove the netsh fallback rules too — harmless if they
-	// were never installed — so a host that switched paths between runs does
-	// not leak the other path's rules.
+	// Always attempt to remove every rule set ephemerd can install — harmless
+	// if a given one was never installed — so a host that switched paths
+	// between runs does not leak the other path's rules.
+	w.removeL2BridgeFirewallRules()
 	w.removeNetshFirewallRules()
 
 	if !hyperVFirewallAvailable() {
@@ -490,27 +602,15 @@ func subtractCIDR(cidr, exclude string) ([]string, error) {
 
 // v4Range returns the first and last address of an IPv4 CIDR as uint32.
 func v4Range(cidr string) (lo, hi uint32, err error) {
-	_, ipnet, err := net.ParseCIDR(cidr)
+	r, _, err := cidrRange(cidr)
 	if err != nil {
 		return 0, 0, fmt.Errorf("parsing %s: %w", cidr, err)
 	}
-	ip4 := ipnet.IP.To4()
-	if ip4 == nil {
-		return 0, 0, fmt.Errorf("parsing %s: not an IPv4 CIDR", cidr)
-	}
-	ones, bits := ipnet.Mask.Size()
-	if bits != 32 {
-		return 0, 0, fmt.Errorf("parsing %s: not an IPv4 mask", cidr)
-	}
-	lo = binary.BigEndian.Uint32(ip4)
-	hi = lo | (1<<(32-ones) - 1)
-	return lo, hi, nil
+	return r.lo, r.hi, nil
 }
 
 // u32ToIP renders a uint32 back to dotted-quad form.
-func u32ToIP(v uint32) string {
-	return net.IPv4(byte(v>>24), byte(v>>16), byte(v>>8), byte(v)).String()
-}
+func u32ToIP(v uint32) string { return u32ToIPv4(v) }
 
 func (w *windowsNetworking) installNetshFirewallRules() error {
 	rules, err := hostFirewallRules(DefaultSubnet, defaultGateway, w.cfg.ControlPorts)

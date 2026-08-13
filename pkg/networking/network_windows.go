@@ -32,6 +32,12 @@ type windowsNetworking struct {
 	cfg     Config
 	network *hcn.HostComputeNetwork
 	mu      sync.Mutex
+
+	// plan and ipam are set only on the L2Bridge path: the resolved LAN
+	// address plan, and the allocator that hands each endpoint an address out
+	// of the operator's reserved pool.
+	plan *l2BridgePlan
+	ipam *ipAllocator
 }
 
 func newPlatformNetworking() platformNetworking {
@@ -112,32 +118,52 @@ func (w *windowsNetworking) publicDNS() []string {
 // so the container never needs the LAN router for name resolution — the egress
 // ACLs block the router.
 //
-// UNRESOLVED — IPAM. This declares NO Ipams, intending the container's vNIC to
-// DHCP on the LAN. HNS does not support that: on metal (Server 2025 26100)
-// Create() fails outright with
+// IPAM — why the network declares a subnet and ephemerd owns allocation.
+// DHCP IPAM is not available. Declaring no Ipams fails on metal (Server 2025
+// 26100) at network creation:
 //
 //	hcnCreateNetwork failed in Win32: The network does not have a subnet for
 //	this endpoint. (0x803b0005) / ErrorCode 2151350277
 //
-// so no L2Bridge network, endpoint, or container can be created at all while
-// this path is taken. An L2Bridge network requires an Ipam subnet with a
-// default route; with one present HNS assigns endpoint addresses itself (no
-// IpConfigurations needed) and the rest of this path — endpoint creation,
-// namespace attach, and the egress ACL ladder — was verified working on metal.
-//
-// Adopting that means ephemerd hands containers addresses out of the real LAN
-// subnet, which needs a range the LAN's DHCP server will not also hand out.
-// That allocation decision is why this is not simply switched over here.
+// so an L2Bridge network must carry a subnet plus a default route. Given one,
+// HNS assigns endpoint addresses on its own — scattered anywhere across the
+// declared prefix, which on a real LAN means straight into the site DHCP
+// server's scope. ephemerd therefore pins each endpoint to an address it
+// allocated out of the operator's reserved network.ip_pool (see setup and
+// l2bridge.go). The subnet and the default-route next hop are read off the host
+// adapter at runtime unless the operator pinned them; nothing here assumes any
+// particular network.
 func (w *windowsNetworking) initL2Bridge(cfg Config) error {
-	if cfg.HostNIC == "" {
-		// Fail closed: without an uplink NIC the bridge has no path off-host,
-		// and silently falling back to NAT would defeat the egress guarantee
-		// the operator opted into.
-		return fmt.Errorf("L2Bridge egress enabled but no host_nic configured (set network.host_nic to the host adapter name to bridge onto)")
+	// Fail closed on an incomplete plan: silently falling back to NAT would
+	// defeat the egress guarantee the operator opted into, and guessing a pool
+	// would hand out addresses that collide with live DHCP leases.
+	plan, err := resolveL2BridgePlan(cfg, hostNetLookup{
+		iface:   hostIPv4OnInterface,
+		gateway: defaultGatewayForAdapter,
+	})
+	if err != nil {
+		return fmt.Errorf("L2Bridge egress enabled but the address plan is incomplete: %w", err)
+	}
+	w.plan = plan
+	w.ipam = newIPAllocator(plan.Pool, plan.HostIP, plan.Gateway)
+
+	cfg.Log.Info("L2Bridge address plan resolved",
+		"host_nic", cfg.HostNIC,
+		"subnet", plan.Subnet, "subnet_derived", plan.DerivedSubnet,
+		"gateway", plan.Gateway, "gateway_derived", plan.DerivedGateway,
+		"host_ip", plan.HostIP,
+		"ip_pool", plan.PoolSpec, "pool_size", plan.Pool.size())
+
+	if cfg.AllowHostAccess {
+		// Worth a warning on its own line: this is the one rule that lets a job
+		// container address the ephemerd host at all.
+		cfg.Log.Warn("L2Bridge egress permits containers to reach this host (required by dind / the module proxy)",
+			"host_ip", plan.HostIP, "control_ports_blocked", cfg.ControlPorts)
 	}
 
 	if existing, err := hcn.GetNetworkByName(l2BridgeNetworkName); err == nil {
 		w.network = existing
+		w.adoptExistingEndpoints(existing)
 		cfg.Log.Info("HCN L2Bridge network found", "name", l2BridgeNetworkName, "id", existing.Id, "host_nic", cfg.HostNIC)
 		return nil
 	}
@@ -152,8 +178,28 @@ func (w *windowsNetworking) initL2Bridge(cfg Config) error {
 	network := &hcn.HostComputeNetwork{
 		Name: l2BridgeNetworkName,
 		Type: hcn.L2Bridge,
-		// No Ipams. See the UNRESOLVED note above: HNS rejects this
-		// (0x803b0005) — an L2Bridge network must carry a subnet.
+		Ipams: []hcn.Ipam{
+			{
+				// "Static" means HNS does not run a DHCP client for the
+				// endpoints; the addresses come from this subnet. ephemerd
+				// narrows that further by pinning each endpoint itself.
+				Type: "Static",
+				Subnets: []hcn.Subnet{
+					{
+						IpAddressPrefix: plan.Subnet,
+						Routes: []hcn.Route{
+							{
+								// The LAN router. Containers route THROUGH it
+								// while the egress ACLs stop them ADDRESSING
+								// it — verified working on metal.
+								NextHop:           plan.Gateway,
+								DestinationPrefix: "0.0.0.0/0",
+							},
+						},
+					},
+				},
+			},
+		},
 		Policies: []hcn.NetworkPolicy{
 			{
 				Type:     hcn.NetAdapterName, // binds the L2Bridge to the physical NIC
@@ -171,12 +217,58 @@ func (w *windowsNetworking) initL2Bridge(cfg Config) error {
 
 	created, err := network.Create()
 	if err != nil {
-		return fmt.Errorf("creating HCN L2Bridge network on %q: %w", cfg.HostNIC, err)
+		return fmt.Errorf("creating HCN L2Bridge network on %q (subnet %s, gateway %s): %w",
+			cfg.HostNIC, plan.Subnet, plan.Gateway, err)
 	}
 	w.network = created
 
-	cfg.Log.Info("HCN L2Bridge network created", "name", l2BridgeNetworkName, "id", created.Id, "host_nic", cfg.HostNIC)
+	cfg.Log.Info("HCN L2Bridge network created",
+		"name", l2BridgeNetworkName, "id", created.Id, "host_nic", cfg.HostNIC,
+		"subnet", plan.Subnet, "gateway", plan.Gateway)
 	return nil
+}
+
+// adoptExistingEndpoints marks the addresses of endpoints already present on an
+// adopted network as in use, so a daemon restart that finds leftover endpoints
+// does not hand the same address to a new container.
+//
+// These reservations are held for the life of the process: ephemerd did not
+// allocate them, so it has no id to release them under. The addresses return to
+// the pool at the next restart, once the stale endpoints are gone. Size the pool
+// with a little headroom rather than exactly runner.max_concurrent.
+//
+// Best-effort: a failure to enumerate is logged, not fatal — HNS rejects a
+// duplicate address at endpoint creation anyway, which fails the job closed.
+func (w *windowsNetworking) adoptExistingEndpoints(network *hcn.HostComputeNetwork) {
+	eps, err := hcn.ListEndpointsOfNetwork(network.Id)
+	if err != nil {
+		w.cfg.Log.Warn("could not enumerate existing L2Bridge endpoints; pool may briefly double-allocate", "error", err)
+		return
+	}
+	for _, ep := range eps {
+		for _, ipc := range ep.IpConfigurations {
+			if ipc.IpAddress != "" {
+				w.ipam.reserve(ipc.IpAddress)
+			}
+		}
+	}
+	if len(eps) > 0 {
+		w.cfg.Log.Info("reserved addresses of pre-existing L2Bridge endpoints", "endpoints", len(eps))
+	}
+}
+
+// hostAddr reports the address containers use to reach services ephemerd hosts.
+// On L2Bridge that is the host's own LAN address — there is no bridge gateway to
+// bind to, and the NAT path's hard-coded 10.88.0.1 exists on no interface once
+// the NAT network is out of the picture. Returning it here is what keeps the
+// per-job dind listener (pkg/dind/listen_windows.go) and the Go module proxy
+// bindable, and therefore jobs provisionable.
+func (w *windowsNetworking) hostAddr() string {
+	if w.cfg.L2BridgeEgress && w.plan != nil {
+		return w.plan.HostIP
+	}
+	// NAT path: unchanged — the generic subnet derivation yields defaultGateway.
+	return ""
 }
 
 func (w *windowsNetworking) setup(ctx context.Context, id string, netns string) (*SetupResult, error) {
@@ -192,10 +284,16 @@ func (w *windowsNetworking) setup(ctx context.Context, id string, netns string) 
 		dnsServers = w.publicDNS()
 	}
 
-	// Create endpoint on the network. On the L2Bridge path we deliberately set
-	// NO IpConfigurations so the container leases its address, gateway, and
-	// default route from the LAN DHCP server (DHCP IPAM). On NAT, HNS assigns
-	// from the NAT subnet as before.
+	// Create endpoint on the network.
+	//
+	// On NAT, HNS assigns from the NAT subnet as before (no IpConfigurations).
+	//
+	// On L2Bridge the container is a peer on the host's LAN, so leaving the
+	// choice to HNS means an address anywhere in the declared subnet — which on
+	// a real LAN overlaps the site DHCP server's scope. ephemerd pins the
+	// endpoint to an address it allocated from the operator's reserved
+	// network.ip_pool instead, at the LAN's own prefix length so the container's
+	// route table matches its neighbours'.
 	endpoint := &hcn.HostComputeEndpoint{
 		Name:               id + "-ep",
 		HostComputeNetwork: w.network.Id,
@@ -208,21 +306,44 @@ func (w *windowsNetworking) setup(ctx context.Context, id string, netns string) 
 		},
 	}
 
+	var allocatedIP string
+	if w.cfg.L2BridgeEgress {
+		if w.ipam == nil || w.plan == nil {
+			return nil, fmt.Errorf("L2Bridge egress enabled but no address plan was resolved for %s (refusing to let HNS pick an address that may collide with a DHCP lease)", id)
+		}
+		ip, err := w.ipam.allocate(id)
+		if err != nil {
+			return nil, fmt.Errorf("allocating an address for %s: %w", id, err)
+		}
+		allocatedIP = ip
+		endpoint.IpConfigurations = []hcn.IpConfig{
+			{
+				IpAddress: allocatedIP,
+				// PrefixLen came from net.IPMask.Size() on an IPv4 mask, so it
+				// is 0-32 and always fits.
+				PrefixLength: uint8(w.plan.PrefixLen),
+			},
+		}
+	}
+
 	created, err := w.network.CreateEndpoint(endpoint)
 	if err != nil {
+		if allocatedIP != "" {
+			w.ipam.release(id)
+		}
 		return nil, fmt.Errorf("creating HCN endpoint for %s: %w", id, err)
 	}
 
-	// Apply ACL policies to block private network access. These are the only
-	// egress restriction that actually enforces on this path: installFirewallRules
-	// is NOT a no-op (firewall_windows.go programs Hyper-V firewall rules), but
-	// those rules are built for the NAT subnet — hyperVEgressRules is called with
-	// DefaultSubnet/defaultGateway — so on L2Bridge, where the container holds a
-	// LAN address, they match nothing. A failure here therefore means the
-	// container would run with unrestricted egress to the host LAN, other RFC1918
-	// services, and link-local metadata endpoints. Fail CLOSED: tear down the
-	// endpoint we just created and refuse the job rather than start a container we
-	// cannot firewall.
+	// Apply ACL policies to block private network access. On L2Bridge these are
+	// the only egress restriction that enforces: the Hyper-V firewall rule set
+	// in firewall_windows.go is built for the NAT subnet and is deliberately not
+	// installed on this path (its subtract-the-container-subnet logic would
+	// carve the management LAN back out of the deny — see the L2Bridge backstop
+	// note there). A failure here therefore means the container would run with
+	// unrestricted egress to the host LAN, other RFC1918 services, and
+	// link-local metadata endpoints. Fail CLOSED: tear down the endpoint we just
+	// created and refuse the job rather than start a container we cannot
+	// firewall.
 	//
 	// The ACLs are applied to the endpoint BEFORE the container is started
 	// (setup runs ahead of task creation), and the L2Bridge rule set is STATIC
@@ -233,6 +354,7 @@ func (w *windowsNetworking) setup(ctx context.Context, id string, netns string) 
 		if delErr := created.Delete(); delErr != nil {
 			w.cfg.Log.Warn("failed to delete endpoint after ACL failure", "id", id, "error", delErr)
 		}
+		w.releaseIP(id)
 		return nil, fmt.Errorf("applying egress ACL policies for %s (refusing to start unfirewalled): %w", id, err)
 	}
 
@@ -244,22 +366,37 @@ func (w *windowsNetworking) setup(ctx context.Context, id string, netns string) 
 	ns, err = ns.Create()
 	if err != nil {
 		_ = created.Delete()
+		w.releaseIP(id)
 		return nil, fmt.Errorf("creating HCN namespace for %s: %w", id, err)
 	}
 
 	if err := hcn.AddNamespaceEndpoint(ns.Id, created.Id); err != nil {
 		_ = ns.Delete()
 		_ = created.Delete()
+		w.releaseIP(id)
 		return nil, fmt.Errorf("attaching endpoint to namespace for %s: %w", id, err)
 	}
 
-	w.cfg.Log.Debug("HCN endpoint created", "id", id, "endpoint", created.Id, "namespace", ns.Id)
-	return &SetupResult{NetNS: ns.Id, EndpointID: created.Id}, nil
+	w.cfg.Log.Debug("HCN endpoint created", "id", id, "endpoint", created.Id, "namespace", ns.Id, "ip", allocatedIP)
+	return &SetupResult{NetNS: ns.Id, EndpointID: created.Id, IP: allocatedIP}, nil
+}
+
+// releaseIP returns a container's pool address, if it holds one. Safe on the NAT
+// path (no allocator) and for containers that never got an address.
+func (w *windowsNetworking) releaseIP(id string) {
+	if w.ipam != nil {
+		w.ipam.release(id)
+	}
 }
 
 func (w *windowsNetworking) teardown(ctx context.Context, id string, netns string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	// Return the pool address whatever happens below: an endpoint that no
+	// longer exists (or one we fail to delete) must not strand its address, or
+	// a long-lived daemon would leak the pool one job at a time.
+	defer w.releaseIP(id)
 
 	// Find endpoint by name
 	endpoint, err := hcn.GetEndpointByName(id + "-ep")
@@ -351,6 +488,10 @@ func buildEgressBlockPolicies() ([]hcn.EndpointPolicy, error) {
 // scope (the removed UDP 67/68 DHCP allows) blackholes the entire port on
 // metal.
 const (
+	// aclPriorityHostAllow carves the ephemerd host's own /32 out ABOVE the
+	// RFC1918 block. Emitted only when Config.AllowHostAccess is set, which is
+	// what makes the per-job dind Docker API and the module proxy reachable.
+	aclPriorityHostAllow uint16 = 90
 	// aclPriorityExtraAllow carves configured destinations out ABOVE the
 	// RFC1918 block. Unused by default (no carve-outs) — reserved for future
 	// operator-allowed destinations.
@@ -391,7 +532,18 @@ func marshalACL(acl hcn.AclPolicySetting) (hcn.EndpointPolicy, error) {
 // gateway carve-out here, and no container-to-container allow (that would be
 // LAN access, which we block). extraAllowed carves additional CIDRs out above
 // the block for future use; empty (the default) reproduces the strict posture.
-func buildL2BridgeEgressACLPolicies(extraAllowed []string) ([]hcn.EndpointPolicy, error) {
+//
+// hostIP, when non-empty, adds one further carve-out: a /32 allow for the
+// ephemerd host itself. Nothing ephemerd serves TO containers over the network
+// works without it — the per-job dind Docker API and the Go module proxy both
+// listen on the host address, and a container that cannot address the host
+// cannot use either. It is deliberately an address-scoped /32 and not a
+// port-scoped rule: see the port-scoping note above; scoping it to the dind
+// port would blackhole the whole VFP port. The exposure that opens (every port
+// the host has listening, not just ephemerd's) is closed back down at the host
+// firewall by l2BridgeControlPlaneRules, which CAN match the container source
+// on this path because L2Bridge does not NAT.
+func buildL2BridgeEgressACLPolicies(extraAllowed []string, hostIP string) ([]hcn.EndpointPolicy, error) {
 	var policies []hcn.EndpointPolicy
 	add := func(acl hcn.AclPolicySetting) error {
 		p, err := marshalACL(acl)
@@ -426,6 +578,21 @@ func buildL2BridgeEgressACLPolicies(extraAllowed []string) ([]hcn.EndpointPolicy
 	//
 	// Nothing here needs DHCP: the endpoint is addressed by HNS IPAM, not by a
 	// DHCP client in the container.
+
+	// Tier: the ephemerd host's own /32, when something it serves must be
+	// reachable (dind, the module proxy). Highest precedence in the ladder.
+	if hostIP != "" {
+		if err := add(hcn.AclPolicySetting{
+			Protocols:       aclAnyProtocol,
+			Action:          hcn.ActionTypeAllow,
+			Direction:       hcn.DirectionTypeOut,
+			RemoteAddresses: hostIP + "/32",
+			RuleType:        hcn.RuleTypeSwitch,
+			Priority:        aclPriorityHostAllow,
+		}); err != nil {
+			return nil, err
+		}
+	}
 
 	// Tier: operator carve-outs (future use). Allowed ABOVE the block so a
 	// listed destination wins. Empty by default.
@@ -488,7 +655,7 @@ func (w *windowsNetworking) applyACLPolicies(endpoint *hcn.HostComputeEndpoint) 
 		err      error
 	)
 	if w.cfg.L2BridgeEgress {
-		policies, err = buildL2BridgeEgressACLPolicies(w.cfg.ExtraAllowedCIDRs)
+		policies, err = buildL2BridgeEgressACLPolicies(w.cfg.ExtraAllowedCIDRs, w.hostAllowIP())
 	} else {
 		policies, err = buildEgressBlockPolicies()
 	}
@@ -499,6 +666,17 @@ func (w *windowsNetworking) applyACLPolicies(endpoint *hcn.HostComputeEndpoint) 
 	return endpoint.ApplyPolicy(hcn.RequestTypeAdd, hcn.PolicyEndpointRequest{
 		Policies: policies,
 	})
+}
+
+// hostAllowIP returns the host address to carve out of the egress block, or ""
+// for the strict posture in which the host is unreachable like the rest of
+// RFC1918. Non-empty only when the operator runs something containers must
+// reach (dind, the module proxy) AND the address plan resolved.
+func (w *windowsNetworking) hostAllowIP() string {
+	if w.cfg.AllowHostAccess && w.plan != nil {
+		return w.plan.HostIP
+	}
+	return ""
 }
 
 // installFirewallRules and removeFirewallRules live in firewall_windows.go

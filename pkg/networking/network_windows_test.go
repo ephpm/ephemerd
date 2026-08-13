@@ -5,6 +5,7 @@ package networking
 import (
 	"encoding/json"
 	"net"
+	"strings"
 	"testing"
 
 	"github.com/Microsoft/hcsshim/hcn"
@@ -74,11 +75,11 @@ func decodeACLs(t *testing.T, policies []hcn.EndpointPolicy) []hcn.AclPolicySett
 }
 
 // TestL2BridgeEgressACLPolicies_LadderShape pins the full router-safe VFP
-// ladder: the two mandatory allow-any rules (Out+In), the DHCP allows, and a
-// whole-supernet block for every RFC1918 + link-local range — with the exact
-// actions, directions, protocols, and priorities that were proven on metal.
+// ladder: the two mandatory allow-any rules (Out+In) and a whole-supernet block
+// for every RFC1918 + link-local range — with the exact actions, directions,
+// protocols, and priorities that were proven on metal.
 func TestL2BridgeEgressACLPolicies_LadderShape(t *testing.T) {
-	acls := decodeACLs(t, mustBuildL2Bridge(t, nil))
+	acls := decodeACLs(t, mustBuildL2Bridge(t, nil, ""))
 
 	var (
 		allowAnyOut, allowAnyIn bool
@@ -125,7 +126,7 @@ func TestL2BridgeEgressACLPolicies_LadderShape(t *testing.T) {
 // block that excludes a subnet. The router and the management plane stay
 // unreachable, matching the Linux end-state.
 func TestL2BridgeEgressACLPolicies_NoGatewayOrSubnetCarveOut(t *testing.T) {
-	acls := decodeACLs(t, mustBuildL2Bridge(t, nil))
+	acls := decodeACLs(t, mustBuildL2Bridge(t, nil, ""))
 
 	for _, a := range acls {
 		// The only allows permitted with default (empty) extraAllowed are the
@@ -167,7 +168,7 @@ func TestL2BridgeEgressACLPolicies_Precedence(t *testing.T) {
 // this ladder address-scoped.
 func TestL2BridgeEgressACLPolicies_EveryRuleIsAddressScoped(t *testing.T) {
 	for _, extra := range [][]string{nil, {"203.0.113.0/24"}} {
-		for _, a := range decodeACLs(t, mustBuildL2Bridge(t, extra)) {
+		for _, a := range decodeACLs(t, mustBuildL2Bridge(t, extra, "198.51.100.7")) {
 			if a.RemoteAddresses == "" && a.LocalAddresses == "" {
 				t.Errorf("ACL with no address scope: %+v (blackholes the whole port on metal)", a)
 			}
@@ -182,7 +183,7 @@ func TestL2BridgeEgressACLPolicies_EveryRuleIsAddressScoped(t *testing.T) {
 // emitted as Out allows ABOVE the block so they win over the RFC1918 deny.
 func TestL2BridgeEgressACLPolicies_ExtraAllowed(t *testing.T) {
 	extra := []string{"192.168.50.10/32", "172.20.0.0/16"}
-	acls := decodeACLs(t, mustBuildL2Bridge(t, extra))
+	acls := decodeACLs(t, mustBuildL2Bridge(t, extra, ""))
 
 	found := map[string]hcn.AclPolicySetting{}
 	for _, a := range acls {
@@ -205,9 +206,9 @@ func TestL2BridgeEgressACLPolicies_ExtraAllowed(t *testing.T) {
 	}
 }
 
-func mustBuildL2Bridge(t *testing.T, extra []string) []hcn.EndpointPolicy {
+func mustBuildL2Bridge(t *testing.T, extra []string, hostIP string) []hcn.EndpointPolicy {
 	t.Helper()
-	policies, err := buildL2BridgeEgressACLPolicies(extra)
+	policies, err := buildL2BridgeEgressACLPolicies(extra, hostIP)
 	if err != nil {
 		t.Fatalf("buildL2BridgeEgressACLPolicies: %v", err)
 	}
@@ -224,5 +225,165 @@ func assertACL(t *testing.T, name string, a hcn.AclPolicySetting, wantProto stri
 	}
 	if a.RuleType != hcn.RuleTypeSwitch {
 		t.Errorf("%s ruletype = %q, want Switch", name, a.RuleType)
+	}
+}
+
+// TestL2BridgeEgressACLPolicies_HostAllow verifies the one carve-out that keeps
+// jobs provisionable: with a host address supplied, the ladder emits an
+// address-scoped /32 Allow ABOVE the RFC1918 block. Without it the container
+// cannot reach the per-job dind Docker API (DOCKER_HOST) or the module proxy,
+// both of which listen on the host address — the host is inside 192.168/16 or
+// 10/8 like every other LAN peer.
+func TestL2BridgeEgressACLPolicies_HostAllow(t *testing.T) {
+	const hostIP = "198.51.100.7"
+	acls := decodeACLs(t, mustBuildL2Bridge(t, nil, hostIP))
+
+	var found *hcn.AclPolicySetting
+	for i, a := range acls {
+		if a.Action == hcn.ActionTypeAllow && a.RemoteAddresses == hostIP+"/32" {
+			found = &acls[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("no /32 allow for the host address %s (dind and the module proxy would be unreachable)", hostIP)
+	}
+	assertACL(t, "host-allow", *found, aclAnyProtocol, aclPriorityHostAllow)
+	if found.Direction != hcn.DirectionTypeOut {
+		t.Errorf("host allow direction = %v, want Out", found.Direction)
+	}
+	if found.Priority >= aclPriorityBlock {
+		t.Errorf("host allow priority %d is not above the block priority %d (it would never win)", found.Priority, aclPriorityBlock)
+	}
+	// It must stay address-scoped. Narrowing it to the dind port would look
+	// safer and would in fact blackhole the whole VFP port (see the metal note
+	// on the removed DHCP rules).
+	if found.RemotePorts != "" || found.LocalPorts != "" {
+		t.Errorf("host allow is port-scoped (%+v); port-scoped Switch ACLs blackhole the VFP port", *found)
+	}
+}
+
+// TestL2BridgeEgressACLPolicies_NoHostAllowByDefault pins the strict default:
+// with no host address supplied (nothing ephemerd serves to containers), the
+// ephemerd host is blocked along with the rest of RFC1918, exactly as verified
+// on metal.
+func TestL2BridgeEgressACLPolicies_NoHostAllowByDefault(t *testing.T) {
+	for _, a := range decodeACLs(t, mustBuildL2Bridge(t, nil, "")) {
+		if a.Action == hcn.ActionTypeAllow && a.RemoteAddresses != "0.0.0.0/0" {
+			t.Errorf("unexpected allow %q with no host access configured (want only 0.0.0.0/0)", a.RemoteAddresses)
+		}
+	}
+}
+
+// TestL2BridgeControlPlaneRules verifies the host-firewall backstop that closes
+// the control-plane ports back off after the host /32 allow opens the host.
+// These are INBOUND rules scoped to the container pool as the remote — which
+// only matches because L2Bridge does not NAT (on NAT the host sees its own
+// address as the source; that is what sank #136).
+func TestL2BridgeControlPlaneRules(t *testing.T) {
+	const (
+		hostIP = "198.51.100.7"
+		pool   = "198.51.100.200-198.51.100.230"
+	)
+	rules := l2BridgeControlPlaneRules(hostIP, pool, []int{10000, 10001, 10002})
+	if len(rules) != 3 {
+		t.Fatalf("got %d rules, want 3 (one per control port)", len(rules))
+	}
+	for _, r := range rules {
+		if !strings.HasPrefix(r.name, firewallRulePrefix) {
+			t.Errorf("rule %q lacks the %q prefix, so Cleanup would not find it", r.name, firewallRulePrefix)
+		}
+		if specValue(r, "dir") != "in" {
+			t.Errorf("rule %s dir = %q, want in (container->host is inbound at the host)", r.name, specValue(r, "dir"))
+		}
+		if specValue(r, "action") != "block" {
+			t.Errorf("rule %s action = %q, want block", r.name, specValue(r, "action"))
+		}
+		if specValue(r, "localip") != hostIP {
+			t.Errorf("rule %s localip = %q, want %s", r.name, specValue(r, "localip"), hostIP)
+		}
+		if specValue(r, "remoteip") != pool {
+			t.Errorf("rule %s remoteip = %q, want the container pool %s", r.name, specValue(r, "remoteip"), pool)
+		}
+		if specValue(r, "localport") == "" {
+			t.Errorf("rule %s has no localport; a portless block would cut the host off the container entirely", r.name)
+		}
+	}
+
+	// Rule names must not collide with the NAT netsh rules, or removing one set
+	// would delete the other.
+	natRules, err := hostFirewallRules(DefaultSubnet, defaultGateway, []int{10000, 10001, 10002})
+	if err != nil {
+		t.Fatalf("hostFirewallRules: %v", err)
+	}
+	natNames := map[string]bool{}
+	for _, r := range natRules {
+		natNames[r.name] = true
+	}
+	for _, r := range rules {
+		if natNames[r.name] {
+			t.Errorf("L2Bridge rule name %q collides with a NAT rule name", r.name)
+		}
+	}
+}
+
+// TestL2BridgeControlPlaneRules_NoPlanNoRules verifies the backstop stays silent
+// when there is nothing to scope it to, rather than emitting a rule with an
+// empty address that would match everything.
+func TestL2BridgeControlPlaneRules_NoPlanNoRules(t *testing.T) {
+	if rules := l2BridgeControlPlaneRules("", "198.51.100.0/24", []int{10000}); rules != nil {
+		t.Errorf("rules emitted with no host address: %+v", rules)
+	}
+	if rules := l2BridgeControlPlaneRules("198.51.100.7", "", []int{10000}); rules != nil {
+		t.Errorf("rules emitted with no pool: %+v", rules)
+	}
+	if rules := l2BridgeControlPlaneRules("198.51.100.7", "198.51.100.0/24", nil); len(rules) != 0 {
+		t.Errorf("rules emitted with no control ports: %+v", rules)
+	}
+}
+
+// TestWindowsHostAddr_L2BridgeReportsHostIP is the regression guard for the
+// binding that took down provisioning on the ICS experiment: on L2Bridge there
+// is no 10.88.0.1 on any interface, so anything that binds GatewayIP() — the
+// per-job dind listener and the Go module proxy — must be handed the host's own
+// LAN address instead.
+func TestWindowsHostAddr_L2BridgeReportsHostIP(t *testing.T) {
+	w := &windowsNetworking{
+		cfg:  Config{L2BridgeEgress: true},
+		plan: &l2BridgePlan{HostIP: "198.51.100.7"},
+	}
+	if got := w.hostAddr(); got != "198.51.100.7" {
+		t.Errorf("hostAddr() = %q, want the host's L2Bridge address", got)
+	}
+	m := &Manager{cfg: Config{}, platform: w}
+	if got := m.GatewayIP(); got != "198.51.100.7" {
+		t.Errorf("GatewayIP() = %q, want the host's L2Bridge address (10.88.0.1 binds to nothing on L2Bridge)", got)
+	}
+
+	// NAT path unchanged: no plan, no override, the old gateway still applies.
+	nat := &windowsNetworking{cfg: Config{}}
+	if got := nat.hostAddr(); got != "" {
+		t.Errorf("NAT hostAddr() = %q, want empty (generic derivation)", got)
+	}
+	if got := (&Manager{cfg: Config{}, platform: nat}).GatewayIP(); got != defaultGateway {
+		t.Errorf("NAT GatewayIP() = %q, want %q", got, defaultGateway)
+	}
+}
+
+// TestWindowsHostAllowIP_GatedOnAllowHostAccess pins that the host carve-out is
+// opt-in: it appears only when ephemerd actually serves something to containers.
+func TestWindowsHostAllowIP_GatedOnAllowHostAccess(t *testing.T) {
+	plan := &l2BridgePlan{HostIP: "198.51.100.7"}
+	off := &windowsNetworking{cfg: Config{L2BridgeEgress: true}, plan: plan}
+	if got := off.hostAllowIP(); got != "" {
+		t.Errorf("hostAllowIP() = %q with AllowHostAccess=false, want empty (strict posture)", got)
+	}
+	on := &windowsNetworking{cfg: Config{L2BridgeEgress: true, AllowHostAccess: true}, plan: plan}
+	if got := on.hostAllowIP(); got != "198.51.100.7" {
+		t.Errorf("hostAllowIP() = %q with AllowHostAccess=true, want the host address", got)
+	}
+	// No plan (init failed or NAT) must never produce a carve-out.
+	none := &windowsNetworking{cfg: Config{L2BridgeEgress: true, AllowHostAccess: true}}
+	if got := none.hostAllowIP(); got != "" {
+		t.Errorf("hostAllowIP() = %q with no resolved plan, want empty", got)
 	}
 }

@@ -213,8 +213,22 @@ func (w *WebhookConfig) ResolvedReconcileInterval() time.Duration {
 
 // NetworkConfig configures container networking.
 type NetworkConfig struct {
-	Subnet string `toml:"subnet"` // container subnet (auto-selected if empty)
-	MTU    int    `toml:"mtu"`    // bridge MTU (auto-detected from host if 0)
+	// Subnet is the container subnet.
+	//
+	// Linux (CNI bridge): auto-selected when empty, avoiding ranges already in
+	// use on the host.
+	//
+	// Windows L2Bridge (l2bridge_egress = true): the CIDR of the LAN the bridge
+	// is attached to — containers are peers on it, not behind NAT — declared as
+	// the HNS network's Ipam subnet. Auto-derived from the address configured on
+	// host_nic when empty, which is the expected setting. Pin it only when the
+	// adapter carries a prefix that differs from the LAN you want declared.
+	//
+	// Windows NAT (the default): not consulted; the HNS NAT network always uses
+	// the built-in 10.88.0.0/16.
+	Subnet string `toml:"subnet"`
+
+	MTU int `toml:"mtu"` // bridge MTU (auto-detected from host if 0)
 
 	// L2BridgeEgress opts a Windows pool into L2Bridge container networking
 	// with VFP-enforced egress filtering, instead of the default HNS NAT.
@@ -232,6 +246,33 @@ type NetworkConfig struct {
 	// hot-added test NIC). Ignored when L2BridgeEgress is false.
 	HostNIC string `toml:"host_nic"`
 
+	// IPPool is the range of LAN addresses ephemerd may assign to job
+	// containers on the L2Bridge path. REQUIRED when L2BridgeEgress is true,
+	// with no default, and validated at load time.
+	//
+	// Why it cannot be inferred: an L2Bridge network must declare a subnet (HNS
+	// rejects a subnet-less one outright), and once it has one HNS will assign
+	// endpoint addresses from anywhere inside it — on a real LAN, straight into
+	// the site DHCP server's scope. ephemerd therefore allocates addresses
+	// itself, and only the operator knows which slice of their LAN the DHCP
+	// server is configured never to lease.
+	//
+	// Accepts a CIDR ("192.0.2.192/27" — network and broadcast excluded) or an
+	// inclusive range ("192.0.2.200-192.0.2.230"). Must lie inside Subnet and
+	// must not contain the host's own address or the LAN gateway. Size it for
+	// at least runner.max_concurrent addresses. Ignored when L2BridgeEgress is
+	// false.
+	IPPool string `toml:"ip_pool"`
+
+	// Gateway is the LAN router the L2Bridge default route points at (the HNS
+	// Ipam route next hop). Auto-derived from the default route on HostNIC when
+	// empty, which is the expected setting; pin it only when the adapter has no
+	// default route of its own or carries more than one.
+	//
+	// Containers route THROUGH this address while the egress ACLs stop them
+	// ADDRESSING it — the gateway gets no allow rule. Windows L2Bridge only.
+	Gateway string `toml:"gateway"`
+
 	// PublicDNS is the DNS resolver list handed to L2Bridge containers. Public
 	// resolvers keep container DNS off the LAN router (which the egress ACLs
 	// block along with the rest of RFC1918). Empty falls back to a built-in
@@ -244,6 +285,39 @@ type NetworkConfig struct {
 	// default empty, which reproduces the strict Linux end-state (no RFC1918
 	// carve-outs at all). Only consulted on the L2Bridge path.
 	ExtraAllowedDestinations []string `toml:"extra_allowed_destinations"`
+}
+
+// validate rejects an L2Bridge configuration that cannot be completed safely at
+// runtime. It runs at config load, on every platform, so a node whose config was
+// rendered wrong dies at startup with a specific message instead of coming up
+// and quietly mis-addressing containers.
+//
+// Only the two settings that cannot be inferred are required. subnet, gateway,
+// and public_dns are all derived from the host's real primary adapter when
+// unset, so nothing here assumes any particular network. ip_pool deliberately
+// has NO default: on L2Bridge, containers take addresses on the operator's own
+// LAN, and a built-in guess would hand out addresses the site's DHCP server is
+// also leasing. Semantic checks that need the host (does the pool fit inside the
+// adapter's subnet, does it swallow the gateway) happen in pkg/networking once
+// the adapter has been read.
+func (n *NetworkConfig) validate() error {
+	if !n.L2BridgeEgress {
+		return nil
+	}
+	if strings.TrimSpace(n.HostNIC) == "" {
+		return fmt.Errorf(`network.host_nic is required when network.l2bridge_egress = true: ` +
+			`set it to the host adapter the bridge attaches to — the name shown by ` + "`Get-NetAdapter`" + `, ` +
+			`e.g. host_nic = "Ethernet". There is no default; the correct adapter is host-specific`)
+	}
+	if strings.TrimSpace(n.IPPool) == "" {
+		return fmt.Errorf(`network.ip_pool is required when network.l2bridge_egress = true: ` +
+			`on L2Bridge, job containers are addressed on this host's own LAN rather than behind NAT, ` +
+			`so ephemerd must be told which addresses it may hand out. Set it to a range your DHCP server ` +
+			`is configured never to lease — either a CIDR (ip_pool = "192.0.2.192/27") or an inclusive ` +
+			`range (ip_pool = "192.0.2.200-192.0.2.230") — sized for at least runner.max_concurrent ` +
+			`containers. There is no default: any built-in guess would collide with live DHCP leases`)
+	}
+	return nil
 }
 
 type ContainerdConfig struct {
@@ -1361,6 +1435,10 @@ func (c *Config) validate() error {
 				return fmt.Errorf("woodpecker.agent_secret is required")
 			}
 		}
+	}
+
+	if err := c.Network.validate(); err != nil {
+		return err
 	}
 
 	// Webhook secret handling depends on who owns the tunnel:
