@@ -38,6 +38,7 @@ var (
 	_ providers.Poll               = (*Provider)(nil)
 	_ providers.Webhook            = (*Provider)(nil)
 	_ providers.RunnerNameReporter = (*Provider)(nil)
+	_ providers.RunnerBusyReporter = (*Provider)(nil)
 )
 
 // New creates a GitHub provider wrapping an existing GitHub client.
@@ -145,6 +146,23 @@ func (p *Provider) ClaimJob(ctx context.Context, event *providers.JobEvent, runn
 
 func (p *Provider) ReleaseJob(ctx context.Context, claim *providers.Claim) error {
 	return p.client.RemoveRunner(ctx, claim.Repo, claim.RunnerID)
+}
+
+// RunnerBusy implements providers.RunnerBusyReporter. GitHub tracks a
+// per-runner `busy` flag on the Actions runners API and flips it for the
+// duration of an assignment, so it answers the teardown question — "is
+// something running on this runner" — without depending on a webhook
+// having been delivered.
+//
+// It is the scheduler's fallback authority, reached only when the local
+// probe cannot see the runner (a runner dispatched into the Linux sidecar
+// VM), and only for a runner already nominated for teardown. That is one
+// GET per nomination, not per job.
+func (p *Provider) RunnerBusy(ctx context.Context, claim *providers.Claim) (bool, error) {
+	if claim == nil {
+		return false, fmt.Errorf("nil claim")
+	}
+	return p.client.RunnerBusy(ctx, claim.Repo, claim.RunnerID)
 }
 
 func (p *Provider) FetchJobImage(ctx context.Context, event *providers.JobEvent) string {
