@@ -122,6 +122,27 @@ type RunnerNameReporter interface {
 	ReportsRunnerNames() bool
 }
 
+// RunnerBusyReporter is optionally implemented by providers that can be
+// asked, on demand, whether a runner they registered is executing a job
+// right now.
+//
+// This is the SECOND authority behind the scheduler's "never destroy a
+// busy runner" invariant. The first is a local probe of the container /
+// VM / process ephemerd owns, which needs no network and no API budget.
+// The provider is consulted only when the local probe cannot answer —
+// notably for runners dispatched into a sidecar VM, whose runtime lives
+// on the far side of a gRPC boundary. Because it is only reached at
+// teardown time, for a runner already nominated for reaping, it is off
+// every hot path.
+type RunnerBusyReporter interface {
+	Provider
+
+	// RunnerBusy reports whether the runner behind claim is currently
+	// running a job. An error means "could not determine" — callers must
+	// fail safe and treat that as possibly busy, never as idle.
+	RunnerBusy(ctx context.Context, claim *Claim) (bool, error)
+}
+
 // PollConfig provides settings for poll-based job discovery.
 type PollConfig struct {
 	PollInterval int // seconds between polls (0 = provider default)

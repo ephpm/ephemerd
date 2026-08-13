@@ -357,6 +357,12 @@ func TestSweepOrphanRunners_LabelSetReconciliation(t *testing.T) {
 				Log:             quietLogger(),
 			})
 			s.webhookMode = true
+			// This matrix pins which runners the rules NOMINATE. The
+			// busy check is a separate layer with its own tests
+			// (busy_test.go), so pin it to a verified-idle answer: a
+			// nomination the check cannot clear is vetoed, and every
+			// row here would otherwise be testing the veto instead.
+			s.busyProbe = idleProbe
 
 			keys := map[string]jobKey{}
 			for _, sp := range tt.spares {
