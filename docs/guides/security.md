@@ -27,18 +27,66 @@ macOS jobs run in full virtual machines via Apple's Virtualization.framework. Ea
 
 ## Network Firewall
 
-By default, containers are blocked from reaching private network ranges:
+The intent is that containers cannot reach private network ranges:
 
 - `10.0.0.0/8` (RFC 1918)
 - `172.16.0.0/12` (RFC 1918)
 - `192.168.0.0/16` (RFC 1918)
 - `169.254.0.0/16` (link-local)
 
-This prevents jobs from scanning or accessing other machines on your local network, cloud metadata services (169.254.169.254), or other containers. Outbound internet access is allowed so jobs can fetch dependencies, push artifacts, and interact with external APIs.
+This keeps jobs from scanning or reaching other machines on your LAN, cloud metadata services (169.254.169.254), or other containers, while outbound internet access stays open so jobs can fetch dependencies and talk to external APIs.
 
-On Linux, these rules are enforced via iptables in the CNI bridge configuration. On Windows, per-endpoint HCN ACL policies block the same ranges.
+**How well that intent holds depends on the platform. Read the Windows section — the default there does not enforce.**
 
-The container's own subnet (default `10.88.0.0/16`) is excluded from the block list so containers can communicate with their gateway for outbound NAT.
+### Linux and macOS — enforced
+
+On Linux this is enforced with iptables rules in the CNI bridge configuration. The container's own subnet (default `10.88.0.0/16`) is excluded so containers can reach their gateway for DNS and outbound NAT.
+
+macOS jobs run inside a Linux VM sidecar and get the identical in-VM iptables stack, and the sidecar is itself NAT-hidden behind the host.
+
+### Windows default (HNS NAT) — NOT enforced
+
+> **Job containers on the default Windows network can reach your entire LAN, including any management interfaces on it.** Treat a Windows runner on the default network as if it were an unfiltered host on your network.
+
+By default, Windows job containers attach to an HNS **NAT** network on the Hyper-V vSwitch. ephemerd still applies per-endpoint HCN ACL policies there, but **they do not take effect**, and no software mechanism on that stack does. This was established by exhaustive testing on real hardware, not inferred:
+
+- **Host WFP filters** (`netsh`, the WFP API, every layer including IPFORWARD and OUTBOUND) never see container egress. WinNAT's translation path does not present the packet to an inspectable filtering layer, even though the packet does traverse `tcpip.sys`.
+- **HNS Switch ACLs** are a VFP construct, and VFP is not engaged on a NAT switch. They apply successfully and do nothing.
+- **Enabling VFP** on the NAT switch default-denies everything — HNS only programs selective VFP policy for L2Bridge and Overlay.
+- **The Hyper-V firewall** (`New-NetFirewallHyperVRule`) has nothing to bind to: Hyper-V-isolated containers on the NAT switch never register a VM creator, so `Get-NetFirewallHyperVVMCreator` returns nothing.
+- **`netsh` host rules** are post-NAT. Container traffic is indistinguishable from the host's own by then, so any rule broad enough to catch a container also blackholes the host — including the host's own DNS if your resolver is a LAN address.
+
+There is no configuration that makes the NAT path filterable. If you need enforced egress on Windows, use L2Bridge.
+
+### Windows L2Bridge — the enforcing path
+
+Setting `network.l2bridge_egress = true` moves job containers onto an L2Bridge network, where VFP *is* engaged and the ACL ladder genuinely enforces. This is the same stack Kubernetes Windows CNIs (Calico, Antrea) use in production.
+
+```toml
+[network]
+l2bridge_egress = true
+host_nic        = "Ethernet"            # wired adapter to bridge onto
+ip_pool         = "192.0.2.192/27"      # reserved range, see below
+```
+
+**Requirements — both are hard:**
+
+- **A wired Ethernet adapter.** L2Bridge puts container MAC addresses on the physical segment. A Wi-Fi adapter operating as a station cannot carry additional MACs, so 802.11 links cannot host this path at all. This is a limitation of wireless, not of ephemerd.
+- **A reserved `ip_pool` your DHCP server will never lease.** On L2Bridge, containers are addressed on your LAN rather than behind NAT, so ephemerd must be told which addresses it may hand out. There is deliberately **no default** — any built-in guess would collide with live DHCP leases. Size it for at least `runner.max_concurrent` containers, and add the matching exclusion on your DHCP server *before* enabling.
+
+`subnet`, `gateway`, and DNS are derived from `host_nic` at startup; set them explicitly only to override. Startup fails fast with a message naming the offending key rather than guessing.
+
+**Understand the trade-offs before enabling:**
+
+- Containers hold **real LAN addresses** and are routable L2 peers of your network. The ACLs are load-bearing — a mis-scoped pool or block list means full LAN access, a worse blast radius than NAT.
+- The block list covers the container's own subnet and its default gateway. Containers still *route* through the gateway but cannot *address* it.
+- If `dind` or the Go module proxy is enabled, containers must be able to reach the host (that is how they reach the Docker API and `GOPROXY`), so a `/32` allow for the host is added automatically. Because a port-scoped Switch ACL disables the whole VFP port, that allow covers **all** host ports — so do not run anything on a Windows runner host that you would not expose to job containers. With both features disabled, the host stays blocked.
+- **Migrating an existing node requires a reboot**, not just a service restart: creating an L2Bridge network beside a live NAT network leaves HNS in a broken state. Reserve the pool, drain the node, set the keys, then reboot.
+- Anti-spoofing is not currently enforced — a container can forge a source address on the segment.
+
+### Local runs
+
+`ephemerd run` uses whatever network the host's `config.toml` specifies, so a local run on an L2Bridge host is filtered the same way a real job is. With no config, or on a Windows host without `l2bridge_egress`, it falls back to the default NAT network and logs a warning that the job's egress is unfiltered.
 
 ## Capability Restrictions
 
