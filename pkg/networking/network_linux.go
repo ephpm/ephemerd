@@ -107,6 +107,11 @@ func (l *linuxNetworking) teardown(ctx context.Context, id string, netns string)
 // hostAddr: no L2Bridge on Linux — the generic subnet derivation applies.
 func (l *linuxNetworking) hostAddr() string { return "" }
 
+// openHostPort/closeHostPort are Windows-L2Bridge-only; Linux containers reach
+// the bridge gateway without a host-firewall carve-out.
+func (l *linuxNetworking) openHostPort(int) error { return nil }
+func (l *linuxNetworking) closeHostPort(int)      {}
+
 func (l *linuxNetworking) cleanup() {
 	log := l.cfg.Log
 

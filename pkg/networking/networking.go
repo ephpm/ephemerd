@@ -174,6 +174,17 @@ type platformNetworking interface {
 	// peers and the reachable host address is the host's own adapter address
 	// — not the .1 of any container subnet.
 	hostAddr() string
+
+	// openHostPort / closeHostPort open and close a scoped host-firewall
+	// inbound allow for one TCP port, from the container pool to the host.
+	// Needed only on the Windows L2Bridge path: the VFP host /32 allow lets a
+	// container's packet leave its port toward the host, but the host's own
+	// inbound Windows Firewall default-denies it, so per-job services ephemerd
+	// binds on the host (the dind Docker API, the module proxy) are otherwise
+	// unreachable. Scoped to remoteip=<pool>, localport=<port> so ONLY that
+	// service opens — RDP/SMB/RPC stay blocked. No-op on NAT and non-Windows.
+	openHostPort(port int) error
+	closeHostPort(port int)
 }
 
 // New creates and initializes the networking manager for the current platform.
@@ -235,6 +246,25 @@ func (m *Manager) GatewayIP() string {
 // InstallFirewallRules blocks container traffic to private network ranges.
 func (m *Manager) InstallFirewallRules() error {
 	return m.platform.installFirewallRules()
+}
+
+// OpenHostPort opens a scoped host-firewall inbound allow for one TCP port from
+// the container pool to the host, so a per-job service ephemerd binds on the
+// host (dind's Docker API, the module proxy) is reachable from job containers.
+// Only the Windows L2Bridge path does anything; elsewhere it is a no-op. Pair
+// with CloseHostPort on teardown.
+func (m *Manager) OpenHostPort(port int) error {
+	if m.platform == nil {
+		return nil
+	}
+	return m.platform.openHostPort(port)
+}
+
+// CloseHostPort removes an allow previously added by OpenHostPort.
+func (m *Manager) CloseHostPort(port int) {
+	if m.platform != nil {
+		m.platform.closeHostPort(port)
+	}
 }
 
 // Cleanup removes all networking state: firewall rules, bridge interface,

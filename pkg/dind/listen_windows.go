@@ -37,6 +37,21 @@ func (s *Server) listen() (net.Listener, error) {
 		_ = ln.Close()
 		return nil, fmt.Errorf("unexpected listener address type: %T", ln.Addr())
 	}
+
+	// On the L2Bridge path the container reaches this listener at the host's
+	// LAN address, where the host's own inbound Windows Firewall default-denies
+	// it (the VFP host /32 allow only governs the container's egress port). Open
+	// a scoped inbound allow for exactly this port from the container pool. No-op
+	// on NAT. Failure is not fatal: log and continue — dind then simply is not
+	// reachable, which the job surfaces, rather than taking provisioning down.
+	if s.network != nil {
+		if err := s.network.OpenHostPort(tcpAddr.Port); err != nil {
+			s.log.Warn("failed to open dind host port for the container pool; docker may be unreachable on L2Bridge", "port", tcpAddr.Port, "error", err)
+		} else {
+			s.hostPort = tcpAddr.Port
+		}
+	}
+
 	s.endpoint = fmt.Sprintf("tcp://%s:%d", host, tcpAddr.Port)
 	return ln, nil
 }

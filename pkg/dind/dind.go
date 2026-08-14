@@ -53,6 +53,9 @@ type Server struct {
 	server          *http.Server
 	client          *client.Client
 	network         *networking.Manager
+	// hostPort is the TCP port the Windows listener opened in the host
+	// firewall for the container pool (L2Bridge only); 0 means none open.
+	hostPort int
 	buildkit        *buildkit.Server // shared embedded BuildKit solver (nil → fall back to platform default)
 	runnerNetNS     string           // path to runner container's net namespace; used to install DNAT rules for port bindings
 	allowPrivileged bool             // gate for docker run --privileged / --cap-add; see config.DindConfig.AllowPrivileged
@@ -347,6 +350,11 @@ func (s *Server) Stop() {
 		if err := s.listener.Close(); err != nil {
 			s.log.Debug("closing listener", "error", err)
 		}
+	}
+	// Remove the L2Bridge host-firewall allow opened for this job's listener.
+	if s.hostPort != 0 && s.network != nil {
+		s.network.CloseHostPort(s.hostPort)
+		s.hostPort = 0
 	}
 
 	// Clean up the socket and job docker directory

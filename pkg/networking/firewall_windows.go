@@ -373,6 +373,54 @@ func (w *windowsNetworking) installL2BridgeFirewallRules() error {
 	return nil
 }
 
+// hostPortAllowRule is the scoped inbound allow that makes one host TCP port
+// reachable from the container pool on the L2Bridge path (see openHostPort).
+func hostPortAllowRule(hostIP, ipPool string, port int) winFirewallRule {
+	return winFirewallRule{
+		name: fmt.Sprintf("%s-l2b-hostport-%d", firewallRulePrefix, port),
+		spec: []string{
+			"dir=in",
+			"action=allow",
+			"protocol=TCP",
+			"localip=" + hostIP,
+			"localport=" + strconv.Itoa(port),
+			"remoteip=" + ipPool,
+			"profile=any",
+			"enable=yes",
+		},
+	}
+}
+
+// openHostPort adds a scoped inbound allow so job containers can reach one host
+// TCP port (a per-job dind Docker API listener, or the module proxy). Without
+// it the host's default inbound deny drops the connection even though the VFP
+// host /32 allow permits the container to send. Scoped to remoteip=<pool> and
+// localport=<port>, so nothing else on the host opens. No-op unless the
+// L2Bridge egress path is active with a resolved plan.
+func (w *windowsNetworking) openHostPort(port int) error {
+	if !w.cfg.L2BridgeEgress || w.plan == nil || w.plan.HostIP == "" || w.plan.PoolSpec == "" {
+		return nil
+	}
+	r := hostPortAllowRule(w.plan.HostIP, w.plan.PoolSpec, port)
+	_ = netsh(r.deleteArgs()...) // idempotent
+	if err := netsh(r.addArgs()...); err != nil {
+		return fmt.Errorf("opening host port %d for the container pool: %w", port, err)
+	}
+	w.cfg.Log.Info("opened L2Bridge host port for container pool", "port", port, "pool", w.plan.PoolSpec)
+	return nil
+}
+
+// closeHostPort removes the allow added by openHostPort.
+func (w *windowsNetworking) closeHostPort(port int) {
+	if !w.cfg.L2BridgeEgress || w.plan == nil || w.plan.HostIP == "" || w.plan.PoolSpec == "" {
+		return
+	}
+	r := hostPortAllowRule(w.plan.HostIP, w.plan.PoolSpec, port)
+	if err := netsh(r.deleteArgs()...); err != nil {
+		w.cfg.Log.Debug("failed to remove L2Bridge host-port allow", "port", port, "error", err)
+	}
+}
+
 // removeL2BridgeFirewallRules deletes the backstop rules by name.
 func (w *windowsNetworking) removeL2BridgeFirewallRules() {
 	if w.plan == nil {
