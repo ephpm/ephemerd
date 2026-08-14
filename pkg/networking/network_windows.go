@@ -316,12 +316,14 @@ func (w *windowsNetworking) setup(ctx context.Context, id string, netns string) 
 			return nil, fmt.Errorf("allocating an address for %s: %w", id, err)
 		}
 		allocatedIP = ip
+		// PrefixLength is deliberately NOT set: HNS derives it from the
+		// network's declared subnet. The 2026-08-12 hand proof pinned exactly
+		// this shape and worked; Microsoft's own sdnbridge CNI also omits it.
+		// Setting it was the delta in the dead deployment (gateway ARP replies
+		// dropped by the vSwitch as "Invalid Packet" before reaching the port).
 		endpoint.IpConfigurations = []hcn.IpConfig{
 			{
 				IpAddress: allocatedIP,
-				// PrefixLen came from net.IPMask.Size() on an IPv4 mask, so it
-				// is 0-32 and always fits.
-				PrefixLength: uint8(w.plan.PrefixLen),
 			},
 		}
 	}
@@ -487,19 +489,37 @@ func buildEgressBlockPolicies() ([]hcn.EndpointPolicy, error) {
 // buildL2BridgeEgressACLPolicies: mixing in a port-scoped rule with no address
 // scope (the removed UDP 67/68 DHCP allows) blackholes the entire port on
 // metal.
+//
+// CRITICAL — priorities below 100 kill the port (proven on metal 2026-08-14,
+// l2test bisect harness, Server 2025 build 26100). A Switch-rule ACL with
+// Priority < 100 silently kills the endpoint's ENTIRE VFP dataplane: the port
+// drops every inbound frame — including the gateway's ARP reply (pktmon shows
+// "Invalid Packet" at the vSwitch before the port) — so the container can
+// never resolve its next hop and has no connectivity at all, while HNS reports
+// the endpoint healthy and applies the policy without error. This is
+// independent of the rule's action, direction, or address: an irrelevant
+// Block 203.0.113.1/32 at priority 90 reproduces it, and the identical ladder
+// with every priority >= 100 works (internet up, RFC1918 blocked). This is
+// what broke the 2026-08-13 production deployment (host-allow at 90), and the
+// earlier "port-scoped DHCP rules blackhole the port" incident (rules at
+// 90/95) was in the same band. NO RULE MAY EVER CARRY Priority < 100; the
+// regression tests enforce it.
 const (
+	// aclPriorityMinimum is the lowest Switch-ACL priority that is safe on
+	// metal. Rules below this kill the port — see the block comment above.
+	aclPriorityMinimum uint16 = 100
 	// aclPriorityHostAllow carves the ephemerd host's own /32 out ABOVE the
 	// RFC1918 block. Emitted only when Config.AllowHostAccess is set, which is
 	// what makes the per-job dind Docker API and the module proxy reachable.
-	aclPriorityHostAllow uint16 = 90
+	aclPriorityHostAllow uint16 = 100
 	// aclPriorityExtraAllow carves configured destinations out ABOVE the
 	// RFC1918 block. Unused by default (no carve-outs) — reserved for future
 	// operator-allowed destinations.
-	aclPriorityExtraAllow uint16 = 95
+	aclPriorityExtraAllow uint16 = 150
 	// aclPriorityBlock denies the RFC1918 + link-local supernets, whole. No
 	// gateway/own-subnet carve-out: on L2Bridge the container is a LAN peer,
 	// so carving the subnet would expose the management plane and the router.
-	aclPriorityBlock uint16 = 100
+	aclPriorityBlock uint16 = 200
 	// aclPriorityAllowAny permits everything not blocked above (the internet)
 	// and, crucially, inbound return traffic. Lowest precedence.
 	aclPriorityAllowAny uint16 = 65500

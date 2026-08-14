@@ -391,15 +391,24 @@ func (w *windowsNetworking) removeL2BridgeFirewallRules() {
 // pick. Returns an empty string (no error) when the adapter has no default
 // route, which the caller turns into a "set network.gateway" message.
 func defaultGatewayForAdapter(name string) (string, error) {
-	out, err := powershellOutput(fmt.Sprintf(
-		"(Get-NetRoute -InterfaceAlias %s -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue "+
-			"| Sort-Object -Property RouteMetric | Select-Object -First 1).NextHop",
-		psQuote(name),
-	))
-	if err != nil {
-		return "", err
+	// Try the configured name and its vEthernet-renamed form (creating the
+	// L2Bridge network renames the NIC — see adapterNameCandidates).
+	var lastErr error
+	for _, candidate := range adapterNameCandidates(name) {
+		out, err := powershellOutput(fmt.Sprintf(
+			"(Get-NetRoute -InterfaceAlias %s -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue "+
+				"| Sort-Object -Property RouteMetric | Select-Object -First 1).NextHop",
+			psQuote(candidate),
+		))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if hop := strings.TrimSpace(out); hop != "" {
+			return hop, nil
+		}
 	}
-	return strings.TrimSpace(out), nil
+	return "", lastErr
 }
 
 func (w *windowsNetworking) installFirewallRules() error {

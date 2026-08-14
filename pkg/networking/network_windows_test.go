@@ -158,6 +158,38 @@ func TestL2BridgeEgressACLPolicies_Precedence(t *testing.T) {
 		t.Fatalf("priority ladder broken: extra=%d block=%d allowany=%d (want extra < block < allowany)",
 			aclPriorityExtraAllow, aclPriorityBlock, aclPriorityAllowAny)
 	}
+	if aclPriorityHostAllow >= aclPriorityBlock {
+		t.Fatalf("host allow (%d) must outrank the RFC1918 block (%d) or dind/module-proxy traffic is denied",
+			aclPriorityHostAllow, aclPriorityBlock)
+	}
+}
+
+// TestL2BridgeEgressACLPolicies_NoRuleBelowPriority100 is a regression guard
+// for the metal finding that killed the 2026-08-13 production deployment: a
+// Switch-rule ACL with Priority < 100 silently kills the endpoint's ENTIRE
+// VFP dataplane on Server 2025 (build 26100). The port drops every inbound
+// frame — including the gateway's ARP reply — so the container never resolves
+// its next hop and has no connectivity, while HNS applies the policy without
+// error and reports the endpoint healthy. Proven independent of the rule's
+// action, direction, and address by the l2test bisect harness (an irrelevant
+// Block 203.0.113.1/32 at priority 90 reproduces it; the identical ladder
+// with every priority >= 100 works). NO rule may ever carry Priority < 100.
+func TestL2BridgeEgressACLPolicies_NoRuleBelowPriority100(t *testing.T) {
+	for _, p := range []uint16{aclPriorityHostAllow, aclPriorityExtraAllow, aclPriorityBlock, aclPriorityAllowAny} {
+		if p < aclPriorityMinimum {
+			t.Fatalf("ladder constant %d is below the safe minimum %d (kills the VFP port on metal)", p, aclPriorityMinimum)
+		}
+	}
+	for _, extra := range [][]string{nil, {"203.0.113.0/24"}} {
+		for _, hostIP := range []string{"", "198.51.100.7"} {
+			for _, a := range decodeACLs(t, mustBuildL2Bridge(t, extra, hostIP)) {
+				if a.Priority < aclPriorityMinimum {
+					t.Errorf("emitted ACL with priority %d < %d (kills the VFP port on metal): %+v",
+						a.Priority, aclPriorityMinimum, a)
+				}
+			}
+		}
+	}
 }
 
 // TestL2BridgeEgressACLPolicies_EveryRuleIsAddressScoped is a regression guard
