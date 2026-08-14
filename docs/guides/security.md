@@ -65,14 +65,13 @@ Setting `network.l2bridge_egress = true` moves job containers onto an L2Bridge n
 ```toml
 [network]
 l2bridge_egress = true
-host_nic        = "Ethernet"            # wired adapter to bridge onto
+host_nic        = "Ethernet 2"          # dedicated NIC to bridge onto (see below)
 ip_pool         = "192.0.2.192/27"      # reserved range, see below
 ```
 
-**Requirements — both are hard:**
+**A reserved `ip_pool` your DHCP server will never lease is mandatory.** On L2Bridge, containers are addressed on your LAN rather than behind NAT, so ephemerd must be told which addresses it may hand out. There is deliberately **no default** — any built-in guess would collide with live DHCP leases. Size it for at least `runner.max_concurrent` containers, and add the matching exclusion on your DHCP server *before* enabling. Container egress ACLs rewrite each container's source MAC to the host NIC's, so the containers appear on the segment as the host itself.
 
-- **A wired Ethernet adapter.** L2Bridge puts container MAC addresses on the physical segment. A Wi-Fi adapter operating as a station cannot carry additional MACs, so 802.11 links cannot host this path at all. This is a limitation of wireless, not of ephemerd.
-- **A reserved `ip_pool` your DHCP server will never lease.** On L2Bridge, containers are addressed on your LAN rather than behind NAT, so ephemerd must be told which addresses it may hand out. There is deliberately **no default** — any built-in guess would collide with live DHCP leases. Size it for at least `runner.max_concurrent` containers, and add the matching exclusion on your DHCP server *before* enabling.
+**A dedicated NIC is strongly recommended.** Creating the L2Bridge builds an external Hyper-V vSwitch on `host_nic` and migrates its IP onto a `vEthernet (<name>)` adapter. If that is the host's only NIC — the one you administer it over — there is a connectivity blip during creation, and a failure mid-creation can leave a remote node unreachable. A second NIC dedicated to container traffic keeps the management path untouched. ephemerd tolerates the vSwitch rename, so once the network exists, daemon restarts are safe. Wi-Fi adapters are untested and not recommended: Hyper-V external switches on 802.11 historically require bridging workarounds.
 
 `subnet`, `gateway`, and DNS are derived from `host_nic` at startup; set them explicitly only to override. Startup fails fast with a message naming the offending key rather than guessing.
 

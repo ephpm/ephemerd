@@ -105,7 +105,16 @@ owner = "your-org"
 # Host NIC the L2Bridge binds onto. REQUIRED when l2bridge_egress = true; there
 # is no default (the correct adapter name is host-specific). Use the name shown
 # by `Get-NetAdapter`. Ignored when l2bridge_egress is false.
-# host_nic = "Ethernet"
+#
+# STRONGLY RECOMMENDED: bind a DEDICATED NIC, not the host's management NIC.
+# Creating the L2Bridge builds an external Hyper-V vSwitch on this adapter and
+# migrates its IP onto a "vEthernet (<name>)" adapter. On a host reached over
+# that same NIC there is a brief connectivity blip during creation, and any
+# failure mid-creation can leave the box unreachable — a hazard for remote
+# nodes. A second NIC dedicated to container traffic keeps the management path
+# untouched. (ephemerd tolerates the vSwitch rename either way, so restarts are
+# safe once the network exists.)
+# host_nic = "Ethernet 2"
 #
 # Addresses ephemerd may assign to job containers. REQUIRED when
 # l2bridge_egress = true, with NO default.
