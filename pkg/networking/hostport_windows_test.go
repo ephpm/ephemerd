@@ -38,4 +38,9 @@ func TestHostPortAllowRule_ScopedToPoolAndPort(t *testing.T) {
 	if !strings.Contains(r.name, "63933") {
 		t.Errorf("rule name %q must be port-specific so concurrent jobs do not collide", r.name)
 	}
+	// The name must fall under the prefix the shutdown sweep matches, or a
+	// hard-killed job leaks its allow forever.
+	if !strings.HasPrefix(r.name, hostPortRulePrefix) {
+		t.Errorf("rule name %q must start with the sweep prefix %q", r.name, hostPortRulePrefix)
+	}
 }

@@ -421,15 +421,27 @@ func (w *windowsNetworking) closeHostPort(port int) {
 	}
 }
 
-// removeL2BridgeFirewallRules deletes the backstop rules by name.
+// hostPortRulePrefix is the DisplayName prefix of every per-job host-port allow
+// (see hostPortAllowRule). Swept by prefix on shutdown so a hard kill — which
+// skips dind's per-job CloseHostPort — cannot leak stale inbound allows.
+const hostPortRulePrefix = firewallRulePrefix + "-l2b-hostport-"
+
+// removeL2BridgeFirewallRules deletes the backstop rules by name, and sweeps any
+// leaked per-job host-port allows by prefix.
 func (w *windowsNetworking) removeL2BridgeFirewallRules() {
-	if w.plan == nil {
-		return
-	}
-	for _, r := range l2BridgeControlPlaneRules(w.plan.HostIP, w.plan.PoolSpec, w.cfg.ControlPorts) {
-		if err := netsh(r.deleteArgs()...); err != nil {
-			w.cfg.Log.Debug("failed to remove L2Bridge control-plane firewall rule", "rule", r.name, "error", err)
+	if w.plan != nil {
+		for _, r := range l2BridgeControlPlaneRules(w.plan.HostIP, w.plan.PoolSpec, w.cfg.ControlPorts) {
+			if err := netsh(r.deleteArgs()...); err != nil {
+				w.cfg.Log.Debug("failed to remove L2Bridge control-plane firewall rule", "rule", r.name, "error", err)
+			}
 		}
+	}
+	// Prefix-sweep the per-job host-port allows. netsh delete-by-name has no
+	// wildcard, so go through the firewall cmdlets. Runs regardless of w.plan —
+	// a hard kill can leave these behind for a pool that no longer resolves, and
+	// startup Cleanup must still reclaim them.
+	if err := powershell("Get-NetFirewallRule -DisplayName '" + hostPortRulePrefix + "*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue"); err != nil {
+		w.cfg.Log.Debug("failed to prefix-sweep L2Bridge host-port allows", "error", err)
 	}
 }
 
