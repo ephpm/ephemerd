@@ -336,16 +336,14 @@ func (w *windowsNetworking) setup(ctx context.Context, id string, netns string) 
 		return nil, fmt.Errorf("creating HCN endpoint for %s: %w", id, err)
 	}
 
-	// Apply ACL policies to block private network access. On L2Bridge these are
-	// the only egress restriction that enforces: the Hyper-V firewall rule set
-	// in firewall_windows.go is built for the NAT subnet and is deliberately not
-	// installed on this path (its subtract-the-container-subnet logic would
-	// carve the management LAN back out of the deny — see the L2Bridge backstop
-	// note there). A failure here therefore means the container would run with
-	// unrestricted egress to the host LAN, other RFC1918 services, and
-	// link-local metadata endpoints. Fail CLOSED: tear down the endpoint we just
-	// created and refuse the job rather than start a container we cannot
-	// firewall.
+	// Apply ACL policies to block private network access. On L2Bridge the VFP
+	// Switch-ACL ladder applied here is the ONLY egress restriction that
+	// enforces — there is no host-side firewall mechanism that can filter this
+	// traffic (see the header in firewall_windows.go). A failure here therefore
+	// means the container would run with unrestricted egress to the host LAN,
+	// other RFC1918 services, and link-local metadata endpoints. Fail CLOSED:
+	// tear down the endpoint we just created and refuse the job rather than start
+	// a container we cannot firewall.
 	//
 	// The ACLs are applied to the endpoint BEFORE the container is started
 	// (setup runs ahead of task creation), and the L2Bridge rule set is STATIC
@@ -432,50 +430,6 @@ var egressBlockedCIDRs = []string{
 	"172.16.0.0/12",
 	"192.168.0.0/16",
 	"169.254.0.0/16",
-}
-
-// buildEgressBlockPolicies constructs the per-endpoint block ACLs from
-// egressBlockedCIDRs. It fails closed: a marshal error on any rule, or an empty
-// resulting set, is an error rather than a silently weaker rule set. Split out
-// from applyACLPolicies so the (pure) rule construction is unit-testable
-// without a live HCN endpoint.
-func buildEgressBlockPolicies() ([]hcn.EndpointPolicy, error) {
-	var policies []hcn.EndpointPolicy
-
-	for _, cidr := range egressBlockedCIDRs {
-		if cidr == DefaultSubnet {
-			continue
-		}
-
-		acl := hcn.AclPolicySetting{
-			Protocols:       "6,17", // TCP + UDP
-			Action:          hcn.ActionTypeBlock,
-			Direction:       hcn.DirectionTypeOut,
-			RemoteAddresses: cidr,
-			RuleType:        hcn.RuleTypeSwitch,
-			Priority:        100,
-		}
-
-		settings, err := json.Marshal(acl)
-		if err != nil {
-			// Fail closed: a rule we cannot serialize is a rule we cannot
-			// enforce. Do not skip it and continue with a weaker rule set.
-			return nil, fmt.Errorf("marshaling egress block ACL for %s: %w", cidr, err)
-		}
-
-		policies = append(policies, hcn.EndpointPolicy{
-			Type:     hcn.ACL,
-			Settings: settings,
-		})
-	}
-
-	if len(policies) == 0 {
-		// Nothing to block would mean no egress restriction at all — treat as
-		// an error so the caller refuses to start an unfirewalled container.
-		return nil, fmt.Errorf("no egress block ACLs constructed (would run unfirewalled)")
-	}
-
-	return policies, nil
 }
 
 // VFP Switch-ACL precedence for the L2Bridge egress model. VFP evaluates ACLs
@@ -663,22 +617,22 @@ func buildL2BridgeEgressACLPolicies(extraAllowed []string, hostIP string) ([]hcn
 	return policies, nil
 }
 
-// applyACLPolicies applies the per-endpoint egress ACLs. On the L2Bridge path
-// it applies the router-safe VFP ladder (buildL2BridgeEgressACLPolicies); on
-// NAT it applies the existing block-only set (buildEgressBlockPolicies), which
-// is left untouched so the default NAT path behaves exactly as before. The full
-// rule set is built up front and applied atomically; any failure is returned so
-// the caller (setup) can treat it as fatal for the job.
+// applyACLPolicies applies the per-endpoint egress ACLs. Only the L2Bridge path
+// has a working enforcement point: it applies the router-safe VFP ladder
+// (buildL2BridgeEgressACLPolicies), built up front and applied atomically, with
+// any failure returned so the caller (setup) can treat it as fatal for the job.
+//
+// On the NAT path there is nothing to apply: block ACLs on the NAT vSwitch port
+// were inert on metal (they never filtered the NAT'd egress), and no host-side
+// mechanism can filter NAT container egress on this stack (see the header in
+// firewall_windows.go). NAT egress is unfiltered by design — installFirewallRules
+// logs that gap and points the operator at network.l2bridge_egress.
 func (w *windowsNetworking) applyACLPolicies(endpoint *hcn.HostComputeEndpoint) error {
-	var (
-		policies []hcn.EndpointPolicy
-		err      error
-	)
-	if w.cfg.L2BridgeEgress {
-		policies, err = buildL2BridgeEgressACLPolicies(w.cfg.ExtraAllowedCIDRs, w.hostAllowIP())
-	} else {
-		policies, err = buildEgressBlockPolicies()
+	if !w.cfg.L2BridgeEgress {
+		return nil
 	}
+
+	policies, err := buildL2BridgeEgressACLPolicies(w.cfg.ExtraAllowedCIDRs, w.hostAllowIP())
 	if err != nil {
 		return err
 	}
