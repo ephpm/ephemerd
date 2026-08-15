@@ -31,6 +31,9 @@ type Config struct {
 	BuildKit    BuildKitConfig    `toml:"buildkit"`
 	ImageGC     ImageGCConfig     `toml:"image_gc"`
 	ModuleProxy ModuleProxyConfig `toml:"module_proxy"`
+	NpmProxy    PkgProxyConfig    `toml:"npm_proxy"`
+	PipProxy    PkgProxyConfig    `toml:"pip_proxy"`
+	PubProxy    PkgProxyConfig    `toml:"pub_proxy"`
 	Runtime     RuntimeConfig     `toml:"runtime"`
 	Runner      RunnerConfig      `toml:"runner"`
 	Metrics     MetricsConfig     `toml:"metrics"`
@@ -677,6 +680,91 @@ type ModuleProxyConfig struct {
 	Port     int    `toml:"port"`     // listen port on bridge gateway (default 8082)
 	Upstream string `toml:"upstream"` // upstream proxy URL (default "https://proxy.golang.org")
 	Cleanup  bool   `toml:"cleanup"`  // wipe cache on shutdown (default true)
+}
+
+// PkgProxyConfig configures one language package caching proxy. The
+// same shape serves [npm_proxy], [pip_proxy] and [pub_proxy]: all three are
+// pull-through HTTP caches with an immutable-artifact half and a mutable-
+// metadata half, and differ only in their upstream and their defaults.
+//
+// Disabled by default, matching [module_proxy]'s opt-in posture.
+//
+// Unlike [module_proxy], `cleanup` defaults to FALSE. A pull-through cache
+// that empties itself on every daemon restart saves nothing, and these are
+// bounded by max_size_gb rather than by being thrown away.
+type PkgProxyConfig struct {
+	// Enabled turns the proxy on. Default false.
+	Enabled bool `toml:"enabled"`
+
+	// Port is the listen port on the bridge gateway. Zero takes the
+	// per-ecosystem default (npm 8084, pip 8085, pub 8086).
+	Port int `toml:"port"`
+
+	// Upstream overrides the registry to pull through to (npm:
+	// https://registry.npmjs.org, pip: https://pypi.org, pub:
+	// https://pub.dev). The upstream's own host is always permitted to
+	// serve artifacts, so an override needs no matching allowed_hosts entry.
+	Upstream string `toml:"upstream"`
+
+	// IndexTTL is how long cached MUTABLE metadata (an npm packument, a PEP
+	// 503 index page, a pub version listing) is served before it is
+	// revalidated with a conditional GET. Zero takes the 5m default; a
+	// negative value revalidates on every request.
+	//
+	// Immutable artifacts — tarballs, wheels, sdists, archives — ignore
+	// this entirely: they are cached permanently and never revalidated.
+	IndexTTL time.Duration `toml:"index_ttl"`
+
+	// MaxSizeGB is the cache's disk budget in GiB. When it is exceeded, the
+	// least-recently-used entries are evicted until the cache is back to
+	// 90% of the budget. Zero takes the 5 GiB default; a NEGATIVE value
+	// disables the budget entirely.
+	//
+	// There is no "unlimited by default" option on purpose: an unbounded
+	// package cache is how a node fills its disk (see [image_gc] and
+	// [buildkit] for the two previous instances of that lesson).
+	MaxSizeGB int64 `toml:"max_size_gb"`
+
+	// AllowedHosts extends the set of hosts the proxy will fetch package
+	// ARTIFACTS from. Metadata documents carry absolute download URLs which
+	// the proxy rewrites to point at itself; this list is what stops a job
+	// from hand-crafting such a URL and using the daemon as an open relay
+	// into the host's network. Entries match a host exactly or as a parent
+	// domain. The ecosystem's own CDNs and the configured upstream are
+	// always allowed.
+	AllowedHosts []string `toml:"allowed_hosts"`
+
+	// Cleanup wipes the cache directory on shutdown. Default false.
+	Cleanup bool `toml:"cleanup"`
+}
+
+// ProxyPort returns the configured port, or def when unset.
+func (p *PkgProxyConfig) ProxyPort(def int) int {
+	if p.Port <= 0 {
+		return def
+	}
+	return p.Port
+}
+
+// ProxyIndexTTL returns the metadata revalidation interval, defaulting to
+// 5 minutes. A negative value is preserved: it means "always revalidate".
+func (p *PkgProxyConfig) ProxyIndexTTL() time.Duration {
+	if p.IndexTTL == 0 {
+		return 5 * time.Minute
+	}
+	return p.IndexTTL
+}
+
+// ProxyMaxBytes returns the cache disk budget in bytes: 5 GiB by default,
+// and a negative value (meaning unbounded) passed through as-is.
+func (p *PkgProxyConfig) ProxyMaxBytes() int64 {
+	if p.MaxSizeGB == 0 {
+		return 5 << 30
+	}
+	if p.MaxSizeGB < 0 {
+		return -1
+	}
+	return p.MaxSizeGB << 30
 }
 
 // VMConfig configures virtual machines for cross-OS job execution.

@@ -289,6 +289,84 @@ shutdown_timeout = "5m"
 # [dispatch]
 # token = "..."
 
+# ==============================================================================
+# Language package caches
+# ==============================================================================
+#
+# Pull-through HTTP caches for npm, pip and pub, so CI jobs stop re-downloading
+# the same dependencies on every ephemeral runner. Each runs on the bridge
+# gateway and injects one env var into every job container — no workflow
+# changes.
+#
+# All three are OFF by default (same posture as [module_proxy]).
+#
+# Shared design, per ecosystem:
+#   * IMMUTABLE artifacts (npm tarballs, Python wheels/sdists, pub archives)
+#     are cached permanently and never revalidated. These are the bytes.
+#   * MUTABLE metadata (npm packuments, PEP 503 index pages, pub version
+#     listings) is cached for index_ttl and then revalidated with a
+#     conditional GET, so a package published minutes ago is still visible.
+#   * Download URLs inside metadata are rewritten to point back at the proxy,
+#     which is what makes the artifact bytes flow through the cache at all.
+#     Integrity hashes are left untouched and still verified by the client.
+#   * FAIL OPEN. A dead cache degrades to "normal speed", never "build fails":
+#     an unreachable upstream serves the stale copy, an uncached download is
+#     307-redirected to the real origin, and a proxy that does not answer its
+#     health probe at startup has its env var withheld entirely.
+#   * BOUNDED. max_size_gb caps each cache; the least-recently-used entries are
+#     evicted back to 90% of the cap. Inspect with `ephemerd cache list`.
+#
+# Shared keys (defaults shown):
+#   enabled       = false     turn the cache on
+#   port          = <see below on the bridge gateway>
+#   upstream      = <the ecosystem's public registry>
+#   index_ttl     = "5m"      metadata revalidation interval; a negative value
+#                             revalidates on every request. Artifacts ignore it.
+#   max_size_gb   = 5         disk budget; -1 disables the bound (not advised)
+#   allowed_hosts = []        EXTRA hosts the proxy may fetch artifacts from.
+#                             The ecosystem CDNs and the configured upstream are
+#                             always allowed. This list is the SSRF fence around
+#                             the rewritten download URLs.
+#   cleanup       = false     wipe the cache on shutdown
+
+# npm / pnpm / Yarn. Injects npm_config_registry (npm, pnpm, Yarn Classic) and
+# YARN_NPM_REGISTRY_SERVER (Yarn Berry). A repo-committed .npmrc or
+# .yarnrc.yml with an explicit registry still wins. Authenticated/private
+# registries are not proxied — this cache forwards no credentials.
+# [npm_proxy]
+# enabled     = false
+# port        = 8084
+# upstream    = "https://registry.npmjs.org"
+# index_ttl   = "5m"
+# max_size_gb = 5
+# cleanup     = false
+
+# pip / Poetry / pip-tools. Injects PIP_INDEX_URL (pointing at the proxy's
+# PEP 503 simple index) and PIP_TRUSTED_HOST, which is required because the
+# proxy speaks plain HTTP on a private address. A pip.conf or a
+# requirements.txt "--index-url" line still wins; uv reads UV_INDEX_URL rather
+# than PIP_INDEX_URL and is not covered.
+# [pip_proxy]
+# enabled     = false
+# port        = 8085
+# upstream    = "https://pypi.org"
+# index_ttl   = "5m"
+# max_size_gb = 5
+# cleanup     = false
+
+# Dart / Flutter. Injects PUB_HOSTED_URL, honoured by both `dart pub` and
+# `flutter pub`. A dependency with an explicit `hosted:` URL in pubspec.yaml
+# still wins, and the Flutter SDK's own artifact downloads follow
+# FLUTTER_STORAGE_BASE_URL instead — those are not cached here. Publishing is
+# never proxied.
+# [pub_proxy]
+# enabled     = false
+# port        = 8086
+# upstream    = "https://pub.dev"
+# index_ttl   = "5m"
+# max_size_gb = 5
+# cleanup     = false
+
 [log]
 # Log level: debug, info, warn, error
 level = "info"
