@@ -26,7 +26,7 @@ We will acknowledge reports within 7 days and aim to release a fix within 30 day
 ephemerd runs untrusted CI/CD workloads. Its security model assumes that **code running inside a job is hostile** and must be prevented from:
 
 1. **Escaping the container/VM** — reaching the host filesystem, processes, or other jobs
-2. **Accessing internal networks** — containers are firewalled from RFC 1918 and link-local ranges
+2. **Accessing internal networks** — containers are firewalled from RFC 1918 and link-local ranges on Linux and macOS, and on Windows when `network.l2bridge_egress` is enabled. The **default** Windows NAT network is not egress-filtered (no host-side mechanism can filter it on that stack) — enable L2Bridge to enforce it
 3. **Escalating privileges** — containers run with a minimal capability set, no `CAP_SYS_ADMIN` or `CAP_NET_ADMIN`
 4. **Persisting after completion** — job environments are destroyed immediately after the runner exits
 
@@ -35,13 +35,13 @@ ephemerd runs untrusted CI/CD workloads. Its security model assumes that **code 
 | Platform | Isolation Mechanism |
 |----------|-------------------|
 | Linux | OCI containers with seccomp profiles, restricted capabilities, CNI bridge firewall |
-| Windows | Hyper-V isolated containers (separate kernel per job), HCN per-endpoint ACL policies |
+| Windows | Hyper-V isolated containers (separate kernel per job). Container egress filtering only via `network.l2bridge_egress` (HNS L2Bridge + VFP ACLs) — the default NAT network is not egress-filtered |
 | macOS | Virtualization.framework VMs with APFS copy-on-write snapshots |
 
 ### What Is In Scope
 
 - Container/VM escape (gaining access to host or other jobs)
-- Network isolation bypass (reaching RFC 1918, link-local, or host-only addresses from a job)
+- Network isolation bypass (reaching RFC 1918, link-local, or host-only addresses from a job) — on Linux/macOS, and on Windows nodes running `network.l2bridge_egress`. On the default Windows NAT network this is expected, not a vulnerability: that stack cannot be egress-filtered host-side; use L2Bridge to enforce it
 - Credential leakage (JIT tokens, GitHub App keys, or PATs exposed to unauthorized parties)
 - Privilege escalation (gaining capabilities beyond the allowed set)
 - Denial of service against the daemon itself (not resource exhaustion from legitimate jobs)

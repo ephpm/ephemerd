@@ -32,6 +32,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -49,6 +50,28 @@ const (
 	// goes down, so a mid-message connection reset can't be misread as a
 	// failed upgrade.
 	restartDelay = 2 * time.Second
+
+	// restartWatchdog bounds how long we wait, after asking the service
+	// manager to restart us, for that restart to actually take. A restart
+	// that works kills this process, so still being alive when the watchdog
+	// fires IS the failure signal — there is nothing else to observe.
+	//
+	// A successful restart is a stop plus a start; the daemon's own SCM stop
+	// path checkpoints every 10s and the scheduler is already drained by
+	// this point, so a healthy restart lands in seconds. 90s is generous
+	// without leaving the node cordoned for long if it never comes.
+	restartWatchdog = 90 * time.Second
+
+	// restartRetryDelay is the shorter wait used when the restart request
+	// itself failed outright (nothing was handed to the service manager, so
+	// there is nothing to wait for).
+	restartRetryDelay = 5 * time.Second
+
+	// restartAttempts is how many times we ask for the restart before
+	// declaring it failed and putting the node back into service. Retrying
+	// is safe precisely because a restart that took effect would already
+	// have terminated us.
+	restartAttempts = 2
 )
 
 // versionRe matches release tags: vX.Y.Z with an optional prerelease
@@ -112,15 +135,24 @@ type RunOptions struct {
 	Drainer         Drainer
 	Log             *slog.Logger
 
+	// Shutdown, when non-nil, is closed (or is a ctx.Done()) as soon as the
+	// daemon begins going down. It is how the restart supervisor learns that
+	// the restart it asked for actually took effect: without it, a slow but
+	// healthy stop would be misread as a failed restart and the node would be
+	// un-cordoned on its way out the door. Optional; nil means the only
+	// evidence of success is process death.
+	Shutdown <-chan struct{}
+
 	// Test/override seams.
-	InstallPath  string                            // default: resolved os.Executable()
-	StageDir     string                            // default: <installdir>/.ephemerd-upgrade
-	HTTPClient   *http.Client                      // default: http.DefaultClient (no timeout; ctx-governed)
-	GOOS         string                            // default: runtime.GOOS
-	GOARCH       string                            // default: runtime.GOARCH
-	Probe        func(path string) (string, error) // default: probeVersion (runs `<path> --version`)
-	Restart      func() error                      // default: triggerRestart (per-OS service restart)
-	RestartDelay time.Duration                     // default: restartDelay; delay before the detached restart fires
+	InstallPath     string                            // default: resolved os.Executable()
+	StageDir        string                            // default: <installdir>/.ephemerd-upgrade
+	HTTPClient      *http.Client                      // default: http.DefaultClient (no timeout; ctx-governed)
+	GOOS            string                            // default: runtime.GOOS
+	GOARCH          string                            // default: runtime.GOARCH
+	Probe           func(path string) (string, error) // default: probeVersion (runs `<path> --version`)
+	Restart         func() error                      // default: triggerRestart (per-OS service restart)
+	RestartDelay    time.Duration                     // default: restartDelay; delay before the detached restart fires
+	RestartWatchdog time.Duration                     // default: restartWatchdog; how long a restart has to take effect
 }
 
 // Run executes the upgrade end to end, emitting Progress at each phase.
@@ -134,6 +166,12 @@ type RunOptions struct {
 //
 // Any error before the swap emits StateFailed, re-uncordons the scheduler,
 // and leaves the node running the old binary.
+//
+// The cordon is never allowed to outlive a failed upgrade. Every exit path —
+// error return, panic, and the post-return case where the service manager
+// simply never restarts us — un-cordons the scheduler, because a node that is
+// drained and NOT upgraded is worse than one that never attempted the
+// upgrade: it looks healthy while quietly accepting no work.
 func Run(ctx context.Context, opts RunOptions, emit Emit) (retErr error) {
 	log := opts.Log
 	if log == nil {
@@ -192,13 +230,37 @@ func Run(ctx context.Context, opts RunOptions, emit Emit) (retErr error) {
 		return nil
 	}
 
-	// 2. Cordon + drain to idle (unless skipped). On any failure before the
-	// restart we uncordon so the node resumes claiming on the old binary.
+	// 2. Cordon + drain to idle (unless skipped).
+	//
+	// From here on the node is NOT accepting jobs, and that is the state we
+	// must never get stuck in. A node that is drained but not upgraded is
+	// strictly worse than one that never tried: it looks healthy (the service
+	// is Running, `ephemerd status` says ok) while silently taking no work.
+	// So the reversal is a single idempotent closure, armed the instant we
+	// cordon and fired from every way out of this function — an error return,
+	// a panic, and (past the point where Run has already returned) the
+	// restart supervisor's watchdog.
 	didCordon := false
+	var undrainOnce sync.Once
+	undrain := func(why string) {
+		if !didCordon || opts.Drainer == nil {
+			return
+		}
+		undrainOnce.Do(func() {
+			active := opts.Drainer.Uncordon()
+			log.Warn("upgrade did not complete; scheduler UNCORDONED so this node keeps accepting jobs",
+				"reason", why, "running_version", current, "target", target, "active_jobs", active)
+		})
+	}
 	defer func() {
-		if retErr != nil && didCordon && opts.Drainer != nil {
-			opts.Drainer.Uncordon()
-			log.Info("upgrade aborted; scheduler uncordoned, node stays on old binary", "current", current)
+		// Cover panics too: an unexpected crash inside Run must not be the
+		// one path that leaves the node cordoned.
+		if r := recover(); r != nil {
+			retErr = fmt.Errorf("upgrade panicked: %v", r)
+			emit(Progress{State: StateFailed, Message: retErr.Error(), CurrentVersion: current, TargetVersion: target})
+		}
+		if retErr != nil {
+			undrain(retErr.Error())
 		}
 	}()
 	if !opts.NoDrain && opts.Drainer != nil {
@@ -300,26 +362,118 @@ func Run(ctx context.Context, opts RunOptions, emit Emit) (retErr error) {
 	emit(Progress{State: StateRestarting, Message: fmt.Sprintf("installed %s (kept %s for rollback); restarting service", target, filepath.Base(backup)), CurrentVersion: current, TargetVersion: target})
 	restart := opts.Restart
 	if restart == nil {
-		restart = triggerRestart
+		// The helper is spawned from the backup — the image this very process
+		// is running — rather than the newly installed binary. See
+		// triggerRestart (Windows) for why; the Unix paths ignore both.
+		restart = func() error { return triggerRestart(backup, installPath) }
 	}
 	delay := opts.RestartDelay
 	if delay <= 0 {
 		delay = restartDelay
 	}
-	scheduleRestart(restart, delay, log)
+	watchdog := opts.RestartWatchdog
+	if watchdog <= 0 {
+		watchdog = restartWatchdog
+	}
+
+	// Supervise the restart instead of firing and forgetting it. Handing a
+	// request to the service manager is not the same as being restarted:
+	// v0.1.8 proved that a hand-off can succeed and still not take effect for
+	// minutes, long past the point where the client has given up. If it does
+	// not take, put the node back into service.
+	go superviseRestart(restartSupervisor{
+		restart:  restart,
+		delay:    delay,
+		watchdog: watchdog,
+		shutdown: opts.Shutdown,
+		log:      log,
+		onFailed: func(cause error) {
+			undrain(fmt.Sprintf("service restart into %s never happened: %v", target, cause))
+			log.Error("upgrade INCOMPLETE: the new binary is installed but the service did not restart",
+				"installed", target, "still_running", current, "install_path", installPath,
+				"rollback_binary", backup, "remediation", manualRestartHint, "error", cause)
+		},
+	})
 	return nil
 }
 
-// scheduleRestart fires restart() after delay, detached from Run's return so
-// it survives this call. It intentionally does not block: the caller's
-// stream must flush the RESTARTING message and disconnect before the service
-// goes down.
-func scheduleRestart(restart func() error, delay time.Duration, log *slog.Logger) {
-	time.AfterFunc(delay, func() {
-		if err := restart(); err != nil {
-			log.Error("upgrade: failed to trigger service restart — new binary is staged; restart manually", "error", err)
+// restartSupervisor is the parameter block for superviseRestart, kept as a
+// struct so the (many) knobs stay named at the call site and the whole thing
+// is trivially table-testable.
+type restartSupervisor struct {
+	restart  func() error
+	delay    time.Duration // wait before the first attempt (lets the stream flush)
+	watchdog time.Duration // how long an accepted request has to take effect
+	shutdown <-chan struct{}
+	log      *slog.Logger
+	onFailed func(error) // called once, only when every attempt failed to take
+}
+
+// superviseRestart asks the service manager to restart us and then verifies
+// that it happened.
+//
+// The verification is indirect but exact: a restart that takes effect stops
+// this process, so if we are still executing after the watchdog, it did not.
+// The one false positive would be a stop that is underway but slow, which is
+// why s.shutdown short-circuits the wait — when the daemon starts going down
+// the restart has demonstrably taken and we exit silently.
+//
+// Retrying is safe for the same reason (a successful attempt would have
+// killed us), so a failed request gets one more, quicker try before we give
+// up and hand control to onFailed.
+func superviseRestart(s restartSupervisor) {
+	if s.log == nil {
+		s.log = slog.Default()
+	}
+	if !waitUnlessShutdown(s.delay, s.shutdown) {
+		return
+	}
+	var lastErr error
+	for attempt := 1; attempt <= restartAttempts; attempt++ {
+		wait := s.watchdog
+		if err := s.restart(); err != nil {
+			lastErr = fmt.Errorf("attempt %d: requesting restart: %w", attempt, err)
+			s.log.Error("upgrade: could not ask the service manager to restart", "attempt", attempt, "error", err)
+			// Nothing was handed off, so there is nothing to wait for —
+			// retry sooner. Never longer than the watchdog itself, which
+			// also keeps this responsive under a test-sized watchdog.
+			wait = restartRetryDelay
+			if s.watchdog < wait {
+				wait = s.watchdog
+			}
+		} else {
+			lastErr = fmt.Errorf("attempt %d: restart was requested but this process was still running %s later", attempt, s.watchdog)
+			s.log.Info("upgrade: restart requested; waiting for the service manager to take us down",
+				"attempt", attempt, "watchdog", s.watchdog)
 		}
-	})
+		if !waitUnlessShutdown(wait, s.shutdown) {
+			return // the daemon is going down: the restart took effect
+		}
+	}
+	if s.onFailed != nil {
+		s.onFailed(lastErr)
+	}
+}
+
+// waitUnlessShutdown sleeps for d and reports true, or returns false as soon
+// as shutdown fires. A nil shutdown channel simply never fires.
+func waitUnlessShutdown(d time.Duration, shutdown <-chan struct{}) bool {
+	if d <= 0 {
+		select {
+		case <-shutdown:
+			return false
+		default:
+			return true
+		}
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-shutdown:
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 // waitDrain blocks until the scheduler reports zero active jobs or timeout.

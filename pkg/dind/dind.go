@@ -53,6 +53,9 @@ type Server struct {
 	server          *http.Server
 	client          *client.Client
 	network         *networking.Manager
+	// hostPort is the TCP port the Windows listener opened in the host
+	// firewall for the container pool (L2Bridge only); 0 means none open.
+	hostPort int
 	buildkit        *buildkit.Server // shared embedded BuildKit solver (nil → fall back to platform default)
 	runnerNetNS     string           // path to runner container's net namespace; used to install DNAT rules for port bindings
 	allowPrivileged bool             // gate for docker run --privileged / --cap-add; see config.DindConfig.AllowPrivileged
@@ -326,6 +329,18 @@ func (s *Server) Stop() {
 		CleanupJobNamespace(context.Background(), s.client, s.jobNamespace, s.log)
 	}
 
+	// Clean up this job's build output in the SHARED buildkit namespace.
+	// CleanupJobNamespace above only covers the per-job dind namespace;
+	// `docker build` results land in the one shared "buildkit" namespace
+	// under a job-scoped name that, because the job ID is unique, nothing
+	// ever overwrites or removes. Left alone they accumulate one set of
+	// records per job forever, and their gc.flat leases pin the content
+	// against containerd's GC — the mechanism behind a 44 GB / 49-dead-job
+	// pile-up observed in production.
+	if s.client != nil && s.buildkit != nil {
+		CleanupJobBuildRecords(context.Background(), s.client, s.buildkit.ContainerdNamespace(), s.jobID, s.log)
+	}
+
 	if s.server != nil {
 		if err := s.server.Shutdown(context.Background()); err != nil {
 			s.log.Debug("shutting down fake docker server", "error", err)
@@ -335,6 +350,11 @@ func (s *Server) Stop() {
 		if err := s.listener.Close(); err != nil {
 			s.log.Debug("closing listener", "error", err)
 		}
+	}
+	// Remove the L2Bridge host-firewall allow opened for this job's listener.
+	if s.hostPort != 0 && s.network != nil {
+		s.network.CloseHostPort(s.hostPort)
+		s.hostPort = 0
 	}
 
 	// Clean up the socket and job docker directory
@@ -370,6 +390,8 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.handleVersion(w, r)
 	case path == "/info":
 		s.handleInfo(w, r)
+	case path == "/system/df" && r.Method == http.MethodGet:
+		s.handleSystemDF(w, r)
 	case path == "/images/json" && r.Method == http.MethodGet:
 		s.handleImageList(w, r)
 	case path == "/images/create" && r.Method == http.MethodPost:

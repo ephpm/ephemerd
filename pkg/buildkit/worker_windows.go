@@ -57,6 +57,10 @@ func newWorkerController(ctx context.Context, cfg Config, _ *session.Manager) (*
 	if err != nil {
 		return nil, fmt.Errorf("containerd worker opt: %w", err)
 	}
+	// Without this the worker reports an empty GC policy and BuildKit's
+	// controller skips collection entirely — the build cache then grows
+	// forever. See GCConfig.
+	workerOpt.GCPolicy = cfg.GC.PruneInfo()
 
 	if cfg.Network != nil {
 		hcnProvider := newHCNNetworkProvider(cfg.Network, cfg.Log)

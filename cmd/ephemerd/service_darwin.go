@@ -11,6 +11,15 @@ import (
 
 const launchdPlist = "/Library/LaunchDaemons/dev.ephpm.ephemerd.plist"
 
+// serviceRestart reloads the launchd job. launchctl unload is synchronous, so
+// the sequential unload/load is race-free.
+func serviceRestart() error {
+	if err := serviceAction("stop"); err != nil {
+		fmt.Printf("note: stop failed: %v\n", err)
+	}
+	return serviceAction("start")
+}
+
 func serviceAction(action string) error {
 	switch action {
 	case "start":

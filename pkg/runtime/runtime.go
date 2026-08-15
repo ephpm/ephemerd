@@ -24,14 +24,20 @@ import (
 	"github.com/ephpm/ephemerd/pkg/buildkit"
 	"github.com/ephpm/ephemerd/pkg/config"
 	"github.com/ephpm/ephemerd/pkg/dind"
+	"github.com/ephpm/ephemerd/pkg/imagegc"
 	"github.com/ephpm/ephemerd/pkg/networking"
 	"github.com/ephpm/ephemerd/pkg/proxies"
 	craneTarball "github.com/google/go-containerregistry/pkg/v1/tarball"
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
+// Namespace is the containerd namespace every runner container, and every
+// image the runtime pulls, lives in. Exported so the image collector can be
+// pointed at it without duplicating the string.
+const Namespace = "ephemerd"
+
 const (
-	namespace         = "ephemerd"
+	namespace         = Namespace
 	defaultImageLinux = "ghcr.io/actions/actions-runner:latest"
 )
 
@@ -125,7 +131,13 @@ type Config struct {
 	// OnTaskDestroy is invoked synchronously by Destroy before the
 	// container is torn down. Symmetric with OnTaskStarted.
 	OnTaskDestroy func(env *RunnerEnv)
-	Log           *slog.Logger
+	// ImageGC evicts LRU container images when the node is under disk
+	// pressure. Nil disables it. The runtime consults it before pulling
+	// an image and before creating a runner environment — a periodic
+	// timer alone loses the race a single job can win by pulling a
+	// multi-gigabyte toolchain image between ticks.
+	ImageGC *imagegc.Collector
+	Log     *slog.Logger
 }
 
 // Runtime manages container lifecycle for runner environments.
@@ -133,6 +145,45 @@ type Runtime struct {
 	cfg    Config
 	client *client.Client
 	pullMu sync.Mutex // serializes image pulls to avoid content store contention
+
+	// provisioning holds the IDs of jobs whose on-disk state (runner-dir copy,
+	// job workdir, snapshot) exists but whose container is not yet registered
+	// in containerd — i.e. jobs somewhere between the copyDirForJob and
+	// NewContainer calls in Create. The orphan sweep decides "orphan" by the
+	// absence of a containerd container, so without this a sweep that fires
+	// during the provisioning window (a Windows image pull can take minutes)
+	// deletes a live job's runner dir out from under it, corrupting it into a
+	// self-update loop (observed on metal 2026-08-14). SweepOrphans unions
+	// these IDs into its keep set.
+	provMu       sync.Mutex
+	provisioning map[string]struct{}
+}
+
+// beginProvisioning marks id as in-flight so the orphan sweep will not reclaim
+// its on-disk state before its container exists. The returned func clears it
+// and must be deferred by the caller.
+func (r *Runtime) beginProvisioning(id string) func() {
+	r.provMu.Lock()
+	if r.provisioning == nil {
+		r.provisioning = make(map[string]struct{})
+	}
+	r.provisioning[id] = struct{}{}
+	r.provMu.Unlock()
+	return func() {
+		r.provMu.Lock()
+		delete(r.provisioning, id)
+		r.provMu.Unlock()
+	}
+}
+
+// addProvisioning inserts the in-flight provisioning IDs into keep so a sweep
+// preserves their on-disk state.
+func (r *Runtime) addProvisioning(keep map[string]struct{}) {
+	r.provMu.Lock()
+	defer r.provMu.Unlock()
+	for id := range r.provisioning {
+		keep[id] = struct{}{}
+	}
 }
 
 // Client returns the underlying containerd client. Used by the in-VM
@@ -180,6 +231,11 @@ func (r *Runtime) SetTaskHooks(onStarted, onDestroy func(*RunnerEnv)) {
 // CleanOrphans removes any leftover containers and snapshots from a previous
 // ephemerd run. This should be called on startup before the scheduler starts
 // accepting jobs.
+//
+// STARTUP ONLY. It kills and deletes EVERY container in the runtime
+// namespace on the assumption that nothing legitimate is running yet.
+// Calling it while jobs are in flight would tear those jobs down. The
+// periodic equivalent is SweepOrphans, which never touches containers.
 func (r *Runtime) CleanOrphans(ctx context.Context) error {
 	ctx = namespaces.WithNamespace(ctx, namespace)
 
@@ -227,16 +283,71 @@ func (r *Runtime) CleanOrphans(ctx context.Context) error {
 		}
 	}
 
+	// On Windows only: grant the runners parent traverse-only access (no
+	// inheritance) so Hyper-V utility VMs can step into per-job
+	// subdirectories. Each per-job directory gets its own Modify ACE at
+	// Create() time so concurrent jobs stay isolated from each other's
+	// runner dirs. Startup-only — the ACE does not need re-applying.
+	if r.cfg.RunnerDir != "" {
+		runnersParent := filepath.Dir(r.cfg.RunnerDir)
+		if err := grantHyperVTraverse(runnersParent); err != nil {
+			r.cfg.Log.Warn("failed to grant Hyper-V traverse on runners parent", "path", runnersParent, "error", err)
+		}
+	}
+
+	// Every container is gone now, so nothing on disk is live: sweep with
+	// an empty keep set.
+	return r.sweepOrphanState(ctx, nil)
+}
+
+// SweepOrphans removes per-job state that no existing container owns:
+// leftover runner-dir copies under <data-dir>/runners/job-*, per-job
+// workdirs under <data-dir>/jobs/*, and writable container snapshots.
+//
+// Unlike CleanOrphans it never touches containers, tasks or networking, so
+// it is safe to run on a timer while jobs are in flight. That matters
+// because the leaks it cleans up are produced by crashes and partially
+// failed creates, which a startup-only sweep leaves to accumulate for the
+// entire uptime of a long-lived daemon.
+//
+// Cost is one container list plus one readdir per directory plus a
+// snapshotter walk — cheap enough for a ~60s cadence.
+func (r *Runtime) SweepOrphans(ctx context.Context) error {
+	ctx = namespaces.WithNamespace(ctx, namespace)
+
+	containers, err := r.client.Containers(ctx)
+	if err != nil {
+		return fmt.Errorf("listing containers: %w", err)
+	}
+	live := make(map[string]struct{}, len(containers))
+	for _, c := range containers {
+		live[c.ID()] = struct{}{}
+	}
+	// Jobs mid-provision have on-disk state but no container yet: keep them.
+	r.addProvisioning(live)
+	return r.sweepOrphanState(ctx, live)
+}
+
+// sweepOrphanState is the shared body of CleanOrphans and SweepOrphans.
+// live is the set of container IDs whose on-disk state must be preserved;
+// nil means "nothing is live".
+//
+// ctx must already carry the runtime namespace.
+func (r *Runtime) sweepOrphanState(ctx context.Context, live map[string]struct{}) error {
 	// Clean orphan per-job runner dir copies from `<data-dir>/runners/job-*`.
 	// These are ~200MB each and accumulate rapidly when container creation
-	// fails after copyDirForJob. No live job needs them at startup — any
-	// survivors belong to a previous ephemerd process.
+	// fails after copyDirForJob (observed: 70 GB across a few hundred
+	// failed jobs).
 	if r.cfg.RunnerDir != "" {
 		runnersParent := filepath.Dir(r.cfg.RunnerDir)
 		entries, err := os.ReadDir(runnersParent)
 		if err == nil {
 			for _, e := range entries {
 				if !e.IsDir() || !strings.HasPrefix(e.Name(), "job-") {
+					continue
+				}
+				// Create() names each copy "job-<container id>".
+				if _, ok := live[strings.TrimPrefix(e.Name(), "job-")]; ok {
 					continue
 				}
 				p := filepath.Join(runnersParent, e.Name())
@@ -246,22 +357,13 @@ func (r *Runtime) CleanOrphans(ctx context.Context) error {
 				}
 			}
 		}
-		// On Windows only: grant the runners parent traverse-only access
-		// (no inheritance) so Hyper-V utility VMs can step into per-job
-		// subdirectories. Each per-job directory gets its own Modify ACE
-		// at Create() time so concurrent jobs stay isolated from each
-		// other's runner dirs.
-		if err := grantHyperVTraverse(runnersParent); err != nil {
-			r.cfg.Log.Warn("failed to grant Hyper-V traverse on runners parent", "path", runnersParent, "error", err)
-		}
 	}
 
 	// Sweep leftover per-job workdirs from <data>/jobs/. Destroy removes each
 	// job's dir on completion, but a crash / SIGKILL of a previous ephemerd
 	// process (or a job dir left by a build that predates the per-job removal)
-	// skips that path. At startup no job is running yet, so every jobs/* dir is
-	// an orphan — pass an empty keep set.
-	CleanOrphanJobDirs(r.cfg.DataDir, nil, r.cfg.Log)
+	// skips that path.
+	CleanOrphanJobDirs(r.cfg.DataDir, live, r.cfg.Log)
 
 	// Clean orphan snapshots that no longer have a container pointing to them.
 	// This catches snapshots left behind when a container create partially failed.
@@ -274,18 +376,13 @@ func (r *Runtime) CleanOrphans(ctx context.Context) error {
 		return nil
 	}
 
-	containerIDs := make(map[string]bool, len(containers))
-	for _, c := range containers {
-		containerIDs[c.ID()+"-snapshot"] = true
-	}
-
 	return snapshotter.Walk(ctx, func(snapCtx context.Context, info snapshots.Info) error {
 		// Only clean ephemerd snapshots (they all end with -snapshot)
 		if !strings.HasSuffix(info.Name, "-snapshot") {
 			return nil
 		}
-		// Skip if we already handled it via container delete above
-		if containerIDs[info.Name] {
+		// Create() names each snapshot "<container id>-snapshot".
+		if _, ok := live[strings.TrimSuffix(info.Name, "-snapshot")]; ok {
 			return nil
 		}
 		r.cfg.Log.Info("removing orphan snapshot", "name", info.Name)
@@ -411,6 +508,9 @@ func importTarball(ctx context.Context, c *client.Client, path, snapshotter stri
 			log.Warn("failed to unpack imported image", "name", img.Name, "error", err)
 			continue
 		}
+		// Stamp the LRU key so an imported image starts its life "just
+		// used" rather than looking never-accessed to the image GC.
+		imagegc.Touch(ctx, c, namespace, img.Name, log)
 		log.Info("image imported and unpacked", "name", img.Name)
 	}
 	return nil
@@ -481,6 +581,7 @@ func (r *Runtime) pullImageLocked(ctx context.Context, ref string) error {
 	}
 	if img, err := r.client.GetImage(ctx, ref); err == nil {
 		if unpacked, _ := img.IsUnpacked(ctx, snapshotter); unpacked {
+			r.touchImage(ctx, ref)
 			return nil
 		}
 		// Image exists but isn't unpacked yet — unpack it now.
@@ -488,9 +589,15 @@ func (r *Runtime) pullImageLocked(ctx context.Context, ref string) error {
 		if err := img.Unpack(ctx, snapshotter); err != nil {
 			r.cfg.Log.Warn("unpack failed, will try full pull", "ref", ref, "error", err)
 		} else {
+			r.touchImage(ctx, ref)
 			return nil
 		}
 	}
+
+	// About to fetch (and extract) potentially gigabytes. Reclaim first if
+	// the disk is already over a watermark — the periodic sweep runs every
+	// ~60s and a single toolchain pull can cross the line inside one tick.
+	r.cfg.ImageGC.EnsureHeadroom(ctx)
 
 	// Qualify unqualified Docker Hub refs ("ephpm/ephemerd:tag", "alpine:3")
 	// so containerd's resolver doesn't dial the first path segment as a
@@ -535,8 +642,24 @@ func (r *Runtime) pullImageLocked(ctx context.Context, ref string) error {
 		}
 	}
 
+	r.touchImage(ctx, ref)
+	if pullRef != ref {
+		r.touchImage(ctx, pullRef)
+	}
+
 	r.cfg.Log.Info("image ready", "ref", pullRef)
 	return nil
+}
+
+// touchImage refreshes the image's ephemerd.io/last-accessed label in the
+// runtime namespace. That label is the LRU key the image GC evicts by; the
+// runtime namespace had nothing writing it before, so every record looked
+// equally cold and the fallback (UpdatedAt) was the only ordering signal.
+//
+// ctx must already carry the runtime namespace. Best-effort by design — a
+// failed label write is logged at debug and never fails a job.
+func (r *Runtime) touchImage(ctx context.Context, ref string) {
+	imagegc.Touch(ctx, r.client, namespace, ref, r.cfg.Log)
 }
 
 // qualifyImageRef ensures a reference carries an explicit registry host.
@@ -596,6 +719,14 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	jitConfig := cfg.JITConfig
 	ctx = namespaces.WithNamespace(ctx, namespace)
 
+	// Protect this job's on-disk state (runner-dir copy, job workdir, snapshot)
+	// from the orphan sweep for the whole provisioning window — from here until
+	// Create returns. Until NewContainer runs there is no containerd container
+	// for the sweep to key off, so without this a sweep firing mid-provision
+	// (an image pull can take minutes) would delete a live job's runner dir.
+	doneProvisioning := r.beginProvisioning(id)
+	defer doneProvisioning()
+
 	// Use a default image when no custom image is specified.
 	// If runner.default_image is set in config, use that.
 	// Otherwise: Linux uses the official GHA runner image,
@@ -610,6 +741,11 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	}
 
 	r.cfg.Log.Info("creating runner environment", "id", id, "image", image, "custom", customImage)
+
+	// A new runner environment means a fresh writable snapshot plus
+	// whatever the job writes into it. Reclaim before we commit to that if
+	// the node is already over a watermark.
+	r.cfg.ImageGC.EnsureHeadroom(ctx)
 
 	// Get the image, pulling if needed. Also ensure it's unpacked — the
 	// background import goroutine may have loaded the content but not yet
@@ -638,6 +774,11 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			return nil, fmt.Errorf("unpacking image %s: %w", image, err)
 		}
 	}
+
+	// The image is in use as of now — refresh the LRU key so a job's image
+	// cannot be evicted as "cold" simply because it was pulled days ago and
+	// has been in steady use since.
+	r.touchImage(ctx, image)
 
 	// Runner paths differ: official image has runner at /home/runner,
 	// custom images get our embedded runner mounted at /actions-runner.
@@ -1059,35 +1200,7 @@ func (r *Runtime) Destroy(ctx context.Context, env *RunnerEnv) error {
 	}
 
 	// Clean up per-job runner directory copy.
-	// DEBUG: preserve runner.log for diagnostics — remove this block when done.
 	if env.RunnerDir != "" {
-		logPath := filepath.Join(env.RunnerDir, "runner.log")
-		dirListing, dirErr := os.ReadDir(env.RunnerDir)
-		if dirErr != nil {
-			r.cfg.Log.Warn("DEBUG failed to list runner dir", "id", env.ID, "dir", env.RunnerDir, "error", dirErr)
-		}
-		names := []string{}
-		for _, d := range dirListing {
-			names = append(names, d.Name())
-		}
-		r.cfg.Log.Info("DEBUG runner dir contents before destroy", "id", env.ID, "dir", env.RunnerDir, "entries", names)
-		if logData, readErr := os.ReadFile(logPath); readErr == nil {
-			saveDir := r.cfg.LogDir
-			if saveDir == "" {
-				saveDir = `C:\tmp`
-			}
-			if err := os.MkdirAll(saveDir, 0o755); err != nil {
-				r.cfg.Log.Warn("DEBUG failed to create log save dir", "id", env.ID, "dir", saveDir, "error", err)
-			}
-			savePath := filepath.Join(saveDir, env.ID+"-runner.log")
-			if werr := os.WriteFile(savePath, logData, 0o644); werr != nil {
-				r.cfg.Log.Warn("DEBUG failed to save runner.log", "id", env.ID, "error", werr)
-			} else {
-				r.cfg.Log.Info("DEBUG preserved runner.log", "id", env.ID, "path", savePath, "bytes", len(logData))
-			}
-		} else {
-			r.cfg.Log.Warn("DEBUG runner.log missing", "id", env.ID, "path", logPath, "error", readErr)
-		}
 		if err := os.RemoveAll(env.RunnerDir); err != nil {
 			r.cfg.Log.Warn("failed to remove job runner dir", "id", env.ID, "path", env.RunnerDir, "error", err)
 		}

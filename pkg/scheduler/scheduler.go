@@ -16,9 +16,9 @@ import (
 	"time"
 
 	"github.com/ephpm/ephemerd/pkg/artifacts"
+	"github.com/ephpm/ephemerd/pkg/cacheprune"
 	"github.com/ephpm/ephemerd/pkg/metrics"
 	"github.com/ephpm/ephemerd/pkg/names"
-	"github.com/ephpm/ephemerd/pkg/native"
 	"github.com/ephpm/ephemerd/pkg/providers"
 	"github.com/ephpm/ephemerd/pkg/runtime"
 	"github.com/ephpm/ephemerd/pkg/tunnel"
@@ -39,8 +39,15 @@ type Config struct {
 	// squats as an orphan until the grace sweep.
 	LinuxJobsDisabled bool
 	MacOSVMConfig     *vm.MacOSVMConfig // if non-nil, macOS-native jobs are enabled (darwin only)
-	DataDir           string            // ephemerd data directory (used for artifact extraction paths)
-	Version           string            // daemon build version (from main.version); surfaced via Status and used by the Upgrade RPC
+	// CachePruner reclaims disk held by daemon-managed caches (BuildKit's
+	// build cache, the containerd image store) on demand, through the
+	// manager that owns each one. Backs the PruneCache RPC that
+	// `ephemerd cache clear` uses so an operator no longer has to stop the
+	// daemon and delete directories. Nil makes PruneCache return
+	// Unimplemented.
+	CachePruner       cacheprune.Interface
+	DataDir           string // ephemerd data directory (used for artifact extraction paths)
+	Version           string // daemon build version (from main.version); surfaced via Status and used by the Upgrade RPC
 	MaxConcurrent     int
 	MaxMacOSVMs       int // max concurrent macOS VMs (Vz limit; default auto-detected)
 	Labels            []string
@@ -90,14 +97,6 @@ type Config struct {
 	// set; the scheduler then falls back to the provider per-OS default
 	// and finally the runtime's host-aware default. Nil-safe.
 	RunnerImageForRepo func(repo, os string) string
-
-	MaxNativeMac      int                      // max concurrent native macOS jobs (default 4)
-	MacOSModeForRepo  func(repo string) string // returns "native" or "vm" per repo (nil = always VM)
-	NativeMacUser     string                   // non-root user for native macOS runner processes
-	NativeMacStrict   bool                     // opt-in deny-by-default sandbox for native macOS jobs
-	NativeMacMaxProcs int                      // ulimit -u for native macOS jobs (0 = unlimited; default 2048)
-	RunnerDir         string                   // path to extracted GHA runner binary dir (runner.Manager.Dir())
-	PrivateKeyPath    string                   // GitHub App private_key_path, denied read access in the native sandbox (empty for PAT auth)
 
 	Log *slog.Logger
 }
@@ -205,10 +204,9 @@ type Scheduler struct {
 	jobsCtx      context.Context           // detached parent for job runtimes; survives runCtx (signal) cancellation
 	jobsCancel   context.CancelFunc        // cancels jobsCtx; called by drain() once the wait/force-kill phase ends
 	mu           sync.Mutex
-	sem          chan struct{} // local/native job concurrency limiter
+	sem          chan struct{} // local job concurrency limiter
 	linuxSem     chan struct{} // Linux dispatch (VM) concurrency limiter
 	macSem       chan struct{} // macOS VM concurrency limiter (Vz has a hard cap)
-	nativeMacSem chan struct{} // native macOS job concurrency limiter (separate from VM limit)
 	draining     bool          // true when shutting down, rejects new jobs
 	startTime    time.Time
 
@@ -279,8 +277,7 @@ type runningJob struct {
 	cancel       context.CancelFunc
 	artifactsDir string              // non-empty if OCI artifacts were extracted for this job
 	dispatched   string              // non-empty if dispatched to Linux VM worker (stores container name)
-	macosVM      vm.MacOSVM          // non-nil if running as a macOS VM job
-	nativeRunner interface{ Stop() } // non-nil if running as a native macOS job
+	macosVM      vm.MacOSVM // non-nil if running as a macOS VM job
 	startedAt    time.Time
 }
 
@@ -382,11 +379,6 @@ func New(cfg Config) *Scheduler {
 		}
 	}
 
-	nativeMac := cfg.MaxNativeMac
-	if nativeMac <= 0 {
-		nativeMac = 4
-	}
-
 	s := &Scheduler{
 		cfg:          cfg,
 		running:      make(map[jobKey]*runningJob),
@@ -399,7 +391,6 @@ func New(cfg Config) *Scheduler {
 		sem:          make(chan struct{}, cfg.MaxConcurrent),
 		linuxSem:     make(chan struct{}, cfg.MaxConcurrent),
 		macSem:       make(chan struct{}, macVMs),
-		nativeMacSem: make(chan struct{}, nativeMac),
 		startTime:    time.Now(),
 	}
 	// Only construct the retry queue when the caller explicitly enabled
@@ -436,6 +427,22 @@ func (s *Scheduler) bindContexts(ctx context.Context) {
 	s.jobsCtx = jobsCtx
 	s.jobsCancel = jobsCancel
 	s.mu.Unlock()
+}
+
+// shutdownCh returns a channel closed when the daemon starts going down
+// (runCtx cancelled by SIGTERM or by the Windows SCM stop handler). The
+// Upgrade RPC hands it to pkg/upgrade so the restart supervisor can tell
+// "the restart I asked for is taking effect" from "the restart never
+// happened" without racing a slow-but-healthy shutdown. Nil-safe: a
+// scheduler that was never Run reports a channel that never closes.
+func (s *Scheduler) shutdownCh() <-chan struct{} {
+	s.mu.Lock()
+	ctx := s.runCtx
+	s.mu.Unlock()
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Done()
 }
 
 // jobContext returns the context bounding a single job's runtime, derived
@@ -826,10 +833,9 @@ func (s *Scheduler) canHandleJob(jobLabels []string) bool {
 		case "windows":
 			osOK = goruntime.GOOS == "windows"
 		case "macos", "macosx":
-			// macOS jobs run in a per-job VM (default) or natively on
-			// the host (when configured for trusted repos). Accept if
-			// either VM config or native mode is available.
-			osOK = goruntime.GOOS == "darwin" && (s.cfg.MacOSVMConfig != nil || s.cfg.MacOSModeForRepo != nil)
+			// macOS jobs run in a per-job VM. Accept only when VM config
+			// is available on a darwin host.
+			osOK = goruntime.GOOS == "darwin" && s.cfg.MacOSVMConfig != nil
 		}
 	}
 	if !osOK {
@@ -956,14 +962,8 @@ func (s *Scheduler) handleQueued(ctx context.Context, event providers.JobEvent) 
 		return
 	}
 
-	// Route macOS jobs to native runner or per-job VM.
+	// Route macOS jobs to a per-job VM (the only macOS path).
 	if isMacOSJob(event.Labels) {
-		// Native mode takes priority when configured for this repo
-		if s.cfg.MacOSModeForRepo != nil && s.cfg.MacOSModeForRepo(event.Repo) == "native" {
-			s.handleNativeMacOSJob(ctx, event)
-			return
-		}
-		// VM path
 		s.mu.Lock()
 		macCfg := s.cfg.MacOSVMConfig
 		s.mu.Unlock()
@@ -971,8 +971,8 @@ func (s *Scheduler) handleQueued(ctx context.Context, event providers.JobEvent) 
 			s.handleMacOSJob(ctx, event)
 			return
 		}
-		// Neither native nor VM available — remove from seen/pending
-		// so the next poll retries this job once the install finishes.
+		// VM not available yet — remove from seen/pending so the next
+		// poll retries this job once the install finishes.
 		s.mu.Lock()
 		delete(s.seen, key)
 		delete(s.pending, key)
@@ -1329,134 +1329,6 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 	}()
 }
 
-// handleNativeMacOSJob runs the GitHub Actions runner directly on the macOS
-// host inside a sandbox. Used for trusted repos that don't need VM isolation.
-func (s *Scheduler) handleNativeMacOSJob(ctx context.Context, event providers.JobEvent) {
-	jobID := event.JobID
-	key := keyFor(event)
-	log := s.cfg.Log.With("job_id", jobID, "repo", event.Repo, "platform", "macos-native")
-
-	unsee := func() {
-		s.mu.Lock()
-		delete(s.seen, key)
-		delete(s.pending, key)
-		s.mu.Unlock()
-	}
-
-	// Acquire native macOS concurrency slot (separate from VM sem)
-	select {
-	case s.nativeMacSem <- struct{}{}:
-	case <-ctx.Done():
-		unsee()
-		return
-	}
-	if !s.admitDispatch(key) {
-		log.Info("abandoning dispatch: job was observed running while this dispatch waited for a concurrency slot",
-			"detail", "same-label JIT runners are fungible; a sibling runner took this job, so provisioning now would create an orphan")
-		<-s.nativeMacSem
-		return
-	}
-
-	log.Info("provisioning native macOS runner for job")
-
-	// Claim job with macOS labels
-	labels := buildLabelsForOS("darwin", s.cfg.Labels)
-	const maxNameRetries = 3
-	claim, err := s.claimJob(ctx, &event, labels, log, maxNameRetries)
-	if err != nil {
-		log.Error("failed to claim job", "error", err, "error_class", classifyErr(err))
-		unsee()
-		s.enqueueRetryIfEligible(ctx, event, err)
-		time.Sleep(backoffDuration(event.Repo))
-		<-s.nativeMacSem
-		return
-	}
-
-	// Create the native runner
-	nr, err := native.New(s.cfg.DataDir, fmt.Sprintf("%d", jobID), claim.RunnerConfig, s.cfg.RunnerDir, s.cfg.PrivateKeyPath, log)
-	if err != nil {
-		log.Error("failed to create native runner", "error", err)
-		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
-			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)
-		}
-		unsee()
-		<-s.nativeMacSem
-		return
-	}
-	if s.cfg.NativeMacUser != "" {
-		nr.SetRunAsUser(s.cfg.NativeMacUser)
-	}
-	nr.SetSandboxStrict(s.cfg.NativeMacStrict)
-	nr.SetMaxProcesses(s.cfg.NativeMacMaxProcs)
-
-	// Derived from jobsCtx, not ctx: the job keeps running across SIGTERM
-	// until it finishes or drain() gives up (see bindContexts).
-	jobCtx, cancel := s.jobContext()
-
-	// Start the runner
-	if err := nr.Start(jobCtx); err != nil {
-		log.Error("failed to start native runner", "error", err)
-		nr.Stop()
-		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
-			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)
-		}
-		unsee()
-		cancel()
-		<-s.nativeMacSem
-		return
-	}
-
-	// Track the running job
-	s.trackRunning(key, &runningJob{
-		provider:     event.Provider,
-		claim:        claim,
-		repo:         event.Repo,
-		cancel:       cancel,
-		nativeRunner: nr,
-		startedAt:    time.Now(),
-	}, event.Provider, labelSetKey(event.Labels))
-
-	log.Info("native macOS runner started", "name", claim.RunnerName)
-
-	// Wait for the job to finish in the background
-	go func() {
-		defer func() { <-s.nativeMacSem }()
-
-		exitCode, err := nr.Wait()
-		if err != nil {
-			if jobCtx.Err() != nil {
-				log.Warn("native macOS runner killed (timeout or shutdown)", "error", err)
-			} else {
-				log.Error("native macOS runner crashed", "error", err)
-			}
-		} else if exitCode != 0 {
-			log.Warn("native macOS runner exited with failure", "exit_code", exitCode)
-		} else {
-			log.Info("native macOS runner exited", "exit_code", exitCode)
-		}
-
-		// Clean up
-		s.mu.Lock()
-		rj, exists := s.running[key]
-		if exists {
-			s.untrackRunningLocked(key, rj)
-			s.mu.Unlock()
-			metrics.JobsActive.Dec()
-			nr.Stop()
-			if rj.provider != nil && rj.claim != nil {
-				if err := rj.provider.ReleaseJob(context.Background(), rj.claim); err != nil {
-					log.Debug("deregister runner after native macOS cleanup", "error", err)
-				}
-			}
-		} else {
-			s.mu.Unlock()
-		}
-
-		// Self-heal: re-provision if this runner's dispatched job never ran.
-		s.reprovisionIfStranded(ctx, event)
-	}()
-}
-
 // handleLocalJob provisions a runner using the local containerd Runtime.
 func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent) {
 	jobID := event.JobID
@@ -1792,8 +1664,6 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event providers.JobEven
 	job.cancel()
 	if job.macosVM != nil {
 		job.macosVM.Stop()
-	} else if job.nativeRunner != nil {
-		job.nativeRunner.Stop()
 	} else if job.dispatched != "" && s.cfg.LinuxDispatcher != nil {
 		if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), job.dispatched); err != nil {
 			log.Warn("failed to destroy dispatched runner", "error", err)
@@ -1878,8 +1748,6 @@ func (s *Scheduler) destroyAll() {
 		job.cancel()
 		if job.macosVM != nil {
 			job.macosVM.Stop()
-		} else if job.nativeRunner != nil {
-			job.nativeRunner.Stop()
 		} else if job.dispatched != "" && s.cfg.LinuxDispatcher != nil {
 			if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), job.dispatched); err != nil {
 				s.cfg.Log.Warn("failed to destroy dispatched runner", "job_id", key.JobID, "error", err)
@@ -2121,8 +1989,6 @@ func (s *Scheduler) sweepOrphanRunners() {
 		v.rj.cancel()
 		if v.rj.macosVM != nil {
 			v.rj.macosVM.Stop()
-		} else if v.rj.nativeRunner != nil {
-			v.rj.nativeRunner.Stop()
 		} else if v.rj.dispatched != "" && s.cfg.LinuxDispatcher != nil {
 			if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), v.rj.dispatched); err != nil {
 				s.cfg.Log.Warn("failed to destroy orphaned dispatched runner", "runner", v.name, "error", err)

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/urfave/cli/v3"
 )
@@ -32,10 +31,7 @@ func restartCmd() *cli.Command {
 		Name:  "restart",
 		Usage: "Restart the ephemerd system service",
 		Action: func(_ context.Context, _ *cli.Command) error {
-			if err := serviceAction("stop"); err != nil {
-				fmt.Printf("note: stop failed: %v\n", err)
-			}
-			return serviceAction("start")
+			return serviceRestart()
 		},
 	}
 }

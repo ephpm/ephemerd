@@ -24,11 +24,32 @@ const (
 	defaultImage = "ghcr.io/actions/actions-runner:latest"
 )
 
+// NetworkOptions carries the host's [network] configuration into a local run.
+//
+// Without it a local run silently built its own default network — on Windows an
+// HNS NAT network plus the NAT-era netsh host-firewall rules — even on a host
+// configured for L2Bridge egress. That was wrong twice over: the container came
+// up unfiltered on NAT rather than on the enforcing L2Bridge path, and the netsh
+// rules block RFC1918 host-wide, which severs the host's own DNS when its
+// resolver is a LAN address. Mirrors the fields serve passes to networking.New.
+type NetworkOptions struct {
+	Subnet            string
+	MTU               int
+	L2BridgeEgress    bool
+	HostNIC           string
+	IPPool            string
+	Gateway           string
+	PublicDNS         []string
+	ExtraAllowedCIDRs []string
+	AllowHostAccess   bool
+}
+
 // Runner executes workflow jobs locally using embedded containerd.
 type Runner struct {
 	DataDir    string
 	SocketPath string // optional: containerd socket override for isolation from the service
 	Image      string // container image; empty falls back to defaultImage
+	Network    NetworkOptions
 	Log        *slog.Logger
 }
 
@@ -67,11 +88,23 @@ func (r *Runner) RunJob(ctx context.Context, jobName string, job Job, repoDir st
 		return fmt.Errorf("extracting CNI plugins: %w", err)
 	}
 
-	// Initialize networking
+	// Initialize networking. A local run joins whatever network the host is
+	// configured for rather than inventing its own — on the L2Bridge path it
+	// adopts the existing network and reserves the addresses of endpoints
+	// already on it, so it cannot hand a job an address the service is using.
 	net, err := networking.New(networking.Config{
-		DataDir:   r.DataDir,
-		CNIBinDir: cm.Dir(),
-		Log:       r.Log,
+		DataDir:           r.DataDir,
+		CNIBinDir:         cm.Dir(),
+		Subnet:            r.Network.Subnet,
+		MTU:               r.Network.MTU,
+		L2BridgeEgress:    r.Network.L2BridgeEgress,
+		HostNIC:           r.Network.HostNIC,
+		IPPool:            r.Network.IPPool,
+		Gateway:           r.Network.Gateway,
+		PublicDNS:         r.Network.PublicDNS,
+		ExtraAllowedCIDRs: r.Network.ExtraAllowedCIDRs,
+		AllowHostAccess:   r.Network.AllowHostAccess,
+		Log:               r.Log,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing networking: %w", err)

@@ -15,11 +15,13 @@ import (
 	apiv1 "github.com/ephpm/ephemerd/api/v1"
 	"github.com/ephpm/ephemerd/pkg/artifacts"
 	"github.com/ephpm/ephemerd/pkg/buildkit"
+	"github.com/ephpm/ephemerd/pkg/cacheprune"
 	"github.com/ephpm/ephemerd/pkg/cni"
 	"github.com/ephpm/ephemerd/pkg/config"
 	"github.com/ephpm/ephemerd/pkg/containerd"
 	"github.com/ephpm/ephemerd/pkg/dind"
 	"github.com/ephpm/ephemerd/pkg/github"
+	"github.com/ephpm/ephemerd/pkg/imagegc"
 	"github.com/ephpm/ephemerd/pkg/metrics"
 	"github.com/ephpm/ephemerd/pkg/networking"
 	"github.com/ephpm/ephemerd/pkg/providers"
@@ -90,6 +92,7 @@ func main() {
 			doctorCmd(),
 			installCmd(),
 			uninstallCmd(),
+			restartHelperCmd(),
 		},
 	}
 
@@ -261,12 +264,19 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		controlPorts := []int{int(containerdTCPPort), int(containerdTCPPort) + 1, int(containerdTCPPort) + 2}
 
 		net, err := networking.New(networking.Config{
-			DataDir:      configDir,
-			Subnet:       cfg.Network.Subnet,
-			MTU:          cfg.Network.MTU,
-			CNIBinDir:    cm.Dir(),
-			ControlPorts: controlPorts,
-			Log:          log,
+			DataDir:           configDir,
+			Subnet:            cfg.Network.Subnet,
+			MTU:               cfg.Network.MTU,
+			CNIBinDir:         cm.Dir(),
+			ControlPorts:      controlPorts,
+			L2BridgeEgress:    cfg.Network.L2BridgeEgress,
+			HostNIC:           cfg.Network.HostNIC,
+			IPPool:            cfg.Network.IPPool,
+			Gateway:           cfg.Network.Gateway,
+			PublicDNS:         cfg.Network.PublicDNS,
+			ExtraAllowedCIDRs: cfg.Network.ExtraAllowedDestinations,
+			AllowHostAccess:   needsHostAccess(cfg),
+			Log:               log,
 		})
 		if err != nil {
 			return fmt.Errorf("initializing networking: %w", err)
@@ -286,8 +296,9 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			bkCfg := buildkit.Config{
 				DataDir:             joinPath(configDir, "buildkit"),
 				ContainerdAddress:   containerd.SocketPath(configDir),
-				ContainerdNamespace: "buildkit",
+				ContainerdNamespace: buildkitNamespace,
 				Network:             net,
+				GC:                  buildkitGCConfig(cfg),
 				Log:                 log.With("component", "buildkit"),
 			}
 			bk, err = buildkit.NewServer(ctx, bkCfg)
@@ -307,6 +318,8 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			}
 		}
 
+		imageGC := newImageGC(cfg, ctrdClient, configDir, log)
+
 		rt, err := runtime.New(runtime.Config{
 			Client:              ctrdClient,
 			RunnerDir:           rm.Dir(),
@@ -321,6 +334,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			WindowsMemoryBytes:  cfg.Runner.Windows.MemoryBytes(),
 			WindowsCPUs:         cfg.Runner.Windows.CPUCount(),
 			BuildKit:            bk,
+			ImageGC:             imageGC,
 			Log:                 log,
 		})
 		if err != nil {
@@ -328,6 +342,14 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		}
 		if err := rt.CleanOrphans(ctx); err != nil {
 			log.Warn("failed to clean orphan containers", "error", err)
+		}
+
+		// Periodic orphan sweep + disk-pressure image collection. Both
+		// used to be startup-only (or, for images in this namespace,
+		// absent entirely), so a VM that stayed up for days accumulated
+		// every image it ever pulled.
+		if interval := cfg.ImageGC.ImageGCCheckInterval(); interval > 0 {
+			go runNodeDiskSweeper(ctx, imageGC, rt, ctrdClient, interval, newBrokenChainRepair(cfg), log)
 		}
 
 		// Clean up dind per-job namespaces left by jobs that didn't shut
@@ -341,13 +363,13 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		dind.CleanupStaleDindNamespaces(cleanupCtx, rt.Client(), log)
 		cancelCleanup()
 
-		// Periodic per-repo image cache pruner. Each cache namespace
-		// (ephemerd-dind-cache-<provider>-<repo>) is scanned every
-		// CachePruneInterval, and any image record whose last-accessed
-		// label is older than CacheMaxAge gets dropped — containerd's
-		// content GC reclaims the unreferenced blobs. Empty cache
-		// namespaces get removed entirely.
-		if interval := cfg.Dind.DindCachePruneInterval(); interval > 0 && cfg.Dind.DindCacheMaxAge() > 0 {
+		// Periodic per-repo image cache reaper. Every CachePruneInterval
+		// each ephemerd-dind-cache-<provider>-<repo> namespace left with
+		// no image records is removed entirely. When the optional
+		// CacheMaxAge backstop is set, records idle longer than it are
+		// evicted first — but bounding cache size is the disk-pressure
+		// collector's job now (see runNodeDiskSweeper), not this loop's.
+		if interval := cfg.Dind.DindCachePruneInterval(); interval > 0 {
 			go runDindCachePruner(ctx, rt.Client(), interval, cfg.Dind.DindCacheMaxAge(), log)
 		}
 
@@ -420,12 +442,19 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 
 	// Initialize container networking
 	net, err := networking.New(networking.Config{
-		DataDir:      configDir,
-		Subnet:       cfg.Network.Subnet,
-		MTU:          cfg.Network.MTU,
-		CNIBinDir:    cm.Dir(),
-		GatewayPorts: gatewayPorts,
-		Log:          log,
+		DataDir:           configDir,
+		Subnet:            cfg.Network.Subnet,
+		MTU:               cfg.Network.MTU,
+		CNIBinDir:         cm.Dir(),
+		GatewayPorts:      gatewayPorts,
+		L2BridgeEgress:    cfg.Network.L2BridgeEgress,
+		HostNIC:           cfg.Network.HostNIC,
+		IPPool:            cfg.Network.IPPool,
+		Gateway:           cfg.Network.Gateway,
+		PublicDNS:         cfg.Network.PublicDNS,
+		ExtraAllowedCIDRs: cfg.Network.ExtraAllowedDestinations,
+		AllowHostAccess:   needsHostAccess(cfg),
+		Log:               log,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing networking: %w", err)
@@ -512,8 +541,9 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		bkCfg := buildkit.Config{
 			DataDir:             joinPath(configDir, "buildkit"),
 			ContainerdAddress:   containerd.SocketPath(configDir),
-			ContainerdNamespace: "buildkit",
+			ContainerdNamespace: buildkitNamespace,
 			Network:             net,
+			GC:                  buildkitGCConfig(cfg),
 			Log:                 log.With("component", "buildkit"),
 		}
 		bk, err = buildkit.NewServer(ctx, bkCfg)
@@ -540,6 +570,8 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	if runtime_.GOOS == "darwin" {
 		containerDataDir = "/mnt/ephemerd"
 	}
+	imageGC := newImageGC(cfg, ctrdClient, configDir, log)
+
 	rt, err := runtime.New(runtime.Config{
 		Client:              ctrdClient,
 		RunnerDir:           rm.Dir(),
@@ -559,6 +591,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		WindowsMemoryBytes:  cfg.Runner.Windows.MemoryBytes(),
 		WindowsCPUs:         cfg.Runner.Windows.CPUCount(),
 		BuildKit:            bk,
+		ImageGC:             imageGC,
 		Log:                 log,
 	})
 	if err != nil {
@@ -566,6 +599,14 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	}
 	if err := rt.CleanOrphans(ctx); err != nil {
 		log.Warn("failed to clean orphan containers", "error", err)
+	}
+
+	// Periodic orphan sweep + disk-pressure image collection. CleanOrphans
+	// above only runs at startup and cannot run again while jobs are in
+	// flight (it deletes every container in the namespace); SweepOrphans is
+	// the job-safe subset and runs on this timer instead.
+	if interval := cfg.ImageGC.ImageGCCheckInterval(); interval > 0 {
+		go runNodeDiskSweeper(ctx, imageGC, rt, ctrdClient, interval, newBrokenChainRepair(cfg), log)
 	}
 
 	// Host-local per-container sampler registry. Only used for native
@@ -703,11 +744,19 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 
 	// Start scheduler (ties CI provider jobs to container lifecycle)
 	sched := scheduler.New(scheduler.Config{
-		Runtime:            rt,
-		Providers:          activeProviders,
-		Artifacts:          artifactExtractor,
-		LinuxDispatcher:    linuxDispatcher,
-		LinuxJobsDisabled:  !cfg.VM.Linux.ResolvedEnabled() && runtime_.GOOS == "darwin",
+		Runtime:           rt,
+		Providers:         activeProviders,
+		Artifacts:         artifactExtractor,
+		LinuxDispatcher:   linuxDispatcher,
+		LinuxJobsDisabled: !cfg.VM.Linux.ResolvedEnabled() && runtime_.GOOS == "darwin",
+		CachePruner: &cacheprune.Pruner{
+			Client:            ctrdClient,
+			BuildKit:          bk,
+			BuildKitNamespace: buildkitNamespace,
+			Policy:            buildkitGCConfig(cfg),
+			ImageGC:           imageGC,
+			Log:               log.With("component", "cache-prune"),
+		},
 		DataDir:            configDir,
 		Version:            version,
 		MaxConcurrent:      cfg.Runner.MaxConcurrent,
@@ -726,13 +775,6 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		ShutdownTimeout:    cfg.Runner.ParsedShutdownTimeout(),
 		LogRetention:       cfg.Log.LogRetentionDuration(),
 		RunnerImageForRepo: cfg.Runner.ImageForRepoOS,
-		MaxNativeMac:       cfg.Runner.MacOS.ResolvedMaxNative(),
-		MacOSModeForRepo:   cfg.Runner.MacOS.ModeForRepo,
-		NativeMacUser:      cfg.Runner.MacOS.User,
-		NativeMacStrict:    cfg.Runner.MacOS.StrictSandbox(),
-		NativeMacMaxProcs:  cfg.Runner.MacOS.ResolvedMaxProcesses(),
-		RunnerDir:          rm.Dir(),
-		PrivateKeyPath:     cfg.GitHub.PrivateKeyPath,
 		Retry:              retryCfg,
 		OrphanSweep:        orphanCfg,
 		Log:                log,
@@ -905,11 +947,173 @@ func initProviders(cfg *config.Config, log *slog.Logger) ([]providers.Provider, 
 	return active, cleanup, nil
 }
 
+// newImageGC builds the disk-pressure image collector for a node, or nil
+// when collection is disabled.
+//
+// Scope is both the main runtime namespace (which had no image GC at all —
+// every runner image and every workflow `container:` image ever pulled was
+// retained forever, extracted layers and all, until the disk filled) and
+// the per-repo dind cache namespaces.
+//
+// dataDir is measured rather than the containerd subdirectory: they are on
+// the same filesystem, and dataDir is guaranteed to exist by the time we
+// get here, so the statfs cannot fail on a fresh node.
+func newImageGC(cfg *config.Config, c *containerdclient.Client, dataDir string, log *slog.Logger) *imagegc.Collector {
+	if !cfg.ImageGC.ImageGCEnabled() {
+		log.Info("image gc disabled by config")
+		return nil
+	}
+	pinned := cfg.PinnedRunnerImages()
+	gc := imagegc.New(imagegc.Config{
+		Client: c,
+		Path:   dataDir,
+		Thresholds: imagegc.Thresholds{
+			HighUsedPercent: cfg.ImageGC.ImageGCHighWatermarkPercent(),
+			LowUsedPercent:  cfg.ImageGC.ImageGCLowWatermarkPercent(),
+			MinFreeBytes:    cfg.ImageGC.ImageGCMinFreeBytes(),
+			TargetFreeBytes: cfg.ImageGC.ImageGCTargetFreeBytes(),
+		},
+		// buildkitNamespace holds the largest reclaimable pile on a
+		// build-heavy node; the runtime namespace and the per-repo dind
+		// caches are the smaller two.
+		Namespaces:        []string{runtime.Namespace, buildkitNamespace},
+		NamespacePrefixes: []string{dind.DindCacheNamespacePrefix},
+		PinnedImages:      pinned,
+		// A live job's BuildKit export records are referenced by no
+		// container — protect them by name prefix instead.
+		LiveJobPrefixes: func(id string) []string { return []string{dind.BuildScopePrefix(id)} },
+		MaxAge:          cfg.ImageGC.ImageGCMaxAge(),
+		Log:             log,
+	})
+	if gc == nil {
+		return nil
+	}
+	log.Info("image gc enabled",
+		"path", dataDir,
+		"high_watermark_percent", cfg.ImageGC.ImageGCHighWatermarkPercent(),
+		"low_watermark_percent", cfg.ImageGC.ImageGCLowWatermarkPercent(),
+		"min_free_gb", cfg.ImageGC.ImageGCMinFreeBytes()/(1024*1024*1024),
+		"target_free_gb", cfg.ImageGC.ImageGCTargetFreeBytes()/(1024*1024*1024),
+		"max_age", cfg.ImageGC.ImageGCMaxAge(),
+		"pinned_images", pinned)
+	return gc
+}
+
+// buildkitNamespace is the containerd namespace the embedded BuildKit
+// solver stores build results and cache records in. It must match the
+// ContainerdNamespace passed to buildkit.NewServer.
+const buildkitNamespace = "buildkit"
+
+// buildkitGCConfig renders the [buildkit] table into the solver's cache GC
+// policy. Without this the worker gets an empty policy and BuildKit never
+// collects anything.
+func buildkitGCConfig(cfg *config.Config) buildkit.GCConfig {
+	return buildkit.GCConfig{
+		Disabled:              !cfg.BuildKit.BuildKitGCEnabled(),
+		ReservedBytes:         cfg.BuildKit.BuildKitGCReservedBytes(),
+		MaxUsedBytes:          cfg.BuildKit.BuildKitGCMaxUsedBytes(),
+		MinFreeBytes:          cfg.BuildKit.BuildKitGCMinFreeBytes(),
+		KeepDuration:          cfg.BuildKit.BuildKitGCKeepDuration(),
+		EphemeralKeepDuration: cfg.BuildKit.BuildKitGCEphemeralKeepDuration(),
+		EphemeralMaxUsedBytes: cfg.BuildKit.BuildKitGCEphemeralMaxUsedBytes(),
+	}
+}
+
+// runNodeDiskSweeper is the periodic half of node disk hygiene, on one
+// timer: an orphan sweep, a sweep of dead jobs' BuildKit export records,
+// and a disk-pressure image collection pass.
+//
+// All three were previously startup-only or absent, which is why long-lived
+// daemons accumulated build records, snapshots and images for their entire
+// uptime. Each pass is cheap on an idle node — a container list, a couple
+// of directory reads and one statfs — and the image collection is a no-op
+// unless a watermark is crossed.
+//
+// Errors from one pass are logged and the loop continues; the next tick
+// retries.
+func runNodeDiskSweeper(ctx context.Context, gc *imagegc.Collector, rt *runtime.Runtime, c *containerdclient.Client, interval time.Duration, repair brokenChainRepair, log *slog.Logger) {
+	log = log.With("component", "node-disk-sweeper", "interval", interval)
+	log.Info("starting node disk sweeper")
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("node disk sweeper stopping")
+			return
+		case <-ticker.C:
+			passCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+			if rt != nil {
+				if err := rt.SweepOrphans(passCtx); err != nil {
+					log.Warn("orphan sweep failed", "error", err)
+				}
+			}
+			sweepDeadBuildRecords(passCtx, c, log)
+			// Correctness repair, not capacity policy — so it runs on
+			// every tick whether or not image GC is enabled, and before
+			// the collector, which would otherwise plan against records
+			// that cannot be used anyway. See #149.
+			dind.SweepBrokenImageChains(passCtx, c, repair.namespaces, repair.snapshotter, repair.pinned, log)
+			if gc != nil {
+				if _, err := gc.Collect(passCtx); err != nil {
+					log.Warn("image gc pass failed", "error", err)
+				}
+			}
+			cancel()
+		}
+	}
+}
+
+// brokenChainRepair parameterises the sweeper's image ↔ snapshot repair pass:
+// which namespaces to scan, which snapshotter holds the layers, and which
+// refs must never be evicted even when their chain looks broken.
+type brokenChainRepair struct {
+	namespaces  []string
+	snapshotter string
+	pinned      []string
+}
+
+// newBrokenChainRepair describes the repair pass for this node.
+//
+// Scope matches the image GC's, plus the per-job dind namespaces: a job
+// namespace that outlives its job (one did on the production node — see #149)
+// can hold broken records just as easily, and nothing else revisits it.
+func newBrokenChainRepair(cfg *config.Config) brokenChainRepair {
+	return brokenChainRepair{
+		namespaces:  []string{runtime.Namespace, buildkitNamespace},
+		snapshotter: buildkit.DefaultSnapshotter(),
+		pinned:      cfg.PinnedRunnerImages(),
+	}
+}
+
+// sweepDeadBuildRecords removes job-scoped BuildKit export records in the
+// shared buildkit namespace whose job no longer exists. dind.Server.Stop
+// handles the graceful path; this catches jobs lost to SIGKILL, a host
+// reboot, or a daemon that predates per-job cleanup.
+func sweepDeadBuildRecords(ctx context.Context, c *containerdclient.Client, log *slog.Logger) {
+	if c == nil {
+		return
+	}
+	live, _, err := imagegc.RunningContainers(ctx, c, log)
+	if err != nil {
+		log.Warn("build record sweep: listing containers", "error", err)
+		return
+	}
+	if _, err := dind.PruneDeadBuildRecords(ctx, c, buildkitNamespace, live, log); err != nil {
+		log.Warn("build record sweep failed", "error", err)
+	}
+}
+
 // pollInterval returns the poll interval for the configured provider.
 // runDindCachePruner runs the per-repo image cache pruner on a fixed
 // interval until ctx is canceled. Called in worker mode so each Linux VM
 // keeps its dind image cache bounded. Errors from a single pass are
 // logged and the loop continues — the next tick retries.
+//
+// maxAge is the OPTIONAL age backstop and defaults to 0 (disabled) — see
+// config.DindConfig.CacheMaxAge. With it disabled this loop still runs, to
+// reap cache namespaces left with no image records; the actual bounding of
+// cache size is now the disk-pressure collector's job.
 func runDindCachePruner(ctx context.Context, c *containerdclient.Client, interval, maxAge time.Duration, log *slog.Logger) {
 	log = log.With("component", "dind-cache-pruner", "interval", interval, "max_age", maxAge)
 	log.Info("starting dind cache pruner")
@@ -975,6 +1179,21 @@ func crictlCmd() *cli.Command {
 			return containerd.ExecCrictl(socketPath, cmd.Args().Slice())
 		},
 	}
+}
+
+// needsHostAccess reports whether ephemerd runs anything that job containers
+// must be able to reach over the network on the host address:
+//
+//   - dind: the per-job Docker API listener, which on Windows is a TCP listener
+//     on the host address handed to the job as DOCKER_HOST.
+//   - the Go module proxy: bound to the same address and injected as GOPROXY.
+//
+// It only affects the Windows L2Bridge egress path, where the ACL ladder
+// otherwise blocks the host along with the rest of RFC1918 — with neither
+// feature enabled the strictest posture (host unreachable) applies. On NAT and
+// on Linux the gateway is already reachable and this changes nothing.
+func needsHostAccess(cfg *config.Config) bool {
+	return cfg.Dind.Enabled || cfg.ModuleProxy.Enabled
 }
 
 func joinPath(parts ...string) string {

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	apiv1 "github.com/ephpm/ephemerd/api/v1"
+	"github.com/ephpm/ephemerd/pkg/cacheprune"
 	"github.com/urfave/cli/v3"
 )
 
@@ -304,6 +305,84 @@ func daemonRunning(ctx context.Context) bool {
 	return err == nil
 }
 
+// daemonPrunable reports whether a cache is one the running daemon can
+// prune through the manager that owns it (see pkg/cacheprune). Pure —
+// split out so the routing rule is testable without a daemon.
+func daemonPrunable(name string) bool {
+	for _, t := range cacheprune.AllTargets() {
+		if t == name {
+			return true
+		}
+	}
+	return false
+}
+
+// splitDaemonPrunable partitions cache entries into the ones the daemon can
+// prune and the ones that still need the filesystem sweep. Pure.
+func splitDaemonPrunable(targets []cacheEntry) (viaDaemon, viaFilesystem []cacheEntry) {
+	for _, c := range targets {
+		if daemonPrunable(c.Name) {
+			viaDaemon = append(viaDaemon, c)
+		} else {
+			viaFilesystem = append(viaFilesystem, c)
+		}
+	}
+	return viaDaemon, viaFilesystem
+}
+
+// pruneViaDaemon asks the running daemon to prune whichever targets it
+// manages, prints what came back, and returns the targets the caller must
+// still handle on the filesystem.
+//
+// A per-target failure is reported and does NOT fall back to deleting the
+// directory: for the BuildKit cache that would leave its bbolt index
+// pointing at content that is gone. Only an explicit --offline does that.
+func pruneViaDaemon(ctx context.Context, targets []cacheEntry) ([]cacheEntry, error) {
+	viaDaemon, viaFilesystem := splitDaemonPrunable(targets)
+	if len(viaDaemon) == 0 {
+		return viaFilesystem, nil
+	}
+
+	cc, err := dialControl(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("connecting to the running daemon: %w", err)
+	}
+	defer func() { _ = cc.Close() }()
+
+	names := make([]string, len(viaDaemon))
+	for i, c := range viaDaemon {
+		names[i] = c.Name
+	}
+	// all=true: "clear" means clear. The daemon still refuses to touch
+	// anything a running job holds — that safety comes from the cache
+	// managers, not from keeping cache around.
+	resp, err := cc.PruneCache(ctx, &apiv1.PruneCacheRequest{Targets: names, All: true})
+	if err != nil {
+		return nil, fmt.Errorf("asking the daemon to prune %s: %w", strings.Join(names, ", "), err)
+	}
+
+	var totalFreed int64
+	var failed []string
+	for _, r := range resp.GetResults() {
+		if e := r.GetError(); e != "" {
+			fmt.Printf("failed  %-12s %s\n", r.GetName(), e)
+			failed = append(failed, r.GetName())
+			continue
+		}
+		totalFreed += r.GetBytesFreed()
+		fmt.Printf("pruned  %-12s (%s freed, %d record(s)) via daemon\n",
+			r.GetName(), humanBytes(r.GetBytesFreed()), r.GetRecordsRemoved())
+	}
+	if len(failed) > 0 {
+		return nil, fmt.Errorf("daemon could not prune: %s (pass --offline to clear on disk with the daemon stopped)",
+			strings.Join(failed, ", "))
+	}
+	if len(viaFilesystem) == 0 {
+		fmt.Printf("Done. Freed %s.\n", humanBytes(totalFreed))
+	}
+	return viaFilesystem, nil
+}
+
 // runningJobDirs returns the immediate child directory names under
 // <data>/jobs/ that belong to a job the daemon is CURRENTLY running, so
 // `cache clear jobs` can skip them. Each job's on-disk workdir is named after
@@ -449,6 +528,7 @@ func cacheClearCmd() *cli.Command {
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "all", Usage: "clear every clearable cache"},
 			&cli.BoolFlag{Name: "yes", Aliases: []string{"force", "y"}, Usage: "skip the confirmation prompt"},
+			&cli.BoolFlag{Name: "offline", Usage: "bypass the daemon and clear on the filesystem (escape hatch for a wedged daemon; may not reclaim the BuildKit cache)"},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			all := cmd.Bool("all")
@@ -475,6 +555,46 @@ func cacheClearCmd() *cli.Command {
 
 			running := daemonRunning(ctx)
 
+			// Confirmation for destructive clears unless --yes/--force.
+			// Asked up front, before the daemon/offline split, so the
+			// operator confirms exactly what they typed.
+			if !force {
+				names := make([]string, len(targets))
+				for i, c := range targets {
+					names[i] = c.Name
+				}
+				fmt.Printf("About to clear: %s\n", strings.Join(names, ", "))
+				fmt.Print("Proceed? [y/N] ")
+				reader := bufio.NewReader(os.Stdin)
+				answer, _ := reader.ReadString('\n')
+				answer = strings.ToLower(strings.TrimSpace(answer))
+				if answer != "y" && answer != "yes" {
+					fmt.Println("Aborted.")
+					return nil
+				}
+			}
+
+			// Ask the RUNNING daemon to prune the caches it manages. That
+			// is surgical (it knows what is in use), it works live, and
+			// for the BuildKit cache it is the ONLY thing that works:
+			// BuildKit's bbolt DB holds its own references to the
+			// snapshots behind each cache record, so deleting the
+			// directory or the containerd records behind its back leaves
+			// them pinned and frees nothing.
+			//
+			// --offline forces the old filesystem sweep as an escape
+			// hatch for a wedged daemon.
+			if running && !cmd.Bool("offline") {
+				remaining, err := pruneViaDaemon(ctx, targets)
+				if err != nil {
+					return err
+				}
+				if len(remaining) == 0 {
+					return nil
+				}
+				targets = remaining
+			}
+
 			// Determine which targets we can actually clear. Non-live-safe
 			// caches are skipped (for --all) or refused (for a named clear)
 			// while the daemon runs, unless --force overrides.
@@ -492,23 +612,6 @@ func cacheClearCmd() *cli.Command {
 			if len(clearable) == 0 {
 				fmt.Println("Nothing to clear.")
 				return nil
-			}
-
-			// Confirmation for destructive clears unless --yes/--force.
-			if !force {
-				names := make([]string, len(clearable))
-				for i, c := range clearable {
-					names[i] = c.Name
-				}
-				fmt.Printf("About to clear: %s\n", strings.Join(names, ", "))
-				fmt.Print("Proceed? [y/N] ")
-				reader := bufio.NewReader(os.Stdin)
-				answer, _ := reader.ReadString('\n')
-				answer = strings.ToLower(strings.TrimSpace(answer))
-				if answer != "y" && answer != "yes" {
-					fmt.Println("Aborted.")
-					return nil
-				}
 			}
 
 			var totalFreed int64

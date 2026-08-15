@@ -113,6 +113,7 @@ func (c *controlServer) Upgrade(req *apiv1.UpgradeRequest, stream grpc.ServerStr
 		Force:           req.Force,
 		DrainTimeout:    time.Duration(req.DrainTimeoutSeconds) * time.Second,
 		Drainer:         c.sched,
+		Shutdown:        c.sched.shutdownCh(),
 		Log:             c.log.With("component", "upgrade"),
 	}
 	c.log.Info("upgrade requested via grpc", "target", req.TargetVersion, "no_drain", req.NoDrain, "force", req.Force)
@@ -120,6 +121,41 @@ func (c *controlServer) Upgrade(req *apiv1.UpgradeRequest, stream grpc.ServerStr
 		return status.Errorf(codes.Internal, "upgrade: %v", err)
 	}
 	return nil
+}
+
+// PruneCache reclaims disk through the managers that own each cache,
+// inside the running daemon.
+//
+// This is what `ephemerd cache clear buildkit|containerd` calls. It
+// replaces an offline directory wipe that needed the daemon stopped and
+// could not tell in-use data from garbage — and that, for the BuildKit
+// cache, did not even work: BuildKit's bbolt DB holds its own references to
+// the snapshots behind every cache record, so removing containerd records
+// or the directory leaves them pinned and frees nothing.
+//
+// One failing target does not fail the call; each result carries its own
+// error so the caller sees what the others reclaimed.
+func (c *controlServer) PruneCache(ctx context.Context, req *apiv1.PruneCacheRequest) (*apiv1.PruneCacheResponse, error) {
+	pruner := c.sched.cfg.CachePruner
+	if pruner == nil {
+		return nil, status.Error(codes.Unimplemented, "this daemon has no prunable caches configured")
+	}
+	c.log.Info("cache prune requested via grpc", "targets", req.Targets, "all", req.All)
+
+	results := pruner.Prune(ctx, req.Targets, req.All)
+	out := &apiv1.PruneCacheResponse{Results: make([]*apiv1.PruneCacheResult, 0, len(results))}
+	for _, r := range results {
+		pr := &apiv1.PruneCacheResult{
+			Name:           r.Name,
+			BytesFreed:     r.BytesFreed,
+			RecordsRemoved: r.RecordsRemoved,
+		}
+		if r.Err != nil {
+			pr.Error = r.Err.Error()
+		}
+		out.Results = append(out.Results, pr)
+	}
+	return out, nil
 }
 
 // progressToProto maps an upgrade.Progress onto the wire enum/message.

@@ -30,6 +30,31 @@
 >   then polls `Status` — which now reports `version` — until the new
 >   binary is live.
 >
+>   On Windows the hand-off is a detached `<ephemerd> __restart-service`
+>   helper that drives the SCM directly (stop, wait for STOPPED, start). It
+>   replaced a detached `powershell -Command "Restart-Service"`, which was
+>   correct but took **6m34s** from swap to SCM stop on the fleet runner —
+>   a cold interpreter start in session 0, right after ~1 GB of
+>   download/extract/delete I/O — so the CLI declared failure on an upgrade
+>   that was still in flight. The helper is spawned from the `.old` backup,
+>   i.e. the image the daemon is already running: it is warm, and it is by
+>   definition the same build as the code invoking it.
+> - **The cordon never outlives a failed upgrade.** Handing a restart to the
+>   service manager is not the same as being restarted, so the daemon
+>   watches for the restart to take effect (a restart that works terminates
+>   the process; the scheduler's shutdown channel distinguishes "going down"
+>   from "never happened"). If it does not take, the scheduler is
+>   un-cordoned and the failure is logged loudly. A node that is drained
+>   *and* still on the old binary is worse than one that never attempted the
+>   upgrade — it reports `status: ok` with the service Running while
+>   silently accepting no work.
+> - **No auto-rollback on a failed restart.** The new binary is the
+>   checksum-verified, `--version`-probed component; the service-manager
+>   hand-off is what failed, and a rollback does not fix that while it does
+>   race a restart that may still be in flight. The verified binary stays
+>   installed so the next restart — automatic or manual — completes the
+>   upgrade, and the CLI says exactly that, naming the remediation.
+>
 > **What mayfly must call:** `Control.Upgrade(UpgradeRequest{target_version:
 > "vX.Y.Z"})`, consume the `UpgradeProgress` stream until
 > `UPGRADE_STATE_RESTARTING` (or `UPGRADE_STATE_UP_TO_DATE` for a no-op, or

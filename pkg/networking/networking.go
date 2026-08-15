@@ -29,6 +29,37 @@ type Config struct {
 	// dispatch server listening on the bridge).
 	ControlPorts []int
 
+	// The fields below configure the Windows L2Bridge egress path (see
+	// network_windows.go and l2bridge.go). They are ignored on Linux/macOS.
+	// When L2BridgeEgress is false (the default), Windows uses the HNS NAT
+	// network and none of them are consulted.
+	//
+	// L2BridgeEgress is the opt-in. HostNIC (the host adapter to bridge onto)
+	// and IPPool (the reserved LAN range container addresses come from) are
+	// REQUIRED when it is set; Subnet and Gateway are derived from HostNIC when
+	// empty. PublicDNS defaults to public resolvers so container DNS never needs
+	// the blocked LAN router. ExtraAllowedCIDRs carves destinations out above
+	// the RFC1918 block.
+	L2BridgeEgress    bool
+	HostNIC           string
+	IPPool            string
+	Gateway           string
+	PublicDNS         []string
+	ExtraAllowedCIDRs []string
+
+	// AllowHostAccess permits job containers to address the ephemerd host
+	// itself on the L2Bridge path. Required by anything ephemerd serves TO
+	// containers over the network — the per-job dind Docker API and the Go
+	// module proxy both listen on the host address — because the egress ACLs
+	// otherwise block the host along with the rest of RFC1918.
+	//
+	// It is an address-scoped /32 allow, so it opens every port the host has
+	// listening, not just ephemerd's. The control-plane ports are blocked back
+	// off at the host firewall (see l2BridgeControlPlaneRules), which CAN match
+	// on the container source here because L2Bridge does not NAT. Left false
+	// when nothing needs to be reachable, which is the strictest posture.
+	AllowHostAccess bool
+
 	Log *slog.Logger
 }
 
@@ -134,6 +165,26 @@ type platformNetworking interface {
 	installFirewallRules() error
 	removeFirewallRules()
 	cleanup()
+
+	// hostAddr returns the host address containers reach ephemerd's own
+	// services on, when the platform knows it better than GatewayIP's
+	// subnet arithmetic does. Empty means "use the generic derivation".
+	//
+	// This exists for the Windows L2Bridge path, where containers are LAN
+	// peers and the reachable host address is the host's own adapter address
+	// — not the .1 of any container subnet.
+	hostAddr() string
+
+	// openHostPort / closeHostPort open and close a scoped host-firewall
+	// inbound allow for one TCP port, from the container pool to the host.
+	// Needed only on the Windows L2Bridge path: the VFP host /32 allow lets a
+	// container's packet leave its port toward the host, but the host's own
+	// inbound Windows Firewall default-denies it, so per-job services ephemerd
+	// binds on the host (the dind Docker API, the module proxy) are otherwise
+	// unreachable. Scoped to remoteip=<pool>, localport=<port> so ONLY that
+	// service opens — RDP/SMB/RPC stay blocked. No-op on NAT and non-Windows.
+	openHostPort(port int) error
+	closeHostPort(port int)
 }
 
 // New creates and initializes the networking manager for the current platform.
@@ -159,11 +210,23 @@ func (m *Manager) Teardown(ctx context.Context, id string, netns string) error {
 	return m.platform.teardown(ctx, id, netns)
 }
 
-// GatewayIP returns the bridge gateway IP address (e.g., "10.88.0.1").
-// This is the first usable IP in the container subnet, reachable from
-// inside containers. Used by services that need to be accessible to jobs
-// (e.g., Go module proxy, DNS).
+// GatewayIP returns the host address that services ephemerd runs for jobs must
+// bind to in order to be reachable from inside containers — the Go module proxy
+// and, on Windows, the per-job dind Docker API listener.
+//
+// Normally that is the bridge gateway (e.g. "10.88.0.1"), the first usable
+// address of the container subnet. On the Windows L2Bridge path there is no
+// such bridge gateway: containers are peers on the host's LAN, so the platform
+// reports the host's own adapter address instead. Binding to the old hard-coded
+// 10.88.0.1 there would fail outright — no interface holds that address once the
+// NAT network is out of the picture — and take dind provisioning down with it.
 func (m *Manager) GatewayIP() string {
+	if m.platform != nil {
+		if addr := m.platform.hostAddr(); addr != "" {
+			return addr
+		}
+	}
+
 	subnet := m.cfg.Subnet
 	if subnet == "" {
 		subnet = DefaultSubnet
@@ -183,6 +246,25 @@ func (m *Manager) GatewayIP() string {
 // InstallFirewallRules blocks container traffic to private network ranges.
 func (m *Manager) InstallFirewallRules() error {
 	return m.platform.installFirewallRules()
+}
+
+// OpenHostPort opens a scoped host-firewall inbound allow for one TCP port from
+// the container pool to the host, so a per-job service ephemerd binds on the
+// host (dind's Docker API, the module proxy) is reachable from job containers.
+// Only the Windows L2Bridge path does anything; elsewhere it is a no-op. Pair
+// with CloseHostPort on teardown.
+func (m *Manager) OpenHostPort(port int) error {
+	if m.platform == nil {
+		return nil
+	}
+	return m.platform.openHostPort(port)
+}
+
+// CloseHostPort removes an allow previously added by OpenHostPort.
+func (m *Manager) CloseHostPort(port int) {
+	if m.platform != nil {
+		m.platform.closeHostPort(port)
+	}
 }
 
 // Cleanup removes all networking state: firewall rules, bridge interface,

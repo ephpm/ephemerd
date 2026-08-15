@@ -13,6 +13,7 @@ import (
 	"archive/tar"
 	"bufio"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -104,35 +105,42 @@ func (s *Server) handleImageBuildBuildkit(bk *buildkit.Server) http.HandlerFunc 
 		w.WriteHeader(http.StatusOK)
 		flusher, _ := w.(http.Flusher)
 
-		statusCh := make(chan *bkclient.SolveStatus, 16)
-		errCh := make(chan error, 1)
-
-		go func() {
-			defer func() {
-				if rec := recover(); rec != nil {
-					s.log.Error("buildkit Build goroutine panic recovered", "panic", rec)
-					errCh <- fmt.Errorf("internal buildkit panic: %v", rec)
+		// The solve runs at most twice. A first failure carrying the
+		// dangling-snapshot signature means the SHARED build store names a
+		// snapshot containerd no longer has — a state no job can repair
+		// from inside its own namespace (see buildheal.go), so ephemerd
+		// repairs it host-side and gives this build the second chance. Any
+		// other failure, and any second failure, is final.
+		solveErr := s.runSolve(r.Context(), bk, opt, w, flusher)
+		if solveErr != nil {
+			healed, _ := buildkit.DanglingSnapshotFromError(solveErr)
+			if s.healAndRetryBuild(r.Context(), bk, solveErr) {
+				if err := writeJSONLine(w, map[string]any{
+					"stream": "ephemerd: repaired a corrupt entry in the shared build store; retrying the build\n",
+				}); err != nil {
+					s.log.Warn("writing heal notice", "error", err)
+					return
 				}
-			}()
-			_, err := bk.Build(r.Context(), opt, statusCh)
-			errCh <- err
-		}()
-
-		for status := range statusCh {
-			if err := writeSolveStatus(w, status); err != nil {
-				s.log.Warn("writing build status", "error", err)
-				return
-			}
-			if flusher != nil {
-				flusher.Flush()
+				if flusher != nil {
+					flusher.Flush()
+				}
+				solveErr = s.runSolve(r.Context(), bk, opt, w, flusher)
+				if solveErr == nil {
+					// The repair stuck. Drop the escalation state so a
+					// recurrence weeks from now starts from the cheap
+					// rung again instead of rebuilding the store.
+					bk.Healer().Forget(healed.ID)
+				}
 			}
 		}
 
-		if err := <-errCh; err != nil {
-			_ = writeJSONLine(w, map[string]any{
+		if err := solveErr; err != nil {
+			if werr := writeJSONLine(w, map[string]any{
 				"errorDetail": map[string]any{"message": err.Error()},
 				"error":       err.Error(),
-			})
+			}); werr != nil {
+				s.log.Warn("writing build error", "error", werr)
+			}
 			return
 		}
 
@@ -140,6 +148,51 @@ func (s *Server) handleImageBuildBuildkit(bk *buildkit.Server) http.HandlerFunc 
 			"stream": "Successfully built\n",
 		})
 	}
+}
+
+// runSolve performs one solve, streaming progress to w in Docker jsonmessage
+// format, and returns the solve's error.
+//
+// Factored out of the handler so a build can be run twice: once, and — after
+// the shared build store has been repaired — once more. Everything a solve
+// needs (the extracted context dir, the translated SolveOpt) is immutable
+// across the two attempts, so a retry is a plain second call.
+func (s *Server) runSolve(ctx context.Context, bk *buildkit.Server, opt bkclient.SolveOpt, w io.Writer, flusher http.Flusher) error {
+	statusCh := make(chan *bkclient.SolveStatus, 16)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				s.log.Error("buildkit Build goroutine panic recovered", "panic", rec)
+				errCh <- fmt.Errorf("internal buildkit panic: %v", rec)
+			}
+		}()
+		_, err := bk.Build(ctx, opt, statusCh)
+		errCh <- err
+	}()
+
+	var writeErr error
+	for status := range statusCh {
+		if writeErr != nil {
+			// Keep draining: the solve closes statusCh only when it is
+			// done, and abandoning the range would leak the goroutine.
+			continue
+		}
+		if err := writeSolveStatus(w, status); err != nil {
+			s.log.Warn("writing build status", "error", err)
+			writeErr = err
+			continue
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	if err := <-errCh; err != nil {
+		return err
+	}
+	return writeErr
 }
 
 // extractBuildContextToTempDir reads a (optionally gzipped) tar stream and extracts
@@ -295,7 +348,35 @@ func dockerBuildOptsToSolveOpt(r *http.Request, ctxDir, jobID string) (bkclient.
 	// <tag> finds the image regardless of which -t the user picked.
 	// Registry push happens later via the existing pkg/dind push path,
 	// which applies the same scoping on lookup.
-	exportAttrs := map[string]string{}
+	exportAttrs := map[string]string{
+		// UNPACK IS WHAT MAKES THE EXPORTED RECORD REFERENCE-COUNTED, and
+		// it is not the default.
+		//
+		// containerd links an image record to its extracted layers with
+		// exactly one edge: a `containerd.io/gc.ref.snapshot.<snapshotter>`
+		// label on the config blob naming the top layer's chain ID.
+		// BuildKit's image exporter writes that label — but only on the
+		// unpack path (exporter/containerimage/export.go), and unpack
+		// defaults to false. Exporting without it produced image records in
+		// the shared "buildkit" namespace that were perfectly resolvable
+		// while the snapshots backing them were pinned by NOTHING except
+		// BuildKit's own cache leases.
+		//
+		// That was survivable only for as long as BuildKit never collected.
+		// #146 gave the worker a GC policy, which means those cache leases
+		// now go away on a size cap — and when they did, containerd would
+		// collect the layers out from under a live image record, leaving
+		// the "image record resolves but its layer snapshot is gone" state
+		// reported in #149. Setting unpack closes that hole at the source:
+		// the record pins its own chain, so no collector on either side can
+		// orphan it.
+		//
+		// It is close to free here. Unpacking re-applies layers through
+		// containerd's rootfs.ApplyLayer, which returns early for any chain
+		// ID the snapshotter already has — and immediately after a build it
+		// has all of them. The work is one Stat per layer.
+		"unpack": "true",
+	}
 	if len(tags) > 0 {
 		scoped := make([]string, len(tags))
 		for i, t := range tags {

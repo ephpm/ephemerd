@@ -1,10 +1,20 @@
 name: dind-test
 on:
   workflow_dispatch:
+    inputs:
+      only:
+        # Running one job at a time matters when investigating the shared
+        # BuildKit store: three same-label jobs make the scheduler retire and
+        # re-dispatch runners underneath a long build, which is indistinguishable
+        # from the build itself failing.
+        description: "Run one job in isolation (docker-ping, docker-cli, docker-build). Empty runs all."
+        required: false
+        default: ""
 
 jobs:
   docker-ping:
     runs-on: [self-hosted, linux, x64]
+    if: inputs.only == '' || inputs.only == 'docker-ping'
     steps:
       - name: Check docker socket exists
         run: test -S /var/run/docker.sock && echo "docker.sock exists"
@@ -26,6 +36,7 @@ jobs:
 
   docker-cli:
     runs-on: [self-hosted, linux, x64]
+    if: inputs.only == '' || inputs.only == 'docker-cli'
     steps:
       - name: Install Docker CLI
         run: |
@@ -42,3 +53,38 @@ jobs:
 
       - name: Docker images shows alpine
         run: docker images | grep alpine
+
+  # Exercises the path that broke in #149: a real `docker build` against the
+  # SHARED host-side BuildKit store. Kept in the dind smoke workflow because
+  # the failure it guards against is invisible to unit tests — it only appears
+  # when a build resolves a layer through BuildKit's own cache metadata.
+  docker-build:
+    runs-on: [self-hosted, linux, x64]
+    if: inputs.only == '' || inputs.only == 'docker-build'
+    steps:
+      - name: Install Docker CLI
+        run: |
+          apk add --no-cache docker-cli || apt-get update && apt-get install -y docker.io || true
+
+      - name: Write a Dockerfile with a package-install stage
+        run: |
+          mkdir -p /tmp/ctx149
+          # debian:12-slim + a plain apt-get stage, mirroring the shape of the
+          # ephpm release build that #149 was filed against.
+          cat > /tmp/ctx149/Dockerfile <<'DOCKERFILE'
+          FROM debian:12-slim
+          RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
+          RUN echo "ephemerd-149" > /marker
+          DOCKERFILE
+
+      # DOCKER_BUILDKIT=0 forces the classic POST /build path, which is what
+      # ephemerd implements — the request lands on its own embedded BuildKit
+      # solver and the SHARED host-side store. Left to itself the CLI hands
+      # the build to buildx's docker-container driver, which tries to launch a
+      # privileged buildkit container (denied on this host) and would never
+      # touch the store this job is here to exercise.
+      - name: docker build
+        run: DOCKER_BUILDKIT=0 docker build -t ephemerd-149-check:latest /tmp/ctx149
+
+      - name: docker system df
+        run: docker system df

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	goruntime "runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,6 +28,8 @@ type Config struct {
 	Network     NetworkConfig     `toml:"network"`
 	VM          VMConfig          `toml:"vm"`
 	Dind        DindConfig        `toml:"dind"`
+	BuildKit    BuildKitConfig    `toml:"buildkit"`
+	ImageGC     ImageGCConfig     `toml:"image_gc"`
 	ModuleProxy ModuleProxyConfig `toml:"module_proxy"`
 	CargoProxy  CargoProxyConfig  `toml:"cargo_proxy"`
 	Runtime     RuntimeConfig     `toml:"runtime"`
@@ -211,8 +214,111 @@ func (w *WebhookConfig) ResolvedReconcileInterval() time.Duration {
 
 // NetworkConfig configures container networking.
 type NetworkConfig struct {
-	Subnet string `toml:"subnet"` // container subnet (auto-selected if empty)
-	MTU    int    `toml:"mtu"`    // bridge MTU (auto-detected from host if 0)
+	// Subnet is the container subnet.
+	//
+	// Linux (CNI bridge): auto-selected when empty, avoiding ranges already in
+	// use on the host.
+	//
+	// Windows L2Bridge (l2bridge_egress = true): the CIDR of the LAN the bridge
+	// is attached to — containers are peers on it, not behind NAT — declared as
+	// the HNS network's Ipam subnet. Auto-derived from the address configured on
+	// host_nic when empty, which is the expected setting. Pin it only when the
+	// adapter carries a prefix that differs from the LAN you want declared.
+	//
+	// Windows NAT (the default): not consulted; the HNS NAT network always uses
+	// the built-in 10.88.0.0/16.
+	Subnet string `toml:"subnet"`
+
+	MTU int `toml:"mtu"` // bridge MTU (auto-detected from host if 0)
+
+	// L2BridgeEgress opts a Windows pool into L2Bridge container networking
+	// with VFP-enforced egress filtering, instead of the default HNS NAT.
+	// NAT cannot software-filter Windows container egress (VFP does not engage
+	// on a NAT network); L2Bridge puts the container on a VFP-managed vSwitch
+	// port so per-endpoint ACLs actually enforce. Windows only; ignored on
+	// Linux/macOS. Default false — NAT stays the default and this flag flips
+	// nothing until an operator opts a pool in.
+	L2BridgeEgress bool `toml:"l2bridge_egress"`
+
+	// HostNIC is the host network adapter name the L2Bridge binds onto
+	// (e.g. "Ethernet"). REQUIRED when L2BridgeEgress is true — the bridge
+	// has no uplink without it. There is no default: the correct NIC name is
+	// host-specific (do not assume "Ethernet 2", which was a spike's
+	// hot-added test NIC). Ignored when L2BridgeEgress is false.
+	HostNIC string `toml:"host_nic"`
+
+	// IPPool is the range of LAN addresses ephemerd may assign to job
+	// containers on the L2Bridge path. REQUIRED when L2BridgeEgress is true,
+	// with no default, and validated at load time.
+	//
+	// Why it cannot be inferred: an L2Bridge network must declare a subnet (HNS
+	// rejects a subnet-less one outright), and once it has one HNS will assign
+	// endpoint addresses from anywhere inside it — on a real LAN, straight into
+	// the site DHCP server's scope. ephemerd therefore allocates addresses
+	// itself, and only the operator knows which slice of their LAN the DHCP
+	// server is configured never to lease.
+	//
+	// Accepts a CIDR ("192.0.2.192/27" — network and broadcast excluded) or an
+	// inclusive range ("192.0.2.200-192.0.2.230"). Must lie inside Subnet and
+	// must not contain the host's own address or the LAN gateway. Size it for
+	// at least runner.max_concurrent addresses. Ignored when L2BridgeEgress is
+	// false.
+	IPPool string `toml:"ip_pool"`
+
+	// Gateway is the LAN router the L2Bridge default route points at (the HNS
+	// Ipam route next hop). Auto-derived from the default route on HostNIC when
+	// empty, which is the expected setting; pin it only when the adapter has no
+	// default route of its own or carries more than one.
+	//
+	// Containers route THROUGH this address while the egress ACLs stop them
+	// ADDRESSING it — the gateway gets no allow rule. Windows L2Bridge only.
+	Gateway string `toml:"gateway"`
+
+	// PublicDNS is the DNS resolver list handed to L2Bridge containers. Public
+	// resolvers keep container DNS off the LAN router (which the egress ACLs
+	// block along with the rest of RFC1918). Empty falls back to a built-in
+	// public default (1.1.1.1, 8.8.8.8). Only consulted on the L2Bridge path.
+	PublicDNS []string `toml:"public_dns"`
+
+	// ExtraAllowedDestinations are additional CIDRs permitted through the
+	// L2Bridge egress ACLs at a precedence ABOVE the RFC1918 block (so a
+	// listed destination wins over the block). Reserved for future use —
+	// default empty, which reproduces the strict Linux end-state (no RFC1918
+	// carve-outs at all). Only consulted on the L2Bridge path.
+	ExtraAllowedDestinations []string `toml:"extra_allowed_destinations"`
+}
+
+// validate rejects an L2Bridge configuration that cannot be completed safely at
+// runtime. It runs at config load, on every platform, so a node whose config was
+// rendered wrong dies at startup with a specific message instead of coming up
+// and quietly mis-addressing containers.
+//
+// Only the two settings that cannot be inferred are required. subnet, gateway,
+// and public_dns are all derived from the host's real primary adapter when
+// unset, so nothing here assumes any particular network. ip_pool deliberately
+// has NO default: on L2Bridge, containers take addresses on the operator's own
+// LAN, and a built-in guess would hand out addresses the site's DHCP server is
+// also leasing. Semantic checks that need the host (does the pool fit inside the
+// adapter's subnet, does it swallow the gateway) happen in pkg/networking once
+// the adapter has been read.
+func (n *NetworkConfig) validate() error {
+	if !n.L2BridgeEgress {
+		return nil
+	}
+	if strings.TrimSpace(n.HostNIC) == "" {
+		return fmt.Errorf(`network.host_nic is required when network.l2bridge_egress = true: ` +
+			`set it to the host adapter the bridge attaches to — the name shown by ` + "`Get-NetAdapter`" + `, ` +
+			`e.g. host_nic = "Ethernet". There is no default; the correct adapter is host-specific`)
+	}
+	if strings.TrimSpace(n.IPPool) == "" {
+		return fmt.Errorf(`network.ip_pool is required when network.l2bridge_egress = true: ` +
+			`on L2Bridge, job containers are addressed on this host's own LAN rather than behind NAT, ` +
+			`so ephemerd must be told which addresses it may hand out. Set it to a range your DHCP server ` +
+			`is configured never to lease — either a CIDR (ip_pool = "192.0.2.192/27") or an inclusive ` +
+			`range (ip_pool = "192.0.2.200-192.0.2.230") — sized for at least runner.max_concurrent ` +
+			`containers. There is no default: any built-in guess would collide with live DHCP leases`)
+	}
+	return nil
 }
 
 type ContainerdConfig struct {
@@ -310,12 +416,21 @@ type DindConfig struct {
 	// disable pruning entirely. Default 24h.
 	CachePruneInterval time.Duration `toml:"cache_prune_interval"`
 
-	// CacheMaxAge is the eviction threshold for cached image records:
+	// CacheMaxAge is an OPTIONAL age backstop for cached image records:
 	// any record whose ephemerd.io/last-accessed label (or UpdatedAt as
 	// fallback) is older than this gets removed on the next prune pass.
 	// Containerd's content GC then reclaims the unreferenced blobs.
-	// Set to 0 to disable eviction (only empty-namespace cleanup runs).
-	// Default 168h (7 days).
+	//
+	// BEHAVIOR CHANGE: this used to default to 168h (7 days) and was the
+	// only image eviction mechanism ephemerd had. It now defaults to 0
+	// (disabled), because disk pressure — not age — is the correct
+	// trigger: evicting a warm cache while the disk is half empty just
+	// forces re-downloads. See [image_gc], which supersedes this for
+	// both the dind cache namespaces and the main runtime namespace.
+	//
+	// An explicit value is still honored, and still applies only to the
+	// ephemerd-dind-cache-* namespaces. Empty cache namespaces are
+	// reaped on every prune pass regardless of this setting.
 	CacheMaxAge time.Duration `toml:"cache_max_age"`
 
 	// AllowPrivileged controls whether `docker run --privileged` (or
@@ -365,13 +480,194 @@ func (d *DindConfig) DindCachePruneInterval() time.Duration {
 	return d.CachePruneInterval
 }
 
-// DindCacheMaxAge returns the eviction threshold with the default applied
-// when unset (or set to 0).
+// DindCacheMaxAge returns the optional age backstop for dind cache
+// namespaces. Zero means disabled, which is now the default — see
+// DindConfig.CacheMaxAge for why. A negative value is also treated as
+// disabled so a typo cannot evict everything.
 func (d *DindConfig) DindCacheMaxAge() time.Duration {
-	if d.CacheMaxAge == 0 {
-		return 7 * 24 * time.Hour
+	if d.CacheMaxAge < 0 {
+		return 0
 	}
 	return d.CacheMaxAge
+}
+
+// ImageGCConfig configures disk-pressure-triggered container image garbage
+// collection.
+//
+// Model (kubelet's): disk pressure is the TRIGGER, least-recently-used is
+// the ORDER. Collection starts when usage crosses a high watermark and
+// evicts LRU-first until a distinctly lower low watermark is reached, then
+// stops. Two watermarks rather than one line is what prevents thrashing at
+// the boundary.
+//
+// Two independent trigger arms exist and the more conservative one wins:
+// a percentage (high_watermark_percent) and an absolute floor
+// (min_free_gb). Neither is safe alone — 15% free of a 1 TB node is 150 GB
+// and evicting there is pointless, while 15% free of a 100 GB node is
+// 15 GB, which three concurrent jobs writing ~5 GB of container layers each
+// can eat between ticks. Size min_free_gb relative to
+// runner.max_concurrent times the expected per-job writable layer.
+//
+// Scope is the main "ephemerd" runtime namespace AND the per-repo
+// "ephemerd-dind-cache-*" namespaces. Images referenced by an existing
+// container, and the node's configured runner images, are never evicted.
+type ImageGCConfig struct {
+	// Enabled toggles collection. Nil = default true; operators disable
+	// by explicitly setting enabled = false.
+	Enabled *bool `toml:"enabled"`
+
+	// CheckInterval is how often disk usage is sampled. The sample is one
+	// statfs-class syscall (microseconds), so this can be short. Default
+	// 60s. Set to 0 to disable the periodic sweep — the pre-pull headroom
+	// check still runs.
+	CheckInterval time.Duration `toml:"check_interval"`
+
+	// HighWatermarkPercent is the disk used-percentage at which a
+	// collection pass triggers. Default 85. Set to 0 to disable the
+	// percentage arm and rely on min_free_gb alone.
+	HighWatermarkPercent float64 `toml:"high_watermark_percent"`
+
+	// LowWatermarkPercent is the used-percentage a triggered pass evicts
+	// down to. Default 70. Must be below HighWatermarkPercent; a value at
+	// or above it degrades to single-threshold behavior.
+	LowWatermarkPercent float64 `toml:"low_watermark_percent"`
+
+	// MinFreeGB is the absolute free-space floor, in GiB, below which a
+	// pass triggers regardless of percentage. Default 20. Set to 0 to
+	// disable the absolute arm.
+	MinFreeGB uint64 `toml:"min_free_gb"`
+
+	// TargetFreeGB is the free space, in GiB, a pass triggered by
+	// MinFreeGB evicts back up to. Defaults to twice MinFreeGB, mirroring
+	// the default 85%/70% percentage gap. Values below MinFreeGB are
+	// clamped up to it.
+	TargetFreeGB uint64 `toml:"target_free_gb"`
+
+	// MaxAge is an OPTIONAL age backstop applied to every collected
+	// namespace: records idle longer than this are evicted whether or not
+	// the disk is under pressure. Default 0 (disabled) — age is
+	// deliberately NOT the primary mechanism, because evicting a warm
+	// cache while the disk is half empty just forces re-downloads.
+	MaxAge time.Duration `toml:"max_age"`
+}
+
+// ImageGCEnabled reports whether image garbage collection runs. Default true.
+func (i *ImageGCConfig) ImageGCEnabled() bool {
+	if i.Enabled != nil {
+		return *i.Enabled
+	}
+	return true
+}
+
+// ImageGCCheckInterval returns the sampling interval, defaulting to 60s.
+// A negative value is treated as 0 (periodic sweep off).
+func (i *ImageGCConfig) ImageGCCheckInterval() time.Duration {
+	if i.CheckInterval == 0 {
+		return 60 * time.Second
+	}
+	if i.CheckInterval < 0 {
+		return 0
+	}
+	return i.CheckInterval
+}
+
+// ImageGCHighWatermarkPercent returns the trigger percentage, defaulting to
+// 85. Out-of-range values fall back to the default rather than failing
+// startup — a misconfigured watermark should not stop the node collecting.
+func (i *ImageGCConfig) ImageGCHighWatermarkPercent() float64 {
+	if i.HighWatermarkPercent < 0 || i.HighWatermarkPercent > 100 {
+		return 85
+	}
+	if i.HighWatermarkPercent == 0 {
+		// An explicit 0 is indistinguishable from "unset" in TOML for a
+		// float, so treat it as unset. Operators who want the
+		// percentage arm off should raise min_free_gb instead.
+		return 85
+	}
+	return i.HighWatermarkPercent
+}
+
+// ImageGCLowWatermarkPercent returns the stop percentage, defaulting to 70.
+// A value at or above the high watermark is clamped to it by the collector.
+func (i *ImageGCConfig) ImageGCLowWatermarkPercent() float64 {
+	if i.LowWatermarkPercent <= 0 || i.LowWatermarkPercent > 100 {
+		return 70
+	}
+	return i.LowWatermarkPercent
+}
+
+// ImageGCMinFreeBytes returns the absolute floor in bytes, defaulting to
+// 20 GiB.
+func (i *ImageGCConfig) ImageGCMinFreeBytes() uint64 {
+	gb := i.MinFreeGB
+	if gb == 0 {
+		gb = 20
+	}
+	return gb * 1024 * 1024 * 1024
+}
+
+// ImageGCTargetFreeBytes returns the absolute target in bytes, defaulting to
+// twice the floor.
+func (i *ImageGCConfig) ImageGCTargetFreeBytes() uint64 {
+	if i.TargetFreeGB > 0 {
+		return i.TargetFreeGB * 1024 * 1024 * 1024
+	}
+	return 2 * i.ImageGCMinFreeBytes()
+}
+
+// ImageGCMaxAge returns the optional age backstop. Zero (the default) and
+// any negative value mean disabled.
+func (i *ImageGCConfig) ImageGCMaxAge() time.Duration {
+	if i.MaxAge < 0 {
+		return 0
+	}
+	return i.MaxAge
+}
+
+// PinnedRunnerImages returns every image ref this node is configured to run
+// runners from: the [runner] default, every per-repo [runner.images.<repo>]
+// entry, and each provider's per-OS defaults.
+//
+// The image GC treats these as never-evictable. Dropping one guarantees a
+// re-pull on the very next job of that shape, which is exactly the network
+// thrash pressure-triggered GC exists to avoid; they are also the images
+// most likely to look "stale" to an LRU sweep on a node that has been busy
+// with third-party container: images.
+//
+// Refs are returned in a stable order with duplicates removed.
+func (c *Config) PinnedRunnerImages() []string {
+	var out []string
+	seen := map[string]struct{}{}
+	add := func(refs ...string) {
+		for _, r := range refs {
+			if r == "" {
+				continue
+			}
+			if _, ok := seen[r]; ok {
+				continue
+			}
+			seen[r] = struct{}{}
+			out = append(out, r)
+		}
+	}
+
+	add(c.Runner.DefaultImage)
+	for _, byOS := range c.Runner.Images {
+		for _, ref := range byOS {
+			add(ref)
+		}
+	}
+	for _, g := range c.GitHubTargets() {
+		add(g.DefaultImageFor("linux"), g.DefaultImageFor("windows"))
+	}
+	add(c.Forgejo.DefaultImageFor("linux"), c.Forgejo.DefaultImageFor("windows"), c.Forgejo.JobImage)
+	add(c.Gitea.DefaultImageFor("linux"), c.Gitea.DefaultImageFor("windows"), c.Gitea.JobImage)
+	add(c.GitLab.DefaultImageFor("linux"), c.GitLab.DefaultImageFor("windows"))
+
+	// A per-repo images map iterates in random order; sort so the log
+	// line and any test assertion are stable.
+	sort.Strings(out)
+	return out
 }
 
 // ModuleProxyConfig configures the Go module caching proxy.
@@ -696,7 +992,6 @@ type RunnerConfig struct {
 	JobTimeout      string            `toml:"job_timeout"`
 	ShutdownTimeout string            `toml:"shutdown_timeout"`
 	Windows         WindowsRunnerToml `toml:"windows"`
-	MacOS           MacOSRunnerConfig `toml:"macos"`
 
 	// ClaimRetry controls the in-memory retry queue for jobs whose
 	// initial claim / provision attempt fails with a transient error
@@ -759,116 +1054,6 @@ type ClaimRetryToml struct {
 	// Default 0.2 (+/-20%). Set 0 to disable jitter (useful in tests,
 	// rarely useful in production).
 	Jitter *float64 `toml:"jitter"`
-}
-
-// MacOSRunnerConfig controls macOS job routing. It lives under [runner]
-// (not [vm.macos]) because native jobs don't involve VMs.
-//
-// TOML shape:
-//
-//	[runner.macos]
-//	mode = "vm"         # default mode: "vm" or "native"
-//	max_native = 4      # max concurrent native jobs
-//	# user = "ciuser"   # optional: existing user for native runners.
-//	#                   # Default (unset): an ephemeral hidden user is
-//	#                   # created per job and deleted on cleanup.
-//
-//	[runner.macos.repos]
-//	"ephpm/*"           = "native"  # all repos in org
-//	"ephpm/secret-repo" = "vm"     # except this one (exact wins over wildcard)
-//	"someuser/ephemerd" = "vm"     # fork stays on VM
-type MacOSRunnerConfig struct {
-	Mode      string            `toml:"mode"`       // "vm" (default) or "native"
-	MaxNative int               `toml:"max_native"` // max concurrent native jobs (default 4)
-	User      string            `toml:"user"`       // existing user for native runners (empty = ephemeral per-job user, recommended)
-	Repos     map[string]string `toml:"repos"`      // "org/repo" -> "vm" or "native"
-
-	// SandboxStrict switches the native sandbox profile from allow-by-default
-	// (deny-list) to deny-by-default (allow-list). Default false. Strict mode
-	// is a much stronger posture but requires enumerating every path a GHA
-	// runner + toolchain legitimately touches, so it is opt-in and needs a
-	// live smoke test on the target host before enabling.
-	SandboxStrict bool `toml:"sandbox_strict"`
-
-	// MaxProcesses caps the number of processes (ulimit -u) a native job may
-	// spawn, providing fork-bomb defense. Default 2048 (generous — clang/php
-	// fork heavily). 0 = unlimited (no ulimit set). Note: macOS has no
-	// cgroups, so RAM and disk cannot be hard-capped on the native path; use
-	// the VM path for untrusted memory/disk DoS resistance.
-	MaxProcesses *int `toml:"max_processes"`
-}
-
-// ResolvedMaxProcesses returns the ulimit -u value for native jobs.
-// Unset (nil) defaults to 2048. An explicit 0 means unlimited (return 0 so
-// the caller skips the ulimit). A negative value is treated as unlimited.
-func (m *MacOSRunnerConfig) ResolvedMaxProcesses() int {
-	if m == nil || m.MaxProcesses == nil {
-		return 2048
-	}
-	if *m.MaxProcesses < 0 {
-		return 0
-	}
-	return *m.MaxProcesses
-}
-
-// StrictSandbox reports whether deny-by-default sandbox mode is enabled.
-func (m *MacOSRunnerConfig) StrictSandbox() bool {
-	return m != nil && m.SandboxStrict
-}
-
-// ModeForRepo returns "native" or "vm" for the given repo. Resolution order:
-//
-//  1. Exact match on "org/repo"
-//  2. Wildcard match on "org/*"
-//  3. Short-name fallback: if repo has no "/", match any "org/<repo>" key
-//  4. Top-level mode
-//  5. Default: "vm"
-//
-// The short-name fallback exists because some providers (GitHub polling)
-// currently emit event.Repo as just the repo name without the org prefix.
-// Config keys should always use "org/repo" format for disambiguation.
-func (m *MacOSRunnerConfig) ModeForRepo(repo string) string {
-	if m != nil && len(m.Repos) > 0 {
-		// 1. Exact match
-		if mode, ok := m.Repos[repo]; ok && isValidMode(mode) {
-			return mode
-		}
-
-		// 2. Wildcard: "org/*" matches any repo under that org
-		if slash := strings.IndexByte(repo, '/'); slash > 0 {
-			wildcard := repo[:slash] + "/*"
-			if mode, ok := m.Repos[wildcard]; ok && isValidMode(mode) {
-				return mode
-			}
-		}
-
-		// 3. Short-name fallback: repo="ephemerd" matches key "ephpm/ephemerd"
-		if !strings.Contains(repo, "/") {
-			suffix := "/" + repo
-			for key, mode := range m.Repos {
-				if strings.HasSuffix(key, suffix) && !strings.HasSuffix(key, "/*") && isValidMode(mode) {
-					return mode
-				}
-			}
-		}
-	}
-	if m != nil && isValidMode(m.Mode) {
-		return m.Mode
-	}
-	return "vm"
-}
-
-func isValidMode(mode string) bool {
-	return mode == "native" || mode == "vm"
-}
-
-// ResolvedMaxNative returns the max concurrent native macOS jobs,
-// defaulting to 4 if unset or non-positive.
-func (m *MacOSRunnerConfig) ResolvedMaxNative() int {
-	if m == nil || m.MaxNative <= 0 {
-		return 4
-	}
-	return m.MaxNative
 }
 
 // WindowsRunnerToml configures resource limits for Hyper-V isolated Windows
@@ -1192,6 +1377,10 @@ func (c *Config) validate() error {
 				return fmt.Errorf("woodpecker.agent_secret is required")
 			}
 		}
+	}
+
+	if err := c.Network.validate(); err != nil {
+		return err
 	}
 
 	// Webhook secret handling depends on who owns the tunnel:

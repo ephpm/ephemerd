@@ -1,0 +1,102 @@
+name: windows-containment
+
+# Security regression test for the Windows L2Bridge egress path
+# (network.l2bridge_egress). Runs INSIDE a real CI job container on a
+# self-hosted Windows runner and asserts, adversarially, that:
+#   1. the container cannot reach RFC1918 / management planes / the LAN router
+#   2. the internet, DNS and HTTPS still work
+#   3. the host's admin services (WinRM/RPC/RDP/SMB) are NOT reachable, but the
+#      per-job dind Docker API is
+#   4. Hyper-V isolation holds (no host filesystem, processes, pipes, or HNS)
+#
+# This guards the class of bug that shipped-then-was-caught in v0.2.0: a job
+# container reaching the host's WinRM (5985) and RPC endpoint mapper (135).
+#
+# Run it against a node that has network.l2bridge_egress enabled. On a NAT node
+# the containment checks are EXPECTED to fail (NAT does not filter egress) — the
+# workflow is only meaningful on an L2Bridge node.
+#
+# `blocked_endpoints` is the site-specific list of "must be unreachable"
+# host:port targets (your management planes). Override it per-fleet; the default
+# is a set of RFC1918 representatives so the test is meaningful out of the box.
+on:
+  workflow_dispatch:
+    inputs:
+      blocked_endpoints:
+        description: "Comma-separated host:port that MUST be blocked from a job (management planes / LAN)."
+        required: false
+        default: "10.0.0.1:22,172.16.0.1:22,192.168.0.1:22,169.254.169.254:80"
+      runner_labels:
+        description: "Comma-separated extra runner labels to target (besides self-hosted,windows,x64)."
+        required: false
+        default: ""
+
+jobs:
+  containment:
+    runs-on: [self-hosted, windows, x64]
+    steps:
+      - name: L2Bridge containment + isolation probe
+        shell: powershell
+        env:
+          BLOCKED: ${{ github.event.inputs.blocked_endpoints }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $fail = 0
+          function Result($label, $ok, $detail) {
+            if ($ok) { '{0,-46} PASS  {1}' -f $label, $detail }
+            else { $script:fail++; '{0,-46} FAIL  {1}' -f $label, $detail }
+          }
+          function Probe($ip, $port) {
+            try { $c = New-Object System.Net.Sockets.TcpClient; $ok = $c.ConnectAsync($ip,[int]$port).Wait(4000) -and $c.Connected; $c.Close(); return $ok } catch { return $false }
+          }
+
+          Write-Output '=== identity ==='
+          Write-Output "  whoami: $(whoami)"
+          Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' } | ForEach-Object { "  ip: $($_.IPAddress)/$($_.PrefixLength) on $($_.InterfaceAlias)" }
+          $hostip = ($env:DOCKER_HOST -replace 'tcp://','' -split ':')[0]
+          Write-Output "  host (DOCKER_HOST): $hostip"
+
+          Write-Output ''
+          Write-Output '=== 1. CONTAINMENT (site management planes / LAN must be blocked) ==='
+          foreach ($ep in ($env:BLOCKED -split ',' | Where-Object { $_ -match ':' })) {
+            $h,$p = $ep.Trim() -split ':',2
+            Result "blocked $h`:$p" (-not (Probe $h $p)) ''
+          }
+
+          Write-Output ''
+          Write-Output '=== 2. INTERNET (must work) ==='
+          Result 'Cloudflare 1.1.1.1:443 reachable' (Probe '1.1.1.1' 443) ''
+          $dns = $false; try { $dns = [bool](Resolve-DnsName example.com -Type A -ErrorAction Stop) } catch {}
+          Result 'DNS resolves example.com' $dns ''
+          $web = $false; try { $web = (Invoke-WebRequest https://example.com -UseBasicParsing -TimeoutSec 15).StatusCode -eq 200 } catch {}
+          Result 'HTTPS GET example.com = 200' $web ''
+
+          Write-Output ''
+          Write-Output '=== 3. HOST REACHABILITY (dind only; admin services blocked) ==='
+          if ($hostip) {
+            $dindPort = [int](($env:DOCKER_HOST -split ':')[-1])
+            Result "dind port $dindPort reachable" (Probe $hostip $dindPort) 'dind'
+            foreach ($ap in @(3389,445,5985,5986,135,139)) {
+              Result "host admin port $ap blocked" (-not (Probe $hostip $ap)) ''
+            }
+          } else { Write-Output '  (no DOCKER_HOST; dind disabled — skipping host checks)' }
+
+          Write-Output ''
+          Write-Output '=== 4. DIND ==='
+          if ($hostip) {
+            docker version | Out-Null; Result 'docker version succeeds' ($LASTEXITCODE -eq 0) ''
+            docker info | Out-Null;    Result 'docker info succeeds'    ($LASTEXITCODE -eq 0) ''
+          }
+
+          Write-Output ''
+          Write-Output '=== 5. ISOLATION / BREAKOUT (Hyper-V boundary) ==='
+          Result 'process table is container-local' ((Get-Process | Measure-Object).Count -lt 120) "count=$((Get-Process | Measure-Object).Count)"
+          Result 'no host ephemerd data dir'        (-not (Test-Path 'C:\ProgramData\ephemerd\config.toml')) ''
+          Result 'no host ephemerd binary'          (-not (Test-Path 'C:\Program Files\ephemerd\ephemerd.exe')) ''
+          Result 'no host user profile mapped'      (-not (Test-Path 'C:\Users\luther')) ''
+          Result 'no host containerd pipe'          (-not (Test-Path '\\.\pipe\ephemerd-containerd')) ''
+          $hns = $false; try { $hns = [bool](Get-HnsNetwork -ErrorAction SilentlyContinue) } catch {}
+          Result 'cannot enumerate host HNS networks' (-not $hns) ''
+
+          Write-Output ''
+          if ($fail -eq 0) { Write-Output 'ALL CONTAINMENT CHECKS PASSED' } else { Write-Output "CONTAINMENT FAILURES: $fail"; exit 1 }

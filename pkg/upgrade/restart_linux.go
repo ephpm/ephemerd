@@ -12,6 +12,9 @@ import (
 // (cmd/ephemerd/install_linux.go).
 const serviceName = "ephemerd"
 
+// manualRestartHint is what an operator types to finish a stalled upgrade.
+const manualRestartHint = "systemctl restart ephemerd"
+
 // triggerRestart asks systemd to restart the ephemerd unit into the
 // newly-swapped binary.
 //
@@ -23,7 +26,11 @@ const serviceName = "ephemerd"
 // with PID 1 the instant systemctl starts, so the restart proceeds even if
 // the child is reaped a moment later. Setsid detaches it from our session
 // as well. We Start (not Run) and never Wait — fire and forget.
-func triggerRestart() error {
+//
+// The two path arguments (the .old backup and the install path) exist for the
+// Windows detached-helper hand-off and are unused here: systemd accepts a
+// restart request from inside the unit, so there is nothing to hand off.
+func triggerRestart(_, _ string) error {
 	cmd := exec.Command("systemctl", "restart", "--no-block", serviceName)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {

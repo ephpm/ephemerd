@@ -72,7 +72,7 @@ repo-wide, not per-runner).
 
 ### 2. Re-provision on runner exit if the job never ran
 
-Every runner's wait-goroutine (linux dispatch, macOS VM, native macOS, local
+Every runner's wait-goroutine (linux dispatch, macOS VM, local
 containerd) calls `reprovisionIfStranded` when the runner exits. If the job it
 was dispatched for was **never observed running** (`started[key]` unset), the
 job never actually ran — so we clear its `seen` dedup and re-dispatch it
