@@ -939,7 +939,6 @@ type RunnerConfig struct {
 	JobTimeout      string            `toml:"job_timeout"`
 	ShutdownTimeout string            `toml:"shutdown_timeout"`
 	Windows         WindowsRunnerToml `toml:"windows"`
-	MacOS           MacOSRunnerConfig `toml:"macos"`
 
 	// ClaimRetry controls the in-memory retry queue for jobs whose
 	// initial claim / provision attempt fails with a transient error
@@ -1002,116 +1001,6 @@ type ClaimRetryToml struct {
 	// Default 0.2 (+/-20%). Set 0 to disable jitter (useful in tests,
 	// rarely useful in production).
 	Jitter *float64 `toml:"jitter"`
-}
-
-// MacOSRunnerConfig controls macOS job routing. It lives under [runner]
-// (not [vm.macos]) because native jobs don't involve VMs.
-//
-// TOML shape:
-//
-//	[runner.macos]
-//	mode = "vm"         # default mode: "vm" or "native"
-//	max_native = 4      # max concurrent native jobs
-//	# user = "ciuser"   # optional: existing user for native runners.
-//	#                   # Default (unset): an ephemeral hidden user is
-//	#                   # created per job and deleted on cleanup.
-//
-//	[runner.macos.repos]
-//	"ephpm/*"           = "native"  # all repos in org
-//	"ephpm/secret-repo" = "vm"     # except this one (exact wins over wildcard)
-//	"someuser/ephemerd" = "vm"     # fork stays on VM
-type MacOSRunnerConfig struct {
-	Mode      string            `toml:"mode"`       // "vm" (default) or "native"
-	MaxNative int               `toml:"max_native"` // max concurrent native jobs (default 4)
-	User      string            `toml:"user"`       // existing user for native runners (empty = ephemeral per-job user, recommended)
-	Repos     map[string]string `toml:"repos"`      // "org/repo" -> "vm" or "native"
-
-	// SandboxStrict switches the native sandbox profile from allow-by-default
-	// (deny-list) to deny-by-default (allow-list). Default false. Strict mode
-	// is a much stronger posture but requires enumerating every path a GHA
-	// runner + toolchain legitimately touches, so it is opt-in and needs a
-	// live smoke test on the target host before enabling.
-	SandboxStrict bool `toml:"sandbox_strict"`
-
-	// MaxProcesses caps the number of processes (ulimit -u) a native job may
-	// spawn, providing fork-bomb defense. Default 2048 (generous — clang/php
-	// fork heavily). 0 = unlimited (no ulimit set). Note: macOS has no
-	// cgroups, so RAM and disk cannot be hard-capped on the native path; use
-	// the VM path for untrusted memory/disk DoS resistance.
-	MaxProcesses *int `toml:"max_processes"`
-}
-
-// ResolvedMaxProcesses returns the ulimit -u value for native jobs.
-// Unset (nil) defaults to 2048. An explicit 0 means unlimited (return 0 so
-// the caller skips the ulimit). A negative value is treated as unlimited.
-func (m *MacOSRunnerConfig) ResolvedMaxProcesses() int {
-	if m == nil || m.MaxProcesses == nil {
-		return 2048
-	}
-	if *m.MaxProcesses < 0 {
-		return 0
-	}
-	return *m.MaxProcesses
-}
-
-// StrictSandbox reports whether deny-by-default sandbox mode is enabled.
-func (m *MacOSRunnerConfig) StrictSandbox() bool {
-	return m != nil && m.SandboxStrict
-}
-
-// ModeForRepo returns "native" or "vm" for the given repo. Resolution order:
-//
-//  1. Exact match on "org/repo"
-//  2. Wildcard match on "org/*"
-//  3. Short-name fallback: if repo has no "/", match any "org/<repo>" key
-//  4. Top-level mode
-//  5. Default: "vm"
-//
-// The short-name fallback exists because some providers (GitHub polling)
-// currently emit event.Repo as just the repo name without the org prefix.
-// Config keys should always use "org/repo" format for disambiguation.
-func (m *MacOSRunnerConfig) ModeForRepo(repo string) string {
-	if m != nil && len(m.Repos) > 0 {
-		// 1. Exact match
-		if mode, ok := m.Repos[repo]; ok && isValidMode(mode) {
-			return mode
-		}
-
-		// 2. Wildcard: "org/*" matches any repo under that org
-		if slash := strings.IndexByte(repo, '/'); slash > 0 {
-			wildcard := repo[:slash] + "/*"
-			if mode, ok := m.Repos[wildcard]; ok && isValidMode(mode) {
-				return mode
-			}
-		}
-
-		// 3. Short-name fallback: repo="ephemerd" matches key "ephpm/ephemerd"
-		if !strings.Contains(repo, "/") {
-			suffix := "/" + repo
-			for key, mode := range m.Repos {
-				if strings.HasSuffix(key, suffix) && !strings.HasSuffix(key, "/*") && isValidMode(mode) {
-					return mode
-				}
-			}
-		}
-	}
-	if m != nil && isValidMode(m.Mode) {
-		return m.Mode
-	}
-	return "vm"
-}
-
-func isValidMode(mode string) bool {
-	return mode == "native" || mode == "vm"
-}
-
-// ResolvedMaxNative returns the max concurrent native macOS jobs,
-// defaulting to 4 if unset or non-positive.
-func (m *MacOSRunnerConfig) ResolvedMaxNative() int {
-	if m == nil || m.MaxNative <= 0 {
-		return 4
-	}
-	return m.MaxNative
 }
 
 // WindowsRunnerToml configures resource limits for Hyper-V isolated Windows

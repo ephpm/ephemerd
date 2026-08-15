@@ -362,7 +362,7 @@ cpus = 2
 memory_mb = 2048
 disk_size_gb = 50                     # sparse — only uses space as needed
 
-# macOS-native jobs (macOS hosts only)
+# macOS jobs (macOS hosts only) — always run in an isolated VM.
 # No enable/disable toggle — macOS VMs always run on darwin hosts.
 [vm.macos]
 disk_image = "/path/to/macos.img"    # base disk image (or auto-pulled from Tart OCI registry)
