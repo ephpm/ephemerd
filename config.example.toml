@@ -163,6 +163,70 @@ owner = "your-org"
 # no egress, runners register then go offline, service stop hangs on drain).
 # Drain the node, set the keys, reboot.
 
+# Container-registry pull-through cache.
+#
+# Every image pull ephemerd makes — the runner image, images a job pulls
+# through the fake Docker socket, images a sibling container is created from —
+# is sent to this cache instead of the origin registry. The first pull of a
+# layer crosses the WAN once; every later pull of it, from any job on any node
+# pointed at the same cache, is served at LAN speed. It also removes the node
+# from Docker Hub's anonymous rate limit, since only the cache talks to Hub.
+#
+# The saving scales with how much jobs share a base image. On a node measured
+# at ~71 GB/day inbound across ~80 jobs, one 1.1 GB CI image accounted for
+# 163 pulls in seven days — dind pulls into a per-job containerd namespace, so
+# that image crossed the WAN for essentially every job.
+#
+# Stand up any OCI pull-through cache on the LAN. The off-the-shelf choice is
+# the upstream registry image in proxy mode:
+#
+#   docker run -d --restart=always -p 5000:5000 \
+#     -v /srv/registry:/var/lib/registry \
+#     -e REGISTRY_PROXY_REMOTEURL=https://registry-1.docker.io \
+#     --name registry-cache registry:2
+#
+# See docs/guides/registry-cache.md for sizing, Zot/Harbor alternatives, and
+# how to verify it is being used.
+# [registry_mirror]
+#
+# Turn mirroring on. Everything else here is inert while this is false, and
+# pulls behave exactly as they do with no [registry_mirror] block at all.
+# enabled = true
+#
+# Base URL of the cache, INCLUDING the scheme. There is no default — the cache
+# is site-specific. A path prefix is allowed for caches published under one
+# (e.g. a Harbor proxy project).
+# endpoint = "http://registry.lan:5000"
+#
+# Which upstream registries this endpoint serves. Defaults to ["docker.io"],
+# which is where the rate limit and the large shared base images are. Add
+# others only if the cache is configured to proxy them — registry:2 in proxy
+# mode serves exactly one upstream per instance.
+# registries = ["docker.io"]
+#
+# Keep the origin registry behind the mirror. DEFAULT TRUE, and you almost
+# certainly want it: a cache that is down, wedged, or simply does not have the
+# image then costs one failed request and the pull completes against the
+# origin. The node degrades to the WAN speed it had before the mirror existed
+# instead of failing every job on it.
+#
+# Set false to make the mirror authoritative — a deliberate egress-control
+# posture (jobs can only run images the cache holds), not a performance knob.
+# fallback_to_origin = true
+#
+# Send the credentials ephemerd would use against the origin registry to the
+# mirror too. DEFAULT FALSE. A pull-through cache normally holds its own
+# upstream credentials and needs none from the client, and a mirror that
+# answered with a Basic challenge would otherwise harvest the registry PAT a
+# job just logged in with — in plaintext when the endpoint is http://. Turn it
+# on only for a mirror you operate that requires authentication.
+# forward_credentials = false
+#
+# Per-registry caches, for sites that cannot serve everything from one
+# endpoint. An entry here wins over endpoint/registries for that host.
+# [registry_mirror.mirrors]
+# "ghcr.io" = "http://ghcr-cache.lan:5000"
+
 [runner]
 
 # Max concurrent jobs

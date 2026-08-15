@@ -26,6 +26,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/dind"
 	"github.com/ephpm/ephemerd/pkg/imagegc"
 	"github.com/ephpm/ephemerd/pkg/networking"
+	"github.com/ephpm/ephemerd/pkg/registrymirror"
 	craneTarball "github.com/google/go-containerregistry/pkg/v1/tarball"
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -87,7 +88,12 @@ type Config struct {
 	// HostConfig.CapAdd are rejected with HTTP 403. See
 	// config.DindConfig.AllowPrivileged for the threat model.
 	DindAllowPrivileged bool
-	CacheProxyEnv       []string // extra env vars from cache proxies (e.g., GOPROXY=...)
+	// RegistryMirror routes image pulls through a LAN pull-through cache.
+	// Nil (the zero value) means no mirror: PullImage builds exactly the
+	// containerd pull call it built before the feature existed. Forwarded
+	// to each per-job dind.Server so the hot dind pull path is covered too.
+	RegistryMirror *registrymirror.Mirror
+	CacheProxyEnv  []string // extra env vars from cache proxies (e.g., GOPROXY=...)
 	// Rlimits sets POSIX resource limits on each runner container's OCI
 	// process. Zero values fall back to the containerd default (1024).
 	// Applies on Linux only; ignored on Windows (HCS uses a different model).
@@ -610,6 +616,12 @@ func (r *Runtime) pullImageLocked(ctx context.Context, ref string) error {
 		pullOpts = append(pullOpts, client.WithPlatform("windows/amd64"))
 	}
 	pullOpts = append(pullOpts, client.WithPullSnapshotter(snapshotter))
+	// Route through the LAN pull-through cache when one is configured.
+	// Appends nothing when it isn't, so the unconfigured pull is unchanged.
+	// The mirror resolver keeps the origin registry behind the cache, so a
+	// dead cache costs one failed request rather than a failed job.
+	r.cfg.RegistryMirror.LogPull(pullRef)
+	pullOpts = append(pullOpts, r.cfg.RegistryMirror.PullOpts(nil)...)
 	_, err := r.client.Pull(ctx, pullRef, pullOpts...)
 	if err != nil {
 		return fmt.Errorf("pulling image %s: %w", pullRef, err)
@@ -903,6 +915,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			Network:         r.cfg.Network,
 			BuildKit:        r.cfg.BuildKit,
 			AllowPrivileged: r.cfg.DindAllowPrivileged,
+			RegistryMirror:  r.cfg.RegistryMirror,
 			Log:             r.cfg.Log,
 		})
 		if err != nil {

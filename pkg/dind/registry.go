@@ -27,6 +27,7 @@ import (
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/ephpm/ephemerd/pkg/registrymirror"
 )
 
 // authConfig is the JSON body docker CLI sends to POST /auth and embeds
@@ -251,6 +252,46 @@ func (s *Server) handleImagePush(w http.ResponseWriter, r *http.Request, refPath
 
 	emit(fmt.Sprintf("%s: digest: %s size: %d", tag, img.Target().Digest, img.Target().Size), "")
 	s.log.Info("image pushed", "ref", fullRef, "digest", img.Target().Digest)
+}
+
+// pullRemoteOpts builds the containerd RemoteOpts for an image pull made on
+// behalf of a request from the job's docker CLI. It is the single place the
+// dind pull paths pick up (a) the configured LAN pull-through mirror and
+// (b) the credentials the job established with `docker login`.
+//
+// Two properties matter here:
+//
+//   - With no mirror configured and no credentials in play it returns nil,
+//     so the pull is the same call dind has always made and containerd
+//     builds its own default resolver internally.
+//   - Credentials fix issue #139: handleImagePull passed no authorizer at
+//     all, so a `docker login` followed by `docker pull` of a private image
+//     went out anonymously and 401'd, even though the push path had been
+//     honoring the same cached credentials all along. The creds only ever
+//     reach the origin registry — a mirror is handed them exclusively when
+//     the operator sets registry_mirror.forward_credentials.
+func (s *Server) pullRemoteOpts(r *http.Request, ref string) []client.RemoteOpt {
+	var creds registrymirror.Creds
+	if cfg, ok := s.resolveAuthForRef(r, ref); ok && cfg.hasSecret() {
+		// Captured by value; the authorizer calls this per host it has to
+		// satisfy a challenge for (the registry itself, and Docker Hub's
+		// separate auth.docker.io token endpoint).
+		creds = func(string) (string, string, error) {
+			if cfg.IdentityToken != "" {
+				return "", cfg.IdentityToken, nil
+			}
+			return cfg.Username, cfg.Password, nil
+		}
+	}
+	return s.mirror.PullOpts(creds)
+}
+
+// hasSecret reports whether these credentials carry anything worth
+// authenticating with. Docker CLI sends `X-Registry-Auth: e30=` (an empty
+// JSON object) on anonymous pulls, which decodes cleanly but must not be
+// mistaken for a login.
+func (a authConfig) hasSecret() bool {
+	return a.Password != "" || a.IdentityToken != ""
 }
 
 // resolveAuthForRef returns the credentials to use for a given image

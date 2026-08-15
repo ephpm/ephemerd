@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	goruntime "runtime"
 	"sort"
@@ -31,11 +32,14 @@ type Config struct {
 	BuildKit    BuildKitConfig    `toml:"buildkit"`
 	ImageGC     ImageGCConfig     `toml:"image_gc"`
 	ModuleProxy ModuleProxyConfig `toml:"module_proxy"`
-	Runtime     RuntimeConfig     `toml:"runtime"`
-	Runner      RunnerConfig      `toml:"runner"`
-	Metrics     MetricsConfig     `toml:"metrics"`
-	Dispatch    DispatchConfig    `toml:"dispatch"`
-	Log         LogConfig         `toml:"log"`
+	// RegistryMirror routes container image pulls through a LAN pull-through
+	// cache instead of the origin registry. See RegistryMirrorConfig.
+	RegistryMirror RegistryMirrorConfig `toml:"registry_mirror"`
+	Runtime        RuntimeConfig        `toml:"runtime"`
+	Runner         RunnerConfig         `toml:"runner"`
+	Metrics        MetricsConfig        `toml:"metrics"`
+	Dispatch       DispatchConfig       `toml:"dispatch"`
+	Log            LogConfig            `toml:"log"`
 }
 
 // DispatchConfig configures the host<->VM dispatch gRPC channel. On Windows
@@ -677,6 +681,234 @@ type ModuleProxyConfig struct {
 	Port     int    `toml:"port"`     // listen port on bridge gateway (default 8082)
 	Upstream string `toml:"upstream"` // upstream proxy URL (default "https://proxy.golang.org")
 	Cleanup  bool   `toml:"cleanup"`  // wipe cache on shutdown (default true)
+}
+
+// RegistryMirrorConfig points container image pulls at a pull-through
+// registry cache on the LAN instead of the origin registry.
+//
+// Every pull ephemerd performs — the runner image, images a job pulls
+// through the fake Docker daemon (dind), and images a sibling container
+// is created from — is routed through the mirror when the reference's
+// registry host is one of the mirrored ones. The first pull of a given
+// layer crosses the WAN once; every later pull of the same layer, from
+// any job on any node pointed at the same cache, is served at LAN speed.
+// It also takes the node out of Docker Hub's anonymous rate limit, since
+// only the cache talks to Hub.
+//
+// The mirror is a read path only. Pushes (docker push from a job) always
+// go to the origin registry: a pull-through cache is not a place to
+// publish, and containerd's own host model marks mirrors pull-only for
+// the same reason.
+//
+// SECURITY: credentials are NOT sent to the mirror unless
+// forward_credentials is set. A pull-through cache normally holds its own
+// upstream credentials and needs none from the client, and a mirror that
+// answered with a Basic challenge would otherwise harvest the registry
+// PAT a job just logged in with — over plaintext when the endpoint is
+// http://.
+type RegistryMirrorConfig struct {
+	// Enabled turns mirroring on. Everything else in this block is inert
+	// when false, and the pull path is exactly what it was before this
+	// feature existed.
+	Enabled bool `toml:"enabled"`
+
+	// Endpoint is the base URL of the pull-through cache, including the
+	// scheme — "http://registry.lan:5000" or "https://cache.example.com".
+	// A path prefix is allowed ("https://harbor.lan/v2/dockerhub-proxy")
+	// and is joined ahead of the /v2 API root.
+	//
+	// It serves every host listed in Registries. Use Mirrors instead (or
+	// as well) when different registries need different caches.
+	Endpoint string `toml:"endpoint"`
+
+	// Registries are the upstream registry hosts Endpoint mirrors.
+	// Defaults to ["docker.io"] when Endpoint is set and this is empty —
+	// Docker Hub is where the rate limit and the big shared base images
+	// are. Add "ghcr.io" etc. when the cache is configured to proxy them.
+	//
+	// Values are normalized: a scheme is stripped, and "index.docker.io" /
+	// "registry-1.docker.io" both fold to "docker.io" (the name containerd
+	// resolves references under).
+	Registries []string `toml:"registries"`
+
+	// Mirrors maps a single upstream registry host to its own cache URL,
+	// for setups where one endpoint cannot serve everything:
+	//
+	//	[registry_mirror.mirrors]
+	//	"ghcr.io" = "http://ghcr-cache.lan:5000"
+	//
+	// An entry here wins over Endpoint/Registries for that host.
+	Mirrors map[string]string `toml:"mirrors"`
+
+	// FallbackToOrigin keeps the origin registry in the host list behind
+	// the mirror, so a cache that is down, wedged, or missing the image
+	// costs a failed request and not a failed job. Pointer so an explicit
+	// `fallback_to_origin = false` is distinguishable from the key being
+	// absent; the default is TRUE — fail open. See
+	// ResolvedFallbackToOrigin.
+	//
+	// Setting false makes the mirror authoritative: a job whose image the
+	// cache cannot serve fails instead of reaching the WAN. That is a
+	// deliberate egress-control posture, not a performance setting.
+	FallbackToOrigin *bool `toml:"fallback_to_origin"`
+
+	// ForwardCredentials sends the credentials ephemerd would have used
+	// against the origin registry to the mirror as well. Off by default —
+	// see the SECURITY note on the type. Turn it on only for a mirror you
+	// operate that requires authentication (Harbor with a robot account,
+	// a Zot instance behind htpasswd).
+	ForwardCredentials bool `toml:"forward_credentials"`
+}
+
+// ResolvedFallbackToOrigin reports whether the origin registry stays in the
+// pull host list behind the mirror. Defaults to true: a dead cache must
+// degrade a node to today's WAN pull speed, never break every job on it.
+func (r *RegistryMirrorConfig) ResolvedFallbackToOrigin() bool {
+	if r.FallbackToOrigin == nil {
+		return true
+	}
+	return *r.FallbackToOrigin
+}
+
+// ResolvedMirrors flattens Endpoint/Registries and Mirrors into a single
+// upstream-host -> mirror-URL table with both sides normalized. Per-host
+// Mirrors entries override the Endpoint/Registries default.
+//
+// Returns nil when mirroring is disabled or nothing is mapped, which every
+// consumer treats as "no mirror configured" and leaves the pull untouched.
+// Only call after validate has accepted the config — it assumes the URLs
+// parse.
+func (r *RegistryMirrorConfig) ResolvedMirrors() map[string]string {
+	if !r.Enabled {
+		return nil
+	}
+	out := make(map[string]string)
+	if ep := normalizeMirrorURL(r.Endpoint); ep != "" {
+		regs := r.Registries
+		if len(regs) == 0 {
+			regs = []string{"docker.io"}
+		}
+		for _, reg := range regs {
+			if h := NormalizeRegistryHost(reg); h != "" {
+				out[h] = ep
+			}
+		}
+	}
+	for reg, endpoint := range r.Mirrors {
+		h := NormalizeRegistryHost(reg)
+		ep := normalizeMirrorURL(endpoint)
+		if h == "" || ep == "" {
+			continue
+		}
+		out[h] = ep
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// NormalizeRegistryHost reduces an upstream registry name to the form
+// containerd resolves references under: no scheme, no path, lowercase, and
+// Docker Hub's several spellings folded to "docker.io". Exported because
+// the pull paths have to look up a mirror by the host containerd hands
+// them.
+func NormalizeRegistryHost(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return ""
+	}
+	// Strip a scheme the operator may have written out of habit.
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	// Drop any path ("docker.io/v2/" -> "docker.io").
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		s = s[:i]
+	}
+	switch s {
+	case "index.docker.io", "registry-1.docker.io":
+		return "docker.io"
+	}
+	return s
+}
+
+// normalizeMirrorURL trims whitespace and any trailing slashes so the /v2
+// API root can be joined onto it unambiguously.
+func normalizeMirrorURL(s string) string {
+	return strings.TrimRight(strings.TrimSpace(s), "/")
+}
+
+// validate rejects a registry-mirror block that would silently do nothing or
+// would produce an unusable endpoint at pull time. It runs at config load on
+// every platform, so a typo'd URL kills the daemon at startup with a message
+// naming the exact key instead of surfacing as a mystery pull failure on the
+// first job of the day.
+//
+// Endpoint values are checked whenever they are set, even with
+// `enabled = false`, so a mirror staged ahead of a rollout is known-good
+// before the toggle is flipped.
+func (r *RegistryMirrorConfig) validate() error {
+	if err := validateMirrorURL("registry_mirror.endpoint", r.Endpoint); err != nil {
+		return err
+	}
+	for reg, endpoint := range r.Mirrors {
+		key := fmt.Sprintf("registry_mirror.mirrors[%q]", reg)
+		if NormalizeRegistryHost(reg) == "" {
+			return fmt.Errorf("%s: the registry host key must not be empty — "+
+				`use the host containerd resolves references under, e.g. "docker.io" or "ghcr.io"`, key)
+		}
+		if strings.TrimSpace(endpoint) == "" {
+			return fmt.Errorf("%s is empty: set it to the mirror's base URL, "+
+				`e.g. "http://registry.lan:5000", or remove the entry`, key)
+		}
+		if err := validateMirrorURL(key, endpoint); err != nil {
+			return err
+		}
+	}
+	if r.Enabled && len(r.ResolvedMirrors()) == 0 {
+		return fmt.Errorf(`registry_mirror.endpoint is required when registry_mirror.enabled = true: ` +
+			`set it to the base URL of your LAN pull-through cache, e.g. ` +
+			`endpoint = "http://registry.lan:5000" — or map individual registries under ` +
+			`[registry_mirror.mirrors]. There is no default; the cache is site-specific`)
+	}
+	if !r.Enabled && (r.Endpoint != "" || len(r.Mirrors) > 0) {
+		// Not an error — staging a mirror before turning it on is normal —
+		// but the operator should know nothing is being routed yet.
+		slog.Debug("registry mirror configured but registry_mirror.enabled = false; pulls go to the origin registry")
+	}
+	return nil
+}
+
+// validateMirrorURL enforces that a configured mirror endpoint is an
+// absolute http(s) URL with a host. An empty value is fine (the key is
+// optional); anything else must be usable as a registry base URL.
+func validateMirrorURL(key, raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	// Check for the scheme textually rather than trusting url.Parse. The most
+	// common typo is a bare "registry.lan:5000", which url.Parse happily
+	// reports as Scheme "registry.lan" with Opaque "5000" — a scheme error
+	// message built from that is actively confusing.
+	if !strings.Contains(raw, "://") {
+		return fmt.Errorf("%s = %q is missing a scheme: write it as %q (plaintext — LAN only) or %q",
+			key, raw, "http://"+raw, "https://"+raw)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s = %q is not a valid URL: %w", key, raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("%s = %q has unsupported scheme %q: a registry mirror must be http:// or https://",
+			key, raw, u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%s = %q has no host: it must be an absolute URL, e.g. %q",
+			key, raw, "http://registry.lan:5000")
+	}
+	return nil
 }
 
 // VMConfig configures virtual machines for cross-OS job execution.
@@ -1327,6 +1559,10 @@ func (c *Config) validate() error {
 	}
 
 	if err := c.Network.validate(); err != nil {
+		return err
+	}
+
+	if err := c.RegistryMirror.validate(); err != nil {
 		return err
 	}
 

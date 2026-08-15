@@ -30,6 +30,7 @@ import (
 	githubProv "github.com/ephpm/ephemerd/pkg/providers/github"
 	"github.com/ephpm/ephemerd/pkg/proxies"
 	goproxy "github.com/ephpm/ephemerd/pkg/proxies/go"
+	"github.com/ephpm/ephemerd/pkg/registrymirror"
 	"github.com/ephpm/ephemerd/pkg/runner"
 	"github.com/ephpm/ephemerd/pkg/runtime"
 	"github.com/ephpm/ephemerd/pkg/scheduler"
@@ -192,6 +193,20 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	log := cfg.Logger()
 	log.Info("starting ephemerd", "version", version, "data_dir", configDir)
 
+	// Resolve the registry-mirror policy once and share it with every pull
+	// path (runtime, each per-job dind server, the macOS artifact
+	// extractor). Nil when unconfigured, and every consumer is nil-safe, so
+	// a node without a mirror pulls exactly as it did before.
+	//
+	// This is constructed in BOTH the containerd-only (in-VM worker) branch
+	// and the full-scheduler branch below, off the same cfg. On a Windows
+	// host the config.toml is staged into the Linux VM's initrd at
+	// /etc/ephemerd/config.toml on every boot, so a [registry_mirror] block
+	// reaches the in-VM ephemerd with no extra plumbing (see
+	// docs/arch/host-config-initrd.md). The macOS Vz VM does not yet receive
+	// the host config — see docs/guides/registry-cache.md.
+	registryMirror := registrymirror.New(cfg.RegistryMirror, log)
+
 	// Ensure data directory exists
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		return fmt.Errorf("creating data directory %s: %w", configDir, err)
@@ -334,6 +349,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			WindowsCPUs:         cfg.Runner.Windows.CPUCount(),
 			BuildKit:            bk,
 			ImageGC:             imageGC,
+			RegistryMirror:      registryMirror,
 			Log:                 log,
 		})
 		if err != nil {
@@ -555,6 +571,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		WindowsCPUs:         cfg.Runner.Windows.CPUCount(),
 		BuildKit:            bk,
 		ImageGC:             imageGC,
+		RegistryMirror:      registryMirror,
 		Log:                 log,
 	})
 	if err != nil {
@@ -618,7 +635,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	// lets a job's `container: { image: ... }` pull OCI images and extract
 	// their layers into the shared data directory (available inside macOS
 	// VMs via virtio-fs).
-	artifactExtractor := artifacts.NewExtractor(ctrdClient, log)
+	artifactExtractor := artifacts.NewExtractor(ctrdClient, registryMirror, log)
 
 	// Wait for Linux dispatch client if the VM is booting in the background.
 	linuxDispatcher, _ := waitDispatch()

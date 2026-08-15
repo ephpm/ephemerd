@@ -33,6 +33,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/ephpm/ephemerd/pkg/buildkit"
 	"github.com/ephpm/ephemerd/pkg/networking"
+	"github.com/ephpm/ephemerd/pkg/registrymirror"
 )
 
 // sharedNamespace is the containerd namespace used by ephemerd for runner
@@ -59,6 +60,12 @@ type Server struct {
 	buildkit        *buildkit.Server // shared embedded BuildKit solver (nil → fall back to platform default)
 	runnerNetNS     string           // path to runner container's net namespace; used to install DNAT rules for port bindings
 	allowPrivileged bool             // gate for docker run --privileged / --cap-add; see config.DindConfig.AllowPrivileged
+
+	// mirror routes this job's image pulls through a LAN pull-through
+	// cache. Nil means no mirror and every pull path below is unchanged.
+	// This is the hot one: dind pulls into a per-job namespace, so the
+	// same base image is re-fetched for essentially every job.
+	mirror *registrymirror.Mirror
 
 	// runnerSnapshotKey identifies the containerd snapshot backing the
 	// runner container that owns this dind socket. Used to resolve sibling
@@ -159,6 +166,11 @@ type Config struct {
 	// the threat model.
 	AllowPrivileged bool
 
+	// RegistryMirror routes this job's image pulls through a LAN
+	// pull-through cache. Nil disables mirroring, leaving the pulls
+	// identical to what they were before the feature existed.
+	RegistryMirror *registrymirror.Mirror
+
 	Log *slog.Logger
 }
 
@@ -189,6 +201,7 @@ func New(cfg Config) (*Server, error) {
 		buildkit:        cfg.BuildKit,
 		runnerNetNS:     cfg.RunnerNetNS,
 		allowPrivileged: cfg.AllowPrivileged,
+		mirror:          cfg.RegistryMirror,
 		log:             cfg.Log.With("component", "dind", "job_id", cfg.JobID),
 		images:          make(map[string]*imageEntry),
 		containers:      make(map[string]*containerEntry),
@@ -627,7 +640,18 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	jobCtx := namespaces.WithNamespace(ctx, s.jobNamespace)
 
-	img, err := s.client.Pull(jobCtx, ref, client.WithPullUnpack)
+	// Route through the LAN pull-through cache when one is configured, and
+	// carry any `docker login` credentials for this registry. Both are
+	// no-ops when unconfigured/absent, leaving the call as it was.
+	//
+	// The per-job namespace re-pull described above is precisely what makes
+	// this the highest-value mirror site in the daemon: the resolve and the
+	// layer fetches happen for essentially every job, so with a mirror they
+	// land on the LAN instead of the WAN.
+	s.mirror.LogPull(ref)
+	pullOpts := append([]client.RemoteOpt{client.WithPullUnpack}, s.pullRemoteOpts(r, ref)...)
+
+	img, err := s.client.Pull(jobCtx, ref, pullOpts...)
 	if err != nil {
 		writeProgress(fmt.Sprintf("Error: %v", err))
 		return
