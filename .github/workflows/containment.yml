@@ -1,0 +1,459 @@
+name: Containment
+
+# Adversarial containment suite: every step asserts that something an
+# attacker would want is NOT reachable from inside a job. These are probes,
+# not exploits — each one checks the door is locked rather than walking
+# through it.
+#
+# Why this exists as a workflow and not a Go test: pkg/runtime's hardening
+# tests inspect the OCI spec we ASK for. This suite runs inside a real
+# runner on real hardware and observes what the kernel ACTUALLY enforced.
+# The two disagree exactly when it matters — a profile that failed to load,
+# a knob the daemon parsed and ignored, a fleet node running an older build.
+#
+# Run this after every fleet uplift (`mayfly apply` to a new ephemerd
+# version), on every platform the fleet serves. A green run is the evidence
+# that a release's security changes reached the metal.
+#
+# Adding a check: assert the SAFE outcome and `exit 1` on the unsafe one.
+# Never leave a probe that only prints — a silent probe is a check nobody
+# is running.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/containment.yml"
+  schedule:
+    # Weekly, so drift (host upgrade, kernel change, profile eviction) is
+    # caught even when nobody cuts a release.
+    - cron: "0 6 * * 1"
+
+jobs:
+  linux:
+    name: Containment (linux ${{ matrix.arch }})
+    runs-on: [self-hosted, linux, "${{ matrix.arch }}"]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - name: Capabilities — dangerous set must be absent
+        run: |
+          set -u
+          # CapEff is the effective set actually granted by the kernel, not
+          # what the spec requested. Bit positions per capability(7).
+          eff=$(awk '/^CapEff/{print $2}' /proc/self/status)
+          echo "CapEff=$eff"
+          fail=0
+          # name:bit — the escape primitives hardening_test.go bans.
+          for entry in SYS_ADMIN:21 SYS_MODULE:16 SYS_RAWIO:17 SYS_PTRACE:19 \
+                       NET_ADMIN:12 DAC_READ_SEARCH:2 MKNOD:27 SYS_BOOT:22 SYS_TIME:25; do
+            name=${entry%%:*}; bit=${entry##*:}
+            # 64-bit hex mask -> test the bit with shell arithmetic.
+            if [ $(( (0x$eff >> bit) & 1 )) -eq 1 ]; then
+              echo "FAIL: CAP_$name is granted"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: no dangerous capabilities"
+
+      - name: Seccomp — filter must be active
+        run: |
+          set -u
+          mode=$(awk '/^Seccomp:/{print $2}' /proc/self/status)
+          echo "Seccomp mode=$mode (2 = filter)"
+          [ "$mode" = "2" ] || { echo "FAIL: seccomp not in filter mode"; exit 1; }
+          echo "OK: seccomp filtering"
+
+      - name: AppArmor — profile must be applied (not unconfined)
+        run: |
+          set -u
+          # Only meaningful where the host has AppArmor at all; ephemerd
+          # fails open by design (see pkg/runtime/apparmor.go), so treat a
+          # host without it as skip, not pass.
+          if [ ! -d /sys/kernel/security/apparmor ] && [ ! -e /sys/module/apparmor ]; then
+            echo "SKIP: host has no AppArmor"; exit 0
+          fi
+          cur=$(cat /proc/self/attr/current 2>/dev/null || echo unknown)
+          echo "profile=$cur"
+          case "$cur" in
+            unconfined*) echo "FAIL: container is unconfined"; exit 1 ;;
+            unknown)     echo "SKIP: cannot read profile"; exit 0 ;;
+            *)           echo "OK: confined by $cur" ;;
+          esac
+
+      - name: Host filesystem must not be reachable
+        run: |
+          set -u
+          fail=0
+          # The host's ephemerd config carries a GitHub PAT and the
+          # cloudflared tunnel token. If a job can read it, the fleet is
+          # fully compromised — this is the single highest-value check here.
+          for p in /var/lib/ephemerd/config.toml /etc/ephemerd/app.pem \
+                   /var/lib/ephemerd/containerd/containerd.sock; do
+            if [ -r "$p" ]; then echo "FAIL: readable from job: $p"; fail=1; fi
+          done
+          # /proc/1/root is only an escape if the PID namespace is SHARED with
+          # the host — then PID 1 is the host init and /proc/1/root is the host
+          # /. With a private PID namespace (the correct case) PID 1 is the
+          # container's own init and /proc/1/root is its own rootfs, which is
+          # traversable and harmless. So check what it POINTS AT, not whether it
+          # opens: a host marker visible through it means the namespace leaked.
+          if [ -e /proc/1/root/var/lib/ephemerd/config.toml ]; then
+            echo "FAIL: host root visible via /proc/1/root (shared PID namespace)"; fail=1
+          fi
+          # A host bind mounted anywhere obvious.
+          if mount | grep -qE ' on /(host|hostfs|mnt/host) '; then
+            echo "FAIL: host bind mount present"; fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: host filesystem not reachable"
+
+      - name: /proc and /sys must not be writable
+        run: |
+          set -u
+          fail=0
+          # A writable /proc/sys is a direct host-config write. A writable
+          # cgroup tree is the classic release_agent escape.
+          for p in /proc/sys/kernel/hostname /proc/sysrq-trigger \
+                   /sys/kernel/uevent_helper /sys/fs/cgroup/release_agent; do
+            if [ -w "$p" ]; then echo "FAIL: writable: $p"; fail=1; fi
+          done
+          if echo test 2>/dev/null > /proc/sys/kernel/hostname; then
+            echo "FAIL: wrote to /proc/sys/kernel/hostname"; fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: /proc and /sys are read-only where it counts"
+
+      - name: Device access must be denied
+        run: |
+          set -u
+          fail=0
+          # Raw disk or kernel memory = read the host's secrets directly.
+          for d in /dev/mem /dev/kmem /dev/sda /dev/nvme0n1 /dev/kvm; do
+            if [ -r "$d" ]; then echo "FAIL: readable device: $d"; fail=1; fi
+          done
+          # CAP_MKNOD is denied, so creating one must fail too.
+          if mknod /tmp/probe-blk b 8 0 2>/dev/null; then
+            echo "FAIL: mknod succeeded"; rm -f /tmp/probe-blk; fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: no raw device access"
+
+      - name: Privileged containers must be refused
+        run: |
+          set -u
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "SKIP: no docker socket in this job"; exit 0
+          fi
+          # dind.allow_privileged is off fleet-wide. If this ever succeeds,
+          # a job can trivially escape via a privileged sibling.
+          if out=$(docker run --rm --privileged busybox true 2>&1); then
+            echo "FAIL: privileged container was allowed"; exit 1
+          fi
+          echo "$out" | head -2
+          echo "OK: privileged refused"
+
+      - name: Docker bind mounts must not expose the host root
+        run: |
+          set -u
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "SKIP: no docker socket in this job"; exit 0
+          fi
+          # pkg/dind/bindtranslate rewrites job-relative bind sources. A
+          # naive shim would hand the sibling container the real host /.
+          if out=$(docker run --rm -v /:/hostroot busybox \
+                     sh -c 'cat /hostroot/var/lib/ephemerd/config.toml' 2>&1); then
+            echo "FAIL: read host ephemerd config through a bind mount"
+            exit 1
+          fi
+          echo "OK: host root not exposed via bind mount"
+
+      - name: Fleet management planes must be unreachable
+        run: |
+          set -u
+          fail=0
+          # ephemerd installs firewall rules blocking container -> private
+          # network. These are the crown jewels on this LAN: Proxmox API,
+          # the Incus daemon, and Grafana/Prometheus.
+          probe() {
+            if timeout 4 sh -c "echo > /dev/tcp/$1/$2" 2>/dev/null; then
+              echo "FAIL: reached $3 at $1:$2"; return 1
+            fi
+            return 0
+          }
+          probe 192.168.5.1 8006 "Proxmox coyotes"   || fail=1
+          probe 192.168.5.2 8006 "Proxmox kings"     || fail=1
+          probe 192.168.12.113 8443 "Incus daemon"   || fail=1
+          probe 192.168.10.45 3000 "Grafana"         || fail=1
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: management planes unreachable"
+
+      - name: Runner working set must not be writable where it matters
+        run: |
+          set -u
+          # The runner binary is a read-only mount; a writable one lets a
+          # job persist into the next job's runner (JIT runners are
+          # single-use, but the mount is shared from the host image).
+          if [ -d /actions-runner ]; then
+            if touch /actions-runner/.probe 2>/dev/null; then
+              echo "FAIL: /actions-runner is writable"; rm -f /actions-runner/.probe; exit 1
+            fi
+            echo "OK: /actions-runner read-only"
+          else
+            echo "SKIP: no /actions-runner mount"
+          fi
+
+  # Active breakout attempts, aimed at the v0.1.6 hardening specifically.
+  # Where the `linux` job checks doors are locked, this job walks up and
+  # rattles the handles — each step tries a concrete escape technique and
+  # fails if the technique WORKS. Kept separate so a regression here reads
+  # as "an escape opened up" rather than "a policy check drifted".
+  breakout:
+    name: Breakout attempts (linux ${{ matrix.arch }})
+    runs-on: [self-hosted, linux, "${{ matrix.arch }}"]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - name: NoNewPrivileges — a setuid binary must not escalate (#128)
+        run: |
+          set -u
+          # #128 sets no_new_privs. With it, executing a setuid-root binary
+          # gains NO privileges — the classic in-container privilege step-up
+          # is dead. Prove it: make a setuid-root helper that reports euid,
+          # then run it as a normal user. euid must stay non-zero.
+          command -v gcc >/dev/null 2>&1 || { echo "SKIP: no compiler"; exit 0; }
+          # Only meaningful if we are root and can create a setuid file at all.
+          [ "$(id -u)" = "0" ] || { echo "SKIP: not uid 0, cannot stage setuid test"; exit 0; }
+          d=$(mktemp -d)
+          cat > "$d/euid.c" <<'EOF'
+          #include <stdio.h>
+          #include <unistd.h>
+          int main(){ printf("%d\n",(int)geteuid()); return 0; }
+          EOF
+          gcc -o "$d/euid" "$d/euid.c" || { echo "SKIP: compile failed"; exit 0; }
+          chown 0:0 "$d/euid"; chmod 4755 "$d/euid"
+          useradd -M -s /bin/sh probe 2>/dev/null || true
+          got=$(su probe -c "$d/euid" 2>/dev/null || echo err)
+          echo "setuid helper reported euid=$got"
+          if [ "$got" = "0" ]; then
+            echo "FAIL: setuid-root binary escalated to euid 0 — no_new_privs not enforced"
+            exit 1
+          fi
+          echo "OK: no_new_privs blocks setuid escalation"
+
+      - name: AppArmor must actually deny, not just be attached (#124)
+        run: |
+          set -u
+          if [ ! -e /sys/module/apparmor ] && [ ! -d /sys/kernel/security/apparmor ]; then
+            echo "SKIP: host has no AppArmor"; exit 0
+          fi
+          prof=$(cat /proc/self/attr/current 2>/dev/null || echo unknown)
+          case "$prof" in unconfined*|unknown) echo "SKIP: not confined ($prof)"; exit 0;; esac
+          fail=0
+          # The confined profile should refuse raw mount and writes to kernel
+          # tunables even when the syscall filter would let them through.
+          if mount -t tmpfs none /mnt 2>/dev/null; then
+            echo "FAIL: mount(2) succeeded under AppArmor confinement"; umount /mnt 2>/dev/null; fail=1
+          fi
+          if echo c 2>/dev/null > /proc/sysrq-trigger; then
+            echo "FAIL: wrote to /proc/sysrq-trigger"; fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: AppArmor denies mount + kernel-tunable writes ($prof)"
+
+      - name: cgroup release_agent escape must be impossible
+        run: |
+          set -u
+          # The canonical container escape: write a host path into a cgroup's
+          # release_agent, then trip an empty-cgroup notification to run it on
+          # the host. Every prerequisite must be missing.
+          fail=0
+          for ra in /sys/fs/cgroup/release_agent \
+                    /sys/fs/cgroup/*/release_agent \
+                    /sys/fs/cgroup/memory/release_agent; do
+            [ -e "$ra" ] || continue
+            if echo /tmp/x 2>/dev/null > "$ra"; then
+              echo "FAIL: wrote release_agent at $ra"; fail=1
+            fi
+          done
+          # Even mounting a fresh cgroup to get a writable release_agent must
+          # fail (needs CAP_SYS_ADMIN + no AppArmor block).
+          d=$(mktemp -d)
+          if mount -t cgroup -o rdma cgroup "$d" 2>/dev/null; then
+            echo "FAIL: mounted a fresh cgroup hierarchy"; umount "$d" 2>/dev/null; fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: release_agent escape blocked"
+
+      - name: core_pattern host-code-exec escape must be blocked
+        run: |
+          set -u
+          # Writing "|/host/binary" to core_pattern makes the kernel run that
+          # binary (on the host) on the next crash. /proc/sys must be read-only.
+          if echo '|/tmp/pwn' 2>/dev/null > /proc/sys/kernel/core_pattern; then
+            echo "FAIL: wrote /proc/sys/kernel/core_pattern"; exit 1
+          fi
+          echo "OK: core_pattern not writable"
+
+      - name: Regaining capabilities via a new user namespace must fail
+        run: |
+          set -u
+          # unshare -Ur creates a userns where the caller is 'root' with a
+          # full capability set *inside that namespace* — the modern path to
+          # CAP_SYS_ADMIN for mount-based escapes. seccomp/AppArmor/sysctl
+          # should stop it, or stop what it enables. If unshare itself is
+          # blocked, that's the strongest outcome.
+          if ! command -v unshare >/dev/null 2>&1; then echo "SKIP: no unshare"; exit 0; fi
+          out=$(unshare -Urm --propagation private sh -c 'mount -t tmpfs none /mnt && echo MOUNTED' 2>&1 || true)
+          echo "$out" | head -2
+          if echo "$out" | grep -q MOUNTED; then
+            echo "FAIL: userns gave a working mount(2) — CAP_SYS_ADMIN regained"
+            exit 1
+          fi
+          echo "OK: user namespace does not yield a usable mount"
+
+      - name: Kernel log and message ring must not leak the host
+        run: |
+          set -u
+          fail=0
+          # dmesg / kmsg leak host kernel addresses and activity across the
+          # tenancy boundary; both should be denied without CAP_SYSLOG.
+          if dd if=/dev/kmsg bs=1 count=1 >/dev/null 2>&1; then
+            echo "FAIL: /dev/kmsg readable"; fail=1
+          fi
+          if command -v dmesg >/dev/null 2>&1 && dmesg >/dev/null 2>&1; then
+            echo "FAIL: dmesg readable"; fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: kernel log not readable"
+
+      - name: The containerd socket must not be reachable from a job
+        run: |
+          set -u
+          # Direct access to containerd's socket is game over — a job could
+          # create a privileged container next to itself. It lives in the
+          # ephemerd data dir on the host, which must not be bind-mounted in.
+          fail=0
+          for s in /run/containerd/containerd.sock \
+                   /var/lib/ephemerd/containerd/containerd.sock \
+                   /run/ephemerd/containerd.sock; do
+            if [ -S "$s" ]; then echo "FAIL: containerd socket present: $s"; fail=1; fi
+          done
+          # And the dind shim's own docker socket must not expose the daemon
+          # namespace (docker info Server should be the ephemerd shim, if any).
+          if command -v docker >/dev/null 2>&1; then
+            srv=$(docker info --format '{{.ServerVersion}}' 2>/dev/null || echo none)
+            echo "docker server: $srv"
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: no containerd socket in the job"
+
+  windows:
+    name: Containment (windows x64)
+    runs-on: [self-hosted, windows, x64]
+    steps:
+      - name: Hyper-V isolation must be active
+        shell: powershell
+        run: |
+          # Windows jobs run in Hyper-V-isolated containers, which is the
+          # platform's equivalent of the VM boundary. Process isolation
+          # would share the host kernel — the thing we pay for isolation to
+          # avoid. A job in a Hyper-V container sees a virtualized firmware.
+          $cs = Get-CimInstance Win32_ComputerSystem
+          Write-Host "Model: $($cs.Model)  Manufacturer: $($cs.Manufacturer)"
+          $bios = Get-CimInstance Win32_BIOS
+          Write-Host "BIOS: $($bios.Manufacturer) $($bios.SMBIOSBIOSVersion)"
+          if ($cs.Model -notmatch 'Virtual' -and $bios.Manufacturer -notmatch 'Microsoft') {
+            Write-Host "FAIL: job does not appear to be in a virtualized container"
+            exit 1
+          }
+          Write-Host "OK: Hyper-V isolated"
+
+      - name: Host filesystem and daemon config must be unreachable
+        shell: powershell
+        run: |
+          $fail = 0
+          # The Windows node's ephemerd config carries the same PAT and
+          # tunnel token as the linux nodes.
+          foreach ($p in @('C:\ProgramData\ephemerd\config.toml',
+                           'C:\ProgramData\ephemerd\app.pem',
+                           'C:\Program Files\ephemerd\ephemerd.exe')) {
+            if (Test-Path $p) { Write-Host "FAIL: reachable from job: $p"; $fail = 1 }
+          }
+          if ($fail) { exit 1 }
+          Write-Host "OK: host ephemerd files not reachable"
+
+      - name: Fleet management planes must be unreachable
+        shell: powershell
+        run: |
+          $fail = 0
+          foreach ($t in @(@('192.168.5.1',8006,'Proxmox coyotes'),
+                           @('192.168.5.2',8006,'Proxmox kings'),
+                           @('192.168.12.113',8443,'Incus daemon'),
+                           @('192.168.10.45',3000,'Grafana'))) {
+            $r = Test-NetConnection -ComputerName $t[0] -Port $t[1] `
+                   -InformationLevel Quiet -WarningAction SilentlyContinue
+            if ($r) { Write-Host "FAIL: reached $($t[2]) at $($t[0]):$($t[1])"; $fail = 1 }
+          }
+          if ($fail) { exit 1 }
+          Write-Host "OK: management planes unreachable"
+
+      - name: The internet must still be reachable
+        shell: powershell
+        run: |
+          # The egress restriction must deny RFC1918 WITHOUT cutting the job
+          # off the internet — jobs still pull from GitHub, registries, and
+          # package mirrors. 1.1.1.1 is a stable public anchor; if this fails
+          # the block is over-broad (a default-deny that ate the default route)
+          # rather than a targeted RFC1918 deny.
+          $r = Test-NetConnection -ComputerName 1.1.1.1 -Port 443 `
+                 -InformationLevel Quiet -WarningAction SilentlyContinue
+          if (-not $r) { Write-Host "FAIL: internet (1.1.1.1:443) unreachable — egress over-blocked"; exit 1 }
+          Write-Host "OK: internet still reachable"
+
+  macos:
+    name: Containment (macos arm64)
+    runs-on: [self-hosted, macos, arm64]
+    steps:
+      - name: Must be inside a VM, not on the host
+        run: |
+          set -u
+          # macOS jobs run in a per-job Virtualization.framework VM. If a
+          # job lands on the bare Mac mini, it shares the host with the
+          # ephemerd daemon and its credentials.
+          model=$(sysctl -n hw.model 2>/dev/null || echo unknown)
+          echo "hw.model=$model"
+          case "$model" in
+            *Virtual*|VirtualMac*) echo "OK: running in a VM" ;;
+            *) echo "FAIL: job appears to be on the bare host ($model)"; exit 1 ;;
+          esac
+
+      - name: Host ephemerd credentials must be unreachable
+        run: |
+          set -u
+          fail=0
+          for p in /usr/local/etc/ephemerd/config.toml /var/lib/ephemerd/config.toml \
+                   /etc/ephemerd/app.pem; do
+            if [ -r "$p" ]; then echo "FAIL: readable from job: $p"; fail=1; fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: host credentials not reachable"
+
+      - name: Fleet management planes must be unreachable
+        run: |
+          set -u
+          fail=0
+          for t in "192.168.5.1 8006 Proxmox-coyotes" "192.168.5.2 8006 Proxmox-kings" \
+                   "192.168.12.113 8443 Incus" "192.168.10.45 3000 Grafana"; do
+            set -- $t
+            if nc -z -G 4 "$1" "$2" 2>/dev/null; then
+              echo "FAIL: reached $3 at $1:$2"; fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: management planes unreachable"
