@@ -58,7 +58,7 @@ func platformChecks(pass, warn, fail func(string)) {
 		}
 	}
 	if !found {
-		pass("no macOS VM disk image yet — ephemerd will download the Apple IPSW and install on first boot (~30 min, one-time)")
+		pass("no macOS VM disk image yet — ephemerd will pull a Tart base image from the OCI registry on first boot (one-time)")
 	}
 
 	// VM capacity guidance

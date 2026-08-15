@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -552,11 +551,7 @@ func cacheClearCmd() *cli.Command {
 					names[i] = c.Name
 				}
 				fmt.Printf("About to clear: %s\n", strings.Join(names, ", "))
-				fmt.Print("Proceed? [y/N] ")
-				reader := bufio.NewReader(os.Stdin)
-				answer, _ := reader.ReadString('\n')
-				answer = strings.ToLower(strings.TrimSpace(answer))
-				if answer != "y" && answer != "yes" {
+				if !confirm("Proceed? [y/N] ") {
 					fmt.Println("Aborted.")
 					return nil
 				}

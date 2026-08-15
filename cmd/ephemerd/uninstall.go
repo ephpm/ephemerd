@@ -7,12 +7,39 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/urfave/cli/v3"
 )
 
+// uninstallPlan renders what `ephemerd uninstall` is about to destroy, for
+// the confirmation prompt. Separated from the command so the wording is
+// testable: the data directory must be named when it is going to be deleted,
+// and must NOT be threatened when --keep-data is set.
+func uninstallPlan(goos, dataDir string, keepData bool) string {
+	var b strings.Builder
+	b.WriteString("About to uninstall ephemerd from this host:\n")
+	b.WriteString("  - stop and remove the ephemerd service\n")
+	b.WriteString("  - remove the ephemerd binary\n")
+	if goos == "windows" {
+		b.WriteString("  - force-stop and delete ALL ephemerd-* Hyper-V VMs and WSL distros\n")
+	} else {
+		b.WriteString("  - remove leftover runtime state (network bridges, VM clones, CNI state)\n")
+	}
+	if keepData {
+		b.WriteString(fmt.Sprintf("  - KEEP the data directory: %s\n", dataDir))
+	} else {
+		b.WriteString(fmt.Sprintf("  - DELETE the entire data directory: %s\n", dataDir))
+		b.WriteString("    (config, logs, container images, job history — this is not recoverable)\n")
+	}
+	return b.String()
+}
+
 func uninstallCmd() *cli.Command {
-	var keepData bool
+	var (
+		keepData  bool
+		assumeYes bool
+	)
 	return &cli.Command{
 		Name:  "uninstall",
 		Usage: "Remove ephemerd binary, service, and optionally all data",
@@ -22,20 +49,36 @@ func uninstallCmd() *cli.Command {
 				Usage:       "keep the data directory (config, logs, container state)",
 				Destination: &keepData,
 			},
+			&cli.BoolFlag{
+				Name:        "yes",
+				Aliases:     []string{"y"},
+				Usage:       "skip the confirmation prompt",
+				Destination: &assumeYes,
+			},
 		},
 		Action: func(_ context.Context, _ *cli.Command) error {
 			dataDir := configDir
 
+			// This is the most destructive command in the CLI and it used to
+			// run on a bare `ephemerd uninstall` with no prompt at all, while
+			// `cache clear` — which removes strictly less — asks. Ask here
+			// too, in the same style, with --yes to skip for automation.
+			if !assumeYes {
+				fmt.Print(uninstallPlan(runtime.GOOS, dataDir, keepData))
+				if !confirm("Proceed? [y/N] ") {
+					fmt.Println("Aborted.")
+					return nil
+				}
+				fmt.Println()
+			}
+
 			fmt.Println("Uninstalling ephemerd...")
 			fmt.Println()
 
-			// Run doctor cleanup first to remove stale runtime state
-			// (containers, network bridges, WSL distros, etc.)
-			fmt.Println("Cleaning up runtime state...")
-			cleanupRuntime(dataDir)
-			fmt.Println()
-
-			// Stop and remove the service
+			// Stop and remove the service BEFORE touching runtime state.
+			// Cleanup deletes the control socket and the VMs the daemon is
+			// using, so doing it first (as this used to) pulls the rug out
+			// from under a daemon that is still running jobs.
 			switch runtime.GOOS {
 			case "linux":
 				uninstallSystemd()
@@ -44,6 +87,13 @@ func uninstallCmd() *cli.Command {
 			case "windows":
 				uninstallWindowsService()
 			}
+			fmt.Println()
+
+			// Now that the daemon is stopped, remove leftover runtime state
+			// (containers, network bridges, WSL distros, VM clones).
+			fmt.Println("Cleaning up runtime state...")
+			cleanupRuntime(dataDir)
+			fmt.Println()
 
 			// Remove the binary
 			exe, err := os.Executable()

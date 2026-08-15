@@ -16,14 +16,90 @@ import (
 	"github.com/urfave/cli/v3"
 )
 
+// doctorCleanup is the decision about whether doctor's cleanup phase may run.
+type doctorCleanup struct {
+	// Run reports whether the destructive cleanup may proceed.
+	Run bool
+	// Reason explains the refusal to the operator when Run is false.
+	Reason string
+}
+
+// decideDoctorCleanup decides whether doctor may run its cleanup phase.
+//
+// Cleanup is not a tidy-up: it deletes the control socket and PID file, and
+// on Windows it force-stops and REMOVES every ephemerd-* Hyper-V VM,
+// unregisters every ephemerd-* WSL distro, and empties <data>/vm. Every one
+// of those belongs to a RUNNING daemon, so doing it live destroys the node's
+// Linux job capacity mid-job and leaves the daemon talking to a socket that
+// no longer exists — and it used to happen on a bare `ephemerd doctor`, with
+// no running-daemon check and no prompt.
+//
+// So: a running daemon means no cleanup, unless the operator says --force.
+// Pure, so the guard is testable without a daemon.
+func decideDoctorCleanup(daemonUp, force bool) doctorCleanup {
+	if daemonUp && !force {
+		return doctorCleanup{
+			Run: false,
+			Reason: "the ephemerd daemon is running — cleanup would delete live state " +
+				"(control socket, PID file, running VMs). Stop it first ('ephemerd stop'), " +
+				"or pass --force to clean anyway.",
+		}
+	}
+	return doctorCleanup{Run: true}
+}
+
+// privilegeHint returns the "you may not have enough privilege" line for the
+// cleanup phase, or "" when none applies.
+//
+// os.Geteuid() returns -1 on Windows, which is != 0, so the unguarded euid
+// test printed "run with sudo" on every single Windows run — advice that is
+// both wrong and impossible to follow there.
+func privilegeHint(goos string, euid int) string {
+	if goos == "windows" {
+		return "(run from an elevated prompt for full cleanup — ephemerd state is owned by SYSTEM)"
+	}
+	if euid != 0 {
+		return "(run with sudo for full cleanup — ephemerd data is owned by root)"
+	}
+	return ""
+}
+
+// platformCleanupPrompt describes what platformCleanup is about to destroy,
+// so the confirmation names the actual damage instead of asking "are you
+// sure?" about an unspecified action.
+func platformCleanupPrompt(goos, dataDir string) string {
+	switch goos {
+	case "windows":
+		return fmt.Sprintf(""+
+			"  About to remove ALL ephemerd-* Hyper-V VMs (force-stopped, then deleted),\n"+
+			"  unregister ALL ephemerd-* WSL distros, and delete %s (except embed/).\n"+
+			"  On a node running the Linux VM sidecar this destroys Linux job capacity.\n"+
+			"  Proceed? [y/N] ", filepath.Join(dataDir, "vm"))
+	case "darwin":
+		return fmt.Sprintf(""+
+			"  About to remove stale macOS VM clones under %s.\n"+
+			"  Proceed? [y/N] ", filepath.Join(dataDir, "vm", "macos", "jobs"))
+	default:
+		return fmt.Sprintf(""+
+			"  About to remove stale CNI state, the DNS config under %s, and the\n"+
+			"  ephemerd0 bridge if present.\n"+
+			"  Proceed? [y/N] ", dataDir)
+	}
+}
+
 func doctorCmd() *cli.Command {
 	var (
 		checkOnly bool
 		cleanOnly bool
+		force     bool
+		assumeYes bool
 	)
 	return &cli.Command{
 		Name:  "doctor",
 		Usage: "Check system readiness and clean up stale state",
+		Description: "Checks always run. Cleanup only runs when the daemon is stopped — it deletes\n" +
+			"the control socket, the PID file and (on Windows) every ephemerd-* VM and WSL\n" +
+			"distro, none of which is safe to do underneath a running daemon.",
 		Flags: []cli.Flag{
 			&cli.BoolFlag{
 				Name:        "check",
@@ -35,8 +111,19 @@ func doctorCmd() *cli.Command {
 				Usage:       "clean up only, skip checks",
 				Destination: &cleanOnly,
 			},
+			&cli.BoolFlag{
+				Name:        "force",
+				Usage:       "clean up even while the daemon is running (DESTROYS live state: running VMs, control socket)",
+				Destination: &force,
+			},
+			&cli.BoolFlag{
+				Name:        "yes",
+				Aliases:     []string{"y"},
+				Usage:       "skip the confirmation prompt before removing VMs/WSL distros",
+				Destination: &assumeYes,
+			},
 		},
-		Action: func(_ context.Context, _ *cli.Command) error {
+		Action: func(ctx context.Context, _ *cli.Command) error {
 			dataDir := configDir
 
 			passed := 0
@@ -123,21 +210,26 @@ func doctorCmd() *cli.Command {
 			}
 
 			if !checkOnly {
+				// Everything below this point deletes state the running
+				// daemon owns, so ask the daemon whether it is there first.
+				if decision := decideDoctorCleanup(daemonRunning(ctx), force); !decision.Run {
+					fmt.Println("Cleanup: skipped")
+					fmt.Printf("  ⚠ %s\n", decision.Reason)
+					fmt.Println()
+					fmt.Printf("Results: %d passed, %d warnings, %d failed\n", passed, warned, failed)
+					if failed > 0 {
+						return fmt.Errorf("%d check(s) failed", failed)
+					}
+					return nil
+				}
+
 				fmt.Println("Cleanup:")
-				if os.Geteuid() != 0 {
-					fmt.Println("  (run with sudo for full cleanup — ephemerd data is owned by root)")
+				if hint := privilegeHint(runtime.GOOS, os.Geteuid()); hint != "" {
+					fmt.Printf("  %s\n", hint)
 				}
 				fmt.Println()
 
 				log := slog.Default()
-
-				// Clean orphan containers
-				cleaned := cleanOrphans(dataDir)
-				if cleaned > 0 {
-					pass(fmt.Sprintf("removed %d orphan container(s)", cleaned))
-				} else {
-					pass("no orphan containers")
-				}
 
 				// Clean stale network state
 				if runtime.GOOS == "linux" {
@@ -174,8 +266,16 @@ func doctorCmd() *cli.Command {
 				rtpkg.CleanOldLogs(logDir, 7*24*time.Hour, log)
 				pass("cleaned old job logs (>7 days)")
 
-				// Platform-specific cleanup
-				platformCleanup(dataDir, pass, warn, fail)
+				// Platform-specific cleanup is the destructive half — on
+				// Windows it deletes VMs and WSL distros outright — so it
+				// gets its own confirmation, in the same style as
+				// `cache clear`. A non-interactive shell reads EOF and
+				// declines, which is the safe answer.
+				if assumeYes || confirm(platformCleanupPrompt(runtime.GOOS, dataDir)) {
+					platformCleanup(dataDir, pass, warn, fail)
+				} else {
+					fmt.Println("  skipped platform cleanup (pass --yes to run it unattended)")
+				}
 
 				fmt.Println()
 			}
@@ -188,23 +288,4 @@ func doctorCmd() *cli.Command {
 			return nil
 		},
 	}
-}
-
-// cleanOrphans attempts to clean orphan containers. Returns count removed.
-// This is best-effort — if containerd isn't running, returns 0.
-func cleanOrphans(dataDir string) int {
-	// Orphan cleanup requires a running containerd, which doctor doesn't start.
-	// Just check for stale snapshot/container state directories.
-	stateDir := filepath.Join(dataDir, "containerd", "state")
-	entries, err := os.ReadDir(stateDir)
-	if err != nil {
-		return 0
-	}
-	count := 0
-	for _, e := range entries {
-		if e.IsDir() && e.Name() != "." && e.Name() != ".." {
-			count++
-		}
-	}
-	return 0 // don't actually remove — containerd manages its own state
 }

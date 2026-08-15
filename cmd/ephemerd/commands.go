@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -84,6 +85,33 @@ func statusCmd() *cli.Command {
 	}
 }
 
+// drainStrategy is how `ephemerd drain` (without --wait) tells the running
+// daemon to stop claiming jobs.
+type drainStrategy int
+
+const (
+	// drainSignal sends SIGTERM to the PID in the pid file: the daemon stops
+	// claiming, lets in-flight jobs finish, then exits.
+	drainSignal drainStrategy = iota
+	// drainControl cordons over the control socket and then asks the SCM to
+	// stop the service, which runs that same graceful shutdown.
+	drainControl
+)
+
+// drainStrategyFor picks the drain mechanism for a platform.
+//
+// Windows has no signals: os.Process.Signal always fails with "not supported
+// by windows" there, so the SIGTERM path could never do anything but error —
+// `ephemerd drain` was simply broken on every Windows node. Windows gets the
+// control-socket route instead, which reaches the same end state through the
+// SCM. Pure, so the routing rule is testable without a daemon.
+func drainStrategyFor(goos string) drainStrategy {
+	if goos == "windows" {
+		return drainControl
+	}
+	return drainSignal
+}
+
 func drainCmd() *cli.Command {
 	return &cli.Command{
 		Name:  "drain",
@@ -91,6 +119,10 @@ func drainCmd() *cli.Command {
 		Description: "By default sends SIGTERM to the running ephemerd daemon: it stops claiming new jobs,\n" +
 			"keeps in-flight jobs running until they finish (or shutdown_timeout expires, default 5m),\n" +
 			"then exits. This command returns immediately; use 'ephemerd status' to monitor progress.\n" +
+			"\n" +
+			"On Windows there are no signals, so the default path instead cordons the daemon over the\n" +
+			"control socket and asks the Service Control Manager to stop it — the service handler runs\n" +
+			"the same graceful shutdown, waiting for in-flight jobs. It also returns immediately.\n" +
 			"\n" +
 			"With --wait no signal is sent. The daemon is cordoned over the control socket (it stops\n" +
 			"claiming new jobs but keeps serving) and this command polls until the active job count\n" +
@@ -113,45 +145,95 @@ func drainCmd() *cli.Command {
 			if cmd.Bool("wait") {
 				return drainWait(ctx, cmd.Duration("timeout"))
 			}
-
-			// Read PID file to find the running daemon
-			pidFile := filepath.Join(configDir, "ephemerd.pid")
-			pidData, err := os.ReadFile(pidFile)
-			if err != nil {
-				return fmt.Errorf("cannot read pid file %s (is ephemerd running?): %w", pidFile, err)
+			if drainStrategyFor(runtime.GOOS) == drainControl {
+				return drainViaControl(ctx)
 			}
-			pid, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
-			if err != nil {
-				return fmt.Errorf("invalid pid file: %w", err)
-			}
-
-			proc, err := os.FindProcess(pid)
-			if err != nil {
-				return fmt.Errorf("cannot find process %d: %w", pid, err)
-			}
-
-			// Check current status via gRPC if reachable
-			cc, dialErr := dialControl(ctx)
-			if dialErr == nil {
-				resp, err := cc.Status(ctx, &apiv1.StatusRequest{})
-				if err == nil {
-					fmt.Printf("Active jobs: %d\n", resp.ActiveJobs)
-				}
-				if err := cc.Close(); err != nil {
-					return fmt.Errorf("closing connection: %w", err)
-				}
-			}
-
-			fmt.Printf("Sending SIGTERM to ephemerd (pid %d)...\n", pid)
-			if err := proc.Signal(syscall.SIGTERM); err != nil {
-				return fmt.Errorf("failed to signal process %d: %w", pid, err)
-			}
-
-			fmt.Println("The daemon will wait for running jobs to finish before exiting.")
-			fmt.Println("Use 'ephemerd status' to monitor progress.")
-			return nil
+			return drainViaSignal(ctx)
 		},
 	}
+}
+
+// drainViaSignal is the POSIX default drain: SIGTERM the daemon, which stops
+// claiming, finishes in-flight jobs, then exits. Returns immediately.
+func drainViaSignal(ctx context.Context) error {
+	// Read PID file to find the running daemon
+	pidFile := filepath.Join(configDir, "ephemerd.pid")
+	pidData, err := os.ReadFile(pidFile)
+	if err != nil {
+		return fmt.Errorf("cannot read pid file %s (is ephemerd running?): %w", pidFile, err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
+	if err != nil {
+		return fmt.Errorf("invalid pid file: %w", err)
+	}
+
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("cannot find process %d: %w", pid, err)
+	}
+
+	// Check current status via gRPC if reachable
+	cc, dialErr := dialControl(ctx)
+	if dialErr == nil {
+		resp, err := cc.Status(ctx, &apiv1.StatusRequest{})
+		if err == nil {
+			fmt.Printf("Active jobs: %d\n", resp.ActiveJobs)
+		}
+		if err := cc.Close(); err != nil {
+			return fmt.Errorf("closing connection: %w", err)
+		}
+	}
+
+	fmt.Printf("Sending SIGTERM to ephemerd (pid %d)...\n", pid)
+	if err := proc.Signal(syscall.SIGTERM); err != nil {
+		return fmt.Errorf("failed to signal process %d: %w", pid, err)
+	}
+
+	fmt.Println("The daemon will wait for running jobs to finish before exiting.")
+	fmt.Println("Use 'ephemerd status' to monitor progress.")
+	return nil
+}
+
+// drainViaControl is the Windows default drain. There is no SIGTERM to send,
+// so the daemon is cordoned over the control socket — it stops claiming new
+// jobs the instant that returns — and then the SCM is asked to stop the
+// service, whose handler cancels serve() and holds StopPending while
+// in-flight jobs finish. Same end state as the POSIX signal, and like the
+// signal it returns immediately rather than blocking.
+//
+// The cordon comes first on purpose: it is the half that matters most and it
+// works whether or not ephemerd was installed as a service. If the SCM stop
+// then fails (running in the foreground, no service registered, no rights),
+// the node is still claiming nothing and the operator is told how to finish;
+// that is reported as success because the documented job of `drain` — stop
+// accepting new work — is done.
+func drainViaControl(ctx context.Context) (retErr error) {
+	cc, err := dialControl(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := cc.Close(); err != nil && retErr == nil {
+			retErr = fmt.Errorf("closing connection: %w", err)
+		}
+	}()
+
+	resp, err := cc.Cordon(ctx, &apiv1.CordonRequest{})
+	if err != nil {
+		return fmt.Errorf("cordon: %w", err)
+	}
+	fmt.Printf("Cordoned: daemon stopped claiming new jobs (%d active).\n", resp.ActiveJobs)
+
+	if err := stopServiceGraceful(); err != nil {
+		fmt.Printf("Could not ask the service manager to stop ephemerd: %v\n", err)
+		fmt.Println("The daemon stays cordoned, so it is claiming nothing. Run 'ephemerd drain --wait'")
+		fmt.Println("to block until in-flight jobs finish, or 'ephemerd uncordon' to resume claiming.")
+		return nil
+	}
+
+	fmt.Println("Asked the service manager to stop ephemerd; it exits once running jobs finish.")
+	fmt.Println("Use 'ephemerd status' to monitor progress.")
+	return nil
 }
 
 // drainWait cordons the daemon over the control socket — no signal, so the

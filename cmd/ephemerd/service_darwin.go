@@ -35,8 +35,15 @@ func serviceAction(action string) error {
 	default:
 		return fmt.Errorf("unsupported action: %s", action)
 	}
-	fmt.Printf("ephemerd %sed\n", action)
+	fmt.Printf("ephemerd %s\n", actionPastTense(action))
 	return nil
+}
+
+// stopServiceGraceful exists so the control-socket drain path compiles on
+// every platform; only Windows uses it (see drainViaControl). On macOS the
+// default drain signals the daemon directly.
+func stopServiceGraceful() error {
+	return fmt.Errorf("stopping the service through a service manager is only used on Windows")
 }
 
 const logFile = "/var/log/ephemerd.log"
