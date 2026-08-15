@@ -57,5 +57,5 @@ func (d *darwinNetworking) hostAddr() string { return "" }
 
 // openHostPort/closeHostPort are Windows-L2Bridge-only; the macOS path
 // delegates networking to the in-VM Linux stack.
-func (d *darwinNetworking) openHostPort(int) error { return nil }
-func (d *darwinNetworking) closeHostPort(int)      {}
+func (d *darwinNetworking) openHostPort(int, string) error { return nil }
+func (d *darwinNetworking) closeHostPort(int, string)      {}

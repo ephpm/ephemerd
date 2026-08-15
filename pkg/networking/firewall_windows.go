@@ -206,51 +206,115 @@ func (w *windowsNetworking) installL2BridgeFirewallRules() error {
 	return nil
 }
 
+// hostPortRuleName is the unique DisplayName for one job's host-port allow.
+//
+// It keys on BOTH the port and the owning container's address. The port alone
+// is not enough: two concurrent jobs each hold a distinct rule, and every
+// open/close does an idempotent delete-by-name first, so a name that collided
+// would let one job's teardown (or its delete-before-add) silently revoke
+// another job's allow and break a running build. The address is also what makes
+// a leaked rule attributable to the container it was opened for.
+//
+// Dots become dashes so the name is a single unquoted token everywhere it is
+// handled (netsh argv, the PowerShell -DisplayName prefix sweep).
+func hostPortRuleName(containerIP string, port int) string {
+	return fmt.Sprintf("%s%d-%s", hostPortRulePrefix, port, strings.ReplaceAll(containerIP, ".", "-"))
+}
+
+// normalizeContainerIP validates the address an allow is about to be scoped to
+// and renders it in canonical dotted-quad form.
+//
+// This is the fail-closed gate for the whole host-port mechanism: callers MUST
+// propagate the error rather than substituting a wider scope. See the comment
+// on hostPortAllowRule for why widening is not an option here.
+func normalizeContainerIP(containerIP string) (string, error) {
+	v, err := parseIPv4(strings.TrimSpace(containerIP))
+	if err != nil {
+		return "", fmt.Errorf("container address %q is not a usable IPv4 address: %w", containerIP, err)
+	}
+	return u32ToIPv4(v), nil
+}
+
 // hostPortAllowRule is the scoped inbound allow that makes one host TCP port
-// reachable from the container pool on the L2Bridge path (see openHostPort).
-func hostPortAllowRule(hostIP, ipPool string, port int) winFirewallRule {
+// reachable from ONE job container on the L2Bridge path (see openHostPort).
+//
+// remoteip is that container's own /32 — never the pool. This is a security
+// boundary, not a tidiness preference. The per-job service behind the port is
+// the fake Docker API (pkg/dind), which performs NO authentication: anything
+// that can open a TCP connection to it gets full control of that job's Docker
+// daemon — run and exec containers, bind-mount arbitrary host paths, read the
+// job's build context and secrets. An earlier revision scoped this allow to
+// remoteip=<ip_pool>, i.e. to every job container on the host, so container A
+// could port-scan the host's LAN address across the ephemeral range, find
+// container B's dind endpoint and drive B's daemon — a cross-job
+// confidentiality and integrity break bounded only by port guessing. With the
+// /32 the host firewall is the authenticator the dind API does not have.
+//
+// caller contract: containerIP has already been through normalizeContainerIP.
+func hostPortAllowRule(hostIP, containerIP string, port int) winFirewallRule {
 	return winFirewallRule{
-		name: fmt.Sprintf("%s-l2b-hostport-%d", firewallRulePrefix, port),
+		name: hostPortRuleName(containerIP, port),
 		spec: []string{
 			"dir=in",
 			"action=allow",
 			"protocol=TCP",
 			"localip=" + hostIP,
 			"localport=" + strconv.Itoa(port),
-			"remoteip=" + ipPool,
+			// /32 to match the CIDR form the rest of the rule set uses.
+			"remoteip=" + containerIP + "/32",
 			"profile=any",
 			"enable=yes",
 		},
 	}
 }
 
-// openHostPort adds a scoped inbound allow so job containers can reach one host
-// TCP port (a per-job dind Docker API listener, or the module proxy). Without
-// it the host's default inbound deny drops the connection even though the VFP
-// host /32 allow permits the container to send. Scoped to remoteip=<pool> and
-// localport=<port>, so nothing else on the host opens. No-op unless the
-// L2Bridge egress path is active with a resolved plan.
-func (w *windowsNetworking) openHostPort(port int) error {
-	if !w.cfg.L2BridgeEgress || w.plan == nil || w.plan.HostIP == "" || w.plan.PoolSpec == "" {
+// openHostPort adds a scoped inbound allow so ONE job container — the one at
+// containerIP — can reach one host TCP port (its own dind Docker API listener).
+// Without it the host's default inbound deny drops the connection even though
+// the VFP host /32 allow permits the container to send. Scoped to
+// remoteip=<containerIP>/32 and localport=<port>, so neither another port on
+// the host nor another job's container is admitted. No-op unless the L2Bridge
+// egress path is active with a resolved plan.
+//
+// Fails closed on a missing or malformed containerIP: it opens nothing and
+// returns an error. The tempting fallback — open the pool when the exact
+// address is unknown — is precisely the cross-job hole this scoping exists to
+// close, so an unknown address must cost the job its docker access, not cost
+// every other job its isolation.
+func (w *windowsNetworking) openHostPort(port int, containerIP string) error {
+	if !w.cfg.L2BridgeEgress || w.plan == nil || w.plan.HostIP == "" {
 		return nil
 	}
-	r := hostPortAllowRule(w.plan.HostIP, w.plan.PoolSpec, port)
+	ip, err := normalizeContainerIP(containerIP)
+	if err != nil {
+		return fmt.Errorf("refusing to open host port %d without a specific container address (a pool-wide allow would expose this job's unauthenticated Docker API to every other job): %w", port, err)
+	}
+	r := hostPortAllowRule(w.plan.HostIP, ip, port)
 	_ = netsh(r.deleteArgs()...) // idempotent
 	if err := netsh(r.addArgs()...); err != nil {
-		return fmt.Errorf("opening host port %d for the container pool: %w", port, err)
+		return fmt.Errorf("opening host port %d for container %s: %w", port, ip, err)
 	}
-	w.cfg.Log.Info("opened L2Bridge host port for container pool", "port", port, "pool", w.plan.PoolSpec)
+	w.cfg.Log.Info("opened L2Bridge host port for a single job container", "port", port, "container_ip", ip, "rule", r.name)
 	return nil
 }
 
-// closeHostPort removes the allow added by openHostPort.
-func (w *windowsNetworking) closeHostPort(port int) {
-	if !w.cfg.L2BridgeEgress || w.plan == nil || w.plan.HostIP == "" || w.plan.PoolSpec == "" {
+// closeHostPort removes the allow added by openHostPort. containerIP must be
+// the same address the allow was opened for — it is half the rule name, which
+// is what keeps one job's teardown from deleting another job's rule.
+func (w *windowsNetworking) closeHostPort(port int, containerIP string) {
+	if !w.cfg.L2BridgeEgress || w.plan == nil || w.plan.HostIP == "" {
 		return
 	}
-	r := hostPortAllowRule(w.plan.HostIP, w.plan.PoolSpec, port)
+	ip, err := normalizeContainerIP(containerIP)
+	if err != nil {
+		// Nothing was opened for an address we cannot parse, so there is
+		// nothing to close; the shutdown prefix sweep is the backstop.
+		w.cfg.Log.Debug("skipping L2Bridge host-port close for an unusable container address", "port", port, "container_ip", containerIP, "error", err)
+		return
+	}
+	r := hostPortAllowRule(w.plan.HostIP, ip, port)
 	if err := netsh(r.deleteArgs()...); err != nil {
-		w.cfg.Log.Debug("failed to remove L2Bridge host-port allow", "port", port, "error", err)
+		w.cfg.Log.Debug("failed to remove L2Bridge host-port allow", "port", port, "container_ip", ip, "error", err)
 	}
 }
 

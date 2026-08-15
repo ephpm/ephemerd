@@ -44,18 +44,26 @@ const sharedNamespace = "ephemerd"
 
 // Server is a per-job fake Docker daemon.
 type Server struct {
-	jobID           string
-	jobNamespace    string // per-job containerd namespace for isolation
-	cacheNamespace  string // per-(provider,repo) shared image cache namespace; empty disables caching
-	sockPath        string // host-side unix socket path (Linux/macOS only)
-	endpoint        string // what the container should set DOCKER_HOST to (e.g. "tcp://gw:port" on Windows)
-	listener        net.Listener
-	server          *http.Server
-	client          *client.Client
-	network         *networking.Manager
-	// hostPort is the TCP port the Windows listener opened in the host
-	// firewall for the container pool (L2Bridge only); 0 means none open.
-	hostPort int
+	jobID          string
+	jobNamespace   string // per-job containerd namespace for isolation
+	cacheNamespace string // per-(provider,repo) shared image cache namespace; empty disables caching
+	sockPath       string // host-side unix socket path (Linux/macOS only)
+	endpoint       string // what the container should set DOCKER_HOST to (e.g. "tcp://gw:port" on Windows)
+	listener       net.Listener
+	server         *http.Server
+	client         *client.Client
+	network        *networking.Manager
+	// listenPort is the TCP port the Windows listener bound (0 on the unix
+	// socket transport). Recorded by listen(); the host-firewall allow for it
+	// is opened later by SetRunnerIP, once the runner container's address is
+	// known. See listen_windows.go for why the two cannot happen together.
+	listenPort int
+	// hostPort / hostPortIP identify the host-firewall allow opened for this
+	// job's listener on the Windows L2Bridge path: the port, and the single
+	// container address it was scoped to. Both are needed to remove it again —
+	// the rule name keys on both. hostPort == 0 means nothing is open.
+	hostPort        int
+	hostPortIP      string
 	buildkit        *buildkit.Server // shared embedded BuildKit solver (nil → fall back to platform default)
 	runnerNetNS     string           // path to runner container's net namespace; used to install DNAT rules for port bindings
 	allowPrivileged bool             // gate for docker run --privileged / --cap-add; see config.DindConfig.AllowPrivileged
@@ -215,6 +223,46 @@ func (s *Server) SetRunnerNetNS(netnsPath string) {
 	s.runnerNetNS = netnsPath
 }
 
+// SetRunnerIP records the address the network assigned to this job's runner
+// container and opens the host-firewall allow that lets exactly that container
+// — and nothing else — reach this server's TCP listener.
+//
+// Windows L2Bridge only. Everywhere else it is a no-op: the unix-socket
+// transport binds no TCP port at all (listenPort stays 0), and the Windows NAT
+// path has no host-firewall carve-out to make.
+//
+// SECURITY. The allow is scoped to containerIP/32 rather than to the container
+// pool because the Docker API this port serves does no authentication
+// whatsoever — it accepts any credentials. A pool-scoped allow (what this used
+// to be) let any job container port-scan the host's LAN address, find another
+// job's dind endpoint, and drive that job's daemon: run and exec containers,
+// bind-mount host paths, read its build context. The firewall scope is the only
+// thing standing between two concurrent jobs here.
+//
+// FAIL CLOSED. An empty or malformed containerIP returns an error and opens
+// nothing; the caller is expected to fail the job. Falling back to a pool-wide
+// allow would trade this job's inconvenience for every other job's isolation.
+//
+// ORDERING. Must be called after the container's network endpoint exists (the
+// address is allocated by networking.Manager.Setup) and before the container is
+// created, so the container never runs without its allow in place. Pairs with
+// SetRunnerNetNS / SetRunnerRootfs, which are the other post-setup handoffs
+// into this server.
+func (s *Server) SetRunnerIP(containerIP string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.network == nil || s.listenPort == 0 {
+		return nil
+	}
+	if err := s.network.OpenHostPort(s.listenPort, containerIP); err != nil {
+		return fmt.Errorf("opening dind host port %d for container %q: %w", s.listenPort, containerIP, err)
+	}
+	s.hostPort = s.listenPort
+	s.hostPortIP = containerIP
+	return nil
+}
+
 // SetRunnerRootfs registers the runner container's snapshot, rootfs mount
 // path, and the non-rootfs bind table ephemerd installed into it, so that
 // subsequent docker create requests from inside the runner can have their
@@ -352,9 +400,13 @@ func (s *Server) Stop() {
 		}
 	}
 	// Remove the L2Bridge host-firewall allow opened for this job's listener.
+	// The container address is half the rule name, so it has to go back in for
+	// the delete to find the right rule — and, crucially, only that rule: a
+	// port-only name would let this teardown revoke a concurrent job's allow.
 	if s.hostPort != 0 && s.network != nil {
-		s.network.CloseHostPort(s.hostPort)
+		s.network.CloseHostPort(s.hostPort, s.hostPortIP)
 		s.hostPort = 0
+		s.hostPortIP = ""
 	}
 
 	// Clean up the socket and job docker directory

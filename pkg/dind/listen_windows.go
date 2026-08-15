@@ -38,19 +38,21 @@ func (s *Server) listen() (net.Listener, error) {
 		return nil, fmt.Errorf("unexpected listener address type: %T", ln.Addr())
 	}
 
-	// On the L2Bridge path the container reaches this listener at the host's
-	// LAN address, where the host's own inbound Windows Firewall default-denies
-	// it (the VFP host /32 allow only governs the container's egress port). Open
-	// a scoped inbound allow for exactly this port from the container pool. No-op
-	// on NAT. Failure is not fatal: log and continue — dind then simply is not
-	// reachable, which the job surfaces, rather than taking provisioning down.
-	if s.network != nil {
-		if err := s.network.OpenHostPort(tcpAddr.Port); err != nil {
-			s.log.Warn("failed to open dind host port for the container pool; docker may be unreachable on L2Bridge", "port", tcpAddr.Port, "error", err)
-		} else {
-			s.hostPort = tcpAddr.Port
-		}
-	}
+	// On the L2Bridge path the container reaches this listener at the host's LAN
+	// address, where the host's own inbound Windows Firewall default-denies it
+	// (the VFP host /32 allow only governs the container's egress port), so an
+	// inbound allow is required. It is NOT opened here.
+	//
+	// The allow must be scoped to the owning container's /32 — the fake Docker
+	// API served on this port is unauthenticated, so anything wider hands every
+	// other job's container control of this job's daemon. That address does not
+	// exist yet: the runtime constructs and starts this server before it calls
+	// networking.Manager.Setup, because the endpoint URI computed below has to
+	// go into the container's OCI spec as DOCKER_HOST. So listen() only records
+	// the bound port, and SetRunnerIP opens the allow once the runtime knows the
+	// address — still before the container is created, so there is no window in
+	// which the container is running without it.
+	s.listenPort = tcpAddr.Port
 
 	s.endpoint = fmt.Sprintf("tcp://%s:%d", host, tcpAddr.Port)
 	return ln, nil

@@ -176,15 +176,22 @@ type platformNetworking interface {
 	hostAddr() string
 
 	// openHostPort / closeHostPort open and close a scoped host-firewall
-	// inbound allow for one TCP port, from the container pool to the host.
+	// inbound allow for one TCP port, from ONE container to the host.
 	// Needed only on the Windows L2Bridge path: the VFP host /32 allow lets a
 	// container's packet leave its port toward the host, but the host's own
 	// inbound Windows Firewall default-denies it, so per-job services ephemerd
-	// binds on the host (the dind Docker API, the module proxy) are otherwise
-	// unreachable. Scoped to remoteip=<pool>, localport=<port> so ONLY that
+	// binds on the host (the dind Docker API) are otherwise unreachable.
+	//
+	// containerIP is the address of the container the port is being opened FOR,
+	// and the allow is scoped to that /32 — never to the whole pool. The dind
+	// API behind these ports is unauthenticated, so a pool-scoped allow would
+	// let any job container reach any other job's Docker daemon. An unknown or
+	// malformed containerIP is an error, not a reason to widen the scope.
+	//
+	// Scoped to remoteip=<containerIP>/32, localport=<port> so ONLY that
 	// service opens — RDP/SMB/RPC stay blocked. No-op on NAT and non-Windows.
-	openHostPort(port int) error
-	closeHostPort(port int)
+	openHostPort(port int, containerIP string) error
+	closeHostPort(port int, containerIP string)
 }
 
 // New creates and initializes the networking manager for the current platform.
@@ -249,21 +256,27 @@ func (m *Manager) InstallFirewallRules() error {
 }
 
 // OpenHostPort opens a scoped host-firewall inbound allow for one TCP port from
-// the container pool to the host, so a per-job service ephemerd binds on the
-// host (dind's Docker API, the module proxy) is reachable from job containers.
-// Only the Windows L2Bridge path does anything; elsewhere it is a no-op. Pair
-// with CloseHostPort on teardown.
-func (m *Manager) OpenHostPort(port int) error {
+// the single container at containerIP to the host, so a per-job service
+// ephemerd binds on the host (dind's Docker API) is reachable from THAT job's
+// container and no other. Only the Windows L2Bridge path does anything;
+// elsewhere it is a no-op. Pair with CloseHostPort on teardown, passing the
+// same containerIP.
+//
+// Returns an error rather than opening anything when containerIP is empty or
+// unparseable — see the platformNetworking doc for why widening is not a
+// permissible fallback.
+func (m *Manager) OpenHostPort(port int, containerIP string) error {
 	if m.platform == nil {
 		return nil
 	}
-	return m.platform.openHostPort(port)
+	return m.platform.openHostPort(port, containerIP)
 }
 
-// CloseHostPort removes an allow previously added by OpenHostPort.
-func (m *Manager) CloseHostPort(port int) {
+// CloseHostPort removes an allow previously added by OpenHostPort. containerIP
+// must match the one it was opened with.
+func (m *Manager) CloseHostPort(port int, containerIP string) {
 	if m.platform != nil {
-		m.platform.closeHostPort(port)
+		m.platform.closeHostPort(port, containerIP)
 	}
 }
 

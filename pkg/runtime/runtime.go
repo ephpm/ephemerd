@@ -939,12 +939,35 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			// block) and returns an error if it could not — there is no global
 			// firewall backstop on Windows. Fail CLOSED: abort the job rather
 			// than start a container with an unfirewalled (or absent) endpoint.
+			if dindServer != nil {
+				dindServer.Stop()
+			}
 			return nil, fmt.Errorf("setting up Windows network endpoint for %s: %w", id, err)
 		}
 		if result != nil {
 			windowsEndpointID = result.EndpointID
 			windowsNetNS = result.NetNS
 			opts = append(opts, withWindowsNetwork(windowsNetNS, windowsEndpointID))
+
+			// The container's address exists only now — Setup is what allocates
+			// it out of the L2Bridge pool — so this is the first moment the dind
+			// host-port allow can be scoped to the one container entitled to use
+			// it. It has to be scoped: the dind Docker API is unauthenticated,
+			// so an allow covering the whole pool would let any other job's
+			// container drive this job's daemon. Still ahead of container
+			// creation below, so the container never runs without its allow.
+			//
+			// Fail CLOSED on error rather than falling back to a wider allow:
+			// losing docker in this job beats losing isolation in all of them.
+			if dindServer != nil {
+				if err := dindServer.SetRunnerIP(result.IP); err != nil {
+					dindServer.Stop()
+					if tearErr := r.cfg.Network.Teardown(ctx, id, windowsNetNS); tearErr != nil {
+						r.cfg.Log.Debug("endpoint cleanup after failed dind host-port open", "error", tearErr)
+					}
+					return nil, fmt.Errorf("authorizing dind access for %s: %w", id, err)
+				}
+			}
 		}
 	}
 
