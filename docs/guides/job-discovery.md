@@ -14,7 +14,7 @@ sequenceDiagram
     participant GH as GitHub API
     participant E as ephemerd
 
-    loop Every 10s (default)
+    loop Every 30s (default)
         E->>GH: GET /repos/.../actions/runs?status=queued
         GH-->>E: List of queued jobs
         E->>E: Filter by labels, dedup
@@ -34,12 +34,12 @@ sequenceDiagram
 
 GitHub rate limits depend on authentication method:
 
-| Auth method | Requests/hour | At 10s interval | At 30s interval |
+| Auth method | Requests/hour | At 10s interval | At 30s interval (default) |
 |-------------|--------------|-----------------|-----------------|
 | Personal Access Token | 5,000 | ~360/hr/repo | ~120/hr/repo |
 | GitHub App | 15,000 | ~360/hr/repo | ~120/hr/repo |
 
-For a PAT monitoring 10 repositories at the default 10-second interval, that is roughly 3,600 requests per hour -- well within the 5,000 limit. A GitHub App gets 15,000 requests per hour, making it the better choice for organizations with many repositories.
+For a PAT monitoring 10 repositories at the default 30-second interval, that is roughly 1,200 requests per hour -- comfortably within the 5,000 limit. Dropping to a 10-second interval triples that to ~3,600/hr, which still fits but leaves much less headroom. A GitHub App gets 15,000 requests per hour, making it the better choice for organizations with many repositories.
 
 ### Configuration
 
@@ -49,7 +49,7 @@ Polling is the default mode. The only required configuration is authentication a
 [github]
 owner = "your-org"
 # repos = ["repo1", "repo2"]   # optional: limit to specific repos
-# poll_interval = "10s"         # default: 10s
+# poll_interval = "30s"         # default: 30s
 ```
 
 Set the token via environment variable:
@@ -95,7 +95,7 @@ sequenceDiagram
 
     Note over GH,E: Webhook active
 
-    GH->>T: POST /webhook (workflow_job event)
+    GH->>T: POST /webhook/github (workflow_job event)
     T->>E: Forward request
     E->>E: Verify HMAC signature
     E->>E: Create container, start runner
@@ -146,7 +146,7 @@ tls_key = "/etc/ephemerd/tls.key"
 ### GitHub Webhook Setup
 
 1. Go to your repository (or organization) settings, then **Webhooks** > **Add webhook**
-2. Set **Payload URL** to `https://your-host:8080/webhook`
+2. Set **Payload URL** to `https://your-host:8080/webhook/github` -- the path is per-provider (`/webhook/<provider>`), not a bare `/webhook`. A bare `/webhook` returns 404 on every delivery.
 3. Set **Content type** to `application/json`
 4. Set **Secret** to the same value as `webhook.secret` in your config
 5. Under **Which events would you like to trigger this webhook?**, select **Let me select individual events** and check only **Workflow jobs**

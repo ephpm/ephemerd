@@ -1,6 +1,6 @@
 ---
 title: crictl
-weight: 16
+weight: 17
 ---
 
 Access the embedded containerd CRI (Container Runtime Interface) endpoint. Runs `crictl` commands in-process against ephemerd's containerd -- no external `crictl` binary required.
@@ -37,11 +37,10 @@ ephemerd crictl logs <container-id>
 
 ## How it works
 
-Unlike `ctrctl` which shells out to the `ctr` binary, `crictl` is linked in-process using the upstream crictl library from `github.com/kubernetes-sigs/cri-tools`. It connects to ephemerd's containerd CRI socket directly. No external binary is needed.
+Unlike a `ctr`-style passthrough that shells out to an external binary, `crictl` is linked in-process using the upstream crictl library from `github.com/kubernetes-sigs/cri-tools`. It connects to ephemerd's containerd CRI socket directly. No external binary is needed.
 
 The CRI interface is the same API that Kubernetes uses to manage containers, so the output format and commands will be familiar if you've debugged containers on a Kubernetes node.
 
 ## See also
 
-- [ctrctl](ctrctl) -- lower-level containerd passthrough (ctr CLI)
 - [Architecture: CRI Passthrough](/architecture/cri-passthrough/) -- design details

@@ -57,7 +57,7 @@ tunnel_url = "http://tunnels.example.com"
 When ephemerd starts, it logs the public webhook URL:
 
 ```
-INFO webhook tunnel ready url=http://abc123.tunnels.example.com/webhook
+INFO webhook tunnel ready provider=github url=http://abc123.tunnels.example.com/webhook/github
 ```
 
 ## GitHub Webhook Setup

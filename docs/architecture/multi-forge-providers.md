@@ -62,7 +62,7 @@ The scheduler type-asserts for `Webhook` when a tunnel or TLS is configured:
 ```go
 if wp, ok := provider.(providers.Webhook); ok {
     handler, whEvents := wp.WebhookHandler(secret)
-    mux.Handle("/webhook", handler)
+    mux.Handle("/webhook/"+provider.Name(), handler)
 }
 ```
 

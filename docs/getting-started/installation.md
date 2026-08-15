@@ -31,7 +31,7 @@ sudo ./ephemerd install --no-service
 
 ## Build from source
 
-ephemerd uses [Mage](https://magefile.org/) as its build system. With Go 1.24+ and Mage installed:
+ephemerd uses [Mage](https://magefile.org/) as its build system. With Go 1.26.1+ (as required by `go.mod`) and Mage installed:
 
 ```bash
 git clone https://github.com/ephpm/ephemerd.git

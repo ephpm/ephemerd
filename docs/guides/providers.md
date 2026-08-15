@@ -27,7 +27,7 @@ The primary provider. ephemerd polls the GitHub API (or receives webhooks) for q
 [github]
 owner = "your-org"
 repos = ["repo1", "repo2"]   # optional: omit for org-level runners
-# poll_interval = "10s"
+# poll_interval = "30s"   # default: 30s
 
 # PAT auth (or set GITHUB_TOKEN env var):
 # token = "ghp_xxx"

@@ -50,9 +50,9 @@ graph TB
 
 ### Windows
 
-Windows jobs run in Hyper-V isolated containers (each gets its own kernel). Linux jobs are dispatched to a WSL2 distro via gRPC — ephemerd embeds an Alpine rootfs and a cross-compiled Linux binary, imports a WSL distro on startup, and runs containerd inside it. The Windows host runs a single scheduler that routes jobs by OS label.
+Windows jobs run in Hyper-V isolated containers (each gets its own kernel). Linux jobs are dispatched via gRPC to a Hyper-V Linux VM that ephemerd boots and manages itself — it embeds a Linux kernel, initrd, rootfs, and a cross-compiled Linux binary, creates the VM through the Host Compute Service (`vmcompute.dll`) API with a direct kernel boot, and runs containerd inside it. The Windows host runs a single scheduler that routes jobs by OS label.
 
-The WSL binary runs from `/mnt/c/` (the Windows filesystem mounted inside WSL) to avoid the slow 9P copy into the Linux filesystem. GitHub credentials stay on the Windows host — WSL only receives container lifecycle commands via gRPC dispatch.
+Creating the VM through HCS rather than WSL2 means ephemerd works from any Windows security context, including `LocalSystem` — which is what the Windows service runs as, and which WSL2 does not support. (WSL is still used by `ephemerd run` for local workflow runs, but not by the daemon.) GitHub credentials stay on the Windows host — the VM only receives container lifecycle commands via gRPC dispatch.
 
 ```mermaid
 graph TB
@@ -62,8 +62,8 @@ graph TB
         E -->|Windows job| CTD[containerd native]
         CTD -->|Hyper-V container| WR[Windows Runner]
 
-        E -->|Linux job via gRPC| WSL[WSL2 distro — Alpine]
-        WSL -->|containerd in WSL| LC[OCI Container]
+        E -->|Linux job via gRPC| LVM[Hyper-V Linux VM — HCS boot]
+        LVM -->|containerd in VM| LC[OCI Container]
         LC --> LR[Linux Runner]
     end
 ```
@@ -331,7 +331,7 @@ server_url = "woodpecker.example.com:9000"   # Woodpecker server gRPC URL
 agent_secret = "your-shared-secret"          # agent authentication secret
 ```
 
-The provider is auto-detected from which section has credentials set. Precedence: Forgejo > Gitea > GitLab > Woodpecker > GitHub (default). See [docs/arch/providers.md](docs/arch/providers.md) for the full architecture.
+The provider is auto-detected from which section has credentials set. Precedence: Forgejo > Gitea > GitLab > Woodpecker > GitHub (default). See [docs/architecture/multi-forge-providers.md](docs/architecture/multi-forge-providers.md) for the full architecture, and [docs/guides/providers.md](docs/guides/providers.md) for per-provider configuration.
 
 ## Configuration
 
@@ -463,7 +463,7 @@ sequenceDiagram
     GH-->>E: Hook created
 
     Note over GH: Workflow job queued
-    GH->>T: POST /webhook (workflow_job event)
+    GH->>T: POST /webhook/github (workflow_job event)
     T->>E: Forward request
     E->>E: Verify HMAC, create container, run job
 
@@ -504,7 +504,7 @@ port = 8080
 Then add a webhook in your GitHub repo or org settings:
 
 1. Go to **Settings → Webhooks → Add webhook**
-2. **Payload URL**: `https://your-host:8080/webhook`
+2. **Payload URL**: `https://your-host:8080/webhook/github` — the path is per-provider (`/webhook/<provider>`), not a bare `/webhook`
 3. **Content type**: `application/json`
 4. **Secret**: same value as `secret` in your config
 5. **Events**: select "Workflow jobs"
@@ -532,11 +532,13 @@ ephemerd restart        Restart the ephemerd system service
 ephemerd logs           Tail the ephemerd system service logs
 ephemerd status         Show running jobs, health, uptime
 ephemerd drain          Stop accepting new jobs, wait for running jobs
+ephemerd uncordon       Resume claiming jobs after a cordon or aborted drain
 ephemerd jobs           List and manage running jobs (kill, logs, ssh — macOS only)
 ephemerd cache          Inspect and clear on-disk caches (list, clear)
 ephemerd config         Validate configuration
 ephemerd doctor         Check system readiness and clean up stale state
 ephemerd install        Install binary and register as a system service
+ephemerd upgrade        Install a specific release and restart into it
 ephemerd uninstall      Remove binary, service, and data
 ephemerd crictl         Debug the embedded containerd (in-process crictl)
 ```
@@ -578,13 +580,13 @@ The same image runs on every host — Linux directly, Windows via Hyper-V Linux 
 
 **macOS builds require macOS** — the darwin binary uses Virtualization.framework (CGO + Apple SDK). Cross-compilation from Linux isn't possible. Build on a Mac or use GitHub's macOS hosted runners for the darwin release.
 
-**Docker-in-Docker (fake daemon)** — ephemerd mounts a fake Docker Engine API socket at `/var/run/docker.sock` inside each job container. `docker pull`, `docker run`, `docker build`, and `docker push` all work — the fake daemon translates Docker API calls into containerd operations on the host. No real Docker daemon runs, no privileged containers, no `CAP_SYS_ADMIN`. Sidecars created via `docker run` are sibling containers on the same network. Enable with `dind.enabled = true` in config. See [docs/arch/dind.md](docs/arch/dind.md) for the full design.
+**Docker-in-Docker (fake daemon)** — ephemerd mounts a fake Docker Engine API socket at `/var/run/docker.sock` inside each job container. `docker pull`, `docker run`, `docker build`, and `docker push` all work — the fake daemon translates Docker API calls into containerd operations on the host. No real Docker daemon runs, no privileged containers, no `CAP_SYS_ADMIN`. Sidecars created via `docker run` are sibling containers on the same network. Enable with `dind.enabled = true` in config. See [docs/architecture/fake-docker-daemon.md](docs/architecture/fake-docker-daemon.md) for the full design.
 
 **ARM64 Windows** — ephemerd supports it at the infrastructure level, but PHP and most build toolchains don't ship ARM64 Windows binaries yet.
 
 ## Architecture
 
-See [docs/arch/overview.md](docs/arch/overview.md) for the full design document covering isolation backends, embedded containerd, VM lifecycle, and the GitHub integration model.
+See [docs/architecture/overview.md](docs/architecture/overview.md) for the full design document covering isolation backends, embedded containerd, VM lifecycle, and the GitHub integration model.
 
 ## License
 

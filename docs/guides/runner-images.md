@@ -79,14 +79,14 @@ Windows images must be built on a Windows host.
 
 ### macOS (artifact image)
 
-macOS jobs run in per-job VMs, not containers. Set `EPHEMERD_IMAGE` in your workflow to deliver pre-built tools via an OCI artifact image:
+macOS jobs run in per-job VMs, not containers. Set the job's `container.image` in your workflow to deliver pre-built tools via an OCI artifact image. GitHub-hosted macOS runners ignore the `container:` key, but on ephemerd it names the image whose layers are extracted onto the running VM:
 
 ```yaml
 jobs:
   build:
     runs-on: [self-hosted, macos]
-    env:
-      EPHEMERD_IMAGE: ghcr.io/your-org/macos-xcode16:latest
+    container:
+      image: ghcr.io/your-org/macos-xcode16:latest
     steps:
       - run: xcodebuild -version
 ```

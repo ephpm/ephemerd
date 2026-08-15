@@ -37,5 +37,5 @@ ephemerd logs --lines 50 -f
 | Platform | Command |
 |----------|---------|
 | Linux | `journalctl -u ephemerd -n <lines> --no-pager` (with `-f` for follow) |
-| macOS | `log show --predicate 'subsystem == "dev.ephpm.ephemerd"'` (or `log stream` with `--follow`) |
-| Windows | `wevtutil.exe qe Application` filtered to ephemerd provider |
+| macOS | Tails the launchd log file `/var/log/ephemerd.log` directly (reads the last N lines, then polls for new data when `--follow` is set) |
+| Windows | `Get-Content -Path <data-dir>\ephemerd.log -Tail <lines>` via PowerShell (adds `-Wait` for follow) |

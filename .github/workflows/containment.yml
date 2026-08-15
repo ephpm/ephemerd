@@ -1,0 +1,1154 @@
+name: Containment
+
+# Adversarial containment suite — Linux (amd64/arm64) and Windows.
+#
+# Every step asserts that something an attacker would want is NOT reachable
+# from inside a job. These are probes, not exploits: each one checks the door
+# is locked rather than walking through it. Each step counts its own failures
+# and exits non-zero, so the suite GATES — a red run means containment
+# regressed on real hardware.
+#
+# Why a workflow and not a Go test: pkg/runtime's hardening tests inspect the
+# OCI spec we ASK for. This suite runs inside a real runner on real hardware
+# and observes what the kernel ACTUALLY enforced. The two disagree exactly
+# when it matters — a profile that failed to load, a knob the daemon parsed
+# and ignored, a fleet node running an older build.
+#
+# Run it after every fleet uplift (`mayfly apply` to a new ephemerd version),
+# on every platform the fleet serves. A green run is the evidence that a
+# release's security changes reached the metal.
+#
+# ---------------------------------------------------------------------------
+# WINDOWS HAS TWO EGRESS MODES — declare which one the node runs
+# ---------------------------------------------------------------------------
+# Windows container egress is only filterable on the opt-in L2Bridge network
+# (network.l2bridge_egress), where per-endpoint VFP ACLs genuinely enforce. On
+# the DEFAULT WinNAT network no host-side mechanism can filter container
+# egress at all — ephemerd installs nothing and logs that egress is
+# unfiltered (see SECURITY.md and docs/guides/security.md). A blanket
+# "management planes must be unreachable" assertion is therefore WRONG on a
+# NAT node and RIGHT on an L2Bridge node.
+#
+# So the Windows job takes `windows_egress_mode`:
+#   nat       — egress + host-admin-port assertions are reported but NOT
+#               gated (they are known-unenforced by design). Isolation,
+#               internet, dind and breakout assertions still gate.
+#   l2bridge  — every egress + host-admin-port assertion gates.
+# The summary always states which mode was asserted, so a NAT run can never
+# read as a green egress sign-off, and can never read as a false red either.
+#
+# ---------------------------------------------------------------------------
+# CHECKS THAT ARE EXPECTED TO FAIL TODAY
+# ---------------------------------------------------------------------------
+# These are the regression net for isolation gaps currently being fixed. They
+# will be RED until the corresponding issue lands — that is correct, not a bug
+# in the suite. Each step prints a NOTE saying so.
+#   * "user namespace remapping"  -> issue #126 (container root IS host root)
+#   * "cgroup limits present"     -> issue #102 (no memory/pids limit)
+#   * "dind container confined"   -> issue #130 (dind gets no AppArmor profile)
+#
+# ---------------------------------------------------------------------------
+# Adding a check: assert the SAFE outcome and count a failure on the unsafe
+# one. Never leave a probe that only prints — a silent probe is a check nobody
+# is running. And never assert something the threat model does not actually
+# promise: a flaky or wrong assertion in a gating suite is worse than none.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      blocked_endpoints:
+        description: >-
+          Comma-separated host:port that MUST be unreachable from a job (your
+          management planes / LAN). The special host `gateway` resolves to the
+          container's default gateway on Linux.
+        required: false
+        default: "10.0.0.1:22,172.16.0.1:22,192.168.0.1:22,169.254.169.254:80"
+      windows_egress_mode:
+        description: >-
+          Egress mode of the Windows node under test. `nat` = default WinNAT
+          (egress is unfiltered by design; egress checks report but do not
+          gate). `l2bridge` = network.l2bridge_egress is enabled (egress
+          checks gate).
+        required: false
+        default: "nat"
+        type: choice
+        options:
+          - nat
+          - l2bridge
+  schedule:
+    # Weekly, so drift (host upgrade, kernel change, profile eviction) is
+    # caught even when nobody cuts a release. Scheduled runs use the defaults
+    # below — override them per fleet when dispatching by hand.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+# `github.event.inputs` is null on a scheduled run, so each value falls back to
+# its default. Defaults are RFC1918 / link-local representatives rather than
+# any real fleet's addresses — the suite must be useful to any operator and
+# must not bake in one person's network.
+env:
+  BLOCKED_ENDPOINTS: ${{ github.event.inputs.blocked_endpoints || '10.0.0.1:22,172.16.0.1:22,192.168.0.1:22,169.254.169.254:80' }}
+  WIN_EGRESS_MODE: ${{ github.event.inputs.windows_egress_mode || 'nat' }}
+
+jobs:
+  # =========================================================================
+  # LINUX — policy checks: the doors that must be locked.
+  # =========================================================================
+  linux:
+    name: Containment (linux ${{ matrix.arch }})
+    runs-on: [self-hosted, linux, "${{ matrix.arch }}"]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - name: Prepare check helpers
+        shell: bash
+        run: |
+          cat > "${RUNNER_TEMP:-/tmp}/chk.sh" <<'HELPER'
+          # Sourced by every check step in this job.
+          #
+          # errexit is deliberately OFF: a check script must run every probe and
+          # report a verdict for each, then exit non-zero once at the end.
+          set +e
+          set -u
+
+          fail=0
+
+          pass() { printf '  %-56s PASS  %s\n' "$1" "${2-}"; }
+          bad()  { printf '  %-56s FAIL  %s\n' "$1" "${2-}"; fail=$((fail + 1)); }
+          skip() { printf '  %-56s SKIP  %s\n' "$1" "${2-}"; }
+          info() { printf '  %-56s INFO  %s\n' "$1" "${2-}"; }
+
+          # finish <section>: print the tally and exit the step.
+          finish() {
+            echo
+            if [ "$fail" -eq 0 ]; then
+              echo "== $1: all checks passed"
+              exit 0
+            fi
+            echo "== $1: $fail FAILURE(S)"
+            exit 1
+          }
+
+          # TCP connect probe. 0 = connected, 1 = not connected, 2 = no tool.
+          # bash's /dev/tcp is preferred because it needs no extra package; note
+          # that plain `sh` on Debian is dash, which does NOT implement /dev/tcp
+          # and would make every "blocked" probe pass for the wrong reason.
+          if command -v timeout >/dev/null 2>&1 && command -v bash >/dev/null 2>&1; then
+            PROBE_KIND=bash
+          elif command -v nc >/dev/null 2>&1; then
+            PROBE_KIND=nc
+          else
+            PROBE_KIND=none
+          fi
+
+          probe() {
+            case "$PROBE_KIND" in
+              bash) timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" >/dev/null 2>&1 ;;
+              nc)   nc -z -w 4 "$1" "$2" >/dev/null 2>&1 ;;
+              *)    return 2 ;;
+            esac
+          }
+          HELPER
+          echo "helpers written to ${RUNNER_TEMP:-/tmp}/chk.sh"
+
+      - name: Capabilities — dangerous set must be absent
+        id: caps
+        if: always()
+        shell: bash
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== capabilities =="
+          # CapEff is the effective set actually granted by the kernel, not what
+          # the spec requested. Bit positions per capability(7).
+          eff=$(awk '/^CapEff/{print $2}' /proc/self/status)
+          info "CapEff" "$eff"
+          # name:bit — the escape primitives pkg/runtime/hardening_test.go bans.
+          for entry in SYS_ADMIN:21 SYS_MODULE:16 SYS_RAWIO:17 SYS_PTRACE:19 \
+                       NET_ADMIN:12 DAC_READ_SEARCH:2 MKNOD:27 SYS_BOOT:22 SYS_TIME:25; do
+            name=${entry%%:*}
+            bit=${entry##*:}
+            if [ $(( (0x$eff >> bit) & 1 )) -eq 1 ]; then
+              bad "CAP_$name not granted" "kernel granted it"
+            else
+              pass "CAP_$name not granted"
+            fi
+          done
+          finish "capabilities"
+
+      - name: Seccomp — filter must be active
+        id: seccomp
+        if: always()
+        shell: bash
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== seccomp =="
+          mode=$(awk '/^Seccomp:/{print $2}' /proc/self/status)
+          info "Seccomp mode" "$mode (2 = filter)"
+          if [ "$mode" = "2" ]; then
+            pass "seccomp filter active"
+          else
+            bad "seccomp filter active" "mode=$mode"
+          fi
+          finish "seccomp"
+
+      - name: AppArmor — profile must be applied
+        id: apparmor
+        if: always()
+        shell: bash
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== AppArmor =="
+          # ephemerd fails open by design (pkg/runtime/apparmor.go), so a host
+          # without AppArmor is a SKIP, not a PASS.
+          if [ ! -d /sys/kernel/security/apparmor ] && [ ! -e /sys/module/apparmor ]; then
+            skip "job container is AppArmor-confined" "host has no AppArmor"
+            finish "apparmor"
+          fi
+          cur=$(cat /proc/self/attr/current 2>/dev/null | tr -d '\000' | head -1)
+          case "${cur:-unknown}" in
+            unconfined*)
+              bad "job container is AppArmor-confined" "profile is unconfined" ;;
+            unknown|"")
+              skip "job container is AppArmor-confined" "cannot read /proc/self/attr/current" ;;
+            *)
+              pass "job container is AppArmor-confined" "$cur" ;;
+          esac
+          finish "apparmor"
+
+      - name: Host filesystem must not be reachable
+        id: hostfs
+        if: always()
+        shell: bash
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== host filesystem =="
+          # The host's ephemerd config carries a GitHub PAT and the cloudflared
+          # tunnel token. If a job can read it, the fleet is fully compromised —
+          # the single highest-value check in this suite.
+          for p in /var/lib/ephemerd/config.toml \
+                   /etc/ephemerd/config.toml \
+                   /etc/ephemerd/app.pem \
+                   /var/lib/ephemerd/containerd/containerd.sock; do
+            if [ -r "$p" ]; then
+              bad "not readable: $p" "READABLE from the job"
+            else
+              pass "not readable: $p"
+            fi
+          done
+          # /proc/1/root is only an escape if the PID namespace is SHARED with
+          # the host — then PID 1 is the host init and /proc/1/root is the host
+          # /. With a private PID namespace (the correct case) PID 1 is the
+          # container's own init and /proc/1/root is its own rootfs, which is
+          # traversable and harmless. So check what it POINTS AT, not whether it
+          # opens: a host marker visible through it means the namespace leaked.
+          if [ -e /proc/1/root/var/lib/ephemerd/config.toml ]; then
+            bad "host root not visible via /proc/1/root" "shared PID namespace"
+          else
+            pass "host root not visible via /proc/1/root"
+          fi
+          if mount | grep -qE ' on /(host|hostfs|mnt/host) '; then
+            bad "no obvious host bind mount" "host bind mount present"
+          else
+            pass "no obvious host bind mount"
+          fi
+          finish "host filesystem"
+
+      - name: /proc and /sys must not be writable
+        id: procsys
+        if: always()
+        shell: bash
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== /proc and /sys =="
+          # A writable /proc/sys is a direct host-config write. A writable
+          # cgroup tree is the classic release_agent escape.
+          for p in /proc/sys/kernel/hostname /proc/sysrq-trigger \
+                   /sys/kernel/uevent_helper /sys/fs/cgroup/release_agent; do
+            if [ -w "$p" ]; then
+              bad "not writable: $p" "WRITABLE"
+            else
+              pass "not writable: $p"
+            fi
+          done
+          if (echo test > /proc/sys/kernel/hostname) 2>/dev/null; then
+            bad "write to /proc/sys/kernel/hostname refused" "the write succeeded"
+          else
+            pass "write to /proc/sys/kernel/hostname refused"
+          fi
+          finish "/proc and /sys"
+
+      - name: Device access must be denied
+        id: devices
+        if: always()
+        shell: bash
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== devices =="
+          # Raw disk or kernel memory = read the host's secrets directly.
+          for d in /dev/mem /dev/kmem /dev/sda /dev/nvme0n1 /dev/kvm; do
+            if [ -r "$d" ]; then
+              bad "not readable: $d" "READABLE"
+            else
+              pass "not readable: $d"
+            fi
+          done
+          # CAP_MKNOD is denied, so creating a block device must fail too.
+          t="${RUNNER_TEMP:-/tmp}/probe-blk"
+          rm -f "$t"
+          if mknod "$t" b 8 0 2>/dev/null; then
+            bad "mknod refused" "created a block device"
+            rm -f "$t"
+          else
+            pass "mknod refused"
+          fi
+          finish "devices"
+
+      - name: User namespace must remap container root (guards #126)
+        id: userns
+        if: always()
+        shell: bash
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== user namespace remapping =="
+          echo "  NOTE: EXPECTED TO FAIL until issue #126 lands. Job containers"
+          echo "        currently share the host user namespace, so uid 0 inside"
+          echo "        the container is uid 0 on the host: any file the"
+          echo "        container escapes to is written as real root."
+          if [ ! -r /proc/self/uid_map ]; then
+            skip "container uid 0 maps to a non-root host uid" "no /proc/self/uid_map"
+            finish "user namespace"
+          fi
+          info "uid_map" "$(tr -s ' ' < /proc/self/uid_map | tr '\n' ';')"
+          info "gid_map" "$(tr -s ' ' < /proc/self/gid_map 2>/dev/null | tr '\n' ';')"
+          # An unremapped container has the identity map "0 0 4294967295".
+          uin=$(awk 'NR==1{print $1}' /proc/self/uid_map)
+          uout=$(awk 'NR==1{print $2}' /proc/self/uid_map)
+          ucnt=$(awk 'NR==1{print $3}' /proc/self/uid_map)
+          if [ "${uin:-}" = "0" ] && [ "${uout:-}" = "0" ]; then
+            bad "container uid 0 maps to a non-root host uid" \
+                "identity map 0->0 count=${ucnt:-?}: container root IS host root"
+          else
+            pass "container uid 0 maps to a non-root host uid" \
+                 "${uin:-?}->${uout:-?} count=${ucnt:-?}"
+          fi
+          gin=$(awk 'NR==1{print $1}' /proc/self/gid_map 2>/dev/null)
+          gout=$(awk 'NR==1{print $2}' /proc/self/gid_map 2>/dev/null)
+          if [ -z "${gin:-}" ]; then
+            skip "container gid 0 maps to a non-root host gid" "no /proc/self/gid_map"
+          elif [ "$gin" = "0" ] && [ "${gout:-}" = "0" ]; then
+            bad "container gid 0 maps to a non-root host gid" "identity map 0->0"
+          else
+            pass "container gid 0 maps to a non-root host gid" "${gin}->${gout:-?}"
+          fi
+          finish "user namespace"
+
+      - name: cgroup limits must be applied (guards #102)
+        id: cgroups
+        if: always()
+        shell: bash
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== cgroup limits =="
+          echo "  NOTE: EXPECTED TO FAIL until issue #102 lands. Linux job"
+          echo "        containers currently run with no memory or pids limit,"
+          echo "        so a runaway job invites the host OOM killer to take the"
+          echo "        runner listener (and the logs) with it."
+          # Inside a cgroup namespace /sys/fs/cgroup is the container's OWN
+          # cgroup root. Without one it is the host root, where the limit files
+          # always read "max" — so also try the path from /proc/self/cgroup
+          # before concluding "no limit", and prefer any real value found.
+          rel=$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup 2>/dev/null | head -1)
+          info "cgroup path" "${rel:-<v1 or unavailable>}"
+
+          limit_value() {
+            best=""
+            for d in /sys/fs/cgroup "/sys/fs/cgroup${rel:-}"; do
+              [ -f "$d/$1" ] || continue
+              v=$(cat "$d/$1" 2>/dev/null)
+              [ -n "${v:-}" ] || continue
+              if [ "$v" != "max" ]; then
+                printf '%s\n' "$v"
+                return 0
+              fi
+              best="$v"
+            done
+            [ -n "$best" ] || return 1
+            printf '%s\n' "$best"
+          }
+
+          if [ -f /sys/fs/cgroup/cgroup.controllers ] || [ -f /sys/fs/cgroup/memory.max ]; then
+            info "cgroup version" "v2"
+            mem=$(limit_value memory.max)
+            pids=$(limit_value pids.max)
+          else
+            info "cgroup version" "v1"
+            mem=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)
+            pids=$(cat /sys/fs/cgroup/pids/pids.max 2>/dev/null)
+            # v1 spells "unlimited" as a huge sentinel rather than "max".
+            case "${mem:-}" in
+              9223372036854771712|18446744073709551615) mem=max ;;
+            esac
+          fi
+
+          if [ -z "${mem:-}" ]; then
+            skip "memory limit applied" "no readable memory limit file"
+          elif [ "$mem" = "max" ]; then
+            bad "memory limit applied" "memory is unlimited"
+          else
+            pass "memory limit applied" "$mem bytes"
+          fi
+
+          if [ -z "${pids:-}" ]; then
+            skip "pids limit applied" "no readable pids limit file"
+          elif [ "$pids" = "max" ]; then
+            bad "pids limit applied" "pids are unlimited (fork bomb takes the host)"
+          else
+            pass "pids limit applied" "$pids"
+          fi
+          finish "cgroup limits"
+
+      - name: Runner working set must not be writable
+        id: runnerfs
+        if: always()
+        shell: bash
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== runner working set =="
+          # The runner binary is a read-only mount; a writable one lets a job
+          # persist into the next job's runner (JIT runners are single-use, but
+          # the mount is shared from the host image).
+          if [ ! -d /actions-runner ]; then
+            skip "/actions-runner is read-only" "no /actions-runner mount"
+            finish "runner working set"
+          fi
+          if touch /actions-runner/.containment-probe 2>/dev/null; then
+            bad "/actions-runner is read-only" "WRITABLE"
+            rm -f /actions-runner/.containment-probe
+          else
+            pass "/actions-runner is read-only"
+          fi
+          finish "runner working set"
+
+      - name: Management planes must be unreachable
+        id: egress
+        if: always()
+        shell: bash
+        env:
+          BLOCKED: ${{ env.BLOCKED_ENDPOINTS }}
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== egress: management planes =="
+          # ephemerd's Linux firewall REJECTs container -> RFC1918 and
+          # link-local in the FORWARD chain (pkg/networking/firewall_linux.go).
+          # Targets come from the `blocked_endpoints` input so this suite does
+          # not bake in one fleet's addresses.
+          info "probe mechanism" "$PROBE_KIND"
+          if [ "$PROBE_KIND" = "none" ]; then
+            skip "management planes unreachable" "no TCP probe tool (bash+timeout or nc)"
+            finish "egress"
+          fi
+
+          gw=$(ip route 2>/dev/null | awk '/^default/{print $3; exit}')
+          info "default gateway" "${gw:-unknown}"
+
+          : "${BLOCKED:=}"
+          old_ifs=$IFS
+          IFS=','
+          set -- $BLOCKED
+          IFS=$old_ifs
+
+          for ep in "$@"; do
+            ep=$(printf '%s' "$ep" | tr -d '[:space:]')
+            [ -n "$ep" ] || continue
+            case "$ep" in
+              *:*) ;;
+              *) info "malformed endpoint" "$ep (want host:port)"; continue ;;
+            esac
+            h=${ep%:*}
+            p=${ep##*:}
+            # `gateway:<port>` targets the container's own default gateway —
+            # useful for the ephemerd control-plane ports on the VM sidecar,
+            # which are DROPped by a targeted INPUT rule.
+            if [ "$h" = "gateway" ]; then
+              if [ -z "${gw:-}" ]; then
+                skip "blocked gateway:$p" "no default gateway found"
+                continue
+              fi
+              h=$gw
+            fi
+            probe "$h" "$p"
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
+              bad "blocked $h:$p" "REACHABLE from the job"
+            elif [ "$rc" -eq 2 ]; then
+              skip "blocked $h:$p" "no probe mechanism"
+            else
+              pass "blocked $h:$p"
+            fi
+          done
+          finish "egress"
+
+      - name: The internet must still be reachable
+        id: internet
+        if: always()
+        shell: bash
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== internet =="
+          # The egress deny must be TARGETED. If this fails, the block is
+          # over-broad (a default-deny that ate the default route) rather than
+          # an RFC1918 deny — jobs still need GitHub, registries and mirrors.
+          # This doubles as the self-test for the probe used by the egress step
+          # above: if no positive control connects, the "blocked" results there
+          # cannot be trusted.
+          if [ "$PROBE_KIND" = "none" ]; then
+            skip "internet reachable" "no TCP probe tool (bash+timeout or nc)"
+            finish "internet"
+          fi
+          if probe 1.1.1.1 443; then
+            pass "internet reachable" "1.1.1.1:443"
+          elif probe github.com 443; then
+            pass "internet reachable" "github.com:443 (DNS also working)"
+          else
+            bad "internet reachable" "neither 1.1.1.1:443 nor github.com:443 connected"
+          fi
+          finish "internet"
+
+      - name: dind containment (privileged, bind mounts, confinement)
+        id: dind
+        if: always()
+        shell: bash
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== dind =="
+          if ! command -v docker >/dev/null 2>&1; then
+            skip "dind containment" "no docker client in this job"
+            finish "dind"
+          fi
+          if ! docker version >/dev/null 2>&1; then
+            skip "dind containment" "docker client present but no daemon reachable"
+            finish "dind"
+          fi
+          info "docker server" "$(docker info --format '{{.ServerVersion}}' 2>/dev/null || echo unknown)"
+
+          # dind.allow_privileged is off fleet-wide. If this ever succeeds, a
+          # job can trivially escape via a privileged sibling.
+          if docker run --rm --privileged busybox true >/dev/null 2>&1; then
+            bad "privileged container refused" "a privileged sibling started"
+          else
+            pass "privileged container refused"
+          fi
+
+          # pkg/dind/bindtranslate rewrites job-relative bind sources. A naive
+          # shim would hand the sibling container the real host /.
+          if docker run --rm -v /:/hostroot busybox \
+               sh -c 'cat /hostroot/var/lib/ephemerd/config.toml' >/dev/null 2>&1; then
+            bad "host root not exposed via bind mount" "read the host ephemerd config"
+          else
+            pass "host root not exposed via bind mount"
+          fi
+
+          # Guards issue #130: a dind-spawned sibling must inherit confinement.
+          echo "  NOTE: the confinement check below is EXPECTED TO FAIL until"
+          echo "        issue #130 lands — dind containers get no AppArmor profile."
+          if [ ! -d /sys/kernel/security/apparmor ] && [ ! -e /sys/module/apparmor ]; then
+            skip "dind sibling is AppArmor-confined" "host has no AppArmor"
+          else
+            prof=$(docker run --rm busybox cat /proc/self/attr/current 2>/dev/null | tr -d '\000' | head -1)
+            case "${prof:-}" in
+              "")          skip "dind sibling is AppArmor-confined" "could not read the sibling's profile" ;;
+              unconfined*) bad  "dind sibling is AppArmor-confined" "sibling is $prof" ;;
+              *)           pass "dind sibling is AppArmor-confined" "$prof" ;;
+            esac
+          fi
+          finish "dind"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          fail=0
+          row() {
+            printf '  %-46s %s\n' "$1" "$2"
+            if [ "$2" = "failure" ]; then fail=$((fail + 1)); fi
+          }
+          echo "=== Linux containment summary (${{ matrix.arch }}) ==="
+          row "capabilities"                 "${{ steps.caps.outcome }}"
+          row "seccomp"                      "${{ steps.seccomp.outcome }}"
+          row "apparmor"                     "${{ steps.apparmor.outcome }}"
+          row "host filesystem"              "${{ steps.hostfs.outcome }}"
+          row "/proc and /sys"               "${{ steps.procsys.outcome }}"
+          row "devices"                      "${{ steps.devices.outcome }}"
+          row "user namespace (#126)"        "${{ steps.userns.outcome }}"
+          row "cgroup limits (#102)"         "${{ steps.cgroups.outcome }}"
+          row "runner working set"           "${{ steps.runnerfs.outcome }}"
+          row "egress / management planes"   "${{ steps.egress.outcome }}"
+          row "internet reachable"           "${{ steps.internet.outcome }}"
+          row "dind containment (#130)"      "${{ steps.dind.outcome }}"
+          echo
+          if [ "$fail" -eq 0 ]; then
+            echo "ALL LINUX CONTAINMENT CHECKS PASSED (${{ matrix.arch }})"
+          else
+            echo "LINUX CONTAINMENT FAILURES: $fail (${{ matrix.arch }})"
+            exit 1
+          fi
+
+  # =========================================================================
+  # LINUX — active breakout attempts.
+  #
+  # Where the `linux` job checks doors are locked, this job walks up and
+  # rattles the handles: each step tries a concrete escape technique and fails
+  # if the technique WORKS. Kept a separate job so a regression here reads as
+  # "an escape opened up" rather than "a policy check drifted".
+  # =========================================================================
+  breakout:
+    name: Breakout attempts (linux ${{ matrix.arch }})
+    runs-on: [self-hosted, linux, "${{ matrix.arch }}"]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - name: Prepare check helpers
+        shell: bash
+        run: |
+          cat > "${RUNNER_TEMP:-/tmp}/chk.sh" <<'HELPER'
+          set +e
+          set -u
+
+          fail=0
+
+          pass() { printf '  %-56s PASS  %s\n' "$1" "${2-}"; }
+          bad()  { printf '  %-56s FAIL  %s\n' "$1" "${2-}"; fail=$((fail + 1)); }
+          skip() { printf '  %-56s SKIP  %s\n' "$1" "${2-}"; }
+          info() { printf '  %-56s INFO  %s\n' "$1" "${2-}"; }
+
+          finish() {
+            echo
+            if [ "$fail" -eq 0 ]; then
+              echo "== $1: all checks passed"
+              exit 0
+            fi
+            echo "== $1: $fail FAILURE(S)"
+            exit 1
+          }
+          HELPER
+          echo "helpers written to ${RUNNER_TEMP:-/tmp}/chk.sh"
+
+      - name: NoNewPrivileges — a setuid binary must not escalate (#128)
+        id: nnp
+        if: always()
+        shell: bash
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== no_new_privs =="
+          # #128 sets no_new_privs. With it, executing a setuid-root binary
+          # gains NO privileges — the classic in-container privilege step-up is
+          # dead. Prove it: build a setuid-root helper that reports its euid,
+          # run it as an unprivileged user, and require euid to stay non-zero.
+          if ! command -v gcc >/dev/null 2>&1; then
+            skip "setuid-root binary does not reach euid 0" "no compiler"
+            finish "no_new_privs"
+          fi
+          if [ "$(id -u)" != "0" ]; then
+            skip "setuid-root binary does not reach euid 0" "not uid 0; cannot stage a setuid file"
+            finish "no_new_privs"
+          fi
+          d=$(mktemp -d "${RUNNER_TEMP:-/tmp}/nnp.XXXXXX") || d=""
+          if [ -z "$d" ]; then
+            skip "setuid-root binary does not reach euid 0" "mktemp failed"
+            finish "no_new_privs"
+          fi
+          # A nosuid mount would strip the setuid bit for reasons unrelated to
+          # no_new_privs, which would make this pass for the wrong reason.
+          if command -v findmnt >/dev/null 2>&1; then
+            opts=$(findmnt -no OPTIONS --target "$d" 2>/dev/null)
+            info "mount options for $d" "${opts:-unknown}"
+            case "${opts:-}" in
+              *nosuid*)
+                skip "setuid-root binary does not reach euid 0" "staging dir is nosuid; result would be meaningless"
+                finish "no_new_privs" ;;
+            esac
+          fi
+          cat > "$d/euid.c" <<'EOF'
+          #include <stdio.h>
+          #include <unistd.h>
+          int main(void) { printf("%d\n", (int)geteuid()); return 0; }
+          EOF
+          if ! gcc -o "$d/euid" "$d/euid.c" >/dev/null 2>&1; then
+            skip "setuid-root binary does not reach euid 0" "compile failed"
+            finish "no_new_privs"
+          fi
+          chown 0:0 "$d/euid" 2>/dev/null
+          chmod 4755 "$d/euid" 2>/dev/null
+          chmod 755 "$d" 2>/dev/null
+          if ! id nnpprobe >/dev/null 2>&1; then
+            useradd -M -s /bin/sh nnpprobe >/dev/null 2>&1
+          fi
+          if ! id nnpprobe >/dev/null 2>&1; then
+            skip "setuid-root binary does not reach euid 0" "cannot create an unprivileged user"
+            finish "no_new_privs"
+          fi
+          got=$(su nnpprobe -s /bin/sh -c "$d/euid" 2>/dev/null)
+          rc=$?
+          info "setuid helper reported euid" "${got:-<none>} (rc=$rc)"
+          if [ "$rc" -ne 0 ] || [ -z "${got:-}" ]; then
+            # An inconclusive run must never read as a pass.
+            skip "setuid-root binary does not reach euid 0" "helper did not run as the unprivileged user"
+          elif [ "$got" = "0" ]; then
+            bad "setuid-root binary does not reach euid 0" "escalated: no_new_privs is not enforced"
+          else
+            pass "setuid-root binary does not reach euid 0" "euid=$got"
+          fi
+          finish "no_new_privs"
+
+      - name: Confinement must actually deny mounts and kernel-tunable writes
+        id: aadeny
+        if: always()
+        shell: bash
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== confinement actually denies =="
+          # Note the honest framing: CAP_SYS_ADMIN is already dropped, so a
+          # refused mount(2) is not proof AppArmor did the refusing. What this
+          # asserts is the outcome that matters — the primitive is unavailable —
+          # and it reports the attached profile so a regression is diagnosable.
+          if [ ! -e /sys/module/apparmor ] && [ ! -d /sys/kernel/security/apparmor ]; then
+            info "AppArmor" "host has no AppArmor; asserting the outcome only"
+          else
+            prof=$(cat /proc/self/attr/current 2>/dev/null | tr -d '\000' | head -1)
+            info "attached profile" "${prof:-unknown}"
+          fi
+          m=$(mktemp -d "${RUNNER_TEMP:-/tmp}/mnt.XXXXXX") || m=""
+          if [ -z "$m" ]; then
+            skip "raw mount(2) refused" "mktemp failed"
+          elif mount -t tmpfs none "$m" 2>/dev/null; then
+            bad "raw mount(2) refused" "mounted a tmpfs at $m"
+            umount "$m" 2>/dev/null
+          else
+            pass "raw mount(2) refused"
+          fi
+          if (echo c > /proc/sysrq-trigger) 2>/dev/null; then
+            bad "write to /proc/sysrq-trigger refused" "the write succeeded"
+          else
+            pass "write to /proc/sysrq-trigger refused"
+          fi
+          finish "confinement denies"
+
+      - name: cgroup release_agent escape must be impossible
+        id: releaseagent
+        if: always()
+        shell: bash
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== cgroup release_agent =="
+          # The canonical container escape: write a host path into a cgroup's
+          # release_agent, then trip an empty-cgroup notification to run it on
+          # the host. Every prerequisite must be missing.
+          found=0
+          for ra in /sys/fs/cgroup/release_agent \
+                    /sys/fs/cgroup/*/release_agent \
+                    /sys/fs/cgroup/memory/release_agent; do
+            [ -e "$ra" ] || continue
+            found=1
+            if (echo /tmp/x > "$ra") 2>/dev/null; then
+              bad "release_agent not writable: $ra" "WROTE it"
+            else
+              pass "release_agent not writable: $ra"
+            fi
+          done
+          if [ "$found" -eq 0 ]; then
+            pass "no release_agent file exists at all"
+          fi
+          # Even mounting a fresh cgroup hierarchy to obtain a writable
+          # release_agent must fail (needs CAP_SYS_ADMIN and no LSM block).
+          d=$(mktemp -d "${RUNNER_TEMP:-/tmp}/cg.XXXXXX") || d=""
+          if [ -z "$d" ]; then
+            skip "cannot mount a fresh cgroup hierarchy" "mktemp failed"
+          elif mount -t cgroup -o rdma cgroup "$d" 2>/dev/null; then
+            bad "cannot mount a fresh cgroup hierarchy" "mounted one at $d"
+            umount "$d" 2>/dev/null
+          else
+            pass "cannot mount a fresh cgroup hierarchy"
+          fi
+          finish "release_agent"
+
+      - name: core_pattern host-code-exec escape must be blocked
+        id: corepattern
+        if: always()
+        shell: bash
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== core_pattern =="
+          # Writing "|/host/binary" to core_pattern makes the kernel run that
+          # binary (on the host) on the next crash. /proc/sys must be read-only.
+          if (echo '|/tmp/pwn' > /proc/sys/kernel/core_pattern) 2>/dev/null; then
+            bad "core_pattern not writable" "WROTE it"
+          else
+            pass "core_pattern not writable"
+          fi
+          if (echo '|/tmp/pwn' > /proc/sys/kernel/modprobe) 2>/dev/null; then
+            bad "modprobe path not writable" "WROTE it"
+          else
+            pass "modprobe path not writable"
+          fi
+          finish "core_pattern"
+
+      - name: Regaining capabilities via a new user namespace must fail
+        id: usernscap
+        if: always()
+        shell: bash
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== user namespace capability regain =="
+          # `unshare -Ur` creates a userns where the caller is "root" with a
+          # full capability set INSIDE that namespace — the modern path to
+          # CAP_SYS_ADMIN for mount-based escapes. seccomp / AppArmor / sysctl
+          # should stop it, or stop what it enables. unshare being blocked
+          # outright is the strongest outcome.
+          if ! command -v unshare >/dev/null 2>&1; then
+            skip "user namespace does not yield a usable mount" "no unshare(1)"
+            finish "userns capability regain"
+          fi
+          out=$(unshare -Urm --propagation private sh -c 'mount -t tmpfs none /mnt && echo MOUNTED' 2>&1)
+          info "unshare output" "$(printf '%s' "$out" | head -1)"
+          if printf '%s' "$out" | grep -q MOUNTED; then
+            bad "user namespace does not yield a usable mount" "CAP_SYS_ADMIN regained"
+          else
+            pass "user namespace does not yield a usable mount"
+          fi
+          finish "userns capability regain"
+
+      - name: Kernel log and message ring must not leak the host
+        id: kmsg
+        if: always()
+        shell: bash
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== kernel log =="
+          # dmesg / kmsg leak host kernel addresses and activity across the
+          # tenancy boundary; both need CAP_SYSLOG, which is denied.
+          if dd if=/dev/kmsg bs=1 count=1 >/dev/null 2>&1; then
+            bad "/dev/kmsg not readable" "READABLE"
+          else
+            pass "/dev/kmsg not readable"
+          fi
+          if command -v dmesg >/dev/null 2>&1; then
+            if dmesg >/dev/null 2>&1; then
+              bad "dmesg not readable" "READABLE"
+            else
+              pass "dmesg not readable"
+            fi
+          else
+            skip "dmesg not readable" "no dmesg(1)"
+          fi
+          finish "kernel log"
+
+      - name: The containerd socket must not be reachable from a job
+        id: ctrsock
+        if: always()
+        shell: bash
+        run: |
+          . "${RUNNER_TEMP:-/tmp}/chk.sh"
+          echo "== containerd socket =="
+          # Direct access to containerd's socket is game over — a job could
+          # create a privileged container next to itself. It lives in the
+          # ephemerd data dir on the host, which must not be bind-mounted in.
+          #
+          # NOT asserted here: /var/run/docker.sock. ephemerd deliberately
+          # bind-mounts the PER-JOB dind socket there (pkg/dind/dind.go), so its
+          # presence is correct, not a leak. What that socket exposes is covered
+          # by the dind containment checks in the `linux` job instead.
+          for s in /run/containerd/containerd.sock \
+                   /var/lib/ephemerd/containerd/containerd.sock \
+                   /run/ephemerd/containerd.sock; do
+            if [ -S "$s" ]; then
+              bad "socket absent: $s" "PRESENT in the job"
+            else
+              pass "socket absent: $s"
+            fi
+          done
+          finish "containerd socket"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          fail=0
+          row() {
+            printf '  %-46s %s\n' "$1" "$2"
+            if [ "$2" = "failure" ]; then fail=$((fail + 1)); fi
+          }
+          echo "=== Linux breakout summary (${{ matrix.arch }}) ==="
+          row "no_new_privs / setuid (#128)"  "${{ steps.nnp.outcome }}"
+          row "confinement denies"            "${{ steps.aadeny.outcome }}"
+          row "cgroup release_agent"          "${{ steps.releaseagent.outcome }}"
+          row "core_pattern / modprobe"       "${{ steps.corepattern.outcome }}"
+          row "userns capability regain"      "${{ steps.usernscap.outcome }}"
+          row "kernel log leak"               "${{ steps.kmsg.outcome }}"
+          row "containerd socket"             "${{ steps.ctrsock.outcome }}"
+          echo
+          if [ "$fail" -eq 0 ]; then
+            echo "ALL LINUX BREAKOUT ATTEMPTS FAILED AS THEY SHOULD (${{ matrix.arch }})"
+          else
+            echo "LINUX BREAKOUT FAILURES: $fail (${{ matrix.arch }})"
+            exit 1
+          fi
+
+  # =========================================================================
+  # WINDOWS
+  #
+  # Isolation, internet and dind assertions gate in BOTH egress modes.
+  # Egress and host-admin-port assertions gate only when the node is declared
+  # `l2bridge`: on WinNAT there is no host-side mechanism that can filter
+  # container egress, so failing there would be a false red, and passing
+  # there would be a false green.
+  # =========================================================================
+  windows:
+    name: Containment (windows x64)
+    runs-on: [self-hosted, windows, x64]
+    steps:
+      - name: Declared mode and identity
+        id: identity
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $mode = "$env:WIN_EGRESS_MODE"
+          Write-Output "=== declared windows_egress_mode: $mode ==="
+          if ($mode -eq 'l2bridge') {
+            Write-Output '  L2Bridge declared: egress and host-admin-port assertions WILL GATE.'
+          } elseif ($mode -eq 'nat') {
+            Write-Output '  NAT declared: egress and host-admin-port assertions are REPORTED BUT NOT GATED.'
+            Write-Output '  WinNAT container egress cannot be filtered by any host-side mechanism;'
+            Write-Output '  ephemerd installs nothing there and logs that egress is unfiltered.'
+            Write-Output '  Set network.l2bridge_egress on the node to make these enforceable.'
+          } else {
+            Write-Output "FAIL: unknown windows_egress_mode '$mode' (want 'nat' or 'l2bridge')"
+            exit 1
+          }
+
+          Write-Output ''
+          Write-Output '=== identity ==='
+          Write-Output "  whoami: $(whoami)"
+          Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -notlike '127.*' } |
+            ForEach-Object { Write-Output "  ip: $($_.IPAddress)/$($_.PrefixLength) on $($_.InterfaceAlias)" }
+          $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+                 Select-Object -First 1).NextHop
+          Write-Output "  default gateway: $gw"
+          $hostip = ''
+          if ($env:DOCKER_HOST) { $hostip = ($env:DOCKER_HOST -replace 'tcp://','' -split ':')[0] }
+          Write-Output "  DOCKER_HOST: $env:DOCKER_HOST  (host ip: $hostip)"
+
+      - name: Hyper-V isolation must hold
+        id: isolation
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $global:fail = 0
+          function Ok($l, $d)     { '  {0,-52} PASS  {1}' -f $l, $d }
+          function Bad($l, $d)    { $global:fail++; '  {0,-52} FAIL  {1}' -f $l, $d }
+          function Skip($l, $d)   { '  {0,-52} SKIP  {1}' -f $l, $d }
+          function Info($l, $d)   { '  {0,-52} INFO  {1}' -f $l, $d }
+          function Result($l, $ok, $d) { if ($ok) { Ok $l $d } else { Bad $l $d } }
+
+          Write-Output '=== Hyper-V isolation / breakout boundary ==='
+          # Windows jobs run in Hyper-V-isolated containers, the platform's
+          # equivalent of a VM boundary. Process isolation would share the host
+          # kernel — the thing we pay for isolation to avoid.
+          $cs   = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+          $bios = Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue
+          Info 'Win32_ComputerSystem' "$($cs.Manufacturer) / $($cs.Model)"
+          Info 'Win32_BIOS'           "$($bios.Manufacturer) $($bios.SMBIOSBIOSVersion)"
+          $virt = ($cs.Model -match 'Virtual') -or ($bios.Manufacturer -match 'Microsoft')
+          Result 'job runs on virtualized firmware' $virt ''
+
+          # The host's ephemerd config carries the same PAT and tunnel token as
+          # the Linux nodes.
+          foreach ($p in @('C:\ProgramData\ephemerd\config.toml',
+                           'C:\ProgramData\ephemerd\app.pem',
+                           'C:\Program Files\ephemerd\ephemerd.exe')) {
+            Result "host path not reachable: $p" (-not (Test-Path -LiteralPath $p)) ''
+          }
+
+          # A precise process-table check: the daemon runs on the HOST, so
+          # seeing it here means the process table is shared. The raw count is
+          # reported for diagnosis but is not asserted — it is a heuristic.
+          $ep = Get-Process -Name 'ephemerd' -ErrorAction SilentlyContinue
+          Result 'ephemerd daemon process not visible' (-not $ep) ''
+          Info 'process count' "$((Get-Process | Measure-Object).Count)"
+
+          Result 'no host containerd named pipe' (-not (Test-Path '\\.\pipe\ephemerd-containerd')) ''
+          $hns = $false
+          try { $hns = [bool](Get-HnsNetwork -ErrorAction SilentlyContinue) } catch { $hns = $false }
+          Result 'cannot enumerate host HNS networks' (-not $hns) ''
+
+          Write-Output ''
+          if ($global:fail -eq 0) { Write-Output '== isolation: all checks passed' }
+          else { Write-Output "== isolation: $global:fail FAILURE(S)"; exit 1 }
+
+      - name: Internet, DNS and dind must still work
+        id: network
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $global:fail = 0
+          function Ok($l, $d)     { '  {0,-52} PASS  {1}' -f $l, $d }
+          function Bad($l, $d)    { $global:fail++; '  {0,-52} FAIL  {1}' -f $l, $d }
+          function Skip($l, $d)   { '  {0,-52} SKIP  {1}' -f $l, $d }
+          function Result($l, $ok, $d) { if ($ok) { Ok $l $d } else { Bad $l $d } }
+          function Probe($ip, $port) {
+            try {
+              $c = New-Object System.Net.Sockets.TcpClient
+              $ok = $c.ConnectAsync($ip, [int]$port).Wait(4000) -and $c.Connected
+              $c.Close()
+              return $ok
+            } catch { return $false }
+          }
+
+          Write-Output '=== internet (must work in BOTH egress modes) ==='
+          # An egress policy that cuts the job off the internet is a broken
+          # policy, not a contained one. This is also the positive control for
+          # the probe used by the egress step.
+          Result 'Cloudflare 1.1.1.1:443 reachable' (Probe '1.1.1.1' 443) ''
+          $dns = $false
+          try { $dns = [bool](Resolve-DnsName example.com -Type A -ErrorAction Stop) } catch { $dns = $false }
+          Result 'DNS resolves example.com' $dns ''
+          $web = $false
+          try { $web = (Invoke-WebRequest https://example.com -UseBasicParsing -TimeoutSec 20).StatusCode -eq 200 } catch { $web = $false }
+          Result 'HTTPS GET example.com = 200' $web ''
+
+          Write-Output ''
+          Write-Output '=== dind ==='
+          if (-not $env:DOCKER_HOST) {
+            Skip 'dind reachable' 'no DOCKER_HOST; dind disabled on this node'
+          } else {
+            $hostip   = ($env:DOCKER_HOST -replace 'tcp://','' -split ':')[0]
+            $dindPort = [int](($env:DOCKER_HOST -split ':')[-1])
+            Result "dind port $dindPort reachable on $hostip" (Probe $hostip $dindPort) ''
+            docker version | Out-Null
+            Result 'docker version succeeds' ($LASTEXITCODE -eq 0) ''
+            docker info | Out-Null
+            Result 'docker info succeeds' ($LASTEXITCODE -eq 0) ''
+          }
+
+          Write-Output ''
+          if ($global:fail -eq 0) { Write-Output '== network: all checks passed' }
+          else { Write-Output "== network: $global:fail FAILURE(S)"; exit 1 }
+
+      - name: Egress and host admin ports (gates only on L2Bridge)
+        id: egress
+        if: always()
+        shell: powershell
+        env:
+          BLOCKED: ${{ env.BLOCKED_ENDPOINTS }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $global:fail = 0
+          $global:enforce = ("$env:WIN_EGRESS_MODE" -eq 'l2bridge')
+          function Ok($l, $d)   { '  {0,-52} PASS  {1}' -f $l, $d }
+          function Bad($l, $d)  { $global:fail++; '  {0,-52} FAIL  {1}' -f $l, $d }
+          function Skip($l, $d) { '  {0,-52} SKIP  {1}' -f $l, $d }
+          function Probe($ip, $port) {
+            try {
+              $c = New-Object System.Net.Sockets.TcpClient
+              $ok = $c.ConnectAsync($ip, [int]$port).Wait(4000) -and $c.Connected
+              $c.Close()
+              return $ok
+            } catch { return $false }
+          }
+          # Gate only when the node was declared L2Bridge. On NAT the same probe
+          # still runs and its real result is printed, but it cannot pass or
+          # fail the suite — there is nothing on that stack that could enforce.
+          function Gate($l, $ok, $d) {
+            if ($global:enforce) {
+              if ($ok) { Ok $l $d } else { Bad $l $d }
+            } elseif ($ok) {
+              Skip $l 'blocked, but NOT ASSERTED (NAT mode)'
+            } else {
+              Skip $l 'REACHABLE - expected on NAT (egress unfiltered by design); enable network.l2bridge_egress'
+            }
+          }
+
+          if ($global:enforce) {
+            Write-Output '=== egress: GATING (node declared l2bridge) ==='
+          } else {
+            Write-Output '=== egress: REPORT ONLY (node declared nat) ==='
+          }
+
+          foreach ($ep in ("$env:BLOCKED" -split ',')) {
+            $ep = $ep.Trim()
+            if (-not $ep -or ($ep -notmatch ':')) { continue }
+            $parts = $ep -split ':', 2
+            $h = $parts[0]
+            $p = $parts[1]
+            Gate "blocked $h`:$p" (-not (Probe $h $p)) ''
+          }
+
+          Write-Output ''
+          Write-Output '=== host admin ports (host RCE surface) ==='
+          # A real pen test from inside a Windows job reached the host's WinRM
+          # (5985) and RPC endpoint mapper (135): the VFP host /32 allow that
+          # makes dind reachable cannot be port-scoped, so port precision falls
+          # to the host firewall, and a stock host ambiently permits those
+          # inbound from the LAN. ephemerd now installs scoped inbound BLOCK
+          # rules for this set as part of the L2Bridge backstop
+          # (pkg/networking/firewall_windows.go). Same mode rule applies: on NAT
+          # no such backstop exists, so this reports rather than gates.
+          if (-not $env:DOCKER_HOST) {
+            Skip 'host admin ports blocked' 'no DOCKER_HOST; cannot locate the host'
+          } else {
+            $hostip = ($env:DOCKER_HOST -replace 'tcp://','' -split ':')[0]
+            foreach ($ap in @(135, 139, 445, 3389, 5985, 5986, 47001)) {
+              Gate "host admin port $ap blocked on $hostip" (-not (Probe $hostip $ap)) ''
+            }
+          }
+
+          Write-Output ''
+          # Residual, documented and NOT asserted: the RPC dynamic range
+          # (49152-65535) overlaps the ephemeral port dind binds and cannot be
+          # blanket-blocked. Blocking the endpoint mapper (135) removes the
+          # discovery path, which is the material mitigation.
+          if ($global:fail -eq 0) {
+            if ($global:enforce) { Write-Output '== egress: all checks passed (l2bridge asserted)' }
+            else { Write-Output '== egress: NOT ASSERTED (nat mode) - see the lines above for the real state' }
+          } else {
+            Write-Output "== egress: $global:fail FAILURE(S)"
+            exit 1
+          }
+
+      - name: Summary
+        id: summary
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $global:fail = 0
+          function Row($l, $o) {
+            '  {0,-40} {1}' -f $l, $o
+            if ($o -eq 'failure') { $global:fail++ }
+          }
+          Write-Output '=== Windows containment summary ==='
+          Write-Output "  declared egress mode: $env:WIN_EGRESS_MODE"
+          if ("$env:WIN_EGRESS_MODE" -eq 'l2bridge') {
+            Write-Output '  egress + host admin ports: ASSERTED'
+          } else {
+            Write-Output '  egress + host admin ports: NOT ASSERTED (NAT node - unfiltered by design)'
+          }
+          Write-Output ''
+          Row 'mode / identity'      '${{ steps.identity.outcome }}'
+          Row 'Hyper-V isolation'    '${{ steps.isolation.outcome }}'
+          Row 'internet + dind'      '${{ steps.network.outcome }}'
+          Row 'egress + admin ports' '${{ steps.egress.outcome }}'
+          Write-Output ''
+          if ($global:fail -eq 0) { Write-Output 'ALL WINDOWS CONTAINMENT CHECKS PASSED' }
+          else { Write-Output "WINDOWS CONTAINMENT FAILURES: $global:fail"; exit 1 }

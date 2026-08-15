@@ -19,10 +19,12 @@ The `ephemerd` binary uses `serve` as its default command. All commands accept t
 | [logs](logs) | Tail the ephemerd system service logs |
 | [status](status) | Show running jobs and daemon health |
 | [drain](drain) | Gracefully drain the running daemon |
+| [uncordon](uncordon) | Resume claiming new jobs after a cordon or aborted drain |
 | [jobs](jobs) | List and manage running jobs |
 | [cache](cache) | Inspect and clear ephemerd's on-disk caches |
 | [config](config) | Validate configuration file |
 | [doctor](doctor) | Check system readiness and clean up stale state |
 | [install](install) | Install ephemerd as a system service |
+| [upgrade](upgrade) | Download and install a specific release, then restart |
 | [uninstall](uninstall) | Remove ephemerd binary, service, and data |
 | [crictl](crictl) | Passthrough to containerd's CRI interface (in-process crictl) |

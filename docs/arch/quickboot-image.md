@@ -15,7 +15,7 @@ than it needs:
 - **Initrd**: hand-built cpio with busybox + e2fsprogs + a pinned set of
   kernel modules (virtio, vsock, hyperv on x86, etc.)
 - **Rootfs**: pre-baked Alpine tarball with gcompat + iptables (see
-  [rootfs.md](rootfs.md))
+  [pre-baked-rootfs.md](../architecture/pre-baked-rootfs.md))
 - **Userspace**: initrd's `/init` formats `/dev/vda`, extracts the rootfs,
   pivots, and execs `ephemerd-linux` from a virtio-fs share
 
@@ -190,7 +190,8 @@ mage build:windows       → embeds quickboot artifacts (phase 3)
 3. **Phase 3 — Windows WSL2 replacement.** Harder: WSL2 has its own kernel
    and init that we don't fully control. Either run our quickboot image
    inside Hyper-V directly (bypasses WSL2 entirely — bigger lift, also
-   eliminates the gRPC dispatch hop in [windows-single-scheduler.md](windows-single-scheduler.md)),
+   eliminates the gRPC dispatch hop in
+   [windows-wsl-dispatch.md](../architecture/windows-wsl-dispatch.md)),
    or ship our initramfs as a WSL2 distro and accept WSL2's kernel. The
    former is the interesting version; the latter is a smaller win.
 

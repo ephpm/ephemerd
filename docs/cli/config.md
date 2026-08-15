@@ -1,6 +1,6 @@
 ---
 title: config
-weight: 11
+weight: 12
 ---
 
 Validate the configuration file without starting the daemon. Prints a summary of the parsed configuration and reports any errors.

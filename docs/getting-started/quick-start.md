@@ -96,5 +96,5 @@ ephemerd jobs
 To validate your configuration without starting the daemon:
 
 ```bash
-ephemerd config check
+ephemerd config
 ```

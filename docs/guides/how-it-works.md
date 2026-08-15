@@ -144,14 +144,16 @@ FROM scratch
 COPY --from=builder /opt/sdk /opt/sdk
 ```
 
-Set `EPHEMERD_IMAGE` in your workflow to trigger extraction:
+Set the job's `container.image` in your workflow to trigger extraction. GitHub-hosted macOS runners ignore the `container:` key, but on ephemerd it names the OCI image whose layers are extracted onto the VM:
 
 ```yaml
 jobs:
   build:
     runs-on: [self-hosted, macos]
-    env:
-      EPHEMERD_IMAGE: ghcr.io/your-org/macos-sdk-cache:latest
+    container:
+      image: ghcr.io/your-org/macos-sdk-cache:latest
     steps:
       - run: ls /opt/sdk   # extracted artifacts available here
 ```
+
+ephemerd reads the workflow YAML from the forge API when the job is queued and picks up `container.image` before creating the VM. If `container:` is not set, the base macOS VM boots as-is.

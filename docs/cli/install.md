@@ -1,6 +1,6 @@
 ---
 title: install
-weight: 13
+weight: 14
 ---
 
 Install ephemerd as a system service. Copies the binary to the system install location, creates the data directory with a default config, and registers a system service.
@@ -14,6 +14,8 @@ ephemerd install [flags]
 | Flag | Description |
 |------|-------------|
 | `--no-service` | Skip service registration (only copy binary and create config) |
+| `--config`, `-c` | Path to a `config.toml` to install into the data directory instead of generating the default one |
+| `--images-dir` | Directory of OCI image tarballs (`*.tar`) to stage into `<data-dir>/images/` at install time. `serve` imports them on next startup, so the source directory does not need to stay mounted |
 
 ## Steps
 
@@ -31,7 +33,7 @@ If the binary is already at the target location, this step is skipped.
 
 ### 2. Create data directory and default config
 
-Creates the data directory and writes a default `config.toml` if one does not already exist. The default config contains:
+Creates the data directory. If `--config` is given, that file is copied to `<data-dir>/config.toml`. Otherwise a default `config.toml` is written if one does not already exist. The default config contains:
 
 ```toml
 [github]

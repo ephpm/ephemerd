@@ -3,7 +3,7 @@ title: Security
 weight: 5
 ---
 
-ephemerd is designed so that CI jobs cannot escape their environment, access the host, or interfere with other jobs. Every isolation mechanism is on by default with no configuration required.
+ephemerd is designed so that CI jobs cannot escape their environment, access the host, or interfere with other jobs. Nearly every isolation mechanism is on by default with no configuration required -- the one exception is **egress filtering on Windows**, which the default NAT network cannot enforce at all and which requires opting into L2Bridge. That exception is spelled out under [Network Firewall](#network-firewall) below; everything else here is the out-of-the-box behavior.
 
 ## Ephemeral Environments
 
@@ -42,13 +42,18 @@ This keeps jobs from scanning or reaching other machines on your LAN, cloud meta
 
 On Linux this is enforced with iptables rules in the CNI bridge configuration. The container's own subnet (default `10.88.0.0/16`) is excluded so containers can reach their gateway for DNS and outbound NAT.
 
-macOS jobs run inside a Linux VM sidecar and get the identical in-VM iptables stack, and the sidecar is itself NAT-hidden behind the host.
+On a Mac host there are two distinct job types, and they are enforced by two different mechanisms:
+
+- **Linux jobs on a Mac** run as containers inside the Linux VM sidecar. They get the identical in-VM iptables stack described above, and the sidecar is itself NAT-hidden behind the host.
+- **macOS-native jobs** run in their own per-job macOS VM, which has no containers and no iptables. Each VM gets a `pfctl` ruleset applied at job start that blocks outbound traffic to the same four ranges, with a carve-out for the Virtualization.framework NAT subnet (`192.168.64.0/24`) so the VM can still reach its gateway and the host.
+
+Both paths block the same ranges; only the tool differs (iptables vs. `pfctl`).
 
 ### Windows default (HNS NAT) — NOT enforced
 
 > **Job containers on the default Windows network can reach your entire LAN, including any management interfaces on it.** Treat a Windows runner on the default network as if it were an unfiltered host on your network.
 
-By default, Windows job containers attach to an HNS **NAT** network on the Hyper-V vSwitch. ephemerd still applies per-endpoint HCN ACL policies there, but **they do not take effect**, and no software mechanism on that stack does. This was established by exhaustive testing on real hardware, not inferred:
+By default, Windows job containers attach to an HNS **NAT** network on the Hyper-V vSwitch. On that path ephemerd installs **no egress filtering at all** -- it logs that container egress is unfiltered and points you at `network.l2bridge_egress`. This is deliberate: no software mechanism on that stack works, which was established by exhaustive testing on real hardware, not inferred. (Earlier versions applied per-endpoint HCN ACL policies on NAT anyway; those were removed in v0.2.0 once they were proven inert, because shipping an inert control is worse than shipping none.)
 
 - **Host WFP filters** (`netsh`, the WFP API, every layer including IPFORWARD and OUTBOUND) never see container egress. WinNAT's translation path does not present the packet to an inspectable filtering layer, even though the packet does traverse `tcpip.sys`.
 - **HNS Switch ACLs** are a VFP construct, and VFP is not engaged on a NAT switch. They apply successfully and do nothing.

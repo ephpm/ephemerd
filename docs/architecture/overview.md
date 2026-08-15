@@ -80,7 +80,7 @@ Standard OCI containers via embedded containerd, running directly on the host ke
 
 ### Windows: containerd + Hyper-V isolation
 
-containerd runs natively on Windows and supports Hyper-V isolation. Each container gets its own kernel in a lightweight VM -- real isolation, malicious code cannot escape to the host. Same OCI images, same containerd APIs, just compiled for Windows. Startup ~5-10s. Networking via HCN (Host Compute Network) with NAT and per-endpoint ACL policies.
+containerd runs natively on Windows and supports Hyper-V isolation. Each container gets its own kernel in a lightweight VM -- real isolation, malicious code cannot escape to the host. Same OCI images, same containerd APIs, just compiled for Windows. Startup ~5-10s. Networking via HCN (Host Compute Network) with NAT by default -- on which container **egress is unfiltered**, because no host-side software mechanism can filter the NAT path. Per-endpoint ACL policies only enforce on the opt-in L2Bridge network (`network.l2bridge_egress = true`), which is the only enforcing path on Windows. See [Security](/guides/security/).
 
 Linux jobs on a Windows host are dispatched via gRPC to a Hyper-V Linux VM that ephemerd boots and manages directly. See [Windows Hyper-V dispatch]({{< relref "windows-wsl-dispatch" >}}).
 

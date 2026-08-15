@@ -1,6 +1,6 @@
 ---
 title: doctor
-weight: 12
+weight: 13
 ---
 
 Check system readiness and clean up stale runtime state. By default, runs both checks and cleanup. Use `--check` or `--clean` to run only one phase.
@@ -9,12 +9,31 @@ Check system readiness and clean up stale runtime state. By default, runs both c
 ephemerd doctor [flags]
 ```
 
+> **The cleanup phase is destructive, and it runs by default.** On Windows it
+> force-stops and deletes every Hyper-V VM named `ephemerd-*` -- including the
+> live Linux VM, killing any Linux jobs running in it. On every platform it
+> removes stale VM directories, sockets, and PID files. Use `ephemerd doctor
+> --check` if you only want the diagnostics.
+
 ## Flags
 
 | Flag | Description |
 |------|-------------|
 | `--check` | Run checks only, skip cleanup |
 | `--clean` | Run cleanup only, skip checks |
+| `--force` | Run cleanup even while the ephemerd daemon is running. **Dangerous** — see below |
+| `--yes`, `-y` | Skip the confirmation prompt before destructive platform cleanup |
+
+### Running-daemon guard
+
+Cleanup **refuses to run while the daemon is up**. Checks always run; only the
+destructive phase is skipped, with a message telling you to `ephemerd stop`
+first. This exists because cleanup deletes the live control socket and PID file,
+and on Windows force-stops and removes every `ephemerd-*` Hyper-V VM — on a
+busy node that destroys Linux job capacity mid-job.
+
+`--force` overrides the guard. Only use it when you are certain the daemon is
+not serving jobs.
 
 ## System checks
 
@@ -41,7 +60,7 @@ These checks run on all platforms:
 - **macOS version** -- reports the OS version.
 - **Architecture** -- verifies Apple Silicon (arm64). Virtualization.framework requires it.
 - **Virtualization entitlement** -- checks the binary's code signature for the `com.apple.security.virtualization` entitlement.
-- **macOS VM disk image** -- looks for an existing disk image. If not found, notes that ephemerd will download and install the Apple IPSW on first boot.
+- **macOS VM disk image** -- looks for an existing disk image. If not found, notes that ephemerd will fetch the base image on first boot (a one-time download of a Tart OCI base image, `ghcr.io/cirruslabs/macos-<codename>-base:latest`, chosen from the host macOS version).
 - **VM capacity** -- calculates how many concurrent macOS VMs the host can support based on CPU and memory.
 
 ### Windows checks
@@ -73,8 +92,16 @@ Cleanup runs as the second phase (requires `sudo` on Linux/macOS for full cleanu
 
 ### Windows-specific cleanup
 
+> **Warning: `doctor` destroys Hyper-V VMs named `ephemerd-*`.** The cleanup
+> phase runs `Get-VM -Name 'ephemerd-*'` and, for every match, `Stop-VM -Force
+> -TurnOff` followed by `Remove-VM -Force`. It does not check whether the VM is
+> in use, so running `doctor` (or `doctor --clean`) on a live host **kills the
+> running Linux VM and any Linux jobs executing inside it**. Drain the node
+> first, or use `doctor --check`, which skips cleanup entirely.
+
+- Stops and removes every Hyper-V VM whose name starts with `ephemerd-`.
 - Unregisters stale WSL distros matching the `ephemerd-*` prefix.
-- Removes stale VM directories (preserving `embed/`).
+- Removes stale VM directories under `<data-dir>/vm/` (preserving `embed/`).
 
 ## Output
 

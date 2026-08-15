@@ -1,6 +1,6 @@
 ---
 title: uninstall
-weight: 14
+weight: 16
 ---
 
 Remove the ephemerd binary, system service, and optionally all data.
@@ -14,6 +14,13 @@ ephemerd uninstall [flags]
 | Flag | Description |
 |------|-------------|
 | `--keep-data` | Keep the data directory (config, logs, container state) |
+| `--yes`, `-y` | Skip the confirmation prompt |
+
+Without `--yes`, `uninstall` prints exactly what it will remove — the service,
+the binary, any `ephemerd-*` VMs and WSL distros, and (unless `--keep-data`) the
+entire data directory, which is **not recoverable** — and asks for confirmation.
+The service is stopped before anything is removed, so a running daemon is shut
+down cleanly rather than having its state deleted underneath it.
 
 ## Steps
 

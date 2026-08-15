@@ -14,10 +14,12 @@ ephemerd serve [flags]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--config`, `-c` | `<data-dir>/config.toml` | Path to config file |
+| `--images-dir` | (none) | Directory of OCI image tarballs (`*.tar`) to copy into `<data-dir>/images/` on startup, where they are imported into containerd |
 | `--containerd-tcp-port` | (none) | Also expose containerd on a TCP port (used by the in-VM worker so the Windows host can reach containerd over TCP) |
 | `--containerd-tcp-addr` | `127.0.0.1` | Bind address for the containerd TCP listener (use `0.0.0.0` when host lives outside the network namespace) |
 | `--containerd-only` | `false` | Only run containerd and the dispatch worker (no scheduler, no GitHub polling, no runner extraction) |
 | `--dind` | `false` | Mount a fake Docker socket into each container (overrides config file setting) |
+| `--dind-allow-privileged` | `false` | Allow privileged sibling containers, overriding `dind.allow_privileged` in config. Set on the in-VM ephemerd from the host's setting |
 
 ## Startup sequence
 

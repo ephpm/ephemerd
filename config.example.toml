@@ -29,7 +29,7 @@ owner = "your-org"
 # common stranding case (fungible-runner churn) is healed event-drivenly on
 # runner exit, so this runs at a low frequency. Default 30m; "0s" disables.
 # reconcile_interval = "30m"
-# By default, ephemerd polls the GitHub API every 10s for new jobs.
+# By default, ephemerd polls the GitHub API every 30s for new jobs.
 # No inbound ports or tunnels required.
 
 # To use localtunnel for instant webhook delivery:
@@ -91,8 +91,10 @@ owner = "your-org"
 # --- Windows L2Bridge egress (opt-in; Windows hosts only) -------------------
 # By default Windows containers use an HNS NAT network. NAT cannot
 # software-filter Windows container egress (VFP does not engage on a NAT
-# network), so egress enforcement there leans on the Hyper-V firewall. Setting
-# l2bridge_egress = true instead puts containers on an L2Bridge with a
+# network), and no host-side mechanism can — so on NAT ephemerd installs
+# nothing and container egress is simply UNFILTERED: job containers can reach
+# your whole LAN. Setting l2bridge_egress = true instead puts containers on an
+# L2Bridge with a
 # VFP-managed vSwitch port, where per-endpoint ACLs actually enforce: all of
 # RFC1918 (10/8, 172.16/12, 192.168/16, 169.254/16) — including the LAN router
 # — is blocked, and only the internet is reachable. Leave false to keep NAT.
@@ -222,8 +224,11 @@ shutdown_timeout = "5m"
 
 [vm.linux]
 # Enable a Linux VM for running Linux jobs on Windows/macOS hosts.
-# On Windows: creates a WSL2 distro with an embedded ephemerd binary.
-# The distro is destroyed on shutdown. Requires WSL2 to be installed.
+# On Windows: boots a Hyper-V Linux VM through the Host Compute Service
+# (vmcompute.dll) from an embedded kernel + initrd, with an embedded
+# ephemerd binary inside. Requires the Hyper-V feature to be enabled.
+# On macOS: boots the VM with Apple's Virtualization.framework.
+# Default is platform-dependent: ON for macOS, OFF (opt-in) for Windows.
 # enabled = false
 # cpus = 2
 # memory_mb = 2048

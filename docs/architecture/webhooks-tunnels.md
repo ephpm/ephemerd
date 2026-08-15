@@ -11,7 +11,15 @@ ephemerd runs on homelab machines, dev laptops, and small VPS instances -- place
 
 ## TunnelProvider Interface
 
-ephemerd embeds tunnel clients as Go libraries. When webhook mode is enabled and a tunnel provider is configured, ephemerd creates a public URL automatically -- no manual ngrok/cloudflared setup, no port forwarding, no reverse proxy config.
+Every tunnel mode sits behind one interface. `tunnel = "localtunnel"` and `"ngrok"` are embedded Go libraries; `"cloudflared"` is a managed subprocess ephemerd downloads and owns (see [below](#why-cloudflare-tunnel-is-a-managed-subprocess-not-an-embedded-library)); `"external"` means the ingress is created and managed outside ephemerd entirely; `"none"` (the default) means polling. In every managed mode ephemerd creates the public URL and registers the forge webhook automatically -- no port forwarding and no reverse proxy config.
+
+| `tunnel` | Ingress | Managed by ephemerd |
+|---|---|---|
+| `none` (default) | none -- polls the forge API instead | n/a |
+| `localtunnel` | localtunnel (public or self-hosted server) | yes, embedded library |
+| `ngrok` | ngrok edge | yes, embedded library |
+| `cloudflared` | Cloudflare Tunnel on a hostname you own | yes, downloaded subprocess |
+| `external` | whatever you put in front of the webhook port | no -- receiver only |
 
 The interface in `pkg/tunnel/tunnel.go`:
 
@@ -26,7 +34,7 @@ type Provider interface {
 }
 ```
 
-Both ngrok-go and localtunnel return `net.Listener`, so the scheduler just swaps its `server.Serve(listener)` call -- no protocol adapters or synthetic wrappers needed.
+Both ngrok-go and localtunnel return `net.Listener` directly, so the scheduler just swaps its `server.Serve(listener)` call -- no protocol adapters or synthetic wrappers needed. The cloudflared provider satisfies the same interface by returning a plain local listener that its subprocess forwards to.
 
 ## Scheduler Integration
 
@@ -78,7 +86,8 @@ localtunnel's server can be self-hosted on a cheap VPS. This is the best option 
 [webhook]
 secret = "your-webhook-secret"
 
-# Tunnel provider: "none" (default, polling), "localtunnel", or "ngrok"
+# Tunnel provider: "none" (default, polling), "localtunnel", "ngrok",
+# "cloudflared", or "external"
 tunnel = "ngrok"
 
 # localtunnel: optional self-hosted server URL
@@ -87,18 +96,32 @@ tunnel = "ngrok"
 # ngrok: auth token (can also use NGROK_AUTHTOKEN env var)
 # ngrok_authtoken = "your-token"
 
+# cloudflared: tunnel token + public hostname (token can also use
+# CLOUDFLARE_TUNNEL_TOKEN env var)
+# cloudflared_token = "eyJhIjoi..."
+# cloudflared_hostname = "ci.example.com"
+# cloudflared_version = "2026.6.1"   # optional; pinned download version
+
+# external: ingress managed outside ephemerd. Requires webhook.secret;
+# set external_url to have ephemerd auto-register the hooks.
+# external_url = "https://ci.example.com"
+
 # max consecutive reconnect failures before falling back to polling
 # tunnel_max_retries = 5
 ```
 
 When `tunnel` is `"none"` or omitted, ephemerd polls the forge API at the configured interval. This is the right default when running behind a reverse proxy or on a VPS with a public IP.
 
-## Why Not Cloudflare Tunnel
+## Why Cloudflare Tunnel Is a Managed Subprocess, Not an Embedded Library
 
-Cloudflare Quick Tunnels look attractive on paper -- free, no auth, Cloudflare's edge network. In practice they are not embeddable as a Go library.
+Cloudflare Tunnel **is** supported (`tunnel = "cloudflared"`), but unlike ngrok and localtunnel it does not run as an in-process Go library. It runs as a subprocess that ephemerd downloads, launches, and owns.
 
-The problem is architectural. ngrok-go and localtunnel give you a `net.Listener` -- your code accepts connections normally. Cloudflare's tunnel protocol is inverted: their edge opens QUIC streams toward your process and delivers traffic via an internal `OriginProxy.ProxyHTTP` handler interface. There is no listener. There is no socket.
+The reason is architectural. ngrok-go and localtunnel give you a `net.Listener` -- ephemerd accepts connections normally and swaps the listener into `server.Serve()`. Cloudflare's tunnel protocol is inverted: their edge opens QUIC streams toward your process and delivers traffic via an internal `OriginProxy.ProxyHTTP` handler interface. There is no listener and no socket to hand back.
 
-To embed this would require importing ~10 tightly coupled internal packages from `cloudflared`, bootstrapping the full tunnel daemon lifecycle, and building a synthetic `net.Listener` wrapper. The dependency footprint includes Cap'n Proto code generation, quic-go, Sentry, and OpenTelemetry. The internal APIs are unstable -- these are private packages of a CLI tool, not a library.
+Embedding it would mean importing ~10 tightly coupled internal packages from `cloudflared`, bootstrapping the full tunnel daemon lifecycle, and building a synthetic `net.Listener` wrapper. The dependency footprint includes Cap'n Proto code generation, quic-go, Sentry, and OpenTelemetry, and the internal APIs are unstable -- these are private packages of a CLI tool, not a library.
 
-If you want Cloudflare Tunnel, run `cloudflared tunnel` as a separate process and point it at ephemerd's webhook port. That works fine -- it is just not embeddable.
+So `pkg/tunnel/cloudflared.go` takes the other path: it downloads a pinned `cloudflared` release into `<data-dir>/cloudflared/`, writes its config, and runs it as a child process forwarding the public hostname to ephemerd's local webhook port. `Listen()` returns an ordinary local listener, so the scheduler integration above is unchanged. The subprocess is bound to ephemerd's lifetime -- on Linux via `Pdeathsig`, so it cannot outlive ephemerd even on SIGKILL or panic; best-effort via `Close()` elsewhere.
+
+The trade-offs versus the embedded providers: it needs a Cloudflare zone and a tunnel token (created in the Cloudflare dashboard or API), and it depends on a downloaded external binary rather than compiled-in Go code. In exchange you get a stable custom hostname on Cloudflare's edge instead of an ephemeral random subdomain.
+
+If you would rather run and manage `cloudflared` yourself -- say on a different host -- use `tunnel = "external"` instead. ephemerd then serves the webhook receiver and disables polling but never creates a tunnel.

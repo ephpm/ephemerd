@@ -251,7 +251,7 @@ Linux VM for running Linux jobs on Windows or macOS hosts.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | boolean | `false` | Enable the Linux VM |
+| `enabled` | boolean | platform-dependent | Enable the Linux VM. When unset: `true` on macOS, `false` on Windows (opt-in). Meaningless on Linux hosts, where jobs run natively. |
 | `cpus` | integer | `2` | Virtual CPUs assigned to the VM |
 | `memory_mb` | integer | `2048` | Memory in MB |
 | `disk_size_gb` | integer | `50` | Sparse disk size in GB |

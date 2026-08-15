@@ -1,6 +1,6 @@
 ---
 title: cache
-weight: 10
+weight: 11
 ---
 
 Inspect and clear ephemerd's on-disk caches. Every cache ephemerd manages
@@ -10,8 +10,8 @@ lives under the data directory (`/var/lib/ephemerd` on Linux/macOS,
 
 ```
 ephemerd cache list [--json]
-ephemerd cache clear <name> [--yes]
-ephemerd cache clear --all [--yes]
+ephemerd cache clear <name> [--yes] [--offline]
+ephemerd cache clear --all [--yes] [--offline]
 ```
 
 ## Caches
@@ -114,3 +114,9 @@ Destructive clears prompt for confirmation. Pass `--yes` (aliases `--force`,
   state (containerd, BuildKit, in-flight VMs). While a daemon is running they
   are skipped by `--all` and refused for a named clear, unless you pass
   `--force`. Stop the daemon first for a clean clear.
+
+  > `--force` is the same flag as `--yes`/`-y`. Passing it to skip the
+  > confirmation prompt **also** overrides this guard, so a scripted
+  > `cache clear --all --yes` against a live daemon will fall through to the
+  > filesystem sweep for caches the daemon could not prune. That is deliberate
+  > but worth knowing before putting it in automation.
