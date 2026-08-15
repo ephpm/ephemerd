@@ -122,6 +122,10 @@ func newTestProxy(t *testing.T, up *fakeUpstream, mutate func(*Config)) (*Proxy,
 		ListenAddr:     "127.0.0.1:0",
 		IndexTTL:       time.Hour,
 		ContainerOS:    "linux",
+		// Off by default so the routing tests are not racing a background
+		// goroutine that rewrites the config file. The watchdog gets its own
+		// test.
+		HealthInterval: -1,
 		Log:            discardLogger(),
 	}
 	if mutate != nil {
@@ -257,6 +261,47 @@ func TestIndex_FailOpenToStaleCache(t *testing.T) {
 	}
 	if body != "cached-body" {
 		t.Errorf("body = %q, want the stale cached copy", body)
+	}
+}
+
+// TestIndex_FailsOpenWithRedirect is the fix for the blocker that stalled
+// this change: GOPROXY has "|direct", Cargo has nothing. Once
+// source.crates-io is replaced there is no second source to fall back to, so
+// an index request the proxy cannot satisfy MUST become a redirect to the
+// real registry rather than a 502 — otherwise an upstream blip while the
+// cache is cold turns into a red build for every Rust job on the node.
+func TestIndex_FailsOpenWithRedirect(t *testing.T) {
+	up := newFakeUpstream(t)
+	up.set("/se/rd/serde", "body", `"v1"`)
+	_, base := newTestProxy(t, up, nil)
+
+	// Upstream broken, nothing cached: the worst case.
+	up.failing.Store(true)
+
+	resp, _ := get(t, base+"/index/se/rd/serde", nil)
+	if resp.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d, want 307 — a 502 here has no fallback and fails the build", resp.StatusCode)
+	}
+	if want := up.URL + "/se/rd/serde"; resp.Header.Get("Location") != want {
+		t.Errorf("Location = %q, want %q", resp.Header.Get("Location"), want)
+	}
+}
+
+// TestRegistryConfig_FailsOpenWithRedirect: config.json is the FIRST thing
+// Cargo asks for, so failing it fails everything after it. Redirected to the
+// real registry, Cargo gets a genuine document whose "dl" points at the
+// crates.io CDN and simply bypasses the cache for that build.
+func TestRegistryConfig_FailsOpenWithRedirect(t *testing.T) {
+	up := newFakeUpstream(t)
+	_, base := newTestProxy(t, up, nil)
+	up.failing.Store(true)
+
+	resp, _ := get(t, base+"/index/config.json", nil)
+	if resp.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d, want 307", resp.StatusCode)
+	}
+	if want := up.URL + "/config.json"; resp.Header.Get("Location") != want {
+		t.Errorf("Location = %q, want %q", resp.Header.Get("Location"), want)
 	}
 }
 
@@ -430,6 +475,116 @@ func TestCrate_ConcurrentMissesFetchUpstreamOnce(t *testing.T) {
 
 	if got := up.hitCount("/crates/tokio/tokio-1.2.3.crate"); got != 1 {
 		t.Errorf("upstream hits = %d, want 1 (concurrent misses must be collapsed)", got)
+	}
+}
+
+// TestStop_IsPromptAfterConcurrentBurst is the regression guard for the
+// intermittent CI failure that stalled this change:
+//
+//	--- FAIL: TestCrate_ConcurrentMissesFetchUpstreamOnce (5.01s)
+//	    Stop: shutting down cargo proxy: context deadline exceeded
+//
+// A burst of parallel requests makes Go's http.Transport dial more
+// connections than it uses; the spares are accepted but never send a request,
+// and http.Server.Shutdown refuses to close such a connection for five
+// seconds. Stop must not inherit that wait. See proxies.Server.
+//
+// The 5.01s in the failure is not a coincidence — it is exactly net/http's
+// "new connection" grace — so a threshold of two seconds distinguishes the
+// bug from a slow machine without being flaky.
+func TestStop_IsPromptAfterConcurrentBurst(t *testing.T) {
+	up := newFakeUpstream(t)
+	up.set("/config.json", `{"dl":"`+up.URL+`/crates/{crate}/{crate}-{version}.crate"}`, "")
+	up.set("/crates/tokio/tokio-1.2.3.crate", "BIG-TARBALL", "")
+
+	dir := t.TempDir()
+	p := New(Config{
+		CacheDir: filepath.Join(dir, "cache"), ConfDir: filepath.Join(dir, "conf"),
+		IndexUpstream: up.URL, RustupUpstream: up.URL,
+		ListenAddr: "127.0.0.1:0", ContainerOS: "linux",
+		HealthInterval: -1, Log: discardLogger(),
+	})
+	if err := p.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	base := "http://" + p.Addr()
+	get(t, base+"/index/config.json", nil)
+
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := http.Get(base + "/crates/tokio/1.2.3/download")
+			if err != nil {
+				return
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}()
+	}
+	wg.Wait()
+
+	start := time.Now()
+	if err := p.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("Stop took %v; it is waiting out net/http's grace for connections that never sent a request", elapsed)
+	}
+}
+
+// TestStop_CancelsInFlightUpstreamFetch: a handler blocked on an upstream
+// that never answers must not hold the daemon's shutdown open. The request
+// context descends from the proxy's, so Stop cancels the fetch and returns
+// within its grace window rather than waiting out the 120s client timeout.
+func TestStop_CancelsInFlightUpstreamFetch(t *testing.T) {
+	release := make(chan struct{})
+	blocked := make(chan struct{})
+
+	var once sync.Once
+	stuck := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		once.Do(func() { close(blocked) })
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	// Order matters: the release must fire BEFORE Close, because
+	// httptest.Server.Close waits for outstanding handlers.
+	defer stuck.Close()
+	defer close(release)
+
+	dir := t.TempDir()
+	p := New(Config{
+		CacheDir: filepath.Join(dir, "cache"), ConfDir: filepath.Join(dir, "conf"),
+		IndexUpstream: stuck.URL, RustupUpstream: stuck.URL,
+		ListenAddr: "127.0.0.1:0", ContainerOS: "linux",
+		HealthInterval: -1, Log: discardLogger(),
+	})
+	if err := p.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	base := "http://" + p.Addr()
+
+	go func() {
+		resp, err := http.Get(base + "/index/se/rd/serde")
+		if err != nil {
+			return
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+	<-blocked
+
+	start := time.Now()
+	if err := p.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	// shutdownGrace plus slack. Without context propagation this would sit
+	// until the upstream client timeout (defaultTimeout, 120s).
+	if elapsed := time.Since(start); elapsed > shutdownGrace+3*time.Second {
+		t.Errorf("Stop took %v with a request stuck on a dead upstream; the fetch context is not being cancelled", elapsed)
 	}
 }
 
@@ -649,6 +804,106 @@ func TestHealthz(t *testing.T) {
 	if resp, _ := get(t, base+healthRoute, nil); resp.StatusCode != http.StatusOK {
 		t.Errorf("healthz status = %d, want 200", resp.StatusCode)
 	}
+}
+
+// --- self-health withdrawal (fail-open layer 3) ----------------------------
+
+// TestWatchdog_WithdrawsConfigWhenTheListenerStopsAnswering is the mitigation
+// for the design blocker: a proxy that is up when the job starts but wedged
+// when Cargo runs would fail the build, because a Cargo source replacement
+// has no fallback. The proxy therefore withdraws its own config — the mount
+// is a directory, so a container already running sees the swap and its next
+// `cargo` invocation goes straight to crates.io.
+func TestWatchdog_WithdrawsConfigWhenTheListenerStopsAnswering(t *testing.T) {
+	up := newFakeUpstream(t)
+	dir := t.TempDir()
+	p := New(Config{
+		CacheDir: filepath.Join(dir, "cache"), ConfDir: filepath.Join(dir, "conf"),
+		IndexUpstream: up.URL, RustupUpstream: up.URL,
+		ListenAddr: "127.0.0.1:0", ContainerOS: "linux",
+		HealthInterval: 10 * time.Millisecond,
+		Log:            discardLogger(),
+	})
+	if err := p.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = p.Stop() }()
+
+	configPath := filepath.Join(p.Mounts()[0].Source, "config.toml")
+	readConfig := func() string {
+		t.Helper()
+		raw, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatalf("reading generated config: %v", err)
+		}
+		return string(raw)
+	}
+
+	// Healthy: the caching config stays installed even as the watchdog ticks.
+	waitFor(t, func() bool { return strings.Contains(readConfig(), `replace-with = "ephemerd"`) },
+		"caching config to be installed while healthy")
+
+	// Simulate the wedge by stopping the HTTP server underneath the proxy.
+	// The daemon lives on and the watchdog keeps running; only the socket
+	// stops answering — the shape of the self-upgrade listener wedge seen on
+	// Windows nodes.
+	if err := p.srv.Shutdown(0); err != nil {
+		t.Fatalf("stopping the inner server: %v", err)
+	}
+
+	waitFor(t, func() bool { return !strings.Contains(readConfig(), "replace-with") },
+		"the proxy to withdraw its config after the listener stopped answering")
+
+	if body := readConfig(); !strings.Contains(body, "[net]") {
+		t.Errorf("withdrawn config is not a usable cargo config:\n%s", body)
+	}
+}
+
+// TestWatchdog_RestoresConfigOnRecovery: withdrawal must not be permanent, or
+// a single blip would cost the whole fleet its cache until the next restart.
+func TestWatchdog_RestoresConfigOnRecovery(t *testing.T) {
+	up := newFakeUpstream(t)
+	dir := t.TempDir()
+	p := New(Config{
+		CacheDir: filepath.Join(dir, "cache"), ConfDir: filepath.Join(dir, "conf"),
+		IndexUpstream: up.URL, RustupUpstream: up.URL,
+		ListenAddr: "127.0.0.1:0", ContainerOS: "linux",
+		HealthInterval: 10 * time.Millisecond,
+		Log:            discardLogger(),
+	})
+	if err := p.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = p.Stop() }()
+
+	configPath := filepath.Join(p.Mounts()[0].Source, "config.toml")
+	has := func(s string) bool {
+		raw, err := os.ReadFile(configPath)
+		return err == nil && strings.Contains(string(raw), s)
+	}
+
+	// Force the withdrawal directly rather than racing a real outage.
+	p.setConfigActive(false, "test")
+	waitFor(t, func() bool { return !has("replace-with") }, "config to be withdrawn")
+
+	// The listener is still fine, so the next probe restores it.
+	waitFor(t, func() bool { return has(`replace-with = "ephemerd"`) },
+		"the watchdog to restore the caching config once probes succeed again")
+}
+
+// waitFor polls cond until it holds, failing the test on timeout. Polling,
+// not sleeping: the watchdog interval is short and the assertion is about
+// eventual state, not timing.
+func waitFor(t *testing.T, cond func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
 }
 
 func TestUnknownRouteIs404(t *testing.T) {

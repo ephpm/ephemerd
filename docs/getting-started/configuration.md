@@ -411,13 +411,15 @@ Cargo/crates caching proxy — the Rust counterpart to `[module_proxy]`. One HTT
 
 A repository that ships its own `.cargo/config.toml` still wins: Cargo prefers config closer to the workspace.
 
-**Fail-open behaviour.** A cache must never turn a registry hiccup into a red CI job, so failures degrade in three layers:
+**Fail-open behaviour.** This needs more care than `[module_proxy]` does. `GOPROXY="<url>|direct"` falls through to the origin on any proxy error, so the Go proxy can never be more than a slowdown. **Cargo has no equivalent**: once `[source.crates-io] replace-with` points at the proxy there is no second source and no fallback, so a naive implementation would make the cache a hard dependency of every Rust build on the node. Instead:
 
-1. If the proxy does not start, nothing is injected and no mount is added — jobs go straight to crates.io.
-2. If an upstream is unreachable or returns 5xx and a cached copy exists, the **stale copy is served** with a warning.
-3. If nothing is cached, crate and rustup downloads are answered with a `307` redirect to the real origin, so the job fetches it directly (slower, uncached) instead of failing.
+1. **Not started → not injected.** A proxy that fails to start is never added to the cache-proxy list, so neither the env var nor the mount reaches any container. Jobs behave as if ephemerd had no cache.
+2. **Running → always answers.** No route returns 5xx. Upstream unreachable with a cached copy → the **stale copy is served** with a warning. Upstream unreachable with nothing cached, cache unreadable, disk full, `config.json` unparseable → a `307` redirect to the real origin, which Cargo follows. This covers the index and `config.json` as well as crate and rustup downloads, so *"the proxy accepts connections"* is the only thing a build depends on — everything behind it can be broken.
+3. **Running but wedged → withdraws itself.** Layer 2 assumes requests still reach a handler. A watchdog probes the proxy's own listener every 15 s; after two consecutive failures the proxy rewrites the mounted `config.toml` to an inert one containing **no source replacement at all**. Because a *directory* is mounted, containers already running see the swap: the next `cargo` invocation goes straight to crates.io. The caching config is restored automatically once probes succeed again. Both transitions are logged (`cargo cache withdrawn from jobs` / `cargo cache re-enabled for jobs`).
 
-Genuine `404`s are passed through as `404` — a nonexistent crate version must stay distinguishable from an outage.
+Genuine `404`s are passed through as `404` — a nonexistent crate version must stay distinguishable from an outage. Malformed request paths are rejected with `400` rather than redirected; real Cargo never emits them.
+
+**Residual failure mode.** A `cargo build` that has *already read* the active config and is mid-resolve when the listener wedges will fail — nothing can retract a config file Cargo has already parsed. The exposure is a single Cargo invocation, bounded by the watchdog interval plus Cargo's own retries (`net.retry = 3` is set in the generated config). Eliminating it entirely would mean not using source replacement, which would mean not caching crates at all.
 
 **Scope.** The mount lands in the runner container. Jobs that run their steps inside a *further* container (a `container:` image spawned via Docker-in-Docker) do not inherit it.
 

@@ -17,6 +17,49 @@
 // .cargo/config.toml on the host and declares it as a read-only mount at the
 // container's filesystem root, where Cargo's ancestor-directory config search
 // always finds it. See containerConfigTOML/containerConfigDest.
+//
+// # Fail-open
+//
+// This is the design constraint that shapes everything below. The Go module
+// proxy is safe to enable because GOPROXY="<url>|direct" falls through to the
+// origin on ANY proxy error. Cargo has no equivalent: once
+// [source.crates-io] replace-with points at this proxy there is no second
+// source, no fallback, and no retry-elsewhere — a dead proxy is a red build
+// for every Rust job on the node. A cache must never be a hard dependency of
+// the job path, so the proxy is built in three layers:
+//
+//  1. NOT STARTED → NOT INJECTED. A proxy that fails to Start is never added
+//     to the cache-proxy list, so neither the mount nor the env var reaches
+//     any container and Cargo talks to crates.io as if ephemerd had no cache.
+//     (cmd/ephemerd/main.go.)
+//
+//  2. RUNNING → ALWAYS ANSWERS. No route ever returns 5xx. Upstream down but
+//     something cached → the stale copy is served. Upstream down with nothing
+//     cached, cache unreadable, disk full, config.json unparseable → a 307 to
+//     the real origin, which Cargo follows. So "the proxy accepts
+//     connections" is the ONLY thing a build depends on; everything behind it
+//     can be broken. Genuine 404s still pass through as 404s, because
+//     "no such crate" is not an outage.
+//
+//  3. RUNNING BUT WEDGED → WITHDRAWS ITSELF. Layer 2 assumes the listener
+//     still answers. A listener can wedge while the daemon lives on (that has
+//     happened here before, in the self-upgrade path), which layer 2 cannot
+//     help with because the job never reaches a handler. So a watchdog probes
+//     the proxy's own listener end to end, and on repeated failure rewrites
+//     the mounted config.toml to an inert one with no source replacement at
+//     all. The mount is a directory, so a container sees the change
+//     immediately: the next `cargo` invocation — in a job already running, not
+//     just the next job — goes straight to crates.io. It is restored on
+//     recovery. See runWatchdog and inertConfigTOML.
+//
+// RESIDUAL FAILURE MODE, stated honestly: a `cargo build` that has already
+// read the active config and is mid-resolve when the listener wedges will
+// fail, because nothing can retract a config file cargo has already parsed.
+// The exposure is one cargo invocation, bounded by HealthInterval plus
+// cargo's own retries (net.retry = 3 in the generated config). Shrinking it
+// further would mean not using source replacement at all, which would mean
+// not caching crates. If ephemerd's whole process freezes, the watchdog
+// freezes with it — but then nothing is scheduling jobs either.
 package cargoproxy
 
 import (
@@ -26,7 +69,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -65,8 +107,22 @@ const (
 	// visible. Revalidation after the TTL is a conditional GET, so the
 	// steady-state cost is a 304, not a re-download.
 	DefaultIndexTTL = 10 * time.Minute
+	// DefaultHealthInterval is how often the proxy checks that its own
+	// listener still answers. See the package comment, layer 3.
+	DefaultHealthInterval = 15 * time.Second
 	// defaultTimeout bounds a single upstream request.
 	defaultTimeout = 120 * time.Second
+	// shutdownGrace bounds how long Stop waits for in-flight requests.
+	shutdownGrace = 5 * time.Second
+	// healthProbeTimeout bounds one self-probe. Generous compared to the
+	// work involved (a static 200 from an in-process handler) so a loaded
+	// node does not look wedged.
+	healthProbeTimeout = 5 * time.Second
+	// healthFailuresToWithdraw is how many consecutive failed probes it
+	// takes to withdraw the container config. More than one so a single
+	// blip does not disable caching across the fleet; few enough that a
+	// genuine wedge is caught in well under a minute.
+	healthFailuresToWithdraw = 2
 )
 
 // Config for the Cargo caching proxy.
@@ -95,7 +151,13 @@ type Config struct {
 	// ContainerOS is the OS of the job containers this proxy serves, used
 	// only to pick the mount destination. Defaults to the host GOOS.
 	ContainerOS string
-	Log         *slog.Logger
+	// HealthInterval is how often the proxy probes its own listener and,
+	// on repeated failure, withdraws the Cargo config it mounts into jobs
+	// (package comment, layer 3). Zero takes DefaultHealthInterval; a
+	// NEGATIVE value disables the watchdog, which leaves a wedged listener
+	// able to fail Rust builds — only sensible in tests.
+	HealthInterval time.Duration
+	Log            *slog.Logger
 }
 
 // Compile-time interface checks.
@@ -107,16 +169,33 @@ var (
 // Proxy is a caching proxy for the Cargo registry and rustup distribution.
 type Proxy struct {
 	cfg      Config
-	server   *http.Server
-	listener net.Listener
+	srv      *proxies.Server
 	client   *http.Client
 	inflight sync.Map // per-path mutex: collapses duplicate upstream fetches
+
+	// probeClient is separate from client: it must not share a connection
+	// pool with upstream traffic, and it must never keep a connection alive
+	// into shutdown.
+	probeClient *http.Client
+
+	// watchdog lifetime, independent of the server's: Stop cancels it first
+	// so a shutting-down proxy does not withdraw its own config on the way
+	// out, and joins it so no goroutine outlives Stop.
+	wdCancel context.CancelFunc
+	wdDone   sync.WaitGroup
 
 	mu sync.RWMutex
 	// dlTemplate is the upstream registry's "dl" template, learned from
 	// config.json. Guarded because index requests (writers) and crate
 	// downloads (readers) run concurrently.
 	dlTemplate string
+
+	// confMu serialises regeneration of the mounted container config, which
+	// Start and the watchdog both perform. configActive is the state that
+	// file is currently in; tracked so the watchdog rewrites it only on a
+	// transition rather than on every tick.
+	confMu       sync.Mutex
+	configActive bool
 }
 
 // New creates a Cargo caching proxy. Call Start() to begin serving.
@@ -137,8 +216,14 @@ func New(cfg Config) *Proxy {
 	cfg.RustupUpstream = strings.TrimRight(cfg.RustupUpstream, "/")
 
 	return &Proxy{
-		cfg:        cfg,
-		client:     &http.Client{Timeout: defaultTimeout},
+		cfg:    cfg,
+		client: &http.Client{Timeout: defaultTimeout},
+		probeClient: &http.Client{
+			Timeout: healthProbeTimeout,
+			// No keep-alives: a probe must not leave a connection parked on
+			// the very listener it is about to help shut down.
+			Transport: &http.Transport{DisableKeepAlives: true},
+		},
 		dlTemplate: defaultDLTemplate,
 	}
 }
@@ -149,7 +234,7 @@ func (p *Proxy) Start() error {
 	if err := os.MkdirAll(p.cfg.CacheDir, 0o755); err != nil {
 		return fmt.Errorf("creating cargo cache dir: %w", err)
 	}
-	if err := p.writeContainerConfig(); err != nil {
+	if err := p.writeContainerConfig(true); err != nil {
 		return fmt.Errorf("writing container cargo config: %w", err)
 	}
 	// Recover the upstream "dl" template from a previous run so the first
@@ -162,17 +247,12 @@ func (p *Proxy) Start() error {
 	if err != nil {
 		return err
 	}
-	p.listener = ln
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", p.handle)
-	p.server = &http.Server{Handler: mux, ReadHeaderTimeout: 30 * time.Second}
-
-	go func() {
-		if err := p.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			p.cfg.Log.Error("cargo proxy server error", "error", err)
-		}
-	}()
+	p.srv = proxies.NewServer("cargo", ln, mux, p.cfg.Log)
+	p.srv.Serve()
+	p.startWatchdog()
 
 	p.cfg.Log.Info("cargo proxy started",
 		"addr", ln.Addr().String(),
@@ -185,13 +265,20 @@ func (p *Proxy) Start() error {
 }
 
 // Stop shuts down the proxy and optionally wipes the cache.
+//
+// Ordering matters: the watchdog is stopped and joined FIRST, so a proxy on
+// its way out cannot probe its own half-closed listener, decide it is wedged,
+// and rewrite the mounted config as a parting gift.
 func (p *Proxy) Stop() error {
 	var errs []error
 
-	if p.server != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := p.server.Shutdown(ctx); err != nil {
+	if p.wdCancel != nil {
+		p.wdCancel()
+	}
+	p.wdDone.Wait()
+
+	if p.srv != nil {
+		if err := p.srv.Shutdown(shutdownGrace); err != nil {
 			errs = append(errs, fmt.Errorf("shutting down cargo proxy: %w", err))
 		}
 	}
@@ -208,10 +295,25 @@ func (p *Proxy) Stop() error {
 
 // Addr returns the address the proxy is listening on.
 func (p *Proxy) Addr() string {
-	if p.listener != nil {
-		return p.listener.Addr().String()
+	if p.srv != nil {
+		return p.srv.Addr().String()
 	}
 	return p.cfg.ListenAddr
+}
+
+// fetchCtx is the context an UPSTREAM fetch runs under.
+//
+// Deliberately the proxy's lifetime context rather than the requesting job's:
+// a fetch fills a shared cache that other requests for the same path are
+// queued behind (see lockFor), so one cargo hanging up — or its container
+// being killed — must not abort the download everybody else is waiting for.
+// It is still bounded by the HTTP client's own timeout, and Stop cancels it,
+// so shutdown never waits on a dead upstream.
+func (p *Proxy) fetchCtx() context.Context {
+	if p.srv != nil {
+		return p.srv.Context()
+	}
+	return context.Background()
 }
 
 // advertiseBase is the base URL containers use to reach this proxy. It is
@@ -262,19 +364,38 @@ func (p *Proxy) hostConfigDir() string {
 	return filepath.Join(p.cfg.ConfDir, ".cargo")
 }
 
-// writeContainerConfig regenerates the container-side Cargo config. Written
-// atomically so a job that starts mid-write never sees a truncated file.
-func (p *Proxy) writeContainerConfig() error {
+// writeContainerConfig regenerates the container-side Cargo config.
+//
+// active=true installs the source replacement that routes Cargo through this
+// proxy. active=false installs the inert config instead, which has no source
+// replacement at all and so sends Cargo straight to crates.io — that is how
+// the proxy withdraws itself when it cannot be trusted (package comment,
+// layer 3).
+//
+// Written atomically so a job that starts mid-write never sees a truncated
+// file, and it is a directory that is bind-mounted, so the swap is visible to
+// containers that are already running.
+func (p *Proxy) writeContainerConfig(active bool) error {
+	p.confMu.Lock()
+	defer p.confMu.Unlock()
+	return p.writeContainerConfigLocked(active)
+}
+
+func (p *Proxy) writeContainerConfigLocked(active bool) error {
 	dir := p.hostConfigDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("creating cargo conf dir %q: %w", dir, err)
+	}
+	body := containerConfigTOML(p.advertiseBase())
+	if !active {
+		body = inertConfigTOML()
 	}
 	target := filepath.Join(dir, "config.toml")
 	tmp, err := os.CreateTemp(dir, ".config-*.toml")
 	if err != nil {
 		return fmt.Errorf("creating temp cargo config: %w", err)
 	}
-	if _, err := tmp.WriteString(containerConfigTOML(p.advertiseBase())); err != nil {
+	if _, err := tmp.WriteString(body); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmp.Name())
 		return fmt.Errorf("writing temp cargo config: %w", err)
@@ -290,8 +411,117 @@ func (p *Proxy) writeContainerConfig() error {
 		_ = os.Remove(tmp.Name())
 		return fmt.Errorf("installing cargo config at %q: %w", target, err)
 	}
-	p.cfg.Log.Info("wrote container cargo config", "path", target, "mount", containerConfigDest(p.containerOS()))
+	p.configActive = active
+	p.cfg.Log.Info("wrote container cargo config",
+		"path", target, "mount", containerConfigDest(p.containerOS()), "cache_in_use", active)
 	return nil
+}
+
+// --- self-health watchdog --------------------------------------------------
+
+// startWatchdog launches the loop described in the package comment (layer 3).
+// A negative HealthInterval disables it.
+func (p *Proxy) startWatchdog() {
+	interval := p.cfg.HealthInterval
+	if interval == 0 {
+		interval = DefaultHealthInterval
+	}
+	if interval < 0 {
+		p.cfg.Log.Debug("cargo proxy health watchdog disabled")
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.wdCancel = cancel
+	p.wdDone.Add(1)
+	go func() {
+		defer p.wdDone.Done()
+		p.runWatchdog(ctx, interval)
+	}()
+}
+
+// runWatchdog probes the proxy's own listener and keeps the mounted Cargo
+// config in step with the answer.
+//
+// The probe goes over real TCP to the bound address, not through an in-process
+// function call, because the failure this guards against is a listener or
+// handler that has stopped serving while the process is otherwise healthy.
+// An in-process check would happily report "fine" the whole time.
+func (p *Proxy) runWatchdog(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	failures := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		if err := p.probeSelf(ctx); err != nil {
+			failures++
+			p.cfg.Log.Warn("cargo proxy self-probe failed",
+				"failures", failures, "threshold", healthFailuresToWithdraw, "error", err)
+			if failures >= healthFailuresToWithdraw {
+				p.setConfigActive(false,
+					"the proxy stopped answering its own health probe; Rust jobs go direct to crates.io")
+			}
+			continue
+		}
+		if failures > 0 {
+			p.cfg.Log.Info("cargo proxy self-probe recovered", "after_failures", failures)
+		}
+		failures = 0
+		p.setConfigActive(true, "the proxy is answering again; Rust jobs use the cache")
+	}
+}
+
+// probeSelf issues a real HTTP request to the proxy's own listener.
+func (p *Proxy) probeSelf(ctx context.Context) error {
+	if p.srv == nil {
+		return errors.New("proxy not started")
+	}
+	url := "http://" + p.srv.ProbeAddr() + healthRoute
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("building health probe for %s: %w", url, err)
+	}
+	resp, err := p.probeClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("probing %s: %w", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		return fmt.Errorf("reading health probe from %s: %w", url, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("health probe %s returned %d", url, resp.StatusCode)
+	}
+	return nil
+}
+
+// setConfigActive flips the mounted config between the caching and the inert
+// form, and does nothing when it is already in the requested state — this
+// runs on a ticker and must not rewrite a bind-mounted file every few
+// seconds. A write failure is logged and retried on the next tick; the
+// previous file stays in place, which is the safe outcome in the "restore"
+// direction and, in the "withdraw" direction, is the one case where the
+// residual failure mode in the package comment applies.
+func (p *Proxy) setConfigActive(active bool, reason string) {
+	p.confMu.Lock()
+	defer p.confMu.Unlock()
+	if p.configActive == active {
+		return
+	}
+	if err := p.writeContainerConfigLocked(active); err != nil {
+		p.cfg.Log.Error("could not update the container cargo config", "active", active, "error", err)
+		return
+	}
+	if active {
+		p.cfg.Log.Info("cargo cache re-enabled for jobs", "reason", reason)
+		return
+	}
+	p.cfg.Log.Warn("cargo cache withdrawn from jobs", "reason", reason)
 }
 
 // --- routing ---------------------------------------------------------------
@@ -330,16 +560,24 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 // revalidated) like any other index entry, and its "dl" template is retained
 // so crate requests can be mapped back to the real CDN.
 func (p *Proxy) handleRegistryConfig(w http.ResponseWriter, r *http.Request) {
+	upstreamURL := p.cfg.IndexUpstream + "/config.json"
+
 	cachePath, err := indexCachePath(p.cfg.CacheDir, "/config.json")
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
-	body, _, err := p.fetchCached(r.Context(), cachePath, p.cfg.IndexUpstream+"/config.json", false, p.cfg.IndexTTL)
+	body, _, err := p.fetchCached(p.fetchCtx(), cachePath, upstreamURL, false, p.cfg.IndexTTL)
 	if err != nil {
-		p.cfg.Log.Warn("registry config.json unavailable", "error", err)
-		http.Error(w, "upstream error", http.StatusBadGateway)
+		// FAIL OPEN. config.json is the first thing Cargo asks for, so a 502
+		// here fails every Rust job on the node. Send it to the real registry
+		// instead: it gets the genuine document, whose "dl" points at the
+		// crates.io CDN, so the rest of the build bypasses this proxy
+		// entirely. Uncached and slower, but green — and we could not have
+		// cached it anyway, since we cannot reach upstream.
+		p.cfg.Log.Warn("registry config.json unavailable; redirecting job to upstream", "error", err)
+		http.Redirect(w, r, upstreamURL, http.StatusTemporaryRedirect)
 		return
 	}
 
@@ -366,21 +604,30 @@ func (p *Proxy) handleRegistryConfig(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) handleIndex(w http.ResponseWriter, r *http.Request, indexPath string) {
 	cachePath, err := indexCachePath(p.cfg.CacheDir, indexPath)
 	if err != nil {
+		// Not a fail-open case. A path this malformed is not something real
+		// Cargo ever emits, and building a redirect out of attacker-supplied
+		// bytes is a worse idea than refusing it.
 		p.cfg.Log.Warn("rejecting index path", "path", indexPath, "error", err)
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
-	body, meta, err := p.fetchCached(r.Context(), cachePath, p.cfg.IndexUpstream+indexPath, isImmutableIndexPath(indexPath), p.cfg.IndexTTL)
+	upstreamURL := p.cfg.IndexUpstream + indexPath
+	body, meta, err := p.fetchCached(p.fetchCtx(), cachePath, upstreamURL, isImmutableIndexPath(indexPath), p.cfg.IndexTTL)
 	if err != nil {
 		if isNotFound(err) {
 			http.NotFound(w, r)
 			return
 		}
-		// Nothing cached and upstream is unreachable. Cargo treats this as
-		// fatal either way; report it honestly.
-		p.cfg.Log.Warn("index fetch failed", "path", indexPath, "error", err)
-		http.Error(w, "upstream error", http.StatusBadGateway)
+		// FAIL OPEN, and this is the important one. Nothing cached and
+		// upstream unreachable used to be a 502, on the reasoning that
+		// "Cargo treats this as fatal either way" — but that is only true
+		// because we told Cargo to replace crates-io with us. Redirecting to
+		// the real index gives it a way out that a 502 does not: the request
+		// is a plain GET of public content and Cargo follows redirects, so
+		// the cost is one extra round trip and an uncached response.
+		p.cfg.Log.Warn("index fetch failed; redirecting job to upstream", "path", indexPath, "error", err)
+		http.Redirect(w, r, upstreamURL, http.StatusTemporaryRedirect)
 		return
 	}
 
@@ -422,7 +669,7 @@ func (p *Proxy) handleCrate(w http.ResponseWriter, r *http.Request) {
 		upstreamURL, _ = expandDL(defaultDLTemplate, name, version)
 	}
 
-	body, _, err := p.fetchCached(r.Context(), cachePath, upstreamURL, true, 0)
+	body, _, err := p.fetchCached(p.fetchCtx(), cachePath, upstreamURL, true, 0)
 	if err != nil {
 		if isNotFound(err) {
 			http.NotFound(w, r)
@@ -456,7 +703,7 @@ func (p *Proxy) handleRustup(w http.ResponseWriter, r *http.Request, distPath st
 	upstreamURL := p.cfg.RustupUpstream + distPath
 	immutable := isImmutableRustupPath(distPath)
 
-	body, meta, err := p.fetchCached(r.Context(), cachePath, upstreamURL, immutable, p.cfg.IndexTTL)
+	body, meta, err := p.fetchCached(p.fetchCtx(), cachePath, upstreamURL, immutable, p.cfg.IndexTTL)
 	if err != nil {
 		if isNotFound(err) {
 			http.NotFound(w, r)

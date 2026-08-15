@@ -1187,13 +1187,15 @@ func crictlCmd() *cli.Command {
 //   - dind: the per-job Docker API listener, which on Windows is a TCP listener
 //     on the host address handed to the job as DOCKER_HOST.
 //   - the Go module proxy: bound to the same address and injected as GOPROXY.
+//   - the Cargo proxy: likewise, and unlike GOPROXY a Cargo source replacement
+//     has no fallback, so a container that cannot reach it fails the build.
 //
 // It only affects the Windows L2Bridge egress path, where the ACL ladder
-// otherwise blocks the host along with the rest of RFC1918 — with neither
-// feature enabled the strictest posture (host unreachable) applies. On NAT and
-// on Linux the gateway is already reachable and this changes nothing.
+// otherwise blocks the host along with the rest of RFC1918 — with none of
+// these features enabled the strictest posture (host unreachable) applies. On
+// NAT and on Linux the gateway is already reachable and this changes nothing.
 func needsHostAccess(cfg *config.Config) bool {
-	return cfg.Dind.Enabled || cfg.ModuleProxy.Enabled
+	return cfg.Dind.Enabled || cfg.ModuleProxy.Enabled || cfg.CargoProxy.Enabled
 }
 
 func joinPath(parts ...string) string {

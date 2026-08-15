@@ -306,9 +306,16 @@ shutdown_timeout = "5m"
 # ephemerd bind-mounts read-only at the container's filesystem root. A repo
 # that ships its own .cargo/config.toml still wins.
 #
-# Fails open: if the proxy does not start, nothing is injected and jobs go
-# straight to crates.io. If an upstream is unreachable, cached data is served
-# stale and uncached downloads are redirected to the origin.
+# Fails open, which matters more here than for [module_proxy]: GOPROXY has
+# "|direct" to fall back on, a Cargo source replacement has nothing. So:
+#   - proxy does not start        -> nothing injected, jobs go direct
+#   - upstream down, copy cached  -> the stale copy is served
+#   - upstream down, nothing      -> 307 to the real origin (index, config.json,
+#                                    crates and rustup alike); never a 5xx
+#   - proxy up but not answering  -> a watchdog notices within ~30s and rewrites
+#                                    the mounted config to one with no source
+#                                    replacement, so cargo goes direct until it
+#                                    recovers
 # [cargo_proxy]
 # enabled         = false
 # port            = 8083                          # listen port on the bridge gateway
