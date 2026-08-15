@@ -157,34 +157,91 @@ func runWorkflow(ctx context.Context, workflowPath string, jobFilter string, ima
 		socketPath = `\\.\pipe\ephemerd-run-` + filepath.Base(tmpDir)
 	}
 
-	image := resolveRunImage(imageFlag, platform)
+	// Load the service config once. A local run must use the SAME container
+	// network the host is configured for — building its own would put the job
+	// on an unfiltered network on a host that was deliberately configured to
+	// filter, and on Windows would also install the NAT-era netsh rules that
+	// block RFC1918 host-wide. A missing or unreadable config is not fatal:
+	// the run falls back to the built-in default network.
+	cfg := loadRunConfig()
 
 	runner := &workflow.Runner{
 		DataDir:    tmpDir,
 		SocketPath: socketPath,
-		Image:      image,
+		Image:      resolveRunImage(imageFlag, platform, cfg),
+		Network:    runNetworkOptions(cfg, log),
 		Log:        log,
 	}
 
 	return runner.RunJob(ctx, jobName, job, repoDir)
 }
 
+// loadRunConfig reads the service config for a local run. A missing or
+// malformed config.toml is not an error here — the run simply falls back to the
+// built-in defaults for both image and network — so it returns nil rather than
+// failing the command.
+func loadRunConfig() *config.Config {
+	cfg, err := config.Load(filepath.Join(configDir, "config.toml"))
+	if err != nil {
+		return nil
+	}
+	return cfg
+}
+
+// runNetworkOptions maps the host's [network] config onto a local run and warns
+// when the job will land on the default, unfilterable container network.
+//
+// On Windows the default is an HNS NAT network on the Hyper-V vSwitch. Container
+// egress there CANNOT be filtered in software — WFP, the Hyper-V firewall, VFP
+// on a NAT switch and netsh have all been ruled out on metal, because WinNAT's
+// translation path never presents the packet to an inspectable filtering layer.
+// A job on that network can reach anything the host can, including the LAN and
+// any management planes on it. network.l2bridge_egress is the only path that
+// actually enforces. See docs/guides/security.md ("Network Firewall").
+func runNetworkOptions(cfg *config.Config, log *slog.Logger) workflow.NetworkOptions {
+	if cfg == nil {
+		warnUnfilteredRunNetwork(log, "no readable config.toml")
+		return workflow.NetworkOptions{}
+	}
+
+	opts := workflow.NetworkOptions{
+		Subnet:            cfg.Network.Subnet,
+		MTU:               cfg.Network.MTU,
+		L2BridgeEgress:    cfg.Network.L2BridgeEgress,
+		HostNIC:           cfg.Network.HostNIC,
+		IPPool:            cfg.Network.IPPool,
+		Gateway:           cfg.Network.Gateway,
+		PublicDNS:         cfg.Network.PublicDNS,
+		ExtraAllowedCIDRs: cfg.Network.ExtraAllowedDestinations,
+		AllowHostAccess:   needsHostAccess(cfg),
+	}
+
+	if runtime.GOOS == "windows" && !opts.L2BridgeEgress {
+		warnUnfilteredRunNetwork(log, "network.l2bridge_egress is not enabled")
+	}
+	return opts
+}
+
+func warnUnfilteredRunNetwork(log *slog.Logger, reason string) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	log.Warn("this job's container egress is NOT filtered: it runs on the default Hyper-V vSwitch (HNS NAT), "+
+		"where container egress cannot be filtered in software — the job can reach your LAN and anything on it. "+
+		"Set network.l2bridge_egress (requires a WIRED adapter and a reserved network.ip_pool) to enforce egress",
+		"reason", reason)
+}
+
 // resolveRunImage determines the container image for a run job.
 // Priority: --image flag → service config.toml → empty (caller applies the
 // built-in default — see workflow.Runner.RunJob, which substitutes
 // defaultImage when this returns "").
-func resolveRunImage(flagValue string, platform workflow.TargetPlatform) string {
+func resolveRunImage(flagValue string, platform workflow.TargetPlatform, cfg *config.Config) string {
 	if flagValue != "" {
 		return flagValue
 	}
-
-	osName := platform.String()
-	cfgPath := filepath.Join(configDir, "config.toml")
-	if cfg, err := config.Load(cfgPath); err == nil {
-		if img := cfg.GitHub.DefaultImageFor(osName); img != "" {
-			return img
-		}
+	if cfg == nil {
+		return ""
 	}
-
-	return ""
+	return cfg.GitHub.DefaultImageFor(platform.String())
 }

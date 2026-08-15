@@ -81,11 +81,87 @@ owner = "your-org"
 [network]
 # Container subnet. Ephemerd auto-picks a free subnet if this conflicts with
 # an existing network (e.g. Podman, Docker). You don't need to change this.
+# On the Windows L2Bridge path below it means something different — see there.
 # subnet = "10.88.0.0/16"
 
 # Bridge MTU. Auto-detected from the host's default interface.
 # Override if containers have connectivity issues on unusual networks.
 # mtu = 1500
+
+# --- Windows L2Bridge egress (opt-in; Windows hosts only) -------------------
+# By default Windows containers use an HNS NAT network. NAT cannot
+# software-filter Windows container egress (VFP does not engage on a NAT
+# network), so egress enforcement there leans on the Hyper-V firewall. Setting
+# l2bridge_egress = true instead puts containers on an L2Bridge with a
+# VFP-managed vSwitch port, where per-endpoint ACLs actually enforce: all of
+# RFC1918 (10/8, 172.16/12, 192.168/16, 169.254/16) — including the LAN router
+# — is blocked, and only the internet is reachable. Leave false to keep NAT.
+#
+# TRADE-OFF: on L2Bridge your job containers are no longer behind NAT. They are
+# peers on this host's LAN with real LAN addresses, which is exactly why the
+# ACLs can enforce — and why you must reserve addresses for them (ip_pool).
+# l2bridge_egress = false
+#
+# Host NIC the L2Bridge binds onto. REQUIRED when l2bridge_egress = true; there
+# is no default (the correct adapter name is host-specific). Use the name shown
+# by `Get-NetAdapter`. Ignored when l2bridge_egress is false.
+#
+# STRONGLY RECOMMENDED: bind a DEDICATED NIC, not the host's management NIC.
+# Creating the L2Bridge builds an external Hyper-V vSwitch on this adapter and
+# migrates its IP onto a "vEthernet (<name>)" adapter. On a host reached over
+# that same NIC there is a brief connectivity blip during creation, and any
+# failure mid-creation can leave the box unreachable — a hazard for remote
+# nodes. A second NIC dedicated to container traffic keeps the management path
+# untouched. (ephemerd tolerates the vSwitch rename either way, so restarts are
+# safe once the network exists.)
+# host_nic = "Ethernet 2"
+#
+# Addresses ephemerd may assign to job containers. REQUIRED when
+# l2bridge_egress = true, with NO default.
+#
+# Why you have to set this: an L2Bridge HNS network must declare a subnet (HNS
+# refuses to create one without), and left to itself HNS then picks endpoint
+# addresses from anywhere inside that subnet — i.e. straight into your DHCP
+# server's scope. ephemerd instead allocates from this pool and pins each
+# container to the address it picked. Reserve the range on your DHCP server (or
+# place it outside the DHCP scope) BEFORE enabling this, or you will get
+# duplicate-address conflicts on your LAN.
+#
+# Either form works. Size it for at least runner.max_concurrent containers.
+# The examples below use RFC 5737 documentation addresses — replace them.
+# ip_pool = "192.0.2.192/27"              # CIDR: .193-.222 (network/broadcast excluded)
+# ip_pool = "192.0.2.200-192.0.2.230"     # or an inclusive range
+#
+# The LAN itself. Both are auto-derived from host_nic at startup — subnet from
+# the address configured on the adapter, gateway from its IPv4 default route —
+# and ephemerd logs what it inferred. Set them only if the adapter has no
+# default route of its own, or carries a prefix other than the LAN you want
+# declared. ip_pool must lie inside subnet and must not contain either the
+# host's own address or the gateway; startup refuses the config if it does.
+# subnet  = "192.0.2.0/24"
+# gateway = "192.0.2.1"
+#
+# Public DNS resolvers handed to L2Bridge containers so name resolution goes to
+# the internet rather than the (blocked) LAN router. Default 1.1.1.1, 8.8.8.8.
+# public_dns = ["1.1.1.1", "8.8.8.8"]
+#
+# Extra destination CIDRs permitted through the L2Bridge egress ACLs, ABOVE the
+# RFC1918 block (reserved for future use; default none — the strict posture).
+# extra_allowed_destinations = []
+#
+# NOTE — host reachability. When dind or the Go module proxy is enabled,
+# ephemerd adds a single /32 allow for its own host address, because both serve
+# job containers over the network (DOCKER_HOST / GOPROXY) and would otherwise be
+# blocked with the rest of RFC1918. HNS Switch ACLs cannot be port-scoped
+# without blackholing the whole port, so the control-plane ports are fenced off
+# at the host firewall instead. With neither feature enabled, this host is
+# unreachable from job containers like every other RFC1918 address.
+#
+# NOTE — migration. Switching an existing Windows node from NAT to L2Bridge
+# needs a REBOOT, not just a daemon restart: creating an L2Bridge network beside
+# a live HNS NAT network has been observed to wedge HNS (containers start with
+# no egress, runners register then go offline, service stop hangs on drain).
+# Drain the node, set the keys, reboot.
 
 [runner]
 

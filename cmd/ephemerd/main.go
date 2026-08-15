@@ -263,12 +263,19 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		controlPorts := []int{int(containerdTCPPort), int(containerdTCPPort) + 1, int(containerdTCPPort) + 2}
 
 		net, err := networking.New(networking.Config{
-			DataDir:      configDir,
-			Subnet:       cfg.Network.Subnet,
-			MTU:          cfg.Network.MTU,
-			CNIBinDir:    cm.Dir(),
-			ControlPorts: controlPorts,
-			Log:          log,
+			DataDir:           configDir,
+			Subnet:            cfg.Network.Subnet,
+			MTU:               cfg.Network.MTU,
+			CNIBinDir:         cm.Dir(),
+			ControlPorts:      controlPorts,
+			L2BridgeEgress:    cfg.Network.L2BridgeEgress,
+			HostNIC:           cfg.Network.HostNIC,
+			IPPool:            cfg.Network.IPPool,
+			Gateway:           cfg.Network.Gateway,
+			PublicDNS:         cfg.Network.PublicDNS,
+			ExtraAllowedCIDRs: cfg.Network.ExtraAllowedDestinations,
+			AllowHostAccess:   needsHostAccess(cfg),
+			Log:               log,
 		})
 		if err != nil {
 			return fmt.Errorf("initializing networking: %w", err)
@@ -427,12 +434,19 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 
 	// Initialize container networking
 	net, err := networking.New(networking.Config{
-		DataDir:      configDir,
-		Subnet:       cfg.Network.Subnet,
-		MTU:          cfg.Network.MTU,
-		CNIBinDir:    cm.Dir(),
-		GatewayPorts: gatewayPorts,
-		Log:          log,
+		DataDir:           configDir,
+		Subnet:            cfg.Network.Subnet,
+		MTU:               cfg.Network.MTU,
+		CNIBinDir:         cm.Dir(),
+		GatewayPorts:      gatewayPorts,
+		L2BridgeEgress:    cfg.Network.L2BridgeEgress,
+		HostNIC:           cfg.Network.HostNIC,
+		IPPool:            cfg.Network.IPPool,
+		Gateway:           cfg.Network.Gateway,
+		PublicDNS:         cfg.Network.PublicDNS,
+		ExtraAllowedCIDRs: cfg.Network.ExtraAllowedDestinations,
+		AllowHostAccess:   needsHostAccess(cfg),
+		Log:               log,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing networking: %w", err)
@@ -1135,6 +1149,21 @@ func crictlCmd() *cli.Command {
 			return containerd.ExecCrictl(socketPath, cmd.Args().Slice())
 		},
 	}
+}
+
+// needsHostAccess reports whether ephemerd runs anything that job containers
+// must be able to reach over the network on the host address:
+//
+//   - dind: the per-job Docker API listener, which on Windows is a TCP listener
+//     on the host address handed to the job as DOCKER_HOST.
+//   - the Go module proxy: bound to the same address and injected as GOPROXY.
+//
+// It only affects the Windows L2Bridge egress path, where the ACL ladder
+// otherwise blocks the host along with the rest of RFC1918 — with neither
+// feature enabled the strictest posture (host unreachable) applies. On NAT and
+// on Linux the gateway is already reachable and this changes nothing.
+func needsHostAccess(cfg *config.Config) bool {
+	return cfg.Dind.Enabled || cfg.ModuleProxy.Enabled
 }
 
 func joinPath(parts ...string) string {

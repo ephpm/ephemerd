@@ -138,6 +138,45 @@ type Runtime struct {
 	cfg    Config
 	client *client.Client
 	pullMu sync.Mutex // serializes image pulls to avoid content store contention
+
+	// provisioning holds the IDs of jobs whose on-disk state (runner-dir copy,
+	// job workdir, snapshot) exists but whose container is not yet registered
+	// in containerd — i.e. jobs somewhere between the copyDirForJob and
+	// NewContainer calls in Create. The orphan sweep decides "orphan" by the
+	// absence of a containerd container, so without this a sweep that fires
+	// during the provisioning window (a Windows image pull can take minutes)
+	// deletes a live job's runner dir out from under it, corrupting it into a
+	// self-update loop (observed on metal 2026-08-14). SweepOrphans unions
+	// these IDs into its keep set.
+	provMu       sync.Mutex
+	provisioning map[string]struct{}
+}
+
+// beginProvisioning marks id as in-flight so the orphan sweep will not reclaim
+// its on-disk state before its container exists. The returned func clears it
+// and must be deferred by the caller.
+func (r *Runtime) beginProvisioning(id string) func() {
+	r.provMu.Lock()
+	if r.provisioning == nil {
+		r.provisioning = make(map[string]struct{})
+	}
+	r.provisioning[id] = struct{}{}
+	r.provMu.Unlock()
+	return func() {
+		r.provMu.Lock()
+		delete(r.provisioning, id)
+		r.provMu.Unlock()
+	}
+}
+
+// addProvisioning inserts the in-flight provisioning IDs into keep so a sweep
+// preserves their on-disk state.
+func (r *Runtime) addProvisioning(keep map[string]struct{}) {
+	r.provMu.Lock()
+	defer r.provMu.Unlock()
+	for id := range r.provisioning {
+		keep[id] = struct{}{}
+	}
 }
 
 // Client returns the underlying containerd client. Used by the in-VM
@@ -277,6 +316,8 @@ func (r *Runtime) SweepOrphans(ctx context.Context) error {
 	for _, c := range containers {
 		live[c.ID()] = struct{}{}
 	}
+	// Jobs mid-provision have on-disk state but no container yet: keep them.
+	r.addProvisioning(live)
 	return r.sweepOrphanState(ctx, live)
 }
 
@@ -670,6 +711,14 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	image := cfg.Image
 	jitConfig := cfg.JITConfig
 	ctx = namespaces.WithNamespace(ctx, namespace)
+
+	// Protect this job's on-disk state (runner-dir copy, job workdir, snapshot)
+	// from the orphan sweep for the whole provisioning window — from here until
+	// Create returns. Until NewContainer runs there is no containerd container
+	// for the sweep to key off, so without this a sweep firing mid-provision
+	// (an image pull can take minutes) would delete a live job's runner dir.
+	doneProvisioning := r.beginProvisioning(id)
+	defer doneProvisioning()
 
 	// Use a default image when no custom image is specified.
 	// If runner.default_image is set in config, use that.

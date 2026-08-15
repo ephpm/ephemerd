@@ -1,5 +1,15 @@
 # Windows container egress: WFP IPFORWARD investigation (negative result)
 
+> **Addendum (2026-08, resolved).** A host-side software path was subsequently
+> found and shipped: HNS **L2Bridge** networks with per-endpoint **VFP Switch
+> ACLs** (`network.l2bridge_egress`), proven on metal. The container is a peer on
+> the host LAN (no NAT), so the VFP dataplane filters its egress at the vSwitch
+> port. The "network-level isolation only" conclusion below therefore applies
+> specifically to the default **NAT** stack this investigation used — where it
+> still holds, and where ephemerd now installs nothing and logs that egress is
+> unfiltered — **not universally**. See `docs/guides/security.md`. The body below
+> is preserved unchanged as the historical record for the NAT stack.
+
 ## TL;DR
 
 On Windows Server 2025 (build 26100) with a Hyper-V-isolated job container on an
