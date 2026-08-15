@@ -44,3 +44,46 @@ func TestHostPortAllowRule_ScopedToPoolAndPort(t *testing.T) {
 		t.Errorf("rule name %q must start with the sweep prefix %q", r.name, hostPortRulePrefix)
 	}
 }
+
+// TestL2BridgeHostHardenRules_BlocksDangerousManagementPorts is the regression
+// guard for the 2026-08-15 pen-test finding: with only the VFP host /32 allow,
+// a job container could reach the host's WinRM (5985) and RPC endpoint mapper
+// (135) — every port the host firewall ambiently permits is exposed, because
+// VFP allows can't be port-scoped. The backstop must block the dangerous
+// management ports from the pool as inbound TCP blocks.
+func TestL2BridgeHostHardenRules_BlocksDangerousManagementPorts(t *testing.T) {
+	const (
+		hostIP = "192.0.2.10"
+		pool   = "192.0.2.192/27"
+	)
+	rules := l2BridgeHostHardenRules(hostIP, pool)
+
+	byPort := map[string]string{} // port -> joined spec
+	for _, r := range rules {
+		byPort[specValue(r, "localport")] = strings.Join(r.spec, " ")
+	}
+	// The two the pen test actually caught, plus the rest of the management set.
+	for _, port := range []string{"135", "139", "445", "3389", "5985", "5986", "47001"} {
+		spec, ok := byPort[port]
+		if !ok {
+			t.Errorf("dangerous host port %s is not blocked from the pool", port)
+			continue
+		}
+		for _, want := range []string{"dir=in", "action=block", "protocol=TCP", "localip=" + hostIP, "remoteip=" + pool} {
+			if !strings.Contains(spec, want) {
+				t.Errorf("host-harden rule for port %s missing %q; spec=%q", port, want, spec)
+			}
+		}
+	}
+	// Must never block the ephemeral range dind binds — that would break docker.
+	if _, blocked := byPort["0"]; blocked {
+		t.Error("host-harden must not contain an all-ports/0 block — it would kill the dind listener")
+	}
+}
+
+// TestL2BridgeHostHardenRules_EmptyWithoutPlan guards the nil-safety.
+func TestL2BridgeHostHardenRules_EmptyWithoutPlan(t *testing.T) {
+	if len(l2BridgeHostHardenRules("", "")) != 0 {
+		t.Error("no rules should be produced without a host IP and pool")
+	}
+}

@@ -277,6 +277,11 @@ Container networking configuration.
 |---|---|---|---|
 | `subnet` | string | auto-selected | Container subnet CIDR. Auto-selected from a private range if empty. |
 | `mtu` | integer | auto-detected | Bridge MTU. Auto-detected from the host's default interface if `0`. |
+| `l2bridge_egress` | boolean | `false` | **Windows only.** Enforce Windows container egress filtering. The default Windows NAT network **cannot** be egress-filtered by any host-side mechanism; this puts containers on an HNS L2Bridge with per-endpoint VFP ACLs, the only path that enforces. Requires `host_nic` and `ip_pool`. See [Security → Network Firewall](../guides/security.md#network-firewall). |
+| `host_nic` | string | none | **Windows, required when `l2bridge_egress = true`.** Host adapter to bridge onto (as shown by `Get-NetAdapter`). A dedicated NIC is strongly recommended — see the Security guide. |
+| `ip_pool` | string | none | **Windows, required when `l2bridge_egress = true`.** LAN range ephemerd assigns to job containers (CIDR or `start-end`). **No default** — reserve it in your DHCP scope *before* enabling, or containers collide with live leases. |
+
+> **Windows egress is not filtered by default.** On the default NAT network, ephemerd installs no egress filter and logs that egress is unfiltered. To enforce it, set `l2bridge_egress` (plus `host_nic` and `ip_pool`) — the full procedure and traps are in the [Security guide's Network Firewall section](../guides/security.md#network-firewall). Linux and macOS jobs are egress-filtered by default.
 
 ### `[dind]`
 

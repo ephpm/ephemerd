@@ -30,7 +30,7 @@ When `serve` starts, it performs these steps in order:
 5. **Extract embedded runner** -- unpacks the GitHub Actions runner binary (`.tar.gz` on Linux, `.zip` on Windows).
 6. **Extract CNI plugins** -- unpacks the embedded CNI plugin binaries.
 7. **Initialize networking** -- sets up the container network (CNI bridge on Linux, HCN NAT on Windows).
-8. **Install firewall rules** -- blocks container access to RFC1918 and link-local ranges.
+8. **Install firewall rules** -- on Linux (and the in-VM Linux worker) installs iptables rules blocking container access to RFC1918 and link-local ranges. On Windows this applies only when `network.l2bridge_egress` is enabled; the default NAT network is **not** egress-filtered (no host-side mechanism can filter it on that stack).
 9. **Create GitHub client** -- authenticates using `GITHUB_TOKEN` or GitHub App credentials from the config.
 10. **Wait for Linux dispatcher** -- if a Hyper-V Linux VM is booting in the background (Windows only), waits for the gRPC dispatch client to become ready.
 11. **Configure webhook tunnel** -- sets up localtunnel or ngrok for webhook delivery, or falls back to polling mode.

@@ -124,26 +124,85 @@ func l2BridgeControlPlaneRules(hostIP, ipPool string, controlPorts []int) []winF
 	return rules
 }
 
-// installL2BridgeFirewallRules programs the L2Bridge backstop. Best-effort like
-// the rest of installFirewallRules: the VFP ladder is the enforcement point and
-// a host that cannot program netsh must not fail daemon startup.
+// windowsHostHardenPorts are host TCP ports that MUST NOT be reachable from a
+// job container even though the VFP host /32 allow (AllowHostAccess) opens the
+// host at the vSwitch layer for dind/module-proxy access.
+//
+// VFP Switch ACLs cannot be port-scoped — a port-scoped Switch rule blackholes
+// the whole endpoint — so the host /32 allow is all-ports at the VFP layer, and
+// port precision falls to the host's OWN Windows Firewall. On a stock Windows
+// host that firewall ambiently permits WinRM and the RPC endpoint mapper
+// inbound from the LAN, so a job container (a LAN peer on L2Bridge) can reach
+// them. A job that reached WinRM could attempt host RCE. Block them explicitly
+// from the pool — a host-firewall Block beats the ambient Allow — leaving only
+// the scoped dind/module-proxy allows (high ephemeral ports) open. Found by the
+// 2026-08-15 pen test: WinRM 5985 and RPC 135 were reachable from a job.
+//
+// Note: the RPC dynamic port range (49152-65535) overlaps the ephemeral port
+// dind binds, so it cannot be blanket-blocked here; blocking the endpoint
+// mapper (135) removes the discovery path, which is the material mitigation.
+var windowsHostHardenPorts = []int{
+	135,   // RPC endpoint mapper (the RPC discovery vector)
+	139,   // NetBIOS session
+	445,   // SMB
+	3389,  // RDP
+	5985,  // WinRM HTTP
+	5986,  // WinRM HTTPS
+	47001, // WSMan / WinRM listener
+}
+
+// l2BridgeHostHardenRules returns the inbound host-firewall blocks that fence
+// the dangerous Windows management ports off from the container pool. Pure so
+// the set is unit-testable without netsh.
+func l2BridgeHostHardenRules(hostIP, ipPool string) []winFirewallRule {
+	if hostIP == "" || ipPool == "" {
+		return nil
+	}
+	rules := make([]winFirewallRule, 0, len(windowsHostHardenPorts))
+	for _, port := range windowsHostHardenPorts {
+		rules = append(rules, winFirewallRule{
+			name: fmt.Sprintf("%s-l2b-harden-%d", firewallRulePrefix, port),
+			spec: []string{
+				"dir=in",
+				"action=block",
+				"protocol=TCP",
+				"localip=" + hostIP,
+				"localport=" + strconv.Itoa(port),
+				"remoteip=" + ipPool,
+				"profile=any",
+				"enable=yes",
+			},
+		})
+	}
+	return rules
+}
+
+// installL2BridgeFirewallRules programs the L2Bridge host-firewall backstop:
+// blocks for the ephemerd control-plane ports (if any) and, always, blocks for
+// the dangerous Windows management ports (windowsHostHardenPorts) so the VFP
+// host /32 allow cannot expose WinRM/RPC/RDP/SMB to job containers. Best-effort
+// like the rest of installFirewallRules: the VFP ladder is the enforcement
+// point and a host that cannot program netsh must not fail daemon startup.
 func (w *windowsNetworking) installL2BridgeFirewallRules() error {
 	if w.plan == nil {
 		return nil
 	}
 	rules := l2BridgeControlPlaneRules(w.plan.HostIP, w.plan.PoolSpec, w.cfg.ControlPorts)
+	rules = append(rules, l2BridgeHostHardenRules(w.plan.HostIP, w.plan.PoolSpec)...)
 	if len(rules) == 0 {
-		w.cfg.Log.Info("L2Bridge egress: no control ports to fence off at the host firewall")
 		return nil
 	}
+	installed := 0
 	for _, r := range rules {
 		_ = netsh(r.deleteArgs()...) // idempotent: clear any rule of this name first
-		w.cfg.Log.Info("adding L2Bridge control-plane firewall rule", "rule", r.name)
 		if err := netsh(r.addArgs()...); err != nil {
-			w.cfg.Log.Warn("failed to add L2Bridge control-plane firewall rule", "rule", r.name, "error", err)
+			w.cfg.Log.Warn("failed to add L2Bridge host-firewall rule", "rule", r.name, "error", err)
+			continue
 		}
+		installed++
 	}
-	w.cfg.Log.Info("L2Bridge control-plane firewall rules installed", "rules", len(rules))
+	w.cfg.Log.Info("L2Bridge host-firewall backstop installed",
+		"rules", installed, "hardened_ports", windowsHostHardenPorts)
 	return nil
 }
 
@@ -204,9 +263,11 @@ const hostPortRulePrefix = firewallRulePrefix + "-l2b-hostport-"
 // leaked per-job host-port allows by prefix.
 func (w *windowsNetworking) removeL2BridgeFirewallRules() {
 	if w.plan != nil {
-		for _, r := range l2BridgeControlPlaneRules(w.plan.HostIP, w.plan.PoolSpec, w.cfg.ControlPorts) {
+		backstop := l2BridgeControlPlaneRules(w.plan.HostIP, w.plan.PoolSpec, w.cfg.ControlPorts)
+		backstop = append(backstop, l2BridgeHostHardenRules(w.plan.HostIP, w.plan.PoolSpec)...)
+		for _, r := range backstop {
 			if err := netsh(r.deleteArgs()...); err != nil {
-				w.cfg.Log.Debug("failed to remove L2Bridge control-plane firewall rule", "rule", r.name, "error", err)
+				w.cfg.Log.Debug("failed to remove L2Bridge host-firewall rule", "rule", r.name, "error", err)
 			}
 		}
 	}

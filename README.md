@@ -517,7 +517,7 @@ Every job runs in full isolation:
 
 - **Ephemeral environments** — created per job, destroyed after. No state leaks between jobs.
 - **Hyper-V isolation on Windows** — each container gets its own kernel. Real VM-level isolation.
-- **Network firewall** — containers are blocked from RFC 1918 and link-local ranges by default. Jobs can reach the internet but not your LAN.
+- **Network firewall** — on Linux and macOS, containers are blocked from RFC 1918 and link-local ranges by default: jobs reach the internet but not your LAN. On Windows this requires `network.l2bridge_egress` (see the [Security guide](docs/guides/security.md)); the default Windows NAT network does **not** filter egress.
 - **Read-only runner mount** — the GitHub Actions runner binary is bind-mounted read-only.
 - **No host access** — no Docker socket, no host filesystem, no privileged mode.
 
