@@ -117,6 +117,16 @@ max_concurrent = 4                   # max simultaneous jobs
 # cache_prune_interval = "24h"       # how often empty per-repo cache namespaces are reaped
 # cache_max_age        = "0"         # OPTIONAL age backstop for the dind cache (0 = off; see [image_gc])
 
+# --- Registry pull-through cache ----------------------------------------------
+[registry_mirror]
+# enabled             = false                        # route image pulls through a LAN cache
+# endpoint            = "http://registry.lan:5000"   # base URL, scheme required; no default
+# registries          = ["docker.io"]                # upstream hosts this endpoint serves
+# fallback_to_origin  = true                         # keep the origin behind the mirror (fail open)
+# forward_credentials = false                        # do NOT hand registry creds to the mirror
+# [registry_mirror.mirrors]
+# "ghcr.io" = "http://ghcr-cache.lan:5000"           # per-registry override
+
 # --- BuildKit build cache -----------------------------------------------------
 [buildkit]
 # gc_enabled                   = true    # bound the build cache (leave on)
@@ -310,6 +320,42 @@ The cache namespace persists across jobs and across ephemerd restarts. Per-job s
 **Pruning.** Every `cache_prune_interval`, dind walks each `ephemerd-dind-cache-*` namespace and evicts Image records whose `ephemerd.io/last-accessed` label is older than `cache_max_age`. Cache namespaces left empty after eviction are removed entirely. Records pre-dating the label fall back to the record's `UpdatedAt` timestamp so a deploy that introduces the cache feature doesn't nuke pre-existing records on first prune.
 
 **Disabling caching.** Setting `cache_prune_interval = "0"` disables the reaper goroutine entirely; equivalent to "keep everything forever, even empty namespaces." Cache size itself is bounded by `[image_gc]`, not by this loop.
+
+### `[registry_mirror]`
+
+Routes container image pulls through a pull-through registry cache on the LAN instead of the origin registry. Covers every pull ephemerd makes: the runner image, images a job pulls through the fake Docker socket, images a sibling container is created from, and the OCI layers extracted for macOS VM jobs. Disabled by default; with no block present, pulls are exactly what they were before the feature existed.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Route pulls through the mirror. Everything else here is inert while this is `false`. |
+| `endpoint` | string | none | Base URL of the cache, **including the scheme** (`http://` or `https://`). **No default** — the cache is site-specific. A path prefix is allowed and is joined ahead of the `/v2` API root. |
+| `registries` | array | `["docker.io"]` | Upstream registry hosts `endpoint` serves. `index.docker.io` and `registry-1.docker.io` fold to `docker.io`. |
+| `fallback_to_origin` | boolean | `true` | Keep the origin registry in the pull host list behind the mirror. **Fail open by default** — see below. |
+| `forward_credentials` | boolean | `false` | Send the credentials used against the origin registry to the mirror too. Off by default; see the security note below. |
+| `mirrors` | table | none | Per-registry cache URLs (`[registry_mirror.mirrors]` sub-table), for sites that cannot serve everything from one endpoint. An entry wins over `endpoint`/`registries` for that host. |
+
+```toml
+[registry_mirror]
+enabled  = true
+endpoint = "http://registry.lan:5000"
+
+[registry_mirror.mirrors]
+"ghcr.io" = "http://ghcr-cache.lan:5000"
+```
+
+> **Fail open is the default.** With `fallback_to_origin = true`, containerd is given the host list `[mirror, origin]` and moves to the next entry whenever one fails to answer or returns 4xx/5xx. A cache that is down, wedged, or simply does not hold the image therefore costs one failed request and the pull completes against the origin — the node degrades to the WAN speed it had before the mirror existed rather than failing every job on it. There is no health check and no circuit breaker; the fallback is containerd's own retry loop. Setting `false` makes the mirror authoritative, which is an egress-control posture (jobs can only run images the cache holds), not a performance setting.
+
+**Why this exists.** Nodes re-pull the same base image constantly. A production `linux-amd64` node measured 294 GB inbound over 4.1 days across ~80 jobs/day — roughly 890 MB per job — and one 1.1 GB CI image accounted for 163 of those pulls in seven days. dind pulls into a per-job containerd namespace, so that image crosses the WAN for essentially every job. A LAN cache makes every pull after the first LAN-speed and takes the node out of Docker Hub's anonymous rate limit, since only the cache talks to Hub. The benefit is largest when many jobs share one large base image; a fleet where every job pulls a different small image will see little.
+
+**Pull only.** The mirror is advertised to containerd with pull and resolve capabilities and nothing else. `docker push` from a job always goes to the origin registry — a pull-through cache is not somewhere to publish.
+
+**Credentials.** By default the mirror is contacted anonymously even when the job has done a `docker login`; only the origin registry receives credentials. A pull-through cache normally holds its own upstream credentials and needs none from the client, and a mirror that answered with a Basic challenge would otherwise harvest the registry PAT a job just logged in with — in plaintext when the endpoint is `http://`. Set `forward_credentials = true` only for a mirror you operate that requires authentication (Harbor with a robot account, Zot behind htpasswd).
+
+**Validation.** A malformed endpoint fails config load with the offending key named, on every platform, whether or not `enabled` is set — so a mirror staged ahead of a rollout is known-good before the toggle is flipped. `endpoint = "registry.lan:5000"` (the common typo) is rejected for the missing scheme with the corrected value in the message.
+
+**Windows and macOS hosts.** Linux jobs on those hosts run inside a Linux VM whose containerd does the pulling. On Windows the host's `config.toml` is staged into the VM on every boot, so `[registry_mirror]` takes effect there with no extra steps. On macOS the Vz VM does not yet receive the host config — see the [registry cache guide](../guides/registry-cache.md#windows-and-macos-hosts).
+
+Operator setup — which cache to run, how to size it, how to verify it — is in the [registry cache guide](../guides/registry-cache.md).
 
 ### `[buildkit]`
 

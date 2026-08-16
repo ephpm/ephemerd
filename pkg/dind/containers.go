@@ -282,7 +282,11 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		pullRef := qualifyDockerHubRef(req.Image)
 		s.log.Info("image not found, pulling for container create", "image", req.Image, "pull_ref", pullRef)
-		img, err = s.client.Pull(ctx, pullRef, client.WithPullUnpack)
+		// Same mirror + credential routing as handleImagePull; both are
+		// no-ops when neither is configured. See Server.pullRemoteOpts.
+		s.mirror.LogPull(pullRef)
+		pullOpts := append([]client.RemoteOpt{client.WithPullUnpack}, s.pullRemoteOpts(r, pullRef)...)
+		img, err = s.client.Pull(ctx, pullRef, pullOpts...)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{
 				"message": fmt.Sprintf("image %s not found: %v", req.Image, err),
