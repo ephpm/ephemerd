@@ -35,10 +35,22 @@ import (
 //     out-of-band of the host tcpip.sys WFP hooks. Full evidence:
 //     docs/arch/windows-egress-wfp-investigation.md.
 //
-// So on the NAT path ephemerd installs nothing and logs that container egress
-// is unfiltered, pointing the operator at network.l2bridge_egress. Enforcing
-// NAT egress requires a network-level control (an isolated VLAN whose uplink
-// denies RFC1918), not a host-side software filter.
+// So on the NAT path ephemerd installs no EGRESS filtering and logs that
+// container egress is unfiltered, pointing the operator at
+// network.l2bridge_egress. Enforcing NAT egress requires a network-level
+// control (an isolated VLAN whose uplink denies RFC1918), not a host-side
+// software filter.
+//
+// The one host-firewall rule the NAT path DOES install is inbound, not egress:
+// the per-job dind host-port allow (openHostPort). That is a different
+// direction and a different question. Container -> LAN egress is forwarded and
+// SNAT'd, so the host firewall cannot match on the container source; container
+// -> gateway (10.88.0.1) terminates ON the host, so it is ordinary inbound
+// traffic carrying the container's own 10.88.x.y source, which the host
+// firewall both sees and default-denies. That deny is what broke every Windows
+// docker command on a NAT node (#162), and a source-scoped inbound allow is
+// what fixes it — verified on mfl-win-amd64-101 by admitting 10.88.0.0/16 to
+// 10.88.0.1 and watching a previously timing-out `docker login` succeed.
 //
 // IPv4 only, deliberately: the HCN NAT network is IPv4-only (no v6 IPAM), so
 // containers have no IPv6 path.
@@ -236,7 +248,9 @@ func normalizeContainerIP(containerIP string) (string, error) {
 }
 
 // hostPortAllowRule is the scoped inbound allow that makes one host TCP port
-// reachable from ONE job container on the L2Bridge path (see openHostPort).
+// reachable from ONE job container (see openHostPort). Used on both Windows
+// paths; only hostIP differs (the host's LAN address on L2Bridge, the bridge
+// gateway on NAT).
 //
 // remoteip is that container's own /32 — never the pool. This is a security
 // boundary, not a tidiness preference. The per-job service behind the port is
@@ -268,33 +282,88 @@ func hostPortAllowRule(hostIP, containerIP string, port int) winFirewallRule {
 	}
 }
 
+// hostPortLocalIP returns the host address a per-job dind allow must be scoped
+// to, and whether this path needs an allow at all.
+//
+// It MUST return the address dind actually bound its listener to, which is
+// Manager.GatewayIP():
+//
+//   - L2Bridge: hostAddr() reports plan.HostIP, the host's own LAN address.
+//   - NAT: hostAddr() reports "", so GatewayIP falls through to the subnet
+//     derivation — the .1 of the container subnet, i.e. 10.88.0.1 by default.
+//     gatewayForSubnet is that same derivation, shared rather than duplicated
+//     so the two cannot drift into scoping the allow at an address nothing is
+//     listening on.
+//
+// The false return is reserved for the one genuinely unresolvable case:
+// L2Bridge egress enabled but no address plan (init failed, or the daemon is
+// mid-teardown). NAT always resolves.
+func (w *windowsNetworking) hostPortLocalIP() (string, bool) {
+	if w.cfg.L2BridgeEgress {
+		if w.plan == nil || w.plan.HostIP == "" {
+			return "", false
+		}
+		return w.plan.HostIP, true
+	}
+	return gatewayForSubnet(w.cfg.Subnet), true
+}
+
+// hostPortRuleFor resolves the one firewall rule an open/close pair acts on.
+//
+// Both openHostPort and closeHostPort go through it, and that is what
+// guarantees teardown deletes exactly the rule setup added: a single function
+// decides the host address, the container /32, and therefore the rule name that
+// netsh matches on. The bool reports whether this path installs a rule at all.
+func (w *windowsNetworking) hostPortRuleFor(port int, containerIP string) (winFirewallRule, bool, error) {
+	hostIP, needed := w.hostPortLocalIP()
+	if !needed {
+		return winFirewallRule{}, false, nil
+	}
+	ip, err := normalizeContainerIP(containerIP)
+	if err != nil {
+		return winFirewallRule{}, false, err
+	}
+	return hostPortAllowRule(hostIP, ip, port), true, nil
+}
+
 // openHostPort adds a scoped inbound allow so ONE job container — the one at
 // containerIP — can reach one host TCP port (its own dind Docker API listener).
-// Without it the host's default inbound deny drops the connection even though
-// the VFP host /32 allow permits the container to send. Scoped to
-// remoteip=<containerIP>/32 and localport=<port>, so neither another port on
-// the host nor another job's container is admitted. No-op unless the L2Bridge
-// egress path is active with a resolved plan.
+// Without it the host's default inbound deny drops the connection and every
+// docker command in the job fails with an i/o timeout.
+//
+// Applies to BOTH Windows paths. On L2Bridge the VFP host /32 allow lets the
+// container's packet leave its vSwitch port, but the host firewall still
+// default-denies it. On NAT there is no VFP layer at all, yet the same host
+// firewall still default-denies the container's inbound connection to the
+// bridge gateway — which is #162: a NAT node took the old L2Bridge-only early
+// return, installed nothing, and silently dropped every job's dind SYN.
+//
+// Scoped to remoteip=<containerIP>/32 and localport=<port>, so neither another
+// port on the host nor another job's container is admitted. The /32 matters as
+// much on NAT as on L2Bridge: every job container on a NAT node shares
+// 10.88.0.0/16 and can address 10.88.0.1, so a subnet-wide allow would let one
+// job port-scan the gateway's ephemeral range and drive another job's
+// unauthenticated Docker API — the exact cross-job break #152 closed.
 //
 // Fails closed on a missing or malformed containerIP: it opens nothing and
-// returns an error. The tempting fallback — open the pool when the exact
+// returns an error. The tempting fallback — open the subnet when the exact
 // address is unknown — is precisely the cross-job hole this scoping exists to
 // close, so an unknown address must cost the job its docker access, not cost
 // every other job its isolation.
 func (w *windowsNetworking) openHostPort(port int, containerIP string) error {
-	if !w.cfg.L2BridgeEgress || w.plan == nil || w.plan.HostIP == "" {
+	r, needed, err := w.hostPortRuleFor(port, containerIP)
+	if err != nil {
+		return fmt.Errorf("refusing to open host port %d without a specific container address (a subnet-wide allow would expose this job's unauthenticated Docker API to every other job): %w", port, err)
+	}
+	if !needed {
 		return nil
 	}
-	ip, err := normalizeContainerIP(containerIP)
-	if err != nil {
-		return fmt.Errorf("refusing to open host port %d without a specific container address (a pool-wide allow would expose this job's unauthenticated Docker API to every other job): %w", port, err)
-	}
-	r := hostPortAllowRule(w.plan.HostIP, ip, port)
 	_ = netsh(r.deleteArgs()...) // idempotent
 	if err := netsh(r.addArgs()...); err != nil {
-		return fmt.Errorf("opening host port %d for container %s: %w", port, ip, err)
+		return fmt.Errorf("opening host port %d for container %s: %w", port, containerIP, err)
 	}
-	w.cfg.Log.Info("opened L2Bridge host port for a single job container", "port", port, "container_ip", ip, "rule", r.name)
+	w.cfg.Log.Info("opened host port for a single job container",
+		"port", port, "container_ip", containerIP, "rule", r.name, "l2bridge", w.cfg.L2BridgeEgress)
 	return nil
 }
 
@@ -302,25 +371,30 @@ func (w *windowsNetworking) openHostPort(port int, containerIP string) error {
 // the same address the allow was opened for — it is half the rule name, which
 // is what keeps one job's teardown from deleting another job's rule.
 func (w *windowsNetworking) closeHostPort(port int, containerIP string) {
-	if !w.cfg.L2BridgeEgress || w.plan == nil || w.plan.HostIP == "" {
-		return
-	}
-	ip, err := normalizeContainerIP(containerIP)
+	r, needed, err := w.hostPortRuleFor(port, containerIP)
 	if err != nil {
 		// Nothing was opened for an address we cannot parse, so there is
 		// nothing to close; the shutdown prefix sweep is the backstop.
-		w.cfg.Log.Debug("skipping L2Bridge host-port close for an unusable container address", "port", port, "container_ip", containerIP, "error", err)
+		w.cfg.Log.Debug("skipping host-port close for an unusable container address", "port", port, "container_ip", containerIP, "error", err)
 		return
 	}
-	r := hostPortAllowRule(w.plan.HostIP, ip, port)
+	if !needed {
+		return
+	}
 	if err := netsh(r.deleteArgs()...); err != nil {
-		w.cfg.Log.Debug("failed to remove L2Bridge host-port allow", "port", port, "container_ip", ip, "error", err)
+		w.cfg.Log.Debug("failed to remove host-port allow", "port", port, "container_ip", containerIP, "error", err)
 	}
 }
 
 // hostPortRulePrefix is the DisplayName prefix of every per-job host-port allow
 // (see hostPortAllowRule). Swept by prefix on shutdown so a hard kill — which
 // skips dind's per-job CloseHostPort — cannot leak stale inbound allows.
+//
+// The "-l2b-" token is historical: these allows are now installed on the NAT
+// path too. It is deliberately NOT renamed. The prefix is the ONLY handle the
+// shutdown sweep has on a leaked rule, so changing it would strand every allow
+// left behind by the previously-running build — the one moment the sweep exists
+// for. The value is a wire format between versions, not a description.
 const hostPortRulePrefix = firewallRulePrefix + "-l2b-hostport-"
 
 // removeL2BridgeFirewallRules deletes the backstop rules by name, and sweeps any
@@ -378,10 +452,14 @@ func (w *windowsNetworking) installFirewallRules() error {
 		return w.installL2BridgeFirewallRules()
 	}
 
-	// NAT path: there is no host-side mechanism that can filter container egress
+	// NAT path: there is no host-side mechanism that can filter container EGRESS
 	// on this stack (WFP, the Hyper-V firewall, and netsh were all disproven on
-	// metal — see the file header). Installing rules here would be security
-	// theater: they match nothing. Log the gap and install nothing.
+	// metal — see the file header). Installing egress rules here would be
+	// security theater: they match nothing. Log the gap and install nothing.
+	//
+	// Note this is the daemon-wide install only. The NAT path still installs the
+	// per-job dind INBOUND allow in openHostPort, which does match — that
+	// traffic terminates on the host rather than being forwarded and SNAT'd.
 	w.cfg.Log.Warn("Windows container egress is NOT filtered on the default NAT network — no host-side mechanism can filter it on this stack; set network.l2bridge_egress to enforce egress (see docs/guides/security.md)")
 	return nil
 }
