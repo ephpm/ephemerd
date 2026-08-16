@@ -91,6 +91,10 @@ max_concurrent = 4                   # max simultaneous jobs
 # job_timeout = "2h"                 # max duration per job
 # shutdown_timeout = "5m"            # grace period for running jobs on shutdown
 
+# --- Linux job isolation (Linux hosts only) -----------------------------------
+[runner.linux]
+# runtime = "runc"                   # "runc" (host kernel) or "kata" (VM per job)
+
 # --- Linux VM (Windows/macOS hosts only) --------------------------------------
 [vm.linux]
 # enabled = false                    # spin up a Linux VM for cross-OS Linux jobs
@@ -244,6 +248,22 @@ Default images when `default_image` is not set:
 - **Windows:** `mcr.microsoft.com/windows/servercore:ltsc20XX` (auto-detected from host build)
 
 **VM resource planning (Windows and macOS):** On Windows and macOS, `max_concurrent` applies to the entire ephemerd instance — Linux container jobs and native OS jobs share the same concurrency pool. All Linux jobs run inside a single VM (Hyper-V Linux VM on Windows, Virtualization.framework on macOS), so if `max_concurrent = 4`, that VM could be running 4 jobs simultaneously. Size the VM's CPU and memory (`[vm.linux]`) accordingly, or jobs will compete for resources and slow each other down.
+
+### `[runner.linux]`
+
+How Linux job containers are isolated. Linux hosts only.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `runtime` | string | `"runc"` | Container runtime for Linux job containers: `"runc"` or `"kata"` |
+
+Windows jobs get Hyper-V isolation and macOS jobs get a full VM, but with the default `runc` a Linux job is an ordinary container sharing the host kernel — so a kernel-level escape is a host compromise. Setting `runtime = "kata"` gives each job container its own kernel inside a lightweight VM ([Kata Containers](https://katacontainers.io/)), making isolation uniform across the three platforms.
+
+**Requirements.** Kata Containers must be installed with `containerd-shim-kata-v2` on the daemon's `PATH`, and `/dev/kvm` must exist and be openable — on a VM that means nested virtualization has to be enabled for the guest. If either is missing, **ephemerd refuses to start**. That is deliberate: falling back to `runc` would run untrusted CI code on the host kernel while the config claims VM isolation, and a silent downgrade of an isolation guarantee is worse than an outage.
+
+> **`runtime = "kata"` is incompatible with `[dind]`.** ephemerd hands jobs a Docker API by bind-mounting a host unix socket at `/var/run/docker.sock`. Under Kata that bind becomes a virtio-fs passthrough, which carries the socket file into the guest but not its connectability: the socket appears and every `connect()` returns `ECONNREFUSED`. Setting both is rejected at config load. Use `dind.enabled = false` with Kata until the Docker API is offered over TCP the way it already is on Windows.
+
+**Measured cost** (8-core Proxmox guest, Kata 4.0.0, QEMU, 10-run medians — see `docs/arch/` benchmarks): container start latency rises from ~0.10 s to ~1.0 s, each running job carries roughly 350 MB of guest-VM memory overhead on top of the workload, CPU-bound work is ~10% slower, and I/O against the bind-mounted runner directory is several times slower because it crosses virtio-fs instead of a plain bind. Short jobs pay the start-up cost proportionally hardest; file-heavy jobs pay the most overall.
 
 ### `[vm.linux]`
 

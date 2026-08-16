@@ -185,6 +185,30 @@ job_timeout = "2h"
 # Time to wait for running jobs during graceful shutdown
 shutdown_timeout = "5m"
 
+# Container runtime for Linux job containers.
+#
+# "runc" (default) runs jobs as ordinary containers on the host kernel.
+# "kata" runs each job container inside its own lightweight VM with its
+# own kernel (Kata Containers), which makes a kernel-level container
+# escape a guest-VM escape instead of a host compromise, and brings Linux
+# in line with the Hyper-V isolation Windows jobs already get.
+#
+# Requirements for "kata": Kata Containers installed with
+# containerd-shim-kata-v2 on PATH, and a usable /dev/kvm (on a VM that
+# means nested virtualization must be enabled). ephemerd REFUSES TO START
+# if either is missing rather than silently falling back to runc.
+#
+# Costs, measured on an 8-core Proxmox guest with Kata 4.0.0 + QEMU:
+# container start goes from ~0.10s to ~1.0s, each job carries a ~350 MB
+# guest-VM memory overhead, CPU-bound work is ~10% slower, and I/O over
+# the bind-mounted runner dir (virtio-fs) is several times slower.
+#
+# NOT compatible with [dind] — the Docker API is passed to jobs through a
+# bind-mounted unix socket, which a Kata guest cannot connect to. Enabling
+# both is a config error.
+# [runner.linux]
+# runtime = "runc"
+
 # Claim retry queue.
 #
 # GitHub does not re-deliver workflow_job webhooks. When ephemerd's

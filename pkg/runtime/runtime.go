@@ -102,7 +102,16 @@ type Config struct {
 	// construction site that forgets this field breaks `sudo` rather
 	// than silently loosening the sandbox.
 	AllowNewPrivileges bool
-	Network *networking.Manager
+	// LinuxRuntime is the containerd runtime handler for Linux job
+	// containers — "io.containerd.runc.v2" (default) or
+	// "io.containerd.kata.v2" for VM-isolated jobs. Empty means runc, so
+	// a construction site that forgets this field keeps today's behavior
+	// rather than failing to create containers. Ignored on Windows, which
+	// always uses io.containerd.runhcs.v1.
+	//
+	// Callers pass config.LinuxRunnerToml.ContainerdRuntime().
+	LinuxRuntime string
+	Network      *networking.Manager
 	// WindowsMemoryBytes is the memory limit for Hyper-V isolated Windows
 	// runner containers. Zero leaves the OCI spec field unset, which gives
 	// the HCS default (~1 GB) — too small for MSVC builds. Caller should
@@ -131,6 +140,28 @@ type Config struct {
 	// multi-gigabyte toolchain image between ticks.
 	ImageGC *imagegc.Collector
 	Log     *slog.Logger
+}
+
+// resolveRuntimeName picks the containerd runtime handler for a job
+// container.
+//
+// The runtime is always named explicitly: containerd 2.2 may otherwise
+// default to the experimental io.containerd.nerdbox.v1 runtime, whose shim
+// binary isn't in our embed.
+//
+// On Linux the handler comes from [runner.linux] runtime — runc by
+// default, io.containerd.kata.v2 when the operator opted into VM-isolated
+// jobs. Windows always uses the host runhcs shim; the Linux knob does not
+// apply there. An empty linuxRuntime means runc, so a construction site
+// that forgets the field keeps today's behavior.
+func resolveRuntimeName(linuxRuntime, goos string) string {
+	if goos == "windows" {
+		return "io.containerd.runhcs.v1"
+	}
+	if linuxRuntime == "" {
+		return "io.containerd.runc.v2"
+	}
+	return linuxRuntime
 }
 
 // Runtime manages container lifecycle for runner environments.
@@ -995,13 +1026,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		}
 	}
 
-	// Force runc runtime. containerd 2.2 may default to the experimental
-	// io.containerd.nerdbox.v1 runtime, whose shim binary isn't in our
-	// embed. Use runc explicitly on Linux, host shim on Windows.
-	runtimeName := "io.containerd.runc.v2"
-	if goruntime.GOOS == "windows" {
-		runtimeName = "io.containerd.runhcs.v1"
-	}
+	runtimeName := resolveRuntimeName(r.cfg.LinuxRuntime, goruntime.GOOS)
 	container, err := r.client.NewContainer(ctx, id,
 		client.WithImage(img),
 		client.WithSnapshotter(snapshotterName),

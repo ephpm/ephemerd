@@ -192,6 +192,15 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	log := cfg.Logger()
 	log.Info("starting ephemerd", "version", version, "data_dir", configDir)
 
+	// Refuse to start if the operator asked for VM-isolated Linux jobs but
+	// this host can't deliver them. Falling back to runc here would run
+	// untrusted CI code on the host kernel while the config says otherwise
+	// — a silent downgrade of an isolation guarantee, which is strictly
+	// worse than not starting.
+	if err := checkKataPrereqs(cfg, log); err != nil {
+		return err
+	}
+
 	// Ensure data directory exists
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		return fmt.Errorf("creating data directory %s: %w", configDir, err)
@@ -329,6 +338,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			DindAllowPrivileged: cfg.Dind.ResolvedAllowPrivileged(),
 			Rlimits:             cfg.Runtime.Rlimits.Resolved(),
 			AllowNewPrivileges:  cfg.Runtime.ResolvedAllowNewPrivileges(),
+			LinuxRuntime:        cfg.Runner.Linux.ContainerdRuntime(),
 			Network:             net,
 			WindowsMemoryBytes:  cfg.Runner.Windows.MemoryBytes(),
 			WindowsCPUs:         cfg.Runner.Windows.CPUCount(),
@@ -550,6 +560,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		CacheProxyEnv:       cacheProxyEnvVars,
 		Rlimits:             cfg.Runtime.Rlimits.Resolved(),
 		AllowNewPrivileges:  cfg.Runtime.ResolvedAllowNewPrivileges(),
+		LinuxRuntime:        cfg.Runner.Linux.ContainerdRuntime(),
 		Network:             net,
 		WindowsMemoryBytes:  cfg.Runner.Windows.MemoryBytes(),
 		WindowsCPUs:         cfg.Runner.Windows.CPUCount(),
