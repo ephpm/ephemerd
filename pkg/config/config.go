@@ -1312,6 +1312,7 @@ type RunnerConfig struct {
 	JobTimeout      string            `toml:"job_timeout"`
 	ShutdownTimeout string            `toml:"shutdown_timeout"`
 	Windows         WindowsRunnerToml `toml:"windows"`
+	Linux           LinuxRunnerToml   `toml:"linux"`
 
 	// ClaimRetry controls the in-memory retry queue for jobs whose
 	// initial claim / provision attempt fails with a transient error
@@ -1382,6 +1383,87 @@ type ClaimRetryToml struct {
 type WindowsRunnerToml struct {
 	MemoryMB uint64 `toml:"memory_mb"` // memory in MB (default: 4096)
 	CPUs     uint64 `toml:"cpus"`      // virtual CPUs (default: 2)
+}
+
+// Container runtimes selectable for Linux job containers via
+// [runner.linux] runtime. These are the TOML values, not the containerd
+// runtime handler names — see LinuxRunnerToml.ContainerdRuntime.
+const (
+	// LinuxRuntimeRunc is the default: an ordinary OCI container sharing
+	// the host kernel, run by io.containerd.runc.v2.
+	LinuxRuntimeRunc = "runc"
+
+	// LinuxRuntimeKata runs each job container inside its own lightweight
+	// VM with its own kernel, via io.containerd.kata.v2.
+	LinuxRuntimeKata = "kata"
+)
+
+// LinuxRunnerToml configures how Linux job containers are isolated.
+//
+// Linux is the weakest of the three platforms today: Windows jobs get
+// Hyper-V isolation and macOS jobs get a full VM, but Linux jobs are
+// ordinary containers on the host kernel, so a kernel-level escape is a
+// host compromise. Setting runtime = "kata" gives each job container its
+// own kernel in a lightweight VM, which makes isolation uniform across
+// platforms.
+//
+// Default is "runc" — Kata is opt-in. Measured on an 8-core amd64 node
+// with Kata 4.0.0 + QEMU, it costs seconds of extra container start
+// latency (0.14s -> 4.1s median), ~310 MB of guest memory per running
+// job instead of ~14 MB, ~35% on CPU-bound work and 8-40x on file-heavy
+// work.
+//
+// [dind] works under Kata. The Docker API cannot be handed over as a
+// bind-mounted unix socket — the guest has its own kernel, so the socket
+// inode arrives with no endpoint behind it and connect(2) returns
+// ECONNREFUSED — so those jobs get the same DOCKER_HOST=tcp:// transport
+// dind has always used for Hyper-V-isolated Windows containers, with the
+// port firewalled to the owning container's address. The transport is
+// chosen from this key at container-create time; see
+// runtime.resolveDindTransport.
+type LinuxRunnerToml struct {
+	// Runtime selects the container runtime for Linux job containers:
+	// "runc" (default) or "kata". Empty means "runc".
+	Runtime string `toml:"runtime"`
+}
+
+// ResolvedRuntime returns the configured Linux job-container runtime,
+// applying the default when the key is unset. Always returns one of the
+// LinuxRuntime* constants; validate() rejects anything else at load time.
+func (l LinuxRunnerToml) ResolvedRuntime() string {
+	if strings.TrimSpace(l.Runtime) == "" {
+		return LinuxRuntimeRunc
+	}
+	return strings.TrimSpace(l.Runtime)
+}
+
+// ContainerdRuntime returns the containerd runtime handler name for the
+// configured runtime — the string passed to containerd's WithRuntime.
+func (l LinuxRunnerToml) ContainerdRuntime() string {
+	if l.ResolvedRuntime() == LinuxRuntimeKata {
+		return "io.containerd.kata.v2"
+	}
+	return "io.containerd.runc.v2"
+}
+
+// validate rejects an unknown runtime name. A typo must not silently fall
+// back to runc: that would quietly drop the isolation the operator asked
+// for, which is the whole point of the key.
+//
+// Kata alongside dind used to be rejected here, on the grounds that the
+// bind-mounted /var/run/docker.sock is unreachable from inside the guest.
+// That part is still true and unfixable, but it was only ever a property
+// of the transport, not of dind: VM-isolated jobs now get the same
+// DOCKER_HOST=tcp:// transport that Hyper-V-isolated Windows containers
+// have always used. The combination is supported and no longer refused.
+func (l LinuxRunnerToml) validate() error {
+	switch l.ResolvedRuntime() {
+	case LinuxRuntimeRunc, LinuxRuntimeKata:
+		return nil
+	default:
+		return fmt.Errorf("runner.linux.runtime is %q (supported: %s, %s)",
+			l.Runtime, LinuxRuntimeRunc, LinuxRuntimeKata)
+	}
 }
 
 // MemoryBytes returns the memory limit in bytes, applying the default if unset.
@@ -1704,6 +1786,10 @@ func (c *Config) validate() error {
 	}
 
 	if err := c.RegistryMirror.validate(); err != nil {
+		return err
+	}
+
+	if err := c.Runner.Linux.validate(); err != nil {
 		return err
 	}
 

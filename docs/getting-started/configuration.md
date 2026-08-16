@@ -91,6 +91,10 @@ max_concurrent = 4                   # max simultaneous jobs
 # job_timeout = "2h"                 # max duration per job
 # shutdown_timeout = "5m"            # grace period for running jobs on shutdown
 
+# --- Linux job isolation (Linux hosts only) -----------------------------------
+[runner.linux]
+# runtime = "runc"                   # "runc" (host kernel) or "kata" (VM per job)
+
 # --- Linux VM (Windows/macOS hosts only) --------------------------------------
 [vm.linux]
 # enabled = false                    # spin up a Linux VM for cross-OS Linux jobs
@@ -287,6 +291,66 @@ Default images when `default_image` is not set:
 - **Windows:** `mcr.microsoft.com/windows/servercore:ltsc20XX` (auto-detected from host build)
 
 **VM resource planning (Windows and macOS):** On Windows and macOS, `max_concurrent` applies to the entire ephemerd instance — Linux container jobs and native OS jobs share the same concurrency pool. All Linux jobs run inside a single VM (Hyper-V Linux VM on Windows, Virtualization.framework on macOS), so if `max_concurrent = 4`, that VM could be running 4 jobs simultaneously. Size the VM's CPU and memory (`[vm.linux]`) accordingly, or jobs will compete for resources and slow each other down.
+
+### `[runner.linux]`
+
+How Linux job containers are isolated. Linux hosts only.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `runtime` | string | `"runc"` | Container runtime for Linux job containers: `"runc"` or `"kata"` |
+
+Windows jobs get Hyper-V isolation and macOS jobs get a full VM, but with the default `runc` a Linux job is an ordinary container sharing the host kernel — so a kernel-level escape is a host compromise. Setting `runtime = "kata"` gives each job container its own kernel inside a lightweight VM ([Kata Containers](https://katacontainers.io/)), making isolation uniform across the three platforms.
+
+**Requirements.** Kata Containers must be installed with `containerd-shim-kata-v2` on the daemon's `PATH`, and `/dev/kvm` must exist and be openable — on a VM that means nested virtualization has to be enabled for the guest. If either is missing, **ephemerd refuses to start**. That is deliberate: falling back to `runc` would run untrusted CI code on the host kernel while the config claims VM isolation, and a silent downgrade of an isolation guarantee is worse than an outage.
+
+**`[dind]` works under Kata, on a different transport.** Normally ephemerd hands a job its Docker API by bind-mounting a host unix socket at `/var/run/docker.sock`. That cannot work into a Kata guest: the bind carries the socket *file* across the VM boundary but not its connectability, so the socket appears and every `connect()` returns `ECONNREFUSED`. VM-isolated jobs therefore get the API over TCP instead — the same `DOCKER_HOST=tcp://…` transport dind has always used for Hyper-V-isolated Windows containers — bound to the bridge gateway on an ephemeral per-job port. Nothing in a workflow needs to change: the docker CLI reads `DOCKER_HOST`. There is no `/var/run/docker.sock` inside the container, so a step that hard-codes the socket path (`curl --unix-socket /var/run/docker.sock`) has to use `$DOCKER_HOST` instead.
+
+> **Security note.** That per-job port is firewalled to the owning container's `/32` — the served Docker API authenticates nothing, so the firewall scope is what keeps one job from driving another job's daemon. If the scope cannot be applied, the job fails rather than starting with a wider one.
+
+> **Sibling bind mounts are limited under Kata.** `docker run -v <path>` from inside a job works only when `<path>` is under a host-backed mount (the runner directory, `/etc/hosts`, `/etc/resolv.conf`). A source inside the job container's *own* filesystem — `/tmp/...`, the GitHub Actions workspace under `/home/runner/_work` — lives in the guest, where the host-side daemon cannot read it. Those are **rejected** with an explicit error at `docker create` rather than mounted: the mount would otherwise succeed and hand the sibling container a silently empty directory.
+
+**Measured cost.** Benchmarked on an 8-core amd64 Proxmox guest (Kata 4.0.0, QEMU 
+hypervisor, containerd runtime handler `io.containerd.kata.v2`), comparing `runc` and 
+`kata` with the same image on the same node, runtimes interleaved:
+
+| Measurement | runc | kata | Ratio |
+|---|---|---|---|
+| Container create → running (median, n=18) | 140 ms | 4 146 ms | 30× |
+| Container create → running (best case) | 69 ms | 2 607 ms | 38× |
+| Host memory per idle container | ~14 MB | ~310 MB | 22× |
+| CPU-bound compile (median, n=4) | 7.5 s | 10.2 s | 1.35× |
+| Create 3 000 files on rootfs (median, n=4) | 645 ms | 5 195 ms | 8.1× |
+| Read 3 000 files on rootfs | 79 ms | 2 890 ms | 37× |
+| Create 3 000 files on the bind-mounted runner dir | 435 ms | 4 712 ms | 10.8× |
+| Read 3 000 files on the bind-mounted runner dir | 73 ms | 2 984 ms | 41× |
+
+Nearly all of the start latency is guest kernel boot (the `task create` step). The memory 
+figure is dominated by the QEMU process (~267 MB resident); it is a per-job cost, so a node 
+running `max_concurrent = 4` needs roughly 1.2 GB of headroom it did not need before. Short 
+jobs pay the start-up cost proportionally hardest; file-heavy jobs (dependency installs, 
+large checkouts) pay the most overall.
+
+**Cost with dind enabled.** The table above was measured with `dind.enabled = false`. 
+Re-measured on the same node with dind on — end-to-end `Runtime.Create`, i.e. image resolve 
+through container create, task create, CNI attach, per-job firewall scope and task start:
+
+| Measurement | runc + dind | kata + dind | Ratio |
+|---|---|---|---|
+| Provision a job container (median, n=9) | 203 ms | 2 498 ms | 12.3× |
+| Provision a job container (min / max) | 197 / 212 ms | 2 472 / 2 528 ms | — |
+
+The TCP transport itself is not a measurable part of that: binding an ephemeral port and 
+appending two iptables rules is sub-millisecond work next to a guest kernel boot. This 
+window is wider than the `create → running` figure in the table above because it includes 
+the surrounding provisioning steps, so compare the two columns with each other, not across 
+tables.
+
+> Cloud Hypervisor and Firecracker ship in the same Kata release and can be selected by 
+> symlinking the shim (`containerd-shim-kata-clh-v2`, `containerd-shim-kata-fc-v2`). Both 
+> were measured on this host and **neither beat QEMU** with stock configuration — medians 
+> 6 260 ms (CLH) and 5 268 ms (Firecracker) against 5 802 ms for QEMU in the same run. There 
+> is no easy start-latency win available by switching hypervisor here.
 
 ### `[vm.linux]`
 
