@@ -885,6 +885,17 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		// Docker-in-Docker is not supported (no CAP_SYS_ADMIN/CAP_NET_ADMIN).
 		oci.WithCapabilities(containerCapabilities),
 	}
+	// Point the runner's tool cache at a path inside the image. Applied after
+	// WithImageConfig/WithEnv so the image and the job keep the last word —
+	// see withDefaultEnv and the WindowsToolCache comment for why the runner's
+	// own default (<runner root>\_work\_tool) is unusable here: that path is
+	// the per-job host directory we map in, so nothing baked into the image
+	// survives there and every setup-* action re-extracts its toolchain over
+	// VSMB. Windows only: on Linux the runner root lives in the image already
+	// and overlayfs small-file writes are not the bottleneck.
+	if goruntime.GOOS == "windows" {
+		opts = append(opts, withDefaultEnv("RUNNER_TOOL_CACHE", WindowsToolCache))
+	}
 	// Cache-proxy config mounts (e.g. the Cargo source-replacement config).
 	// Read-only: a job must never be able to rewrite what the next job on
 	// this host will read.
