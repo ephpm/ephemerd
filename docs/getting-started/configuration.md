@@ -162,6 +162,24 @@ max_concurrent = 4                   # max simultaneous jobs
 # index_ttl       = "10m"            # sparse-index revalidation interval
 # cleanup         = false            # keep the cache across restarts
 
+# --- Language package caches --------------------------------------------------
+# Pull-through caches so jobs stop re-downloading the same dependencies.
+# All off by default. See "Language package caches" below.
+# [npm_proxy]
+# enabled     = false                # npm / pnpm / Yarn
+# port        = 8084
+# max_size_gb = 5
+
+# [pip_proxy]
+# enabled     = false                # pip / Poetry / pip-tools
+# port        = 8085
+# max_size_gb = 5
+
+# [pub_proxy]
+# enabled     = false                # Dart / Flutter
+# port        = 8086
+# max_size_gb = 5
+
 # --- Metrics ------------------------------------------------------------------
 [metrics]
 # enabled = false                    # expose Prometheus /metrics endpoint
@@ -470,6 +488,86 @@ Genuine `404`s are passed through as `404` — a nonexistent crate version must 
 **Scope.** The mount lands in the runner container. Jobs that run their steps inside a *further* container (a `container:` image spawned via Docker-in-Docker) do not inherit it.
 
 **Cache location.** Cached content lives at `<data-dir>/cache/cargo/` and is visible to `ephemerd cache list` / `ephemerd cache clear cargo`. The generated container config lives at `<data-dir>/cargo/` — deliberately outside the cache root, so clearing the cache cannot pull the mounted config out from under a running job.
+### Language package caches — `[npm_proxy]`, `[pip_proxy]`, `[pub_proxy]`
+
+`[npm_proxy]`, `[pip_proxy]` and `[pub_proxy]` are pull-through HTTP caches that sit between job containers and the public package registries, so a CI job on a fresh ephemeral runner does not re-download dependencies the node already has on disk.
+
+Each runs one HTTP server on the bridge gateway and injects one environment variable into every job container. **No workflow changes are required.**
+
+| Section | Accelerates | Env var injected | Default port |
+|---|---|---|---|
+| `[npm_proxy]` | `npm install` / `npm ci`, pnpm, Yarn | `npm_config_registry`, `YARN_NPM_REGISTRY_SERVER` | 8084 |
+| `[pip_proxy]` | `pip install`, Poetry, pip-tools | `PIP_INDEX_URL`, `PIP_TRUSTED_HOST` | 8085 |
+| `[pub_proxy]` | `dart pub get`, `flutter pub get` | `PUB_HOSTED_URL` | 8086 |
+
+All three are **disabled by default**, matching `[module_proxy]`'s opt-in posture.
+
+#### Shared settings
+
+Every section takes the same keys.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Run the cache |
+| `port` | integer | per ecosystem | Listen port on the bridge gateway |
+| `upstream` | string | the public registry | Registry to pull through to. Its host is automatically permitted to serve artifacts. |
+| `index_ttl` | duration | `"5m"` | How long cached **mutable metadata** is served before it is revalidated with a conditional GET. A negative value revalidates on every request. Immutable artifacts ignore this. |
+| `max_size_gb` | integer | `5` | Disk budget in GiB. When exceeded, least-recently-used entries are evicted back to 90% of the budget. `-1` disables the bound. |
+| `allowed_hosts` | list | `[]` | **Extra** hosts the cache may fetch package artifacts from, on top of the ecosystem's own CDNs and the configured `upstream`. |
+| `cleanup` | boolean | `false` | Wipe the cache directory on shutdown. Defaults to **false**, unlike `[module_proxy]` — a pull-through cache that empties itself on every restart saves nothing, and these are bounded by `max_size_gb` instead. |
+
+#### What is cached, and what is not
+
+Each ecosystem splits into an **immutable** half and a **mutable** half, and they are treated very differently.
+
+| Cache | Cached permanently (immutable) | Cached for `index_ttl`, then revalidated (mutable) | Relayed, never cached |
+|---|---|---|---|
+| npm | Package tarballs (`/<pkg>/-/<pkg>-<ver>.tgz`) | Packuments (`/<pkg>`) | `/-/v1/search`, `/-/ping` |
+| pip | Wheels and sdists | PEP 503/691 index pages (`/simple/`, `/simple/<project>/`) | — |
+| pub | Package archives (`/api/archives/<file>`) | Version listings (`/api/packages/<name>`) | Other `/api/` reads (advisories) |
+
+Immutability here is not an assumption — it is a registry guarantee. A published npm `(name, version)` tarball cannot be re-published with different bytes, PyPI refuses re-upload of a filename even after deletion, and pub.dev publishes an `archive_sha256` per version. Those files are cached forever and never revalidated, and they are essentially all of the bytes.
+
+Metadata is the opposite: a packument gains a version on every publish, `dist-tags.latest` moves, a project page gains a row per release. Caching one indefinitely would pin every job on the node to whatever existed when the daemon started, and a dependency released an hour ago would resolve to `ETARGET` / `No matching distribution`. Hence the short TTL plus conditional revalidation — in the steady state an unchanged document costs one `304`, not a re-download.
+
+**Download URLs inside metadata are rewritten.** Every packument, index page and version listing carries absolute URLs pointing at the origin CDN. Left alone, a client would take the cheap metadata from the cache and every byte from the internet. Each proxy therefore rewrites those URLs to point back at itself. Integrity metadata — npm's `dist.integrity`/`shasum`, PyPI's `#sha256=` fragments and `hashes`, pub's `archive_sha256` — is **never** touched, so the client still verifies exactly what it downloads; the rewrite cannot smuggle in different bytes. Unknown fields survive verbatim.
+
+A download URL on a host that is **not** allowlisted is deliberately left alone, so the client fetches it directly (uncached) rather than through a relay ephemerd has no business operating.
+
+#### Fail-open behaviour
+
+A cache must never turn a registry hiccup into a red CI job. Unlike Go's `GOPROXY=…|direct`, none of `npm_config_registry`, `PIP_INDEX_URL` or `PUB_HOSTED_URL` has a built-in fallback — whatever they name *is* the registry. Failures therefore degrade in four layers:
+
+1. **The proxy does not start, or does not answer its health probe at daemon startup** → its env vars are never injected. Jobs go straight to the public registry.
+2. **Upstream is unreachable or returns 5xx, and a copy is cached** → the stale copy is served with a warning. A registry outage becomes a slightly out-of-date index, not a failed resolve.
+3. **Nothing is cached and upstream cannot be reached** → the client gets a `307` redirect to the real origin. npm, pip and pub all follow redirects, so the job fetches it itself — slower and uncached, but it completes.
+4. **The cache cannot be written** (disk full, permissions) → the download is streamed to the job anyway, uncached.
+
+A genuine upstream `404` is passed through as a `404`. "This version does not exist" is a real answer the job must see, and it has to stay distinguishable from an outage.
+
+> **The one gap.** The env var is decided when the daemon starts a job's container. If a proxy dies *mid-job*, the tool already pointed at it will fail for that job; the next job is unaffected because the health gate re-evaluates. This is a real limitation of env-var-based redirection, and it is why the daemon probes health before injecting rather than assuming.
+
+#### Disk bound
+
+Each cache has its own budget (`max_size_gb`, default 5 GiB — 15 GiB across all three). When a write pushes a cache over it, least-recently-used entries are evicted until it is back to 90% of the budget; the gap is the same anti-thrash idea as `[image_gc]`'s two watermarks. Reads count as uses, so a hot dependency outlives a newer one nobody wants. The index is rebuilt by scanning the cache directory at startup, so the budget also applies to content written by a previous run — including after you *lower* the budget.
+
+There is no unbounded default on purpose: an unbounded package cache is how a node fills its disk. Setting `max_size_gb = -1` is supported but should be a deliberate choice.
+
+The caches appear in `ephemerd cache list` as `npm`, `pip` and `pub` (at `<data-dir>/cache/{npm,pip,pub}`) and can be cleared individually with `ephemerd cache clear <name>` while the daemon runs — every entry is a pull-through copy of public content, so a job that misses simply refetches it.
+
+#### Security posture
+
+- **Read-only.** Only `GET` and `HEAD` are served; every other method returns `405` and is never relayed upstream. Publishing (`npm publish`, `dart pub publish`, a PyPI upload) must target the real registry directly.
+- **No credentials cross the proxy.** `Authorization` and `Cookie` headers are not forwarded upstream, and upstream `Set-Cookie` is dropped. This is a shared, node-wide cache: one job's token must never fetch another job's packages. Authenticated and private registries are therefore **not** supported through these caches.
+- **Artifact hosts are allowlisted.** Rewritten download URLs encode the origin URL in the path, so the artifact route is host-checked against the ecosystem's CDNs plus `upstream` plus `allowed_hosts`. Without that fence a job could hand-craft a URL and use the daemon as an open relay into the host's network (cloud metadata endpoints, the LAN, ephemerd's own control ports).
+- **Path traversal.** URL paths are mapped to disk through two independent checks: per-segment validation that rejects `..`, backslashes, drive letters and control bytes, and a containment check on the resolved path. Package and file names are additionally matched against each registry's own naming rules. Artifacts are keyed by the hash of their URL, not by its path.
+
+#### Known limitations
+
+- **npm.** A repo-committed `.npmrc` (or Yarn Berry `.yarnrc.yml`) with an explicit `registry` wins over the environment. Yarn Berry ignores `npm_config_*` entirely, hence the separate `YARN_NPM_REGISTRY_SERVER`; Yarn Classic and pnpm both read `npm_config_registry`. Yarn's offline mirror / zero-installs bypasses the network altogether. `npm audit` POSTs to the registry and gets a `405`; npm degrades that to a warning, but `--no-audit` avoids the noise.
+- **pip.** A `pip.conf`, or an `--index-url` line inside `requirements.txt`, wins over `PIP_INDEX_URL`. Poetry uses sources declared in `pyproject.toml`. `uv` reads `UV_INDEX_URL`, not `PIP_INDEX_URL`, and is not configured. `PIP_TRUSTED_HOST` is required and injected because the proxy speaks plain HTTP on a private address.
+- **pub.** A dependency declared with an explicit `hosted:` URL wins over `PUB_HOSTED_URL`. Git and path dependencies never touch a registry. The Flutter **SDK's** own artifact downloads follow `FLUTTER_STORAGE_BASE_URL` and are not cached by `[pub_proxy]`.
+- **All three.** Steps that run inside a *further* container (a `container:` image spawned through Docker-in-Docker) do not inherit the env vars.
 
 ### `[metrics]`
 

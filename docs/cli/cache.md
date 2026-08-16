@@ -21,6 +21,9 @@ ephemerd cache clear --all [--yes] [--offline]
 | `images` | `images/` | Staged OCI image tarballs imported into containerd on startup | yes |
 | `gomod` | `cache/gomod/` | Go module proxy cache (GOPROXY) served to job containers | yes |
 | `cargo` | `cache/cargo/` | Cargo proxy cache (crates.io sparse index, `.crate` tarballs, rustup toolchains) served to job containers | yes |
+| `npm` | `cache/npm/` | npm registry proxy cache (packuments + tarballs) served to job containers | yes |
+| `pip` | `cache/pip/` | pip/PyPI proxy cache (simple index pages + wheels/sdists) served to job containers | yes |
+| `pub` | `cache/pub/` | pub.dev proxy cache (version listings + package archives) served to job containers | yes |
 | `buildkit` | `buildkit/` | Embedded BuildKit solver cache + history (`docker build` layers) | no |
 | `worker` | `worker/` | BuildKit worker snapshot/content root | no |
 | `runners` | `runners/` | Extracted GitHub Actions runner binaries (per version/OS) | no |

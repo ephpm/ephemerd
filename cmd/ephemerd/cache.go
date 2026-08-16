@@ -78,6 +78,27 @@ func managedCaches() []cacheEntry {
 			LiveSafe: true,
 		},
 		{
+			Name:        "npm",
+			Rel:         filepath.Join("cache", "npm"),
+			Description: "npm registry proxy cache (packuments + tarballs) served to job containers",
+			// Live-safe: every entry is a pull-through copy of public
+			// registry content, so a running job that misses simply
+			// refetches it from the origin.
+			LiveSafe: true,
+		},
+		{
+			Name:        "pip",
+			Rel:         filepath.Join("cache", "pip"),
+			Description: "pip/PyPI proxy cache (simple index pages + wheels/sdists) served to job containers",
+			LiveSafe:    true,
+		},
+		{
+			Name:        "pub",
+			Rel:         filepath.Join("cache", "pub"),
+			Description: "pub.dev proxy cache (version listings + package archives) served to job containers",
+			LiveSafe:    true,
+		},
+		{
 			Name:        "buildkit",
 			Rel:         "buildkit",
 			Description: "Embedded BuildKit solver cache + history (docker build layers)",

@@ -455,6 +455,8 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	if cfg.CargoProxy.Enabled {
 		gatewayPorts = append(gatewayPorts, cargoProxyPort)
 	}
+	// Language package caches (npm, pip, pub) — see pkgproxies.go.
+	gatewayPorts = append(gatewayPorts, pkgProxyPorts(cfg)...)
 
 	// Initialize container networking
 	net, err := networking.New(networking.Config{
@@ -533,6 +535,13 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			}()
 		}
 	}
+
+	// Start the language package caches (npm, pip, pub). Only those that
+	// start AND answer a health probe are returned, so an unhealthy cache is
+	// never advertised to a job — see startPkgProxies for the fail-open story.
+	pkgProxies, stopPkgProxies := startPkgProxies(cfg, configDir, net, log)
+	defer stopPkgProxies()
+	cacheProxies = append(cacheProxies, pkgProxies...)
 
 	// Collect env vars and mounts from all cache proxies for injection into
 	// containers. Only proxies that actually STARTED are in cacheProxies, so
