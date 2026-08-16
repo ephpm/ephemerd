@@ -4,6 +4,7 @@ package networking
 
 import (
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -144,28 +145,166 @@ func TestL2BridgeHostHardenRules_BlocksDangerousManagementPorts(t *testing.T) {
 		hostIP = "192.0.2.10"
 		pool   = "192.0.2.192/27"
 	)
-	rules := l2BridgeHostHardenRules(hostIP, pool)
+	byProtoPort := hardenRulesByProtoPort(t, hostIP, pool)
 
-	byPort := map[string]string{} // port -> joined spec
-	for _, r := range rules {
-		byPort[specValue(r, "localport")] = strings.Join(r.spec, " ")
-	}
 	// The two the pen test actually caught, plus the rest of the management set.
 	for _, port := range []string{"135", "139", "445", "3389", "5985", "5986", "47001"} {
-		spec, ok := byPort[port]
+		spec, ok := byProtoPort["TCP/"+port]
 		if !ok {
-			t.Errorf("dangerous host port %s is not blocked from the pool", port)
+			t.Errorf("dangerous host port TCP/%s is not blocked from the pool", port)
 			continue
 		}
 		for _, want := range []string{"dir=in", "action=block", "protocol=TCP", "localip=" + hostIP, "remoteip=" + pool} {
 			if !strings.Contains(spec, want) {
-				t.Errorf("host-harden rule for port %s missing %q; spec=%q", port, want, spec)
+				t.Errorf("host-harden rule for TCP/%s missing %q; spec=%q", port, want, spec)
 			}
 		}
 	}
 	// Must never block the ephemeral range dind binds — that would break docker.
-	if _, blocked := byPort["0"]; blocked {
-		t.Error("host-harden must not contain an all-ports/0 block — it would kill the dind listener")
+	for _, k := range []string{"TCP/0", "UDP/0", "TCP/any", "UDP/any"} {
+		if _, blocked := byProtoPort[k]; blocked {
+			t.Errorf("host-harden must not contain an all-ports block (%s) — it would kill the dind listener", k)
+		}
+	}
+}
+
+// hardenRulesByProtoPort indexes the emitted harden set by "PROTO/port". The
+// key has to carry the protocol now that the same port number appears on both
+// TCP and UDP — indexing by port alone would silently hide half the set, and a
+// rule NAME that collided would make each rule's idempotent delete-before-add
+// remove its counterpart.
+func hardenRulesByProtoPort(t *testing.T, hostIP, pool string) map[string]string {
+	t.Helper()
+	rules := l2BridgeHostHardenRules(hostIP, pool)
+
+	names := map[string]bool{}
+	out := map[string]string{}
+	for _, r := range rules {
+		if names[r.name] {
+			t.Errorf("duplicate rule name %q — the delete-before-add would revoke the other rule", r.name)
+		}
+		names[r.name] = true
+		if !strings.HasPrefix(r.name, hardenRulePrefix) {
+			t.Errorf("rule name %q must start with the sweep prefix %q, or an upgrade leaks it", r.name, hardenRulePrefix)
+		}
+		out[specValue(r, "protocol")+"/"+specValue(r, "localport")] = strings.Join(r.spec, " ")
+	}
+	return out
+}
+
+// TestL2BridgeHostHardenRules_CoversUDP is the regression guard for issue #153:
+// every harden rule used to be protocol=TCP, so the host's UDP listeners on the
+// same management services stayed reachable from the pool while the docs claimed
+// those ports were blocked.
+func TestL2BridgeHostHardenRules_CoversUDP(t *testing.T) {
+	const (
+		hostIP = "192.0.2.10"
+		pool   = "192.0.2.192/27"
+	)
+	byProtoPort := hardenRulesByProtoPort(t, hostIP, pool)
+
+	for _, port := range []string{"135", "139", "445", "3389", "5985", "5986", "47001"} {
+		spec, ok := byProtoPort["UDP/"+port]
+		if !ok {
+			t.Errorf("host port UDP/%s is not blocked from the pool (issue #153: the set was TCP-only)", port)
+			continue
+		}
+		for _, want := range []string{"dir=in", "action=block", "protocol=UDP", "localip=" + hostIP, "remoteip=" + pool} {
+			if !strings.Contains(spec, want) {
+				t.Errorf("host-harden rule for UDP/%s missing %q; spec=%q", port, want, spec)
+			}
+		}
+	}
+}
+
+// TestL2BridgeHostHardenRules_NameResolutionIsNotLocalIPScoped is the subtle
+// half of issue #153. LLMNR (5355) and mDNS (5353) arrive at multicast groups
+// and NBNS (137) at the subnet broadcast, so the packet's local address is the
+// group/broadcast address — NOT the host's unicast address. A rule carrying
+// localip=<hostIP> would not match them at all, which is how a "we block those
+// ports" rule set can end up blocking nothing. These must be pool-scoped on the
+// remote side and unscoped on the local side.
+func TestL2BridgeHostHardenRules_NameResolutionIsNotLocalIPScoped(t *testing.T) {
+	const (
+		hostIP = "192.0.2.10"
+		pool   = "192.0.2.192/27"
+	)
+	rules := l2BridgeHostHardenRules(hostIP, pool)
+
+	want := map[string]bool{"137": false, "138": false, "5353": false, "5355": false}
+	for _, r := range rules {
+		port := specValue(r, "localport")
+		if _, tracked := want[port]; !tracked {
+			continue
+		}
+		if specValue(r, "protocol") != "UDP" {
+			continue
+		}
+		if lip := specValue(r, "localip"); lip != "" {
+			t.Errorf("name-resolution block for UDP/%s carries localip=%s; multicast/broadcast traffic never has the host's unicast address as its local address, so this rule matches nothing", port, lip)
+		}
+		if got := specValue(r, "remoteip"); got != pool {
+			t.Errorf("name-resolution block for UDP/%s has remoteip=%q, want the pool %q — it must not block the host's own LAN name resolution", port, got, pool)
+		}
+		if got := specValue(r, "action"); got != "block" {
+			t.Errorf("name-resolution rule for UDP/%s has action=%q, want block", port, got)
+		}
+		want[port] = true
+	}
+	for port, seen := range want {
+		if !seen {
+			t.Errorf("no name-resolution block emitted for UDP/%s (LLMNR/NBNS/mDNS poisoning position)", port)
+		}
+	}
+}
+
+// TestL2BridgeHostHardenRules_DoesNotTouchTheDindAllow proves the widened
+// hardening cannot collide with the per-container dind allow. The allow is
+// TCP-only on an ephemeral port scoped to one container's /32; nothing in the
+// harden set may block that port, and no harden rule may borrow its name.
+func TestL2BridgeHostHardenRules_DoesNotTouchTheDindAllow(t *testing.T) {
+	const (
+		hostIP      = "192.0.2.10"
+		pool        = "192.0.2.192/27"
+		containerIP = "192.0.2.200"
+		dindPort    = 63933
+	)
+	allow := hostPortAllowRule(hostIP, containerIP, dindPort)
+
+	// The dind allow is unchanged: TCP, single port, single container.
+	if got := specValue(allow, "protocol"); got != "TCP" {
+		t.Errorf("dind allow protocol = %q, want TCP (the Docker API is TCP only)", got)
+	}
+	if got := specValue(allow, "remoteip"); got != containerIP+"/32" {
+		t.Errorf("dind allow remoteip = %q, want the owning container's /32", got)
+	}
+
+	for _, r := range l2BridgeHostHardenRules(hostIP, pool) {
+		if specValue(r, "localport") == strconv.Itoa(dindPort) {
+			t.Errorf("harden rule %q blocks the dind port %d", r.name, dindPort)
+		}
+		if r.name == allow.name {
+			t.Errorf("harden rule shares the dind allow's name %q; the delete-before-add would revoke it", r.name)
+		}
+		// A harden rule must never carry a /32 remote scope: that is the
+		// per-job allow's shape, and a block there would be attributed to one
+		// container while the rest of the pool stayed open.
+		if strings.HasSuffix(specValue(r, "remoteip"), "/32") {
+			t.Errorf("harden rule %q is scoped to a single container; it must cover the whole pool", r.name)
+		}
+	}
+}
+
+// TestL2BridgeHostHardenRules_NeverAllows pins that the harden set is blocks
+// only. An action=allow slipping in here would widen the host, not narrow it.
+func TestL2BridgeHostHardenRules_NeverAllows(t *testing.T) {
+	for _, r := range l2BridgeHostHardenRules("192.0.2.10", "192.0.2.192/27") {
+		if got := specValue(r, "action"); got != "block" {
+			t.Errorf("harden rule %q has action=%q, want block", r.name, got)
+		}
+		if got := specValue(r, "dir"); got != "in" {
+			t.Errorf("harden rule %q has dir=%q, want in", r.name, got)
+		}
 	}
 }
 
