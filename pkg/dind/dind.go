@@ -272,11 +272,12 @@ func (s *Server) SetRunnerNetNS(netnsPath string) {
 // container and opens the firewall allow that lets exactly that container —
 // and nothing else — reach this server's TCP listener.
 //
-// Applies to every TCP-transport server: the Windows L2Bridge path, and the
-// Linux VM-isolated (Kata) path where the allow is an iptables pair scoped to
-// containerIP/32. A no-op on the unix-socket transport, which binds no TCP
-// port at all (listenPort stays 0), and on the Windows NAT path, which has no
-// host-firewall carve-out to make.
+// Applies to every TCP-transport server: BOTH Windows paths — L2Bridge and the
+// default NAT network, where the Docker API listens on the bridge gateway and
+// the host firewall default-denies the container's inbound connection to it
+// (#162) — and the Linux VM-isolated (Kata) path, where the allow is an
+// iptables pair scoped to containerIP/32. A no-op only on the unix-socket
+// transport, which binds no TCP port at all (listenPort stays 0).
 //
 // SECURITY. The allow is scoped to containerIP/32 rather than to the container
 // pool because the Docker API this port serves does no authentication

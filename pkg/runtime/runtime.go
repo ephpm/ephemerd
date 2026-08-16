@@ -1037,13 +1037,14 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			windowsNetNS = result.NetNS
 			opts = append(opts, withWindowsNetwork(windowsNetNS, windowsEndpointID))
 
-			// The container's address exists only now — Setup is what allocates
-			// it out of the L2Bridge pool — so this is the first moment the dind
-			// host-port allow can be scoped to the one container entitled to use
-			// it. It has to be scoped: the dind Docker API is unauthenticated,
-			// so an allow covering the whole pool would let any other job's
-			// container drive this job's daemon. Still ahead of container
-			// creation below, so the container never runs without its allow.
+			// The container's address exists only now — Setup either allocates
+			// it out of the L2Bridge pool or reads back what HNS assigned on the
+			// NAT network — so this is the first moment the dind host-port allow
+			// can be scoped to the one container entitled to use it. It has to
+			// be scoped: the dind Docker API is unauthenticated, so an allow
+			// covering the whole subnet would let any other job's container
+			// drive this job's daemon. Still ahead of container creation below,
+			// so the container never runs without its allow.
 			//
 			// Fail CLOSED on error rather than falling back to a wider allow:
 			// losing docker in this job beats losing isolation in all of them.
