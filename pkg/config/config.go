@@ -1034,10 +1034,12 @@ const (
 // own kernel in a lightweight VM, which makes isolation uniform across
 // platforms.
 //
-// Default is "runc" — Kata is opt-in. It costs roughly two seconds of
-// extra container start latency and a fixed per-job memory footprint for
-// the guest, and it is NOT compatible with [dind] (see the validate
-// method on Config for why).
+// Default is "runc" — Kata is opt-in. Measured on an 8-core amd64 node
+// with Kata 4.0.0 + QEMU, it costs seconds of extra container start
+// latency (0.14s -> 4.1s median), ~310 MB of guest memory per running
+// job instead of ~14 MB, ~35% on CPU-bound work and 8-40x on file-heavy
+// work. It is also NOT compatible with [dind] — see the validate method
+// below for why.
 type LinuxRunnerToml struct {
 	// Runtime selects the container runtime for Linux job containers:
 	// "runc" (default) or "kata". Empty means "runc".

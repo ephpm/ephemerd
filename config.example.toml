@@ -199,9 +199,10 @@ shutdown_timeout = "5m"
 # if either is missing rather than silently falling back to runc.
 #
 # Costs, measured on an 8-core Proxmox guest with Kata 4.0.0 + QEMU:
-# container start goes from ~0.10s to ~1.0s, each job carries a ~350 MB
-# guest-VM memory overhead, CPU-bound work is ~10% slower, and I/O over
-# the bind-mounted runner dir (virtio-fs) is several times slower.
+# container start goes from 0.14s to 4.1s (medians), each running job
+# carries ~310 MB of guest-VM memory instead of ~14 MB, CPU-bound work is
+# ~35% slower, and file-heavy work is 8-40x slower because both the
+# rootfs and the bind-mounted runner dir cross virtio-fs.
 #
 # NOT compatible with [dind] — the Docker API is passed to jobs through a
 # bind-mounted unix socket, which a Kata guest cannot connect to. Enabling

@@ -263,7 +263,32 @@ Windows jobs get Hyper-V isolation and macOS jobs get a full VM, but with the de
 
 > **`runtime = "kata"` is incompatible with `[dind]`.** ephemerd hands jobs a Docker API by bind-mounting a host unix socket at `/var/run/docker.sock`. Under Kata that bind becomes a virtio-fs passthrough, which carries the socket file into the guest but not its connectability: the socket appears and every `connect()` returns `ECONNREFUSED`. Setting both is rejected at config load. Use `dind.enabled = false` with Kata until the Docker API is offered over TCP the way it already is on Windows.
 
-**Measured cost** (8-core Proxmox guest, Kata 4.0.0, QEMU, 10-run medians — see `docs/arch/` benchmarks): container start latency rises from ~0.10 s to ~1.0 s, each running job carries roughly 350 MB of guest-VM memory overhead on top of the workload, CPU-bound work is ~10% slower, and I/O against the bind-mounted runner directory is several times slower because it crosses virtio-fs instead of a plain bind. Short jobs pay the start-up cost proportionally hardest; file-heavy jobs pay the most overall.
+**Measured cost.** Benchmarked on an 8-core amd64 Proxmox guest (Kata 4.0.0, QEMU 
+hypervisor, containerd runtime handler `io.containerd.kata.v2`), comparing `runc` and 
+`kata` with the same image on the same node, runtimes interleaved:
+
+| Measurement | runc | kata | Ratio |
+|---|---|---|---|
+| Container create → running (median, n=18) | 140 ms | 4 146 ms | 30× |
+| Container create → running (best case) | 69 ms | 2 607 ms | 38× |
+| Host memory per idle container | ~14 MB | ~310 MB | 22× |
+| CPU-bound compile (median, n=4) | 7.5 s | 10.2 s | 1.35× |
+| Create 3 000 files on rootfs (median, n=4) | 645 ms | 5 195 ms | 8.1× |
+| Read 3 000 files on rootfs | 79 ms | 2 890 ms | 37× |
+| Create 3 000 files on the bind-mounted runner dir | 435 ms | 4 712 ms | 10.8× |
+| Read 3 000 files on the bind-mounted runner dir | 73 ms | 2 984 ms | 41× |
+
+Nearly all of the start latency is guest kernel boot (the `task create` step). The memory 
+figure is dominated by the QEMU process (~267 MB resident); it is a per-job cost, so a node 
+running `max_concurrent = 4` needs roughly 1.2 GB of headroom it did not need before. Short 
+jobs pay the start-up cost proportionally hardest; file-heavy jobs (dependency installs, 
+large checkouts) pay the most overall.
+
+> Cloud Hypervisor and Firecracker ship in the same Kata release and can be selected by 
+> symlinking the shim (`containerd-shim-kata-clh-v2`, `containerd-shim-kata-fc-v2`). Both 
+> were measured on this host and **neither beat QEMU** with stock configuration — medians 
+> 6 260 ms (CLH) and 5 268 ms (Firecracker) against 5 802 ms for QEMU in the same run. There 
+> is no easy start-latency win available by switching hypervisor here.
 
 ### `[vm.linux]`
 
