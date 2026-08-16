@@ -360,19 +360,30 @@ func TestBackoffDuration_AfterSuccessReset(t *testing.T) {
 // TestHandleQueued_ZombieSkip verifies that a job which keeps reaching
 // provisioning but never runs to completion (GitHub lists it queued forever)
 // is skipped after maxProvisionAttempts, instead of re-provisioning on every
-// poll. draining=true keeps any real provisioning from happening — the zombie
-// check runs before the drain check, so the attempt counter still advances.
+// poll.
+//
+// The job is driven through REAL provisioning passes: claimErrorProvider lets
+// each pass run all the way to ClaimJob and then fails it, which is what a
+// zombie looks like from the scheduler's side. (This test used to set
+// draining=true as a shortcut to stop provisioning, relying on the zombie
+// counter being incremented before the drain check. That coupling is gone — a
+// cordon rejection must not burn the zombie budget, or a long cordon would
+// permanently mark every refused job undispatchable; see
+// TestCordon_DoesNotBurnZombieBudget. Using a claim failure exercises the cap
+// on the path it actually guards, and additionally pins that provisioning
+// STOPS at the cap, which the draining shortcut could never show.)
 func TestHandleQueued_ZombieSkip(t *testing.T) {
-	mp := newMockProvider("github")
-	s := New(Config{Providers: []providers.Provider{mp}, Log: testLogger()})
-	s.draining = true
+	p := newClaimErrorProvider("github", errors.New("claim rejected by test"))
+	s := New(Config{Providers: []providers.Provider{p}, Log: testLogger()})
+	s.bindContexts(context.Background())
 
-	event := providers.JobEvent{Provider: mp, Action: "queued", Repo: "myrepo", JobID: 7}
+	event := providers.JobEvent{Provider: p, Action: "queued", Repo: "myrepo", JobID: 7}
 	key := keyFor(event)
 
 	// Simulate the seenTTL gap between polls by clearing the dedup entries so
 	// each call is treated as a fresh provisioning pass.
-	for i := 0; i < maxProvisionAttempts+3; i++ {
+	const polls = maxProvisionAttempts + 3
+	for i := 0; i < polls; i++ {
 		s.mu.Lock()
 		delete(s.seen, key)
 		delete(s.pending, key)
@@ -388,9 +399,11 @@ func TestHandleQueued_ZombieSkip(t *testing.T) {
 	if attempts <= maxProvisionAttempts {
 		t.Errorf("attempts = %d, want > %d (cap should be exceeded)", attempts, maxProvisionAttempts)
 	}
-	// A zombie is never claimed.
-	if got := len(mp.claims); got != 0 {
-		t.Errorf("zombie job should never be claimed, got %d claims", got)
+	// Provisioning stops at the cap: the polls after it never reach the
+	// provider, so the zombie stops re-provisioning a runner/VM forever.
+	if got := p.claims.Load(); got != maxProvisionAttempts {
+		t.Errorf("zombie job reached the provider %d time(s) over %d polls, want %d (capped)",
+			got, polls, maxProvisionAttempts)
 	}
 }
 

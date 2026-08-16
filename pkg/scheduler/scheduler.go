@@ -469,6 +469,21 @@ func (s *Scheduler) jobContext() (context.Context, context.CancelFunc) {
 // the number of jobs still running. Used by the Cordon RPC so
 // `ephemerd drain --wait` can stop claims first and only restart the daemon
 // once the active job count reaches zero.
+//
+// The flag is enforced at three points, all of which read it live rather than
+// snapshotting it at admission (issue #154):
+//
+//   - handleQueued — refuses new queued events, whatever their source
+//     (webhook, poll, startup catch-up, reconcile sweep, retry-queue fire).
+//   - admitDispatch — abandons a dispatch that was accepted before the cordon
+//     and then sat blocked on a concurrency semaphore. This is the one that
+//     was missing: the node kept provisioning for over a minute after the
+//     operator was told it had stopped claiming.
+//   - claimJob — the hard backstop. Nothing can register a JIT runner on a
+//     cordoned node, even from a dispatch path that skips the gates above.
+//
+// Cordon means "stop claiming NEW work". Jobs already running are untouched:
+// their contexts hang off jobsCtx and are never cancelled here.
 func (s *Scheduler) Cordon() int {
 	s.mu.Lock()
 	s.draining = true
@@ -922,6 +937,25 @@ func (s *Scheduler) handleQueued(ctx context.Context, event providers.JobEvent) 
 	// a spare runner still has same-label work it could pick up.
 	s.jobLabels[key] = labelSetKey(event.Labels)
 
+	// Admission gate #1: the cordon. Checked BEFORE the zombie counter is
+	// touched — a cordon rejection is a refusal to take the job, not a failed
+	// provisioning attempt, so it must not burn the job's zombie budget. (It
+	// used to sit after the increment: a cordon held for maxProvisionAttempts *
+	// seenTTL (~50 min) would permanently mark every rejected job undispatchable
+	// even after Uncordon.)
+	if s.draining {
+		// Drop the pending stamp: it has no TTL, so leaving it would
+		// permanently block this job from being handled after Uncordon.
+		// The seen entry stays (expires after seenTTL), so an uncordoned
+		// scheduler picks the job up again on a later poll/reconcile pass.
+		// Keeping it is deliberate: clearing it would let a continuous poll
+		// re-enter this path every interval instead of once per seenTTL.
+		delete(s.pending, key)
+		s.mu.Unlock()
+		log.Info("rejecting job, scheduler is draining")
+		return
+	}
+
 	// Zombie guard: a job that keeps reaching provisioning but never runs to
 	// completion (GitHub lists it queued but never dispatches it) is skipped
 	// after maxProvisionAttempts so it stops re-provisioning a runner/VM on
@@ -941,17 +975,6 @@ func (s *Scheduler) handleQueued(ctx context.Context, event providers.JobEvent) 
 		} else {
 			log.Debug("skipping zombie job (already over provision cap)", "attempts", attempts)
 		}
-		return
-	}
-
-	if s.draining {
-		// Drop the pending stamp: it has no TTL, so leaving it would
-		// permanently block this job from being handled after Uncordon.
-		// The seen entry stays (expires after seenTTL), so an uncordoned
-		// scheduler picks the job up again on a later poll/reconcile pass.
-		delete(s.pending, key)
-		s.mu.Unlock()
-		log.Info("rejecting job, scheduler is draining")
 		return
 	}
 	s.mu.Unlock()
@@ -984,36 +1007,88 @@ func (s *Scheduler) handleQueued(ctx context.Context, event providers.JobEvent) 
 	s.handleLocalJob(ctx, event)
 }
 
+// dispatchVerdict is the outcome of the post-slot admission gate. Anything
+// other than dispatchAdmit means the caller must release its concurrency slot
+// and return WITHOUT provisioning.
+type dispatchVerdict int
+
+const (
+	// dispatchAdmit: go ahead and provision.
+	dispatchAdmit dispatchVerdict = iota
+	// dispatchAbandonSatisfied: a fungible sibling runner already ran this job.
+	dispatchAbandonSatisfied
+	// dispatchAbandonCordoned: the node was cordoned while this dispatch
+	// waited for a concurrency slot.
+	dispatchAbandonCordoned
+)
+
+// log emits the verdict's explanation on the caller's job-scoped logger, so
+// every provisioning path reports an abandonment identically.
+func (v dispatchVerdict) log(log *slog.Logger) {
+	switch v {
+	case dispatchAbandonSatisfied:
+		log.Info("abandoning dispatch: job was observed running while this dispatch waited for a concurrency slot",
+			"detail", "same-label JIT runners are fungible; a sibling runner took this job, so provisioning now would create an orphan")
+	case dispatchAbandonCordoned:
+		log.Info("abandoning dispatch: scheduler was cordoned while this dispatch waited for a concurrency slot",
+			"detail", "cordon means stop claiming NEW work; the job stays queued for another node or for this node after uncordon")
+	}
+}
+
 // admitDispatch is the last gate before a provisioning path claims a runner.
 // Every path calls it immediately after acquiring its concurrency slot, in
 // place of the bare pending-map cleanup it replaces. It always clears
-// pending[key]; it returns false when this dispatch must be ABANDONED.
+// pending[key]; it returns a non-admit verdict when this dispatch must be
+// ABANDONED. The caller must release its concurrency slot on abandon.
 //
-// The window it closes is the one that produced the production livelock.
-// handleQueued accepts a job and hands it to a provisioning path, which then
-// blocks on the concurrency semaphore — on a max_concurrent = 1 node, for the
-// entire duration of whatever is already running. Meanwhile GitHub, which
-// treats same-label JIT runners as fungible, hands an ALREADY-DISPATCHED
-// runner this very job; it runs and completes. Nothing between "slot acquired"
-// and "claim" used to consult that, so the path would go on to register a
-// fresh JIT runner for a job that finished minutes ago. That runner never
-// binds, so no completed event ever tears it down, and it holds the only
-// concurrency slot until the orphan sweep's grace window expires.
+// TWO windows close here, both of the same shape: the decision to provision is
+// taken in handleQueued, but provisioning happens later — after the path has
+// blocked on the concurrency semaphore, which on a max_concurrent = 1 node is
+// the entire duration of whatever is already running. State can change
+// underneath a blocked dispatch, so it is re-checked here rather than trusted
+// from admission time.
 //
-// Returning false here is the "discharge": the sibling runner's execution
-// satisfied the job, so the pending dispatch for it is retired instead of
-// being converted into an orphan. The caller must release its concurrency
-// slot on false.
-func (s *Scheduler) admitDispatch(key jobKey) bool {
+//  1. Fungibility (dispatchAbandonSatisfied). GitHub treats same-label JIT
+//     runners as interchangeable and hands an ALREADY-DISPATCHED runner this
+//     very job; it runs and completes. Without this check the path would go on
+//     to register a fresh JIT runner for a job that finished minutes ago. That
+//     runner never binds, so no completed event tears it down, and it holds the
+//     only concurrency slot until the orphan sweep's grace window expires.
+//
+//  2. Cordon (dispatchAbandonCordoned). This is issue #154: `drain`/`Cordon`
+//     set draining=true and the operator was told the node had stopped claiming,
+//     but a job admitted seconds earlier was still parked on the semaphore. When
+//     the slot freed it sailed past the (already-passed) handleQueued check and
+//     registered a JIT runner 82 seconds after the cordon was acknowledged, so
+//     the node never quiesced. Re-reading the flag here is what makes the cordon
+//     an actual gate rather than an admission-time snapshot.
+//
+// Intended behaviour for a job accepted before the cordon but not yet
+// provisioned: it is ABANDONED, not provisioned and not queued for later. The
+// pending stamp is cleared (it has no TTL and would otherwise block the job
+// forever) and the seen stamp is deliberately left in place to age out via
+// seenTTL — identical to the handleQueued rejection, so a job rejected at
+// either gate behaves the same. The job itself is untouched on the platform: it
+// stays queued, so another node can take it immediately, or this node picks it
+// up after Uncordon on the next poll/reconcile/catch-up pass.
+//
+// Jobs ALREADY RUNNING are unaffected — this gate is only ever consulted on the
+// path to a new claim, never on a running job's lifecycle.
+func (s *Scheduler) admitDispatch(key jobKey) dispatchVerdict {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.pending, key)
+	if s.draining {
+		return dispatchAbandonCordoned
+	}
 	if !s.webhookMode {
 		// started is only populated from in_progress/completed webhooks.
-		return true
+		return dispatchAdmit
 	}
-	_, done := s.started[key]
-	return !done
+	if _, done := s.started[key]; done {
+		return dispatchAbandonSatisfied
+	}
+	return dispatchAdmit
 }
 
 // handleLinuxJob dispatches a Linux job to the Linux VM worker via gRPC.
@@ -1039,9 +1114,8 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		unsee()
 		return
 	}
-	if !s.admitDispatch(key) {
-		log.Info("abandoning dispatch: job was observed running while this dispatch waited for a concurrency slot",
-			"detail", "same-label JIT runners are fungible; a sibling runner took this job, so provisioning now would create an orphan")
+	if v := s.admitDispatch(key); v != dispatchAdmit {
+		v.log(log)
 		<-s.linuxSem
 		return
 	}
@@ -1169,9 +1243,8 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		unsee()
 		return
 	}
-	if !s.admitDispatch(key) {
-		log.Info("abandoning dispatch: job was observed running while this dispatch waited for a concurrency slot",
-			"detail", "same-label JIT runners are fungible; a sibling runner took this job, so provisioning now would create an orphan")
+	if v := s.admitDispatch(key); v != dispatchAdmit {
+		v.log(log)
 		<-s.macSem
 		return
 	}
@@ -1350,9 +1423,8 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 		unsee()
 		return
 	}
-	if !s.admitDispatch(key) {
-		log.Info("abandoning dispatch: job was observed running while this dispatch waited for a concurrency slot",
-			"detail", "same-label JIT runners are fungible; a sibling runner took this job, so provisioning now would create an orphan")
+	if v := s.admitDispatch(key); v != dispatchAdmit {
+		v.log(log)
 		<-s.sem
 		return
 	}
@@ -2028,6 +2100,17 @@ func (s *Scheduler) enqueueRetryIfEligible(ctx context.Context, event providers.
 	if s.retry == nil {
 		return
 	}
+	// Cordoned nodes take on no new retry work. A retry scheduled now would
+	// fire minutes later against a node that is draining (or, during an
+	// upgrade, already gone), and every fire re-enters handleQueued only to be
+	// rejected. Outstanding retries for jobs already in the queue are dropped
+	// by classifyErr's errCordoned case as they fail through.
+	s.mu.Lock()
+	draining := s.draining
+	s.mu.Unlock()
+	if draining {
+		return
+	}
 	s.retry.Add(event, s.retryHandler, err)
 }
 
@@ -2200,9 +2283,32 @@ func buildLabelsForOS(targetOS string, extraLabels []string) []string {
 	return labels
 }
 
+// errCordoned is returned by claimJob when the scheduler is cordoned. It is
+// classified errNonRetryable (see classifyErr) so the retry queue drops the
+// job rather than spinning its backoff ladder against a node that has been
+// told to stop taking work.
+var errCordoned = errors.New("scheduler is cordoned; not claiming new jobs")
+
 // claimJob generates a runner name and claims the job via the Provider,
 // retrying with a new name if the name already exists (409 conflict).
+//
+// This is the cordon's LOAD-BEARING gate. Every provisioning path — local,
+// Linux-dispatch, macOS-VM — funnels through here, and Provider.ClaimJob is
+// the one call that registers a JIT runner with the platform ("registered
+// repo-level JIT runner"). admitDispatch is the gate that lets a path unwind
+// cleanly, but checking here too is what makes the cordon hold BY
+// CONSTRUCTION: a future dispatch source that forgets admitDispatch still
+// cannot register a runner on a cordoned node. Issue #154 happened precisely
+// because the cordon was checked at one admission point and not at the point
+// of claiming.
 func (s *Scheduler) claimJob(ctx context.Context, event *providers.JobEvent, labels []string, log *slog.Logger, maxRetries int) (*providers.Claim, error) {
+	s.mu.Lock()
+	draining := s.draining
+	s.mu.Unlock()
+	if draining {
+		return nil, errCordoned
+	}
+
 	var lastErr error
 	for attempt := range maxRetries {
 		name := fmt.Sprintf("ephemerd-%s-%s-%s", event.Provider.Name(), event.Repo, names.Generate())
