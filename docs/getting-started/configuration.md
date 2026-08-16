@@ -147,6 +147,21 @@ max_concurrent = 4                   # max simultaneous jobs
 # target_free_gb          = 40     # free space a floor-triggered pass restores (default 2x min_free_gb)
 # max_age                 = "0"    # OPTIONAL age backstop across all namespaces (0 = off)
 
+# --- Package caching proxies --------------------------------------------------
+# [module_proxy]
+# enabled  = false                   # run a GOPROXY on the bridge gateway
+# port     = 8082                    # listen port
+# upstream = "https://proxy.golang.org"
+# cleanup  = true                    # wipe the cache on shutdown
+
+# [cargo_proxy]
+# enabled         = false            # pull-through cache for crates.io + rustup
+# port            = 8083             # listen port
+# upstream        = "https://index.crates.io"
+# rustup_upstream = "https://static.rust-lang.org"
+# index_ttl       = "10m"            # sparse-index revalidation interval
+# cleanup         = false            # keep the cache across restarts
+
 # --- Metrics ------------------------------------------------------------------
 [metrics]
 # enabled = false                    # expose Prometheus /metrics endpoint
@@ -402,6 +417,59 @@ Disk-pressure-triggered container image garbage collection, covering the `buildk
 **LRU key.** Eviction order comes from the `ephemerd.io/last-accessed` label, refreshed on pull, import and container start. Records pre-dating the label fall back to containerd's `UpdatedAt`, so a node upgrading into this feature sorts sanely instead of treating everything as never-used.
 
 **Orphan sweep.** The same timer runs a job-safe orphan sweep (leftover per-job runner-dir copies, job workdirs, and container snapshots with no owning container). This previously ran only at startup, so a long-lived daemon accumulated them for its entire uptime.
+
+### `[module_proxy]`
+
+Go module caching proxy. ephemerd runs a single GOPROXY on the bridge gateway and injects `GOPROXY=http://<gateway>:<port>|direct` into every job container, so repeated `go mod download` runs hit the local disk cache instead of `proxy.golang.org`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Run the Go module proxy |
+| `port` | integer | `8082` | Listen port on the bridge gateway |
+| `upstream` | string | `"https://proxy.golang.org"` | Fetched from on a cache miss |
+| `cleanup` | boolean | `true` | Wipe the cache directory on shutdown. Set `false` to keep it across restarts. |
+
+Immutable module files (`.info`, `.mod`, `.zip`) are cached; mutable endpoints (`@latest`, `@v/list`) and `sumdb` requests pass through. The `|direct` separator means the go command falls back to the origin on **any** proxy error, so a broken cache slows a build rather than failing it.
+
+### `[cargo_proxy]`
+
+Cargo/crates caching proxy — the Rust counterpart to `[module_proxy]`. One HTTP server on the bridge gateway serves three routes:
+
+| Route | Upstream | Caching |
+|---|---|---|
+| `/index/…` | `upstream` (sparse registry index) | **Mutable** — served from cache for `index_ttl`, then revalidated with a conditional GET |
+| `/crates/{name}/{version}/download` | the registry's own `dl` template | **Immutable** — cached permanently, never refetched |
+| `/rustup/…` | `rustup_upstream` | Dated artifacts (`dist/YYYY-MM-DD/…`) immutable; channel manifests revalidated on `index_ttl` |
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Run the Cargo proxy |
+| `port` | integer | `8083` | Listen port on the bridge gateway |
+| `upstream` | string | `"https://index.crates.io"` | Sparse registry index |
+| `rustup_upstream` | string | `"https://static.rust-lang.org"` | Toolchain distribution server |
+| `index_ttl` | duration | `"10m"` | How long a cached index entry is served before revalidation. A negative value revalidates on every request. |
+| `cleanup` | boolean | `false` | Wipe the cache on shutdown. Defaults to **false**, unlike `[module_proxy]` — a pull-through cache that empties itself on every restart saves nothing. |
+
+**How jobs pick it up — no workflow changes required.**
+
+- **rustup** reads its mirror from the environment, so ephemerd injects `RUSTUP_DIST_SERVER`.
+- **Cargo does not.** Source replacement (`[source.crates-io] replace-with`) is the only mechanism Cargo offers for redirecting crates.io, and it is read **exclusively from config files** — `CARGO_SOURCE_*` environment variables are silently ignored. ephemerd therefore generates a `.cargo/config.toml` under `<data-dir>/cargo/` and bind-mounts it **read-only** at the container's filesystem root (`/.cargo`, or `C:\.cargo` on Windows). Cargo searches the current directory and *every ancestor* for `.cargo/config.toml`, so a file at the root applies to any workspace path a job checks out — no knowledge of the checkout location, the job user's home, or the image's `CARGO_HOME` is needed, and `CARGO_HOME` itself is left untouched so it stays writable.
+
+A repository that ships its own `.cargo/config.toml` still wins: Cargo prefers config closer to the workspace.
+
+**Fail-open behaviour.** This needs more care than `[module_proxy]` does. `GOPROXY="<url>|direct"` falls through to the origin on any proxy error, so the Go proxy can never be more than a slowdown. **Cargo has no equivalent**: once `[source.crates-io] replace-with` points at the proxy there is no second source and no fallback, so a naive implementation would make the cache a hard dependency of every Rust build on the node. Instead:
+
+1. **Not started → not injected.** A proxy that fails to start is never added to the cache-proxy list, so neither the env var nor the mount reaches any container. Jobs behave as if ephemerd had no cache.
+2. **Running → always answers.** No route returns 5xx. Upstream unreachable with a cached copy → the **stale copy is served** with a warning. Upstream unreachable with nothing cached, cache unreadable, disk full, `config.json` unparseable → a `307` redirect to the real origin, which Cargo follows. This covers the index and `config.json` as well as crate and rustup downloads, so *"the proxy accepts connections"* is the only thing a build depends on — everything behind it can be broken.
+3. **Running but wedged → withdraws itself.** Layer 2 assumes requests still reach a handler. A watchdog probes the proxy's own listener every 15 s; after two consecutive failures the proxy rewrites the mounted `config.toml` to an inert one containing **no source replacement at all**. Because a *directory* is mounted, containers already running see the swap: the next `cargo` invocation goes straight to crates.io. The caching config is restored automatically once probes succeed again. Both transitions are logged (`cargo cache withdrawn from jobs` / `cargo cache re-enabled for jobs`).
+
+Genuine `404`s are passed through as `404` — a nonexistent crate version must stay distinguishable from an outage. Malformed request paths are rejected with `400` rather than redirected; real Cargo never emits them.
+
+**Residual failure mode.** A `cargo build` that has *already read* the active config and is mid-resolve when the listener wedges will fail — nothing can retract a config file Cargo has already parsed. The exposure is a single Cargo invocation, bounded by the watchdog interval plus Cargo's own retries (`net.retry = 3` is set in the generated config). Eliminating it entirely would mean not using source replacement, which would mean not caching crates at all.
+
+**Scope.** The mount lands in the runner container. Jobs that run their steps inside a *further* container (a `container:` image spawned via Docker-in-Docker) do not inherit it.
+
+**Cache location.** Cached content lives at `<data-dir>/cache/cargo/` and is visible to `ephemerd cache list` / `ephemerd cache clear cargo`. The generated container config lives at `<data-dir>/cargo/` — deliberately outside the cache root, so clearing the cache cannot pull the mounted config out from under a running job.
 
 ### `[metrics]`
 

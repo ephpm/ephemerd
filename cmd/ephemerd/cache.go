@@ -66,6 +66,18 @@ func managedCaches() []cacheEntry {
 			LiveSafe:    true,
 		},
 		{
+			Name: "cargo",
+			Rel:  filepath.Join("cache", "cargo"),
+			Description: "Cargo proxy cache (crates.io sparse index, .crate tarballs, rustup toolchains) " +
+				"served to job containers",
+			// Live-safe: every entry is a pull-through copy of public
+			// registry content, so a running job that misses simply
+			// refetches it. The generated container config that jobs
+			// bind-mount deliberately lives OUTSIDE this dir (<data>/cargo),
+			// so clearing the cache cannot yank it from a running job.
+			LiveSafe: true,
+		},
+		{
 			Name:        "buildkit",
 			Rel:         "buildkit",
 			Description: "Embedded BuildKit solver cache + history (docker build layers)",

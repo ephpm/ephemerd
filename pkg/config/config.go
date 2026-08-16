@@ -32,6 +32,7 @@ type Config struct {
 	BuildKit    BuildKitConfig    `toml:"buildkit"`
 	ImageGC     ImageGCConfig     `toml:"image_gc"`
 	ModuleProxy ModuleProxyConfig `toml:"module_proxy"`
+	CargoProxy  CargoProxyConfig  `toml:"cargo_proxy"`
 	// RegistryMirror routes container image pulls through a LAN pull-through
 	// cache instead of the origin registry. See RegistryMirrorConfig.
 	RegistryMirror RegistryMirrorConfig `toml:"registry_mirror"`
@@ -680,7 +681,59 @@ type ModuleProxyConfig struct {
 	Enabled  bool   `toml:"enabled"`  // enable Go module caching proxy
 	Port     int    `toml:"port"`     // listen port on bridge gateway (default 8082)
 	Upstream string `toml:"upstream"` // upstream proxy URL (default "https://proxy.golang.org")
-	Cleanup  bool   `toml:"cleanup"`  // wipe cache on shutdown (default true)
+	Cleanup  *bool  `toml:"cleanup"`  // wipe cache on shutdown (default true)
+}
+
+// CleanupEnabled reports whether the Go module cache is wiped on shutdown.
+// Defaults to true, preserving the historical behavior.
+//
+// Pointer-typed so "unset" is distinguishable from an explicit false. The
+// previous plain bool could not express that: the call site coerced any
+// false value back to true, which silently ignored `cleanup = false`.
+func (m *ModuleProxyConfig) CleanupEnabled() bool {
+	if m.Cleanup == nil {
+		return true
+	}
+	return *m.Cleanup
+}
+
+// CargoProxyConfig configures the Cargo/crates caching proxy.
+//
+// When enabled, ephemerd runs a pull-through cache for the crates.io sparse
+// index, .crate tarballs, and rustup toolchain artifacts on the bridge
+// gateway. Job containers are pointed at it automatically: rustup via
+// RUSTUP_DIST_SERVER, and Cargo via a generated .cargo/config.toml that is
+// bind-mounted read-only at the container's filesystem root (Cargo ignores
+// CARGO_SOURCE_* environment variables, so a file is the only mechanism).
+type CargoProxyConfig struct {
+	// Enabled turns the proxy on. Default false.
+	Enabled bool `toml:"enabled"`
+	// Port is the listen port on the bridge gateway. Default 8083.
+	Port int `toml:"port"`
+	// Upstream is the sparse registry index base URL.
+	// Default "https://index.crates.io".
+	Upstream string `toml:"upstream"`
+	// RustupUpstream is the toolchain distribution server.
+	// Default "https://static.rust-lang.org".
+	RustupUpstream string `toml:"rustup_upstream"`
+	// IndexTTL is how long a cached sparse-index entry is served before a
+	// conditional revalidation. Default 10m. Crate tarballs ignore this —
+	// they are immutable and cached permanently.
+	IndexTTL time.Duration `toml:"index_ttl"`
+	// Cleanup wipes the cache on shutdown. Default FALSE, unlike the Go
+	// module proxy: the whole point of a pull-through cache is to survive
+	// restarts, and wiping it on every shutdown is what made the module
+	// proxy's cache worthless.
+	Cleanup *bool `toml:"cleanup"`
+}
+
+// CleanupEnabled reports whether the Cargo cache is wiped on shutdown.
+// Defaults to false — see the field comment.
+func (c *CargoProxyConfig) CleanupEnabled() bool {
+	if c.Cleanup == nil {
+		return false
+	}
+	return *c.Cleanup
 }
 
 // RegistryMirrorConfig points container image pulls at a pull-through

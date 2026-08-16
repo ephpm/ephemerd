@@ -29,6 +29,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/providers/gitea"
 	githubProv "github.com/ephpm/ephemerd/pkg/providers/github"
 	"github.com/ephpm/ephemerd/pkg/proxies"
+	cargoproxy "github.com/ephpm/ephemerd/pkg/proxies/cargo"
 	goproxy "github.com/ephpm/ephemerd/pkg/proxies/go"
 	"github.com/ephpm/ephemerd/pkg/registrymirror"
 	"github.com/ephpm/ephemerd/pkg/runner"
@@ -447,6 +448,13 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	if cfg.ModuleProxy.Enabled {
 		gatewayPorts = append(gatewayPorts, modProxyPort)
 	}
+	cargoProxyPort := cfg.CargoProxy.Port
+	if cargoProxyPort == 0 {
+		cargoProxyPort = 8083
+	}
+	if cfg.CargoProxy.Enabled {
+		gatewayPorts = append(gatewayPorts, cargoProxyPort)
+	}
 
 	// Initialize container networking
 	net, err := networking.New(networking.Config{
@@ -481,16 +489,11 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		if upstream == "" {
 			upstream = "https://proxy.golang.org"
 		}
-		cleanup := cfg.ModuleProxy.Cleanup
-		if !cleanup {
-			cleanup = true
-		}
-
 		goProxy := goproxy.New(goproxy.Config{
 			CacheDir:   joinPath(configDir, "cache", "gomod"),
 			Upstream:   upstream,
 			ListenAddr: fmt.Sprintf("%s:%d", net.GatewayIP(), modProxyPort),
-			Cleanup:    cleanup,
+			Cleanup:    cfg.ModuleProxy.CleanupEnabled(),
 			Log:        log,
 		})
 		if err := goProxy.Start(); err != nil {
@@ -505,10 +508,43 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		}
 	}
 
-	// Collect env vars from all cache proxies for injection into containers.
+	// Start Cargo/crates caching proxy if enabled
+	if cfg.CargoProxy.Enabled {
+		cargoProxy := cargoproxy.New(cargoproxy.Config{
+			CacheDir: joinPath(configDir, "cache", "cargo"),
+			// Config dir sits OUTSIDE the cache so `ephemerd cache clear
+			// cargo` cannot delete the file mounted into running jobs.
+			ConfDir:        joinPath(configDir, "cargo"),
+			IndexUpstream:  cfg.CargoProxy.Upstream,
+			RustupUpstream: cfg.CargoProxy.RustupUpstream,
+			ListenAddr:     fmt.Sprintf("%s:%d", net.GatewayIP(), cargoProxyPort),
+			IndexTTL:       cfg.CargoProxy.IndexTTL,
+			Cleanup:        cfg.CargoProxy.CleanupEnabled(),
+			Log:            log,
+		})
+		if err := cargoProxy.Start(); err != nil {
+			log.Warn("failed to start Cargo proxy, continuing without it", "error", err)
+		} else {
+			cacheProxies = append(cacheProxies, cargoProxy)
+			defer func() {
+				if err := cargoProxy.Stop(); err != nil {
+					log.Warn("error stopping Cargo proxy", "error", err)
+				}
+			}()
+		}
+	}
+
+	// Collect env vars and mounts from all cache proxies for injection into
+	// containers. Only proxies that actually STARTED are in cacheProxies, so
+	// a failed proxy is never advertised to a job — that is the outer
+	// fail-open: jobs go straight to the upstream registry instead.
 	var cacheProxyEnvVars []string
+	var cacheProxyMounts []proxies.Mount
 	for _, cp := range cacheProxies {
 		cacheProxyEnvVars = append(cacheProxyEnvVars, cp.EnvVars()...)
+		if mp, ok := cp.(proxies.MountProvider); ok {
+			cacheProxyMounts = append(cacheProxyMounts, mp.Mounts()...)
+		}
 	}
 
 	// Start the shared embedded BuildKit solver. One solver serves every
@@ -564,6 +600,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		DindEnabled:         cfg.Dind.Enabled,
 		DindAllowPrivileged: cfg.Dind.ResolvedAllowPrivileged(),
 		CacheProxyEnv:       cacheProxyEnvVars,
+		CacheProxyMounts:    cacheProxyMounts,
 		Rlimits:             cfg.Runtime.Rlimits.Resolved(),
 		AllowNewPrivileges:  cfg.Runtime.ResolvedAllowNewPrivileges(),
 		Network:             net,
@@ -1167,13 +1204,15 @@ func crictlCmd() *cli.Command {
 //   - dind: the per-job Docker API listener, which on Windows is a TCP listener
 //     on the host address handed to the job as DOCKER_HOST.
 //   - the Go module proxy: bound to the same address and injected as GOPROXY.
+//   - the Cargo proxy: likewise, and unlike GOPROXY a Cargo source replacement
+//     has no fallback, so a container that cannot reach it fails the build.
 //
 // It only affects the Windows L2Bridge egress path, where the ACL ladder
-// otherwise blocks the host along with the rest of RFC1918 — with neither
-// feature enabled the strictest posture (host unreachable) applies. On NAT and
-// on Linux the gateway is already reachable and this changes nothing.
+// otherwise blocks the host along with the rest of RFC1918 — with none of
+// these features enabled the strictest posture (host unreachable) applies. On
+// NAT and on Linux the gateway is already reachable and this changes nothing.
 func needsHostAccess(cfg *config.Config) bool {
-	return cfg.Dind.Enabled || cfg.ModuleProxy.Enabled
+	return cfg.Dind.Enabled || cfg.ModuleProxy.Enabled || cfg.CargoProxy.Enabled
 }
 
 func joinPath(parts ...string) string {

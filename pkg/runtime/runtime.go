@@ -26,6 +26,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/dind"
 	"github.com/ephpm/ephemerd/pkg/imagegc"
 	"github.com/ephpm/ephemerd/pkg/networking"
+	"github.com/ephpm/ephemerd/pkg/proxies"
 	"github.com/ephpm/ephemerd/pkg/registrymirror"
 	craneTarball "github.com/google/go-containerregistry/pkg/v1/tarball"
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
@@ -94,6 +95,12 @@ type Config struct {
 	// to each per-job dind.Server so the hot dind pull path is covered too.
 	RegistryMirror *registrymirror.Mirror
 	CacheProxyEnv  []string // extra env vars from cache proxies (e.g., GOPROXY=...)
+	// CacheProxyMounts are read-only bind mounts requested by cache proxies
+	// for toolchains that cannot be redirected with an env var. The Cargo
+	// proxy uses this to place a generated .cargo/config.toml at the
+	// container's filesystem root, where Cargo's ancestor-directory config
+	// search finds it for any workspace path.
+	CacheProxyMounts []proxies.Mount
 	// Rlimits sets POSIX resource limits on each runner container's OCI
 	// process. Zero values fall back to the containerd default (1024).
 	// Applies on Linux only; ignored on Windows (HCS uses a different model).
@@ -108,7 +115,7 @@ type Config struct {
 	// construction site that forgets this field breaks `sudo` rather
 	// than silently loosening the sandbox.
 	AllowNewPrivileges bool
-	Network *networking.Manager
+	Network            *networking.Manager
 	// WindowsMemoryBytes is the memory limit for Hyper-V isolated Windows
 	// runner containers. Zero leaves the OCI spec field unset, which gives
 	// the HCS default (~1 GB) — too small for MSVC builds. Caller should
@@ -819,6 +826,12 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		// Docker-in-Docker is not supported (no CAP_SYS_ADMIN/CAP_NET_ADMIN).
 		oci.WithCapabilities(containerCapabilities),
 	}
+	// Cache-proxy config mounts (e.g. the Cargo source-replacement config).
+	// Read-only: a job must never be able to rewrite what the next job on
+	// this host will read.
+	if len(r.cfg.CacheProxyMounts) > 0 {
+		opts = append(opts, withCacheProxyMounts(r.cfg.CacheProxyMounts))
+	}
 	opts = append(opts, seccompOpts()...)
 	// AppArmor is an additional, independent layer over what the default spec
 	// above already does (read-only /proc/sys and /sys, masked /proc paths,
@@ -1419,6 +1432,44 @@ func withRunnerMount(hostDir, containerDir string) oci.SpecOpts {
 				Type:        "bind",
 				Source:      hostDir,
 				Options:     []string{"rbind", "rw"},
+			})
+		}
+		return nil
+	}
+}
+
+// withCacheProxyMounts adds the bind mounts a cache proxy needs in every job
+// container. The sources are host directories ephemerd generates and owns;
+// runc creates the destination if the image does not have it.
+func withCacheProxyMounts(mounts []proxies.Mount) oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
+		for _, m := range mounts {
+			if m.Source == "" || m.Destination == "" {
+				continue
+			}
+			if goruntime.GOOS == "windows" {
+				opts := []string{"rw"}
+				if m.ReadOnly {
+					opts = []string{"ro"}
+				}
+				s.Mounts = append(s.Mounts, ocispec.Mount{
+					Destination: m.Destination,
+					Source:      m.Source,
+					Options:     opts,
+				})
+				continue
+			}
+			opts := []string{"rbind", "rw"}
+			if m.ReadOnly {
+				// "ro" alone is not enough on a recursive bind: without
+				// rprivate a later host-side mount could propagate in.
+				opts = []string{"rbind", "ro", "rprivate"}
+			}
+			s.Mounts = append(s.Mounts, ocispec.Mount{
+				Destination: m.Destination,
+				Type:        "bind",
+				Source:      m.Source,
+				Options:     opts,
 			})
 		}
 		return nil

@@ -12,10 +12,10 @@ package goproxy
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -28,21 +28,23 @@ import (
 
 // Config for the Go module caching proxy.
 type Config struct {
-	CacheDir   string       // on-disk cache directory
-	Upstream   string       // upstream proxy URL (default: https://proxy.golang.org)
-	ListenAddr string       // address to listen on (e.g., "10.88.0.1:8082")
-	Cleanup    bool         // wipe cache dir on Stop
+	CacheDir   string // on-disk cache directory
+	Upstream   string // upstream proxy URL (default: https://proxy.golang.org)
+	ListenAddr string // address to listen on (e.g., "10.88.0.1:8082")
+	Cleanup    bool   // wipe cache dir on Stop
 	Log        *slog.Logger
 }
 
 // Compile-time interface check.
 var _ proxies.CacheProxy = (*Proxy)(nil)
 
+// shutdownGrace bounds how long Stop waits for in-flight requests.
+const shutdownGrace = 5 * time.Second
+
 // Proxy is a caching Go module proxy server.
 type Proxy struct {
 	cfg      Config
-	server   *http.Server
-	listener net.Listener
+	srv      *proxies.Server
 	client   *http.Client
 	inflight sync.Map // prevents duplicate upstream fetches for the same path
 }
@@ -68,22 +70,22 @@ func (p *Proxy) Start() error {
 		return fmt.Errorf("creating cache dir: %w", err)
 	}
 
-	ln, err := net.Listen("tcp", p.cfg.ListenAddr)
+	// proxies.Listen (not net.Listen): the bridge gateway IP does not exist
+	// yet at daemon boot — CNI creates the ephemerd0 bridge with the first
+	// job container — so a direct bind fails with EADDRNOTAVAIL and the
+	// proxy silently never starts. See proxies.Listen for the full story.
+	ln, err := proxies.Listen(p.cfg.ListenAddr, p.cfg.Log)
 	if err != nil {
-		return fmt.Errorf("listening on %s: %w", p.cfg.ListenAddr, err)
+		return err
 	}
-	p.listener = ln
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", p.handle)
 
-	p.server = &http.Server{Handler: mux}
-
-	go func() {
-		if err := p.server.Serve(ln); err != nil && err != http.ErrServerClosed {
-			p.cfg.Log.Error("go module proxy server error", "error", err)
-		}
-	}()
+	// proxies.NewServer, not a bare http.Server: a plain Shutdown with a
+	// deadline intermittently fails to stop at all. See proxies.Server.
+	p.srv = proxies.NewServer("go", ln, mux, p.cfg.Log)
+	p.srv.Serve()
 
 	p.cfg.Log.Info("go module proxy started", "addr", ln.Addr().String(), "cache", p.cfg.CacheDir)
 	return nil
@@ -93,10 +95,8 @@ func (p *Proxy) Start() error {
 func (p *Proxy) Stop() error {
 	var errs []error
 
-	if p.server != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := p.server.Shutdown(ctx); err != nil {
+	if p.srv != nil {
+		if err := p.srv.Shutdown(shutdownGrace); err != nil {
 			errs = append(errs, fmt.Errorf("shutting down proxy: %w", err))
 		}
 	}
@@ -108,25 +108,51 @@ func (p *Proxy) Stop() error {
 		}
 	}
 
-	if len(errs) > 0 {
-		return errs[0]
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // Addr returns the address the proxy is listening on.
 func (p *Proxy) Addr() string {
-	if p.listener != nil {
-		return p.listener.Addr().String()
+	if p.srv != nil {
+		return p.srv.Addr().String()
 	}
 	return p.cfg.ListenAddr
 }
 
+// fetchCtx is the context an upstream fetch runs under: the proxy's lifetime,
+// not the requesting job's. Same reasoning as the Cargo proxy — a fetch fills
+// a shared cache other requests are queued behind, so one client hanging up
+// must not abort it, and Stop must be able to cancel it.
+func (p *Proxy) fetchCtx() context.Context {
+	if p.srv != nil {
+		return p.srv.Context()
+	}
+	return context.Background()
+}
+
 // EnvVars returns the environment variables to inject into job containers.
+//
+// The advertised address is the CONFIGURED one (the bridge gateway), not
+// p.Addr(): when the listener falls back to the wildcard, Addr() reports
+// "[::]:8082", which is meaningless inside a container.
+//
+// The "|" separator (not ",") is what makes this fail open. With ",direct"
+// the go command only falls through to the origin on 404/410 — a proxy that
+// is down, wedged, or returning 5xx hard-fails the build. With "|direct" it
+// falls through on ANY error, so a broken cache degrades to a slower build
+// instead of a red job.
 func (p *Proxy) EnvVars() []string {
 	return []string{
-		"GOPROXY=http://" + p.Addr() + ",direct",
+		"GOPROXY=http://" + p.advertiseAddr() + "|direct",
 	}
+}
+
+// advertiseAddr is the address containers should use to reach this proxy.
+func (p *Proxy) advertiseAddr() string {
+	if p.cfg.ListenAddr != "" {
+		return p.cfg.ListenAddr
+	}
+	return p.Addr()
 }
 
 // Name returns the proxy name for logging.
@@ -178,7 +204,7 @@ func (p *Proxy) cacheAndServe(w http.ResponseWriter, r *http.Request) {
 
 	p.cfg.Log.Debug("cache miss", "path", r.URL.Path)
 	upstreamURL := p.cfg.Upstream + r.URL.Path
-	resp, err := p.client.Get(upstreamURL)
+	resp, err := p.upstreamGet(upstreamURL)
 	if err != nil {
 		p.cfg.Log.Warn("upstream fetch failed", "url", upstreamURL, "error", err)
 		http.Error(w, "upstream error", http.StatusBadGateway)
@@ -246,9 +272,19 @@ func (p *Proxy) cacheAndServe(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// upstreamGet fetches an upstream URL under the proxy's lifetime context, so
+// Stop can cancel a fetch that is blocked on a wedged upstream.
+func (p *Proxy) upstreamGet(url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(p.fetchCtx(), http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("building upstream request for %s: %w", url, err)
+	}
+	return p.client.Do(req)
+}
+
 func (p *Proxy) reverseProxy(w http.ResponseWriter, r *http.Request) {
 	upstreamURL := p.cfg.Upstream + r.URL.Path
-	resp, err := p.client.Get(upstreamURL)
+	resp, err := p.upstreamGet(upstreamURL)
 	if err != nil {
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
