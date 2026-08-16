@@ -465,17 +465,14 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		if upstream == "" {
 			upstream = "https://proxy.golang.org"
 		}
-		cleanup := cfg.ModuleProxy.Cleanup
-		if !cleanup {
-			cleanup = true
-		}
-
 		goProxy := goproxy.New(goproxy.Config{
-			CacheDir:   joinPath(configDir, "cache", "gomod"),
-			Upstream:   upstream,
-			ListenAddr: fmt.Sprintf("%s:%d", net.GatewayIP(), modProxyPort),
-			Cleanup:    cleanup,
-			Log:        log,
+			CacheDir:      joinPath(configDir, "cache", "gomod"),
+			Upstream:      upstream,
+			ListenAddr:    fmt.Sprintf("%s:%d", net.GatewayIP(), modProxyPort),
+			Cleanup:       cfg.ModuleProxy.ResolvedCleanup(),
+			MaxCacheBytes: cfg.ModuleProxy.ModuleProxyMaxCacheBytes(),
+			PruneInterval: cfg.ModuleProxy.ModuleProxyPruneInterval(),
+			Log:           log,
 		})
 		if err := goProxy.Start(); err != nil {
 			log.Warn("failed to start Go module proxy, continuing without it", "error", err)

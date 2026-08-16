@@ -672,11 +672,84 @@ func (c *Config) PinnedRunnerImages() []string {
 // ModuleProxyConfig configures the Go module caching proxy.
 // When enabled, ephemerd runs a local GOPROXY on the bridge gateway that
 // caches module downloads. Containers receive GOPROXY env var automatically.
+//
+// The cache is SHARED by every job on the node — that is the point of it,
+// and it is safe because jobs only ever speak HTTP to the proxy (they cannot
+// write the cache), because the proxy stores upstream's response under the
+// key derived from the same path it fetched, and because the `go` client
+// authenticates modules itself via go.sum and the checksum database. What
+// sharing does expose is DISK: any job can ask for arbitrarily many module
+// versions, so the cache needs a bound of its own. See MaxCacheGB.
 type ModuleProxyConfig struct {
 	Enabled  bool   `toml:"enabled"`  // enable Go module caching proxy
 	Port     int    `toml:"port"`     // listen port on bridge gateway (default 8082)
 	Upstream string `toml:"upstream"` // upstream proxy URL (default "https://proxy.golang.org")
-	Cleanup  bool   `toml:"cleanup"`  // wipe cache on shutdown (default true)
+
+	// Cleanup wipes the whole cache directory when the daemon stops.
+	//
+	// Pointer form so a missing TOML key is distinguishable from an
+	// explicit `cleanup = false`. It used to be a plain bool, which made
+	// the two indistinguishable — the code that meant to supply the
+	// default instead forced cleanup on for everyone, so the cache never
+	// survived a restart and an operator who turned it off got no signal.
+	// See ResolvedCleanup for the default policy.
+	Cleanup *bool `toml:"cleanup"`
+
+	// MaxCacheGB is the ceiling, in GiB, on the on-disk module cache.
+	// A prune pass evicts least-recently-used files until the directory is
+	// back under it. Default 20.
+	//
+	// 20 GiB is chosen to sit alongside the node's other disk bounds
+	// rather than compete with them: [buildkit].gc_max_used_gb defaults to
+	// 25 and [image_gc].min_free_gb to 20, so on the ~100 GB CI nodes this
+	// runs on the three together still leave headroom. It is also far
+	// larger than any single repo's module closure (a big Go service is a
+	// few GB with all its versions), so the cache stays warm in normal
+	// operation and the bound only bites when something pathological —
+	// or hostile — is filling it.
+	MaxCacheGB uint64 `toml:"max_cache_gb"`
+
+	// PruneInterval is how often the eviction pass runs. Default 1h.
+	// A pass is a directory walk plus a stat per file, so it is cheap;
+	// hourly is frequent enough that a job downloading modules in a loop
+	// cannot sit far above the cap for long. Set to a negative value to
+	// disable periodic pruning entirely (the cache is then unbounded
+	// again — only do this while debugging).
+	PruneInterval time.Duration `toml:"prune_interval"`
+}
+
+// ResolvedCleanup reports whether the module cache is wiped on shutdown,
+// applying the default when the operator hasn't set the key explicitly.
+//
+// Default policy: true, matching the behavior ephemerd has always had.
+// Now that the cache is size-bounded (see MaxCacheGB), `cleanup = false`
+// is the better setting for a long-lived node — it keeps the cache warm
+// across restarts and version bumps — but flipping the default silently
+// would change every existing node's disk profile, so it stays opt-in.
+func (m *ModuleProxyConfig) ResolvedCleanup() bool {
+	if m.Cleanup != nil {
+		return *m.Cleanup
+	}
+	return true
+}
+
+// ModuleProxyMaxCacheBytes returns the module cache ceiling in bytes,
+// default 20 GiB.
+func (m *ModuleProxyConfig) ModuleProxyMaxCacheBytes() int64 {
+	return gbOrDefault(m.MaxCacheGB, 20)
+}
+
+// ModuleProxyPruneInterval returns the eviction interval, default 1h.
+// A negative value means disabled and is returned as 0, matching
+// ImageGCConfig.ImageGCCheckInterval.
+func (m *ModuleProxyConfig) ModuleProxyPruneInterval() time.Duration {
+	if m.PruneInterval < 0 {
+		return 0
+	}
+	if m.PruneInterval == 0 {
+		return time.Hour
+	}
+	return m.PruneInterval
 }
 
 // VMConfig configures virtual machines for cross-OS job execution.

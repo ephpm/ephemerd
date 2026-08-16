@@ -60,6 +60,12 @@ func managedCaches() []cacheEntry {
 			LiveSafe:    true,
 		},
 		{
+			// Live-safe because the proxy only ever reads these files and
+			// re-fetches on a miss. The running daemon also bounds this one
+			// itself — goproxy.Proxy.Prune evicts LRU-first down to
+			// [module_proxy].max_cache_gb every [module_proxy].prune_interval
+			// — so a manual clear here is a "start cold now", not the thing
+			// keeping the cache from filling the disk.
 			Name:        "gomod",
 			Rel:         filepath.Join("cache", "gomod"),
 			Description: "Go module proxy cache (GOPROXY) served to job containers",

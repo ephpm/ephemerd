@@ -908,9 +908,104 @@ cleanup = false
 	if cfg.ModuleProxy.Upstream != "https://goproxy.io" {
 		t.Errorf("ModuleProxy.Upstream = %q, want %q", cfg.ModuleProxy.Upstream, "https://goproxy.io")
 	}
-	if cfg.ModuleProxy.Cleanup {
+	if cfg.ModuleProxy.Cleanup == nil {
+		t.Fatal("ModuleProxy.Cleanup = nil, want an explicit false")
+	}
+	if *cfg.ModuleProxy.Cleanup {
 		t.Error("ModuleProxy.Cleanup = true, want false")
 	}
+	if cfg.ModuleProxy.ResolvedCleanup() {
+		t.Error("ResolvedCleanup() = true, want false — an explicit cleanup = false must be honored")
+	}
+}
+
+// TestModuleProxyResolvedCleanup_TriState pins the fix for the bug where
+// Cleanup was a plain bool: unset and an explicit `cleanup = false` were
+// indistinguishable, so the code supplying the default forced cleanup on
+// unconditionally and the cache never survived a restart.
+func TestModuleProxyResolvedCleanup_TriState(t *testing.T) {
+	tr, fa := true, false
+	tests := []struct {
+		name string
+		set  *bool
+		want bool
+	}{
+		{"unset defaults to true", nil, true},
+		{"explicit false is honored", &fa, false},
+		{"explicit true stays true", &tr, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := ModuleProxyConfig{Cleanup: tt.set}
+			if got := m.ResolvedCleanup(); got != tt.want {
+				t.Errorf("ResolvedCleanup() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestModuleProxyResolvedCleanup_FromTOML checks the tri-state survives an
+// actual TOML round trip, not just direct struct construction.
+func TestModuleProxyResolvedCleanup_FromTOML(t *testing.T) {
+	tests := []struct {
+		name string
+		toml string
+		want bool
+	}{
+		{"key absent", "", true},
+		{"cleanup = false", "cleanup = false\n", false},
+		{"cleanup = true", "cleanup = true\n", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GITHUB_TOKEN", "")
+			path := filepath.Join(t.TempDir(), "config.toml")
+			body := "[github]\ntoken = \"ghp_test\"\nowner = \"org\"\n\n[module_proxy]\nenabled = true\n" + tt.toml
+			if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load() error: %v", err)
+			}
+			if got := cfg.ModuleProxy.ResolvedCleanup(); got != tt.want {
+				t.Errorf("ResolvedCleanup() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestModuleProxyCacheBounds covers the size cap and prune interval that
+// keep the shared module cache from filling the node's disk.
+func TestModuleProxyCacheBounds(t *testing.T) {
+	const gib = int64(1024 * 1024 * 1024)
+
+	t.Run("defaults", func(t *testing.T) {
+		m := ModuleProxyConfig{}
+		if got, want := m.ModuleProxyMaxCacheBytes(), 20*gib; got != want {
+			t.Errorf("ModuleProxyMaxCacheBytes() = %d, want %d (20 GiB)", got, want)
+		}
+		if got, want := m.ModuleProxyPruneInterval(), time.Hour; got != want {
+			t.Errorf("ModuleProxyPruneInterval() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("explicit values win", func(t *testing.T) {
+		m := ModuleProxyConfig{MaxCacheGB: 3, PruneInterval: 15 * time.Minute}
+		if got, want := m.ModuleProxyMaxCacheBytes(), 3*gib; got != want {
+			t.Errorf("ModuleProxyMaxCacheBytes() = %d, want %d", got, want)
+		}
+		if got, want := m.ModuleProxyPruneInterval(), 15*time.Minute; got != want {
+			t.Errorf("ModuleProxyPruneInterval() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("negative interval disables pruning", func(t *testing.T) {
+		m := ModuleProxyConfig{PruneInterval: -1}
+		if got := m.ModuleProxyPruneInterval(); got != 0 {
+			t.Errorf("ModuleProxyPruneInterval() = %v, want 0 (disabled)", got)
+		}
+	})
 }
 
 // --- Provider() detection ---

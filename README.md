@@ -387,7 +387,9 @@ max_concurrent = 2                    # max simultaneous macOS VMs (default: aut
 enabled = true                        # run a GOPROXY on the bridge gateway
 # port = 8082                         # default listen port
 # upstream = "https://proxy.golang.org"  # upstream to fetch from on cache miss
-# cleanup = true                      # wipe cache on shutdown
+# cleanup = true                      # wipe cache on shutdown; set false to keep it warm across restarts
+# max_cache_gb = 20                   # LRU eviction down to this ceiling
+# prune_interval = "1h"               # how often eviction runs (negative disables it)
 
 [log]
 level = "info"                        # debug, info, warn, error
