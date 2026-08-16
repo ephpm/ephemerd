@@ -67,15 +67,55 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 # escape=`
 FROM ghcr.io/actions/actions-runner:latest-win
 
+ARG GO_VERSION=1.26.6
+
 SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop';"]
 
-RUN Invoke-WebRequest -Uri "https://go.dev/dl/go1.26.1.windows-amd64.zip" -OutFile go.zip; `
-    Expand-Archive go.zip -DestinationPath C:\; `
-    Remove-Item go.zip
-ENV PATH="C:\go\bin;${PATH}"
+# Install into the runner tool cache, not C:\go — see "Windows: preinstall into
+# the tool cache" below.
+RUN Invoke-WebRequest -Uri "https://go.dev/dl/go${env:GO_VERSION}.windows-amd64.zip" -OutFile go.zip; `
+    Expand-Archive go.zip -DestinationPath C:\go-extract; `
+    New-Item -ItemType Directory -Force -Path "C:\hostedtoolcache\go\${env:GO_VERSION}" | Out-Null; `
+    Move-Item C:\go-extract\go "C:\hostedtoolcache\go\${env:GO_VERSION}\x64"; `
+    New-Item -ItemType File -Path "C:\hostedtoolcache\go\${env:GO_VERSION}\x64.complete" | Out-Null; `
+    Remove-Item -Recurse -Force go.zip, C:\go-extract
+ENV PATH="C:\hostedtoolcache\go\${GO_VERSION}\x64\bin;C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0"
 ```
 
 Windows images must be built on a Windows host.
+
+#### Windows: preinstall into the tool cache
+
+Putting a toolchain on `PATH` is not enough on Windows. `actions/setup-go`,
+`setup-node`, `setup-python` and friends never look at `PATH` — they look in the
+runner's **tool cache**, and if it is empty they download and extract their own
+copy. On a Hyper-V isolated Windows job that extraction is the single slowest
+thing in the job: the Go toolchain is roughly 15,000 files, and `setup-go` times
+itself out after 8 minutes long before it finishes.
+
+ephemerd sets `RUNNER_TOOL_CACHE=C:\hostedtoolcache` for every Windows job so
+that the cache lives **inside the image**. The runner's own default,
+`<runner root>\_work\_tool`, cannot work here: on Windows the runner root is a
+per-job copy of a host directory that ephemerd maps into the container, so it
+shadows anything the image put there and every write crosses a VSMB share into
+the utility VM.
+
+The layout is fixed by `actions/toolkit`, and all three parts are required:
+
+```
+C:\hostedtoolcache\<tool>\<x.y.z>\x64\          the tool itself (for Go, GOROOT)
+C:\hostedtoolcache\<tool>\<x.y.z>\x64.complete  a marker FILE, sibling of the dir
+```
+
+- The version directory must be a full `x.y.z` semver. `1.26` is ignored.
+- The `x64.complete` marker is not optional — without it the action reports a
+  cache miss and downloads anyway.
+- `x64` is the architecture name Node reports (`os.arch()`), not `amd64`.
+
+A cache hit only happens on an **exact** version match, so pick the version your
+workflows actually request. `go-version-file: go.mod` and `go-version: stable`
+both resolve to an exact release. If you set `RUNNER_TOOL_CACHE` yourself — in
+the image or via the job environment — ephemerd leaves your value alone.
 
 ### macOS (artifact image)
 
@@ -222,7 +262,7 @@ ephemerd's own CI uses custom runner images that pre-cache all build dependencie
 | Image | Base | What it caches |
 |-------|------|----------------|
 | `runner-ci-linux` | `ghcr.io/actions/actions-runner:latest` | Go, Mage, runner archive, CNI plugins, containerd shim, runc, golangci-lint |
-| `runner-ci-windows` | `ghcr.io/actions/actions-runner:latest-win` | Go, Mage, runner archive (Windows + Linux), golangci-lint |
+| `runner-ci-windows` | `ghcr.io/actions/actions-runner:latest-win` | Go (in the tool cache, so `actions/setup-go` hits it), Mage, runner archive (Windows + Linux), golangci-lint |
 | `runner-ci-macos` | `scratch` | Runner archive (macOS), Mage, golangci-lint (cross-compiled for darwin) |
 
 The Linux image supports multi-arch (amd64 + arm64) via `docker buildx`. Each image includes an entrypoint script that copies the cached dependencies into the workspace so `mage ci` runs without downloading anything. The Go module cache is also enabled -- after the first CI job runs, the module cache is warm and all subsequent jobs skip the `go mod download` entirely. The first job downloads and builds everything; every job after that just copies in the cached assets and runs `mage ci`.
