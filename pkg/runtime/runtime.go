@@ -164,6 +164,34 @@ func resolveRuntimeName(linuxRuntime, goos string) string {
 	return linuxRuntime
 }
 
+// kataRuntimeName is the containerd runtime handler for Kata Containers —
+// the one Linux handler that puts the job container in its own VM, with its
+// own kernel.
+const kataRuntimeName = "io.containerd.kata.v2"
+
+// resolveDindTransport picks how the per-job Docker API is handed to the job
+// container.
+//
+// The deciding question is whether the container shares the host's kernel.
+// When it does (runc), a bind-mounted unix socket is the cheapest and most
+// Docker-native answer, and stays the default. When it does not — a Kata
+// guest on Linux, a Hyper-V-isolated container on Windows — the bind carries
+// the socket inode across the VM boundary but not the listening endpoint
+// behind it, so every connect(2) in the guest returns ECONNREFUSED. Those get
+// TCP on the bridge gateway, which the guest reaches over IP like any other
+// service. It is the same failure and the same fix on both platforms; only
+// the trigger differs, and on Linux the trigger is a runtime choice rather
+// than the build target, which is why this cannot be a build tag.
+func resolveDindTransport(linuxRuntime, goos string) dind.Transport {
+	if goos == "windows" {
+		return dind.TransportTCP
+	}
+	if resolveRuntimeName(linuxRuntime, goos) == kataRuntimeName {
+		return dind.TransportTCP
+	}
+	return dind.TransportUnixSocket
+}
+
 // Runtime manages container lifecycle for runner environments.
 type Runtime struct {
 	cfg    Config
@@ -914,14 +942,16 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		opts = append(opts, withHostsMount(hostDataDir, containerDataDir, id))
 	}
 
-	// Start per-job fake Docker daemon. Exposure to the container differs
-	// by platform:
-	//   - Linux/macOS: bind-mount the unix socket at /var/run/docker.sock
-	//     (standard Docker CLI auto-discovery).
-	//   - Windows: DOCKER_HOST=tcp://<hcn-gateway>:<port> env var, because
-	//     the OCI Type:"bind" mount isn't supported by runhcs and named pipe
-	//     sharing into Hyper-V-isolated containers needs extra HCS plumbing.
-	//     docker.exe inside the container picks up DOCKER_HOST and talks TCP.
+	// Start per-job fake Docker daemon. How it reaches the container depends
+	// on whether the container shares the host kernel — see
+	// resolveDindTransport:
+	//   - Kernel-sharing container (runc on Linux/macOS): bind-mount the unix
+	//     socket at /var/run/docker.sock, standard Docker CLI auto-discovery.
+	//   - VM-isolated container (Kata on Linux, Hyper-V on Windows):
+	//     DOCKER_HOST=tcp://<gateway>:<port>, because a bind-mounted socket
+	//     inode has no endpoint behind it once it crosses into a guest with
+	//     its own kernel. The docker CLI inside the container picks up
+	//     DOCKER_HOST and talks TCP.
 	var dindServer *dind.Server
 	if r.cfg.DindEnabled {
 		var err error
@@ -934,6 +964,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			Network:         r.cfg.Network,
 			BuildKit:        r.cfg.BuildKit,
 			AllowPrivileged: r.cfg.DindAllowPrivileged,
+			Transport:       resolveDindTransport(r.cfg.LinuxRuntime, goruntime.GOOS),
 			Log:             r.cfg.Log,
 		})
 		if err != nil {
@@ -942,14 +973,14 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		if err := dindServer.Start(); err != nil {
 			return nil, fmt.Errorf("starting dind server for %s: %w", id, err)
 		}
-		if goruntime.GOOS == "windows" {
-			// oci.WithEnv appends/overrides — safe to call after the initial
-			// WithEnv on line 517. The runner's docker CLI (mounted from
-			// r.cfg.RunnerDir) sees DOCKER_HOST and talks TCP to our fake
-			// daemon on the HCN gateway.
-			opts = append(opts, oci.WithEnv([]string{"DOCKER_HOST=" + dindServer.Endpoint()}))
+		// An empty SocketPath is the TCP transport: there is nothing to
+		// mount, and the endpoint goes in as an env var instead. oci.WithEnv
+		// appends/overrides, so it is safe to call after the initial WithEnv
+		// above.
+		if sock := dindServer.SocketPath(); sock != "" {
+			opts = append(opts, withDockerSocket(sock))
 		} else {
-			opts = append(opts, withDockerSocket(dindServer.SocketPath()))
+			opts = append(opts, oci.WithEnv([]string{"DOCKER_HOST=" + dindServer.Endpoint()}))
 		}
 	}
 
@@ -1095,7 +1126,8 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		if dindServer != nil {
 			dindServer.SetRunnerNetNS(netns)
 		}
-		if _, err := r.cfg.Network.Setup(ctx, id, netns); err != nil {
+		setupResult, err := r.cfg.Network.Setup(ctx, id, netns)
+		if err != nil {
 			stopDind()
 			if _, delErr := task.Delete(ctx, client.WithProcessKill); delErr != nil {
 				r.cfg.Log.Debug("task cleanup after failed network setup", "error", delErr)
@@ -1104,6 +1136,34 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 				r.cfg.Log.Debug("container cleanup after failed network setup", "error", delErr)
 			}
 			return nil, fmt.Errorf("setting up network for %s: %w", id, err)
+		}
+
+		// The container's address exists only now — CNI is what allocates it
+		// — so this is the first moment the dind TCP port can be scoped to
+		// the one container entitled to use it. It has to be scoped: the dind
+		// Docker API is unauthenticated and every container on the bridge can
+		// address the gateway, so an unscoped port would let any concurrent
+		// job drive this job's daemon. A no-op on the unix-socket transport,
+		// which binds no port.
+		//
+		// Still ahead of task.Start below, so the container never runs
+		// without its allow in place. Fail CLOSED rather than starting with a
+		// wider (or no) scope: losing docker in this job beats losing
+		// isolation in all of them.
+		if dindServer != nil && setupResult != nil {
+			if err := dindServer.SetRunnerIP(setupResult.IP); err != nil {
+				stopDind()
+				if tearErr := r.cfg.Network.Teardown(ctx, id, netns); tearErr != nil {
+					r.cfg.Log.Debug("network teardown after failed dind port scope", "error", tearErr)
+				}
+				if _, delErr := task.Delete(ctx, client.WithProcessKill); delErr != nil {
+					r.cfg.Log.Debug("task cleanup after failed dind port scope", "error", delErr)
+				}
+				if delErr := container.Delete(ctx, client.WithSnapshotCleanup); delErr != nil {
+					r.cfg.Log.Debug("container cleanup after failed dind port scope", "error", delErr)
+				}
+				return nil, fmt.Errorf("authorizing dind access for %s: %w", id, err)
+			}
 		}
 	}
 

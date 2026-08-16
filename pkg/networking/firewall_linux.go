@@ -4,11 +4,27 @@ package networking
 
 import (
 	"fmt"
+	"net"
 	"os/exec"
 	"strings"
 )
 
 const chainName = "EPHEMERD-FORWARD"
+
+// dindChainName holds the per-job allow/deny pairs for dind's TCP Docker API
+// listeners. It is a chain of its own, jumped to from both INPUT and
+// EPHEMERD-FORWARD, so that per-job rules can be added and removed
+// independently of the static rule set that installFirewallRules lays down —
+// re-running the installer must not revoke a live job's allow, and a job
+// ending must not disturb the static rules.
+//
+// Both jump points are needed. A container packet addressed to the bridge
+// gateway is delivered locally and traverses INPUT, never FORWARD, so INPUT is
+// where the decision actually gets made today. EPHEMERD-FORWARD is covered as
+// well because its "allow container-to-container" rule (the gateway address is
+// inside the container subnet) would otherwise be a standing bypass on any
+// host or kernel configuration where bridged traffic does reach FORWARD.
+const dindChainName = "EPHEMERD-DIND"
 
 var deniedRanges = []string{
 	"10.0.0.0/8",
@@ -71,6 +87,129 @@ func controlPlaneInputRules(subnet, gateway string, ports []int) [][]string {
 	return rules
 }
 
+// dindPortRules returns the ordered rule pair that authorizes exactly one
+// container to reach one dind Docker API port on the gateway.
+//
+// First an ACCEPT for the owning container's /32, then a DROP for everything
+// else aimed at that port. Order is the whole mechanism: iptables takes the
+// first match, so the /32 is carved out of a deny that is otherwise total.
+//
+// The DROP is deliberately not scoped to the container subnet. The port only
+// ever needs to serve its one container, so denying every other source —
+// other containers, other bridges, the host's own processes, anything that
+// routes to the gateway address — is both free and strictly safer than
+// enumerating who is excluded.
+//
+// Exposed as a pure function (no side effects) so tests can assert the exact
+// rules and their order without invoking iptables.
+func dindPortRules(gateway, containerIP string, port int) [][]string {
+	dport := fmt.Sprintf("%d", port)
+	return [][]string{
+		{"-s", containerIP + "/32", "-d", gateway, "-p", "tcp", "--dport", dport, "-j", "ACCEPT"},
+		{"-d", gateway, "-p", "tcp", "--dport", dport, "-j", "DROP"},
+	}
+}
+
+// ensureDindChain creates EPHEMERD-DIND and its jumps if they are not already
+// in place. Idempotent, and safe to call when installFirewallRules has already
+// run — every step is check-before-add.
+//
+// Called from openHostPort rather than only from installFirewallRules so that
+// the per-job allow cannot silently land in a chain nothing jumps to. A dind
+// rule that is installed but unreachable would look like success while leaving
+// the port open to every container.
+func (l *linuxNetworking) ensureDindChain() error {
+	// -N fails with EEXIST when the chain is already there; that is the
+	// normal case after the first job, so the error is not interesting.
+	_ = iptables("-N", dindChainName)
+
+	if err := iptables("-C", "INPUT", "-j", dindChainName); err != nil {
+		if err := iptables("-I", "INPUT", "1", "-j", dindChainName); err != nil {
+			return fmt.Errorf("inserting %s jump into INPUT: %w", dindChainName, err)
+		}
+	}
+
+	// EPHEMERD-FORWARD is created by installFirewallRules. If that has not
+	// run (or failed), there is nothing to hook and nothing to protect there
+	// — the INPUT jump above is the one that matters. Create it so the jump
+	// has a home rather than failing the whole open.
+	_ = iptables("-N", chainName)
+	if err := iptables("-C", chainName, "-j", dindChainName); err != nil {
+		if err := iptables("-I", chainName, "1", "-j", dindChainName); err != nil {
+			return fmt.Errorf("inserting %s jump into %s: %w", dindChainName, chainName, err)
+		}
+	}
+	return nil
+}
+
+// openHostPort authorizes exactly one container to reach one dind Docker API
+// port on the bridge gateway, and denies it to everything else.
+//
+// SECURITY. This is not a convenience carve-out, it is the authenticator. The
+// Docker API dind serves on this port accepts any request from anyone: it has
+// no credentials, no TLS, no notion of which job is calling. Reaching the port
+// is equivalent to full control of that job's daemon — run and exec
+// containers, bind-mount host paths, read its build context. Linux containers
+// share one bridge and can address the gateway freely (INPUT policy is ACCEPT
+// and nothing else filters container→gateway), so without these rules every
+// concurrent job could drive every other job's daemon. Scoping to the owning
+// container's /32 is what makes the transport safe to use at all.
+//
+// FAIL CLOSED. An empty or unparseable containerIP returns an error and opens
+// nothing; the caller is expected to fail the job. There is no wider fallback
+// — losing docker in one job beats losing isolation in all of them.
+func (l *linuxNetworking) openHostPort(port int, containerIP string) error {
+	if port <= 0 || port > 65535 {
+		return fmt.Errorf("dind host port %d is out of range", port)
+	}
+	ip := net.ParseIP(strings.TrimSpace(containerIP))
+	if ip == nil || ip.To4() == nil {
+		return fmt.Errorf("dind host port %d: container IP %q is not a usable IPv4 address", port, containerIP)
+	}
+	if err := l.ensureDindChain(); err != nil {
+		return err
+	}
+
+	gateway := deriveGateway(l.cfg.subnet())
+	rules := dindPortRules(gateway, ip.String(), port)
+	for i, rule := range rules {
+		if err := iptables(append([]string{"-A", dindChainName}, rule...)...); err != nil {
+			// Roll back whatever landed: a lone ACCEPT with no DROP behind it
+			// is the pool-wide hole this function exists to prevent.
+			for j := 0; j < i; j++ {
+				if delErr := iptables(append([]string{"-D", dindChainName}, rules[j]...)...); delErr != nil {
+					l.cfg.Log.Warn("failed to roll back partial dind port allow",
+						"port", port, "container_ip", ip.String(), "error", delErr)
+				}
+			}
+			return fmt.Errorf("adding dind port rule (tcp/%d for %s): %w", port, ip.String(), err)
+		}
+	}
+	l.cfg.Log.Info("dind API port scoped to owning container",
+		"port", port, "container_ip", ip.String(), "gateway", gateway)
+	return nil
+}
+
+// closeHostPort removes the pair openHostPort added. Best-effort: the rules
+// are also flushed wholesale when the daemon tears the firewall down, so a
+// failure here leaks at worst until the next restart, and only for a port
+// nothing is listening on any more.
+func (l *linuxNetworking) closeHostPort(port int, containerIP string) {
+	ip := net.ParseIP(strings.TrimSpace(containerIP))
+	if ip == nil || ip.To4() == nil {
+		l.cfg.Log.Debug("skipping dind port close: unusable container IP",
+			"port", port, "container_ip", containerIP)
+		return
+	}
+	gateway := deriveGateway(l.cfg.subnet())
+	for _, rule := range dindPortRules(gateway, ip.String(), port) {
+		if err := iptables(append([]string{"-D", dindChainName}, rule...)...); err != nil {
+			l.cfg.Log.Debug("failed to remove dind port rule",
+				"port", port, "container_ip", ip.String(), "error", err)
+		}
+	}
+}
+
 func (l *linuxNetworking) installFirewallRules() error {
 	// Create our own chain to avoid interference from CNI/Netavark
 	_ = iptables("-N", chainName)
@@ -94,6 +233,22 @@ func (l *linuxNetworking) installFirewallRules() error {
 	}
 
 	// Rules inside our chain (evaluated in order, top to bottom):
+
+	// 0. Per-job dind Docker API rules. Must be first: rule 2 below allows
+	//    container-to-container traffic across the whole subnet, and the
+	//    gateway address sits inside that subnet, so anything appended after
+	//    it could never deny a container reaching a dind port. The chain is
+	//    empty until a job opens a port; see ensureDindChain.
+	if err := l.ensureDindChain(); err != nil {
+		return err
+	}
+	// Drop per-job rules left by a previous daemon that did not shut down
+	// cleanly. This runs at startup, before any job exists, so nothing live
+	// is being revoked — whereas a stale DROP for a port number the kernel
+	// later hands to a new job would silently break that job's docker.
+	if err := iptables("-F", dindChainName); err != nil {
+		l.cfg.Log.Debug("failed to flush dind chain", "error", err)
+	}
 
 	// 1. Allow return traffic
 	l.cfg.Log.Info("adding firewall rule", "rule", "allow return traffic")
@@ -231,6 +386,16 @@ func ipv6FirewallRules(controlPorts []int) []ip6Rule {
 }
 
 func (l *linuxNetworking) removeFirewallRules() {
+	// Remove the per-job dind chain and its jumps. The EPHEMERD-FORWARD jump
+	// goes away with that chain below, but the INPUT one lives in a built-in
+	// chain and has to be deleted by hand or it dangles across restarts.
+	if err := iptables("-D", "INPUT", "-j", dindChainName); err != nil {
+		l.cfg.Log.Debug("failed to remove dind jump from INPUT", "error", err)
+	}
+	if err := iptables("-F", dindChainName); err != nil {
+		l.cfg.Log.Debug("failed to flush dind chain", "error", err)
+	}
+
 	// Remove jump rules from FORWARD
 	if err := iptables("-D", "FORWARD", "-s", l.cfg.subnet(), "-j", chainName); err != nil {
 		l.cfg.Log.Debug("failed to remove forward jump rule", "error", err)
@@ -245,6 +410,11 @@ func (l *linuxNetworking) removeFirewallRules() {
 	}
 	if err := iptables("-X", chainName); err != nil {
 		l.cfg.Log.Debug("failed to delete chain", "error", err)
+	}
+	// Delete the dind chain only after EPHEMERD-FORWARD is gone — the jump
+	// from it is a reference that -X would otherwise refuse to drop.
+	if err := iptables("-X", dindChainName); err != nil {
+		l.cfg.Log.Debug("failed to delete dind chain", "error", err)
 	}
 
 	// Remove the IPv4 control-plane INPUT drops (they live in the built-in

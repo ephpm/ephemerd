@@ -261,7 +261,11 @@ Windows jobs get Hyper-V isolation and macOS jobs get a full VM, but with the de
 
 **Requirements.** Kata Containers must be installed with `containerd-shim-kata-v2` on the daemon's `PATH`, and `/dev/kvm` must exist and be openable — on a VM that means nested virtualization has to be enabled for the guest. If either is missing, **ephemerd refuses to start**. That is deliberate: falling back to `runc` would run untrusted CI code on the host kernel while the config claims VM isolation, and a silent downgrade of an isolation guarantee is worse than an outage.
 
-> **`runtime = "kata"` is incompatible with `[dind]`.** ephemerd hands jobs a Docker API by bind-mounting a host unix socket at `/var/run/docker.sock`. Under Kata that bind becomes a virtio-fs passthrough, which carries the socket file into the guest but not its connectability: the socket appears and every `connect()` returns `ECONNREFUSED`. Setting both is rejected at config load. Use `dind.enabled = false` with Kata until the Docker API is offered over TCP the way it already is on Windows.
+**`[dind]` works under Kata, on a different transport.** Normally ephemerd hands a job its Docker API by bind-mounting a host unix socket at `/var/run/docker.sock`. That cannot work into a Kata guest: the bind carries the socket *file* across the VM boundary but not its connectability, so the socket appears and every `connect()` returns `ECONNREFUSED`. VM-isolated jobs therefore get the API over TCP instead — the same `DOCKER_HOST=tcp://…` transport dind has always used for Hyper-V-isolated Windows containers — bound to the bridge gateway on an ephemeral per-job port. Nothing in a workflow needs to change: the docker CLI reads `DOCKER_HOST`. There is no `/var/run/docker.sock` inside the container, so a step that hard-codes the socket path (`curl --unix-socket /var/run/docker.sock`) has to use `$DOCKER_HOST` instead.
+
+> **Security note.** That per-job port is firewalled to the owning container's `/32` — the served Docker API authenticates nothing, so the firewall scope is what keeps one job from driving another job's daemon. If the scope cannot be applied, the job fails rather than starting with a wider one.
+
+> **Sibling bind mounts are limited under Kata.** `docker run -v <path>` from inside a job works only when `<path>` is under a host-backed mount (the runner directory, `/etc/hosts`, `/etc/resolv.conf`). A source inside the job container's *own* filesystem — `/tmp/...`, the GitHub Actions workspace under `/home/runner/_work` — lives in the guest, where the host-side daemon cannot read it. Those are **rejected** with an explicit error at `docker create` rather than mounted: the mount would otherwise succeed and hand the sibling container a silently empty directory.
 
 **Measured cost.** Benchmarked on an 8-core amd64 Proxmox guest (Kata 4.0.0, QEMU 
 hypervisor, containerd runtime handler `io.containerd.kata.v2`), comparing `runc` and 
@@ -283,6 +287,21 @@ figure is dominated by the QEMU process (~267 MB resident); it is a per-job cost
 running `max_concurrent = 4` needs roughly 1.2 GB of headroom it did not need before. Short 
 jobs pay the start-up cost proportionally hardest; file-heavy jobs (dependency installs, 
 large checkouts) pay the most overall.
+
+**Cost with dind enabled.** The table above was measured with `dind.enabled = false`. 
+Re-measured on the same node with dind on — end-to-end `Runtime.Create`, i.e. image resolve 
+through container create, task create, CNI attach, per-job firewall scope and task start:
+
+| Measurement | runc + dind | kata + dind | Ratio |
+|---|---|---|---|
+| Provision a job container (median, n=9) | 203 ms | 2 498 ms | 12.3× |
+| Provision a job container (min / max) | 197 / 212 ms | 2 472 / 2 528 ms | — |
+
+The TCP transport itself is not a measurable part of that: binding an ephemeral port and 
+appending two iptables rules is sub-millisecond work next to a guest kernel boot. This 
+window is wider than the `create → running` figure in the table above because it includes 
+the surrounding provisioning steps, so compare the two columns with each other, not across 
+tables.
 
 > Cloud Hypervisor and Firecracker ship in the same Kata release and can be selected by 
 > symlinking the shim (`containerd-shim-kata-clh-v2`, `containerd-shim-kata-fc-v2`). Both 

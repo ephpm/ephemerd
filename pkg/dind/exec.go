@@ -198,7 +198,7 @@ func (s *Server) handleExecStartLog(w http.ResponseWriter, r *http.Request, exec
 		User: ocispec.User{UID: 0, GID: 0},
 	}
 
-	logDir := filepath.Join(filepath.Dir(s.sockPath), "exec", exec.ID)
+	logDir := filepath.Join(s.dockerDir, "exec", exec.ID)
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"message": fmt.Sprintf("creating exec log dir: %v", err),
@@ -681,7 +681,7 @@ func (s *Server) copyToViaExec(w http.ResponseWriter, r *http.Request, entry *co
 		User: ocispec.User{UID: 0, GID: 0},
 	}
 
-	logDir := filepath.Join(filepath.Dir(s.sockPath), "exec", execID)
+	logDir := filepath.Join(s.dockerDir, "exec", execID)
 	_ = os.MkdirAll(logDir, 0o755)
 	logPath := filepath.Join(logDir, "output.log")
 

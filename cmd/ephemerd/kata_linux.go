@@ -35,17 +35,6 @@ func checkKataPrereqs(cfg *config.Config, log *slog.Logger) error {
 		return nil
 	}
 
-	// Re-check the dind incompatibility here as well as in config
-	// validation. Load() validates the config file, but serve() applies
-	// the --dind and --dind-allow-privileged flags *after* Load returns,
-	// so the flag path would otherwise slip a known-broken combination
-	// past validation.
-	if cfg.Dind.Enabled {
-		return fmt.Errorf(`runner.linux.runtime = "kata" is incompatible with dind ` +
-			`(dind passes the Docker API through a bind-mounted unix socket, which a Kata ` +
-			`guest cannot connect to over virtio-fs — drop --dind / set dind.enabled = false)`)
-	}
-
 	shimPath, err := exec.LookPath(kataShimBinary)
 	if err != nil {
 		return fmt.Errorf(`runner.linux.runtime = "kata" but %s was not found in PATH `+
@@ -72,9 +61,22 @@ func checkKataPrereqs(cfg *config.Config, log *slog.Logger) error {
 	}
 	_ = f.Close()
 
+	// dind is supported under Kata, on a different transport: the Docker API
+	// is served over TCP on the bridge gateway and handed to the job as
+	// DOCKER_HOST, because a bind-mounted unix socket carries no endpoint
+	// across the VM boundary. Log it — an operator reading "kata + dind"
+	// should be able to see which transport was chosen without reading code,
+	// since it is the difference between a working docker.sock and one that
+	// refuses every call.
+	if cfg.Dind.Enabled {
+		log.Info("dind will use the TCP transport under kata",
+			"reason", "a bind-mounted unix socket has no listening endpoint inside a guest kernel")
+	}
+
 	log.Info("kata runtime preflight passed",
 		"shim", shimPath,
 		"runtime", cfg.Runner.Linux.ContainerdRuntime(),
+		"dind_enabled", cfg.Dind.Enabled,
 		"kata_version", kataVersion())
 	return nil
 }

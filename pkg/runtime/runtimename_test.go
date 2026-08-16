@@ -1,6 +1,10 @@
 package runtime
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/ephpm/ephemerd/pkg/dind"
+)
 
 func TestResolveRuntimeName(t *testing.T) {
 	tests := []struct {
@@ -53,6 +57,63 @@ func TestResolveRuntimeName(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := resolveRuntimeName(tt.linuxRuntime, tt.goos); got != tt.want {
 				t.Errorf("resolveRuntimeName(%q, %q) = %q, want %q",
+					tt.linuxRuntime, tt.goos, got, tt.want)
+			}
+		})
+	}
+}
+
+// The dind transport is a runtime decision, not a build-tag one: the same
+// Linux binary must hand a runc job a unix socket and a Kata job a TCP
+// endpoint, because only the second has its own kernel.
+func TestResolveDindTransport(t *testing.T) {
+	tests := []struct {
+		name         string
+		linuxRuntime string
+		goos         string
+		want         dind.Transport
+	}{
+		{
+			name:         "linux default (runc) keeps the unix socket",
+			linuxRuntime: "",
+			goos:         "linux",
+			want:         dind.TransportUnixSocket,
+		},
+		{
+			name:         "explicit runc keeps the unix socket",
+			linuxRuntime: "io.containerd.runc.v2",
+			goos:         "linux",
+			want:         dind.TransportUnixSocket,
+		},
+		{
+			name:         "kata switches to TCP",
+			linuxRuntime: "io.containerd.kata.v2",
+			goos:         "linux",
+			want:         dind.TransportTCP,
+		},
+		{
+			name:         "windows is TCP regardless of the linux knob",
+			linuxRuntime: "io.containerd.kata.v2",
+			goos:         "windows",
+			want:         dind.TransportTCP,
+		},
+		{
+			name:         "windows is TCP with the knob unset",
+			linuxRuntime: "",
+			goos:         "windows",
+			want:         dind.TransportTCP,
+		},
+		{
+			name:         "darwin keeps the unix socket",
+			linuxRuntime: "",
+			goos:         "darwin",
+			want:         dind.TransportUnixSocket,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolveDindTransport(tt.linuxRuntime, tt.goos); got != tt.want {
+				t.Errorf("resolveDindTransport(%q, %q) = %q, want %q",
 					tt.linuxRuntime, tt.goos, got, tt.want)
 			}
 		})

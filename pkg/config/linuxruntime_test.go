@@ -89,19 +89,20 @@ func TestLoad_RunnerLinuxUnknownRuntime_Rejected(t *testing.T) {
 	}
 }
 
-// Kata + dind is a known-broken combination (the bind-mounted docker.sock
-// is unreachable from inside the guest), so it must fail at load rather
-// than hand jobs a socket that refuses every connection.
-func TestLoad_RunnerLinuxKataWithDind_Rejected(t *testing.T) {
-	_, err := loadRunnerLinuxTOML(t, "runtime = \"kata\"\n", "[dind]\nenabled = true\n")
-	if err == nil {
-		t.Fatal("expected error: kata with dind.enabled = true must be rejected")
+// Kata + dind must load. It was rejected while dind could only hand over a
+// bind-mounted unix socket, which a guest with its own kernel cannot connect
+// to; VM-isolated jobs now get the DOCKER_HOST=tcp:// transport instead, so
+// refusing the combination would block a configuration that works.
+func TestLoad_RunnerLinuxKataWithDind_OK(t *testing.T) {
+	cfg, err := loadRunnerLinuxTOML(t, "runtime = \"kata\"\n", "[dind]\nenabled = true\n")
+	if err != nil {
+		t.Fatalf("Load with kata + dind: %v", err)
 	}
-	msg := err.Error()
-	for _, want := range []string{"runner.linux.runtime", "kata", "dind.enabled"} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("error %q does not mention %q", msg, want)
-		}
+	if !cfg.Dind.Enabled {
+		t.Error("Dind.Enabled = false, want true")
+	}
+	if got := cfg.Runner.Linux.ContainerdRuntime(); got != "io.containerd.kata.v2" {
+		t.Errorf("ContainerdRuntime() = %q, want io.containerd.kata.v2", got)
 	}
 }
 

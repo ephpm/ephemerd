@@ -1038,8 +1038,16 @@ const (
 // with Kata 4.0.0 + QEMU, it costs seconds of extra container start
 // latency (0.14s -> 4.1s median), ~310 MB of guest memory per running
 // job instead of ~14 MB, ~35% on CPU-bound work and 8-40x on file-heavy
-// work. It is also NOT compatible with [dind] — see the validate method
-// below for why.
+// work.
+//
+// [dind] works under Kata. The Docker API cannot be handed over as a
+// bind-mounted unix socket — the guest has its own kernel, so the socket
+// inode arrives with no endpoint behind it and connect(2) returns
+// ECONNREFUSED — so those jobs get the same DOCKER_HOST=tcp:// transport
+// dind has always used for Hyper-V-isolated Windows containers, with the
+// port firewalled to the owning container's address. The transport is
+// chosen from this key at container-create time; see
+// runtime.resolveDindTransport.
 type LinuxRunnerToml struct {
 	// Runtime selects the container runtime for Linux job containers:
 	// "runc" (default) or "kata". Empty means "runc".
@@ -1065,29 +1073,19 @@ func (l LinuxRunnerToml) ContainerdRuntime() string {
 	return "io.containerd.runc.v2"
 }
 
-// validate rejects an unknown runtime name, and rejects the one
-// combination that is known to be broken rather than merely slower.
+// validate rejects an unknown runtime name. A typo must not silently fall
+// back to runc: that would quietly drop the isolation the operator asked
+// for, which is the whole point of the key.
 //
-// Kata + dind is fatal, not a warning: ephemerd hands jobs a Docker
-// daemon by bind-mounting a host unix socket at /var/run/docker.sock.
-// Under Kata the container rootfs lives in a guest VM and that bind
-// becomes a virtio-fs passthrough, which carries the socket *inode* into
-// the guest but not the socket's connectability — the file appears with
-// mode "srw-rw-rw-" and every connect() returns ECONNREFUSED. A job
-// would see a docker.sock that exists and refuses every call, which is a
-// far more confusing failure than being told at startup. Operators who
-// want Kata today must set dind.enabled = false; see the DOCKER_HOST=tcp
-// transport dind already uses on Windows for how this would be fixed.
-func (l LinuxRunnerToml) validate(dind *DindConfig) error {
+// Kata alongside dind used to be rejected here, on the grounds that the
+// bind-mounted /var/run/docker.sock is unreachable from inside the guest.
+// That part is still true and unfixable, but it was only ever a property
+// of the transport, not of dind: VM-isolated jobs now get the same
+// DOCKER_HOST=tcp:// transport that Hyper-V-isolated Windows containers
+// have always used. The combination is supported and no longer refused.
+func (l LinuxRunnerToml) validate() error {
 	switch l.ResolvedRuntime() {
-	case LinuxRuntimeRunc:
-		return nil
-	case LinuxRuntimeKata:
-		if dind != nil && dind.Enabled {
-			return fmt.Errorf(`runner.linux.runtime = "kata" is incompatible with dind.enabled = true ` +
-				`(dind passes the Docker API through a bind-mounted unix socket, which a Kata guest ` +
-				`cannot connect to over virtio-fs — set dind.enabled = false to use Kata)`)
-		}
+	case LinuxRuntimeRunc, LinuxRuntimeKata:
 		return nil
 	default:
 		return fmt.Errorf("runner.linux.runtime is %q (supported: %s, %s)",
@@ -1414,7 +1412,7 @@ func (c *Config) validate() error {
 		return err
 	}
 
-	if err := c.Runner.Linux.validate(&c.Dind); err != nil {
+	if err := c.Runner.Linux.validate(); err != nil {
 		return err
 	}
 
