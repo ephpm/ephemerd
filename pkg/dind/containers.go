@@ -299,7 +299,8 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 		if s.cacheNamespace != "" {
 			for _, name := range dedup(pullRef, req.Image) {
 				if merr := MirrorImageToCache(r.Context(), s.client, s.jobNamespace, s.cacheNamespace, name, s.log); merr != nil {
-					s.log.Debug("dind cache: mirror after container-create pull", "image", name, "error", merr)
+					s.log.Warn("dind cache: mirror after container-create pull failed, next job will re-pull",
+						"image", name, "error", merr)
 				}
 			}
 		}

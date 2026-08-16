@@ -1,4 +1,4 @@
-package config
+﻿package config
 
 import (
 	"bytes"
@@ -552,7 +552,7 @@ func TestImageForRepoOS_PerOSOverride(t *testing.T) {
 
 func TestImageForRepoOS_RepoMissingOSReturnsEmpty(t *testing.T) {
 	// A repo that only declares Linux must return "" for Windows so the
-	// caller falls through to the provider/runtime defaults — *not* leak
+	// caller falls through to the provider/runtime defaults â€” *not* leak
 	// the Linux image into a Windows job.
 	r := &RunnerConfig{
 		Images: map[string]map[string]string{
@@ -830,7 +830,7 @@ func TestLogger_JSONOutput(t *testing.T) {
 	cfg := &Config{Log: LogConfig{Level: "info", Format: "json"}}
 	logger := cfg.Logger()
 
-	// Logger should produce valid JSON — test by logging to a buffer
+	// Logger should produce valid JSON â€” test by logging to a buffer
 	// We can't easily redirect cfg.Logger() output, but we can verify
 	// the handler type by checking it handles records without panic
 	logger.Info("test message", "key", "value")
@@ -908,13 +908,19 @@ cleanup = false
 	if cfg.ModuleProxy.Upstream != "https://goproxy.io" {
 		t.Errorf("ModuleProxy.Upstream = %q, want %q", cfg.ModuleProxy.Upstream, "https://goproxy.io")
 	}
+	if cfg.ModuleProxy.Cleanup == nil {
+		t.Fatal("ModuleProxy.Cleanup = nil, want an explicit false")
+	}
+	if *cfg.ModuleProxy.Cleanup {
+		t.Error("ModuleProxy.Cleanup = true, want false")
+	}
 	if cfg.ModuleProxy.CleanupEnabled() {
 		t.Error("ModuleProxy.CleanupEnabled() = true, want false (cleanup = false was set explicitly)")
 	}
 }
 
 // TestModuleProxyCleanupDefault pins that an unset cleanup still defaults to
-// true — the pointer field must not change existing behavior, only make an
+// true â€” the pointer field must not change existing behavior, only make an
 // explicit false actually take effect.
 func TestModuleProxyCleanupDefault(t *testing.T) {
 	var m ModuleProxyConfig
@@ -971,7 +977,7 @@ cleanup = true
 }
 
 // TestCargoProxyDefaults pins the defaults that matter: the proxy is opt-in,
-// and — unlike the Go module proxy — its cache is NOT wiped on shutdown. A
+// and â€” unlike the Go module proxy â€” its cache is NOT wiped on shutdown. A
 // pull-through cache that empties itself on every restart saves nothing.
 func TestCargoProxyDefaults(t *testing.T) {
 	var c CargoProxyConfig
@@ -981,6 +987,95 @@ func TestCargoProxyDefaults(t *testing.T) {
 	if c.CleanupEnabled() {
 		t.Error("CargoProxy.CleanupEnabled() = true when unset, want false")
 	}
+}
+
+// TestModuleProxyCleanupEnabled_TriState pins the fix for the bug where
+// Cleanup was a plain bool: unset and an explicit `cleanup = false` were
+// indistinguishable, so the code supplying the default forced cleanup on
+// unconditionally and the cache never survived a restart.
+func TestModuleProxyCleanupEnabled_TriState(t *testing.T) {
+	tr, fa := true, false
+	tests := []struct {
+		name string
+		set  *bool
+		want bool
+	}{
+		{"unset defaults to true", nil, true},
+		{"explicit false is honored", &fa, false},
+		{"explicit true stays true", &tr, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := ModuleProxyConfig{Cleanup: tt.set}
+			if got := m.CleanupEnabled(); got != tt.want {
+				t.Errorf("CleanupEnabled() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestModuleProxyCleanupEnabled_FromTOML checks the tri-state survives an
+// actual TOML round trip, not just direct struct construction.
+func TestModuleProxyCleanupEnabled_FromTOML(t *testing.T) {
+	tests := []struct {
+		name string
+		toml string
+		want bool
+	}{
+		{"key absent", "", true},
+		{"cleanup = false", "cleanup = false\n", false},
+		{"cleanup = true", "cleanup = true\n", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GITHUB_TOKEN", "")
+			path := filepath.Join(t.TempDir(), "config.toml")
+			body := "[github]\ntoken = \"ghp_test\"\nowner = \"org\"\n\n[module_proxy]\nenabled = true\n" + tt.toml
+			if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load() error: %v", err)
+			}
+			if got := cfg.ModuleProxy.CleanupEnabled(); got != tt.want {
+				t.Errorf("CleanupEnabled() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestModuleProxyCacheBounds covers the size cap and prune interval that
+// keep the shared module cache from filling the node's disk.
+func TestModuleProxyCacheBounds(t *testing.T) {
+	const gib = int64(1024 * 1024 * 1024)
+
+	t.Run("defaults", func(t *testing.T) {
+		m := ModuleProxyConfig{}
+		if got, want := m.ModuleProxyMaxCacheBytes(), 20*gib; got != want {
+			t.Errorf("ModuleProxyMaxCacheBytes() = %d, want %d (20 GiB)", got, want)
+		}
+		if got, want := m.ModuleProxyPruneInterval(), time.Hour; got != want {
+			t.Errorf("ModuleProxyPruneInterval() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("explicit values win", func(t *testing.T) {
+		m := ModuleProxyConfig{MaxCacheGB: 3, PruneInterval: 15 * time.Minute}
+		if got, want := m.ModuleProxyMaxCacheBytes(), 3*gib; got != want {
+			t.Errorf("ModuleProxyMaxCacheBytes() = %d, want %d", got, want)
+		}
+		if got, want := m.ModuleProxyPruneInterval(), 15*time.Minute; got != want {
+			t.Errorf("ModuleProxyPruneInterval() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("negative interval disables pruning", func(t *testing.T) {
+		m := ModuleProxyConfig{PruneInterval: -1}
+		if got := m.ModuleProxyPruneInterval(); got != 0 {
+			t.Errorf("ModuleProxyPruneInterval() = %v, want 0 (disabled)", got)
+		}
+	})
 }
 
 // --- Provider() detection ---
@@ -1411,7 +1506,7 @@ func TestProviders_GitHubAndForgejo(t *testing.T) {
 
 func TestValidate_MultiProvider_BothChecked(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "")
-	// GitHub has owner but no token — should fail validation
+	// GitHub has owner but no token â€” should fail validation
 	cfg := &Config{
 		GitHub:  GitHubConfig{Owner: "org"},
 		Forgejo: ForgejoConfig{InstanceURL: "https://codeberg.org", Token: "tok"},
@@ -1851,7 +1946,7 @@ func TestValidate_NoSecretWhenTunnelEmpty(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	// Currently empty string != "none" so it WILL generate a secret.
-	// This documents current behavior — caller must explicitly set "none".
+	// This documents current behavior â€” caller must explicitly set "none".
 	if cfg.Webhook.Secret == "" {
 		t.Skip("if behavior changes to treat empty tunnel as 'none', this test will need update")
 	}
@@ -1911,7 +2006,7 @@ func TestProviders_NoCredentials_Empty(t *testing.T) {
 // --- Additional duration parser coverage ---
 
 func TestLogRetentionDuration_7d(t *testing.T) {
-	// "7d" is the documented default form — ensure it parses to 7 days.
+	// "7d" is the documented default form â€” ensure it parses to 7 days.
 	lc := LogConfig{LogRetention: "7d"}
 	if d := lc.LogRetentionDuration(); d != 7*24*time.Hour {
 		t.Errorf("LogRetention(7d) = %v, want %v", d, 7*24*time.Hour)
@@ -1928,7 +2023,7 @@ func TestLogRetentionDuration_168h(t *testing.T) {
 
 func TestLogRetentionDuration_SingleD(t *testing.T) {
 	// "d" alone (no number) is too short to be valid Nd shorthand and is
-	// not a Go duration — should fall back to default 7d.
+	// not a Go duration â€” should fall back to default 7d.
 	lc := LogConfig{LogRetention: "d"}
 	if d := lc.LogRetentionDuration(); d != 7*24*time.Hour {
 		t.Errorf("LogRetention(d) = %v, want default 168h", d)
@@ -1936,8 +2031,8 @@ func TestLogRetentionDuration_SingleD(t *testing.T) {
 }
 
 func TestLogRetentionDuration_BadDays(t *testing.T) {
-	// "abcd" — ends with 'd' but the prefix is not a valid duration.
-	// Falls through to time.ParseDuration which also fails — default returned.
+	// "abcd" â€” ends with 'd' but the prefix is not a valid duration.
+	// Falls through to time.ParseDuration which also fails â€” default returned.
 	lc := LogConfig{LogRetention: "abcd"}
 	if d := lc.LogRetentionDuration(); d != 7*24*time.Hour {
 		t.Errorf("LogRetention(abcd) = %v, want default 168h", d)
@@ -1959,7 +2054,7 @@ func TestLogRetentionDuration_30Days(t *testing.T) {
 }
 
 func TestLogRetentionDuration_MixedUnits(t *testing.T) {
-	// "30m" — Go duration form; should parse as 30 minutes.
+	// "30m" â€” Go duration form; should parse as 30 minutes.
 	lc := LogConfig{LogRetention: "30m"}
 	if d := lc.LogRetentionDuration(); d != 30*time.Minute {
 		t.Errorf("LogRetention(30m) = %v, want 30m", d)
@@ -2066,7 +2161,7 @@ nproc = 2048
 }
 
 func TestLoad_RuntimeRlimits_Omitted(t *testing.T) {
-	// Empty config — Resolved() must still produce 1024/1024 so callers
+	// Empty config â€” Resolved() must still produce 1024/1024 so callers
 	// never have to special-case "no [runtime] block in config.toml".
 	t.Setenv("GITHUB_TOKEN", "ghp_test123")
 	tmp := t.TempDir()
@@ -2121,7 +2216,7 @@ func TestLinuxVMResolvedEnabled_ExplicitTrueWins(t *testing.T) {
 }
 
 func TestLoad_LinuxVMEnabled_OmittedIsNil(t *testing.T) {
-	// The key being absent must load as nil (platform default), not false —
+	// The key being absent must load as nil (platform default), not false â€”
 	// every existing darwin fleet config omits it and must keep serving
 	// Linux jobs after upgrade.
 	dir := t.TempDir()
@@ -2195,7 +2290,7 @@ func TestResolvedAllowPrivileged_ExplicitFalseWins(t *testing.T) {
 	}
 }
 
-// Unlike allow_privileged, this one defaults ON — flipping it would break
+// Unlike allow_privileged, this one defaults ON â€” flipping it would break
 // `sudo apt-get install` in every existing workflow, so the tightening is
 // an explicit per-pool decision rather than a new default.
 func TestResolvedAllowNewPrivileges_DefaultsOn(t *testing.T) {
@@ -2209,7 +2304,7 @@ func TestResolvedAllowNewPrivileges_ExplicitFalseWins(t *testing.T) {
 	no := false
 	r := RuntimeConfig{AllowNewPrivileges: &no}
 	if r.ResolvedAllowNewPrivileges() {
-		t.Error("explicit allow_new_privileges=false should resolve false — a pool opting into hardening must actually get it")
+		t.Error("explicit allow_new_privileges=false should resolve false â€” a pool opting into hardening must actually get it")
 	}
 }
 
@@ -2276,7 +2371,7 @@ enabled = true
 	if cfg.Dind.AllowPrivileged != nil {
 		t.Errorf("AllowPrivileged ptr = %v, want nil (key not set in TOML)", *cfg.Dind.AllowPrivileged)
 	}
-	// Omitted key → secure default false on every platform.
+	// Omitted key â†’ secure default false on every platform.
 	if got := cfg.Dind.ResolvedAllowPrivileged(); got {
 		t.Errorf("ResolvedAllowPrivileged on GOOS=%s = true, want false (default off)", goruntime.GOOS)
 	}
