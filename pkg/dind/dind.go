@@ -717,18 +717,22 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
-	// Mirror the Image record into the per-repo cache namespace so the
-	// gc.ref labels keep the manifest+config+layer blobs alive after the
-	// per-job namespace is cleaned up. Next job in the same repo gets a
-	// content-store hit. Cross-repo / cross-provider jobs do NOT see this
-	// cache record (namespace isolation), so private images don't leak.
+	// Mirror the image — Image record plus a content reference for every
+	// blob in its DAG — into the per-repo cache namespace, so the
+	// manifest+config+layer blobs survive the per-job namespace cleanup
+	// and containerd's GC. Next job in the same repo gets a content-store
+	// hit instead of a network pull. Cross-repo / cross-provider jobs do
+	// NOT see this cache namespace, so private images don't leak.
 	if s.cacheNamespace != "" {
 		// Mirror both the qualified ref (what containerd pulled under)
 		// and the unqualified docker-CLI form, so future cache hits via
 		// either name work.
 		for _, name := range dedup(ref, unqualifiedRef) {
 			if err := MirrorImageToCache(ctx, s.client, s.jobNamespace, s.cacheNamespace, name, s.log); err != nil {
-				s.log.Debug("dind cache: mirror failed", "image", name, "error", err)
+				// Not fatal to the job, but it means the next job for
+				// this repo re-downloads the whole image — worth seeing.
+				s.log.Warn("dind cache: mirror failed, next job will re-pull",
+					"image", name, "error", err)
 			}
 		}
 	}
