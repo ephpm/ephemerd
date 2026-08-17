@@ -336,3 +336,83 @@ func TestIPv6FirewallRules_PortsPresent(t *testing.T) {
 		}
 	}
 }
+
+// The dind port rules are the authenticator for an unauthenticated Docker
+// API, so both their content and their ORDER are load-bearing: iptables takes
+// the first match, and an ACCEPT that lands after the DROP authorizes nobody
+// while a DROP that lands after a subnet-wide ACCEPT denies nobody.
+func TestDindPortRules_AcceptsOwnerThenDeniesEveryoneElse(t *testing.T) {
+	gateway := "10.88.0.1"
+	containerIP := "10.88.0.7"
+	port := 41235
+
+	rules := dindPortRules(gateway, containerIP, port)
+	if len(rules) != 2 {
+		t.Fatalf("dindPortRules returned %d rules, want 2 (accept owner, deny rest)", len(rules))
+	}
+
+	accept := joinRule(rules[0])
+	for _, want := range []string{"-s 10.88.0.7/32", "-d 10.88.0.1", "-p tcp", "--dport 41235", "-j ACCEPT"} {
+		if !strings.Contains(accept, want) {
+			t.Errorf("accept rule %q missing %q", accept, want)
+		}
+	}
+
+	deny := joinRule(rules[1])
+	for _, want := range []string{"-d 10.88.0.1", "-p tcp", "--dport 41235", "-j DROP"} {
+		if !strings.Contains(deny, want) {
+			t.Errorf("deny rule %q missing %q", deny, want)
+		}
+	}
+	// A source-scoped deny would leave the port open to anything outside the
+	// container subnet that can route to the gateway. The port serves exactly
+	// one container, so the deny is total.
+	if strings.Contains(deny, "-s ") {
+		t.Errorf("deny rule %q is source-scoped; it must deny every source but the carved-out /32", deny)
+	}
+}
+
+// Two concurrent jobs must not be able to reach each other's daemon: each
+// job's pair names its own port, so neither job's ACCEPT can match the other
+// job's port and each port keeps its own total DROP.
+func TestDindPortRules_ConcurrentJobsCannotCrossOver(t *testing.T) {
+	gateway := "10.88.0.1"
+	jobA := dindPortRules(gateway, "10.88.0.7", 41235)
+	jobB := dindPortRules(gateway, "10.88.0.8", 41236)
+
+	acceptA := joinRule(jobA[0])
+	if strings.Contains(acceptA, "--dport 41236") {
+		t.Errorf("job A's accept %q matches job B's port", acceptA)
+	}
+	acceptB := joinRule(jobB[0])
+	if strings.Contains(acceptB, "10.88.0.7/32") {
+		t.Errorf("job B's accept %q admits job A's container", acceptB)
+	}
+	// Job B's container hitting job A's port matches no ACCEPT (wrong source
+	// on the only rule that names 41235) and falls to job A's DROP.
+	denyA := joinRule(jobA[1])
+	if !strings.Contains(denyA, "--dport 41235") || !strings.Contains(denyA, "-j DROP") {
+		t.Errorf("job A's deny %q does not cover job A's port", denyA)
+	}
+}
+
+// The port is the whole scope on the deny side, so a caller passing an
+// address the CNI result did not produce must fail rather than open
+// something wider or something wrong.
+func TestOpenHostPort_RejectsUnusableContainerIP(t *testing.T) {
+	l := &linuxNetworking{cfg: Config{Subnet: "10.88.0.0/16", Log: testLogger()}}
+	for _, ip := range []string{"", "   ", "not-an-ip", "fd00::1", "10.88.0.7/16"} {
+		if err := l.openHostPort(41235, ip); err == nil {
+			t.Errorf("openHostPort with container IP %q returned nil; it must fail closed", ip)
+		}
+	}
+}
+
+func TestOpenHostPort_RejectsOutOfRangePort(t *testing.T) {
+	l := &linuxNetworking{cfg: Config{Subnet: "10.88.0.0/16", Log: testLogger()}}
+	for _, port := range []int{0, -1, 70000} {
+		if err := l.openHostPort(port, "10.88.0.7"); err == nil {
+			t.Errorf("openHostPort with port %d returned nil; it must fail closed", port)
+		}
+	}
+}

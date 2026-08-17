@@ -135,18 +135,30 @@ ephemerd-dind-cache-gitlab-acme_platform_api ← nested GitLab groups OK
 
 ### Cache writes
 
-Two events mirror image metadata into the cache:
+Two events mirror an image into the cache:
 
-1. **Image pull (`POST /images/create`)** — after a successful pull, the Image record is created/updated in the cache namespace with an `ephemerd.io/last-accessed` label set to the current RFC3339 UTC time.
+1. **Image pull (`POST /images/create`)** — after a successful pull, `MirrorImageToCache` walks the image DAG and gives the cache namespace its own **content reference** for every descriptor (manifest, config, each layer), then creates/updates the Image record with an `ephemerd.io/last-accessed` label set to the current RFC3339 UTC time.
 2. **Container create (`POST /containers/create`)** — if the requested image is already present in the cache (no pull needed), the cache record's `last-accessed` label is refreshed. Captures cache hits driven by `docker run` of a previously-pulled image.
 
-The cache record's `gc.ref.content.*` labels pin the underlying content blobs in containerd's content store. Even when the per-job namespace is deleted and its Image record gone, the cache record keeps the blobs alive. The next job in the same repo gets a content-store hit and pulls only the manifest (to revalidate the digest).
+### Why content references, not just an Image record
+
+Copying the content references is the part that makes this a cache, and getting it wrong is invisible until you look at a bandwidth graph (see #138).
+
+containerd's GC operates on `(namespace, digest)` nodes, and `metadata.contentStore.garbageCollect` deletes a backing blob as soon as **no namespace holds a blob bucket for it**. An Image record's target and its `gc.ref.content.*` labels only *nominate* nodes — if the cache namespace has no bucket for a digest, the mark phase has nothing to keep. A cache namespace holding only an Image record therefore pinned nothing: dropping the per-job namespace made the whole image collectable and the next job re-downloaded it.
+
+The copy costs neither bytes nor network. containerd's default content sharing policy is `shared`, so opening a writer in the cache namespace for a digest already in the backing store short-circuits and `Commit` merely creates the bucket. The source blob's labels are carried over, which matters: the `gc.ref.content.*` labels are the edges the mark phase follows from a manifest to its config and layers, so without them the manifest bucket would survive a GC pass and its children would not.
+
+Once the buckets exist, the next job's pull into a fresh per-job namespace hits the same short-circuit inside `remotes.fetch` (`ws.Offset == desc.Size`) and downloads nothing but the manifest, to revalidate the digest.
+
+Descriptors that aren't in the local store — manifests for platforms this node never pulled, foreign/URL layers — are skipped rather than treated as errors. The whole mirror runs under a short-lived lease so a GC pass landing between the first copied blob and the Image record that will root it can't sweep the work back out.
 
 ### Privacy boundary
 
-Containerd's namespace isolation is the privacy guarantee. A content blob whose only Image record reference lives in `ephemerd-dind-cache-foo-private` is **invisible** to a resolver running in any other namespace — containerd's content store lookup is namespace-scoped at the metadata layer. Two forges with same-named repos (`github/ephpm` vs `gitea/ephpm`) get distinct cache namespaces; two repos within the same forge get distinct caches keyed by the full `owner/repo` path. Auth credentials live in the per-job in-memory auth cache and are never copied into the cache namespace.
+Containerd's namespace isolation is the privacy boundary. Reads are namespace-scoped at the metadata layer: a job namespace cannot list, resolve by name, or `ReaderAt` a blob whose bucket lives only in `ephemerd-dind-cache-foo-private`. Two forges with same-named repos (`github/ephpm` vs `gitea/ephpm`) get distinct cache namespaces; two repos within the same forge get distinct caches keyed by the full `owner/repo` path. Auth credentials live in the per-job in-memory auth cache and are never copied into the cache namespace.
 
-This relies on never setting the `containerd.io/namespace.shareable` label on cache namespaces. Don't.
+Be precise about what that does and does not buy, because the same mechanism the cache depends on is the one that bounds the guarantee. Under containerd's default `shared` content sharing policy, a namespace that **already knows a blob's exact digest** can materialize its own reference to it without contacting a registry — that short-circuit is exactly what turns a cache hit into a zero-byte pull. So the boundary is "you cannot enumerate or name another repo's images", not "the bytes are unreachable to anyone who has the digest". In practice a manifest digest for a private image is only obtainable from the registry with credentials for it, so this is not a path to another repo's images — but do not describe the cache as making blobs cryptographically invisible, and do not lean on it as the *only* control for a genuinely secret layer.
+
+Switching the metadata plugin to `content_sharing_policy = "isolated"` would tighten that at the cost of a real byte copy per namespace; the mirror path handles both policies. Separately, this all relies on never setting the `containerd.io/namespace.shareable` label on cache namespaces. Don't.
 
 ### Cache pruning
 
@@ -238,7 +250,7 @@ Enable with `dind.enabled = true` in config or the `--dind` flag on `serve`:
 | `pkg/dind/dind.go` | Fake Docker API server, route dispatch, image pull, cache-mirror on pull |
 | `pkg/dind/containers.go` | Container lifecycle, `last-accessed` refresh on container-create |
 | `pkg/dind/cleanup.go` | Per-job namespace cleanup (containers, images, leases, snapshots leaf-first, content, namespace) + boot-time stale sweep |
-| `pkg/dind/cache.go` | Per-repo cache namespace name derivation + sanitization, mirror helper, last-accessed refresh, periodic prune |
+| `pkg/dind/cache.go` | Per-repo cache namespace name derivation + sanitization, image + content-reference mirroring, last-accessed refresh, periodic prune |
 | `pkg/dind/buildheal.go` | Detects a poisoned shared build store, repairs it and retries the build; background broken-chain sweep |
 | `pkg/dind/systemdf.go` | `GET /system/df` |
 | `pkg/buildkit/heal.go` | Dangling-snapshot error signature + the repair escalation ladder (pure) |
@@ -246,3 +258,4 @@ Enable with `dind.enabled = true` in config or the `--dind` flag on `serve`:
 | `pkg/dind/dind_test.go` | Tests for health and image endpoints |
 | `pkg/dind/cleanup_test.go` | Tests covering full namespace teardown + stale-sweep prefix filter |
 | `pkg/dind/cache_test.go` | Tests covering cross-provider isolation, sanitization invariants, mirror + refresh + prune lifecycle |
+| `pkg/dind/cache_retention_test.go` | Tests that mirrored content survives a real containerd GC pass, with an un-mirrored negative control |

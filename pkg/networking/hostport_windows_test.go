@@ -9,6 +9,237 @@ import (
 	"testing"
 )
 
+// natNetworking builds a windowsNetworking on the default NAT path: no
+// L2Bridge, no address plan — exactly the shape of a node with no [network]
+// section in its config, which is what mfl-win-amd64-101 was running when #162
+// was reproduced.
+func natNetworking(subnet string) *windowsNetworking {
+	return &windowsNetworking{cfg: Config{Subnet: subnet}}
+}
+
+// l2bNetworking builds a windowsNetworking on the L2Bridge path with a
+// resolved plan.
+func l2bNetworking(hostIP, pool string) *windowsNetworking {
+	return &windowsNetworking{
+		cfg:  Config{L2BridgeEgress: true},
+		plan: &l2BridgePlan{HostIP: hostIP, PoolSpec: pool},
+	}
+}
+
+// TestHostPortRuleFor_NATOpensAScopedAllow is the regression test for #162.
+//
+// On the default NAT network the Windows dind Docker API listens on the bridge
+// gateway over TCP (runhcs has no unix socket and no named-pipe sharing), so a
+// job container reaching its own daemon is making an INBOUND connection to the
+// host — which the host's Windows Firewall default-denies. openHostPort used to
+// return early unless L2Bridge egress was on, so a NAT node installed nothing
+// and every docker command in every Windows job died with
+// "dial tcp 10.88.0.1:<port>: i/o timeout".
+//
+// Proven on metal 2026-08-16: with a temporary inbound allow admitting
+// 10.88.0.0/16 to 10.88.0.1, a `docker login` that had timed out minutes
+// earlier on the same node succeeded.
+func TestHostPortRuleFor_NATOpensAScopedAllow(t *testing.T) {
+	const (
+		containerIP = "10.88.10.204" // a real address HNS handed a job on that node
+		port        = 51098          // the port its dind actually bound
+	)
+	w := natNetworking("") // no subnet configured — the default 10.88.0.0/16
+
+	r, needed, err := w.hostPortRuleFor(port, containerIP)
+	if err != nil {
+		t.Fatalf("NAT path refused to build a host-port rule: %v", err)
+	}
+	if !needed {
+		t.Fatal("NAT path installed no host-port allow — this is #162: the container's dind SYN is silently dropped and every docker command times out")
+	}
+
+	spec := strings.Join(r.spec, " ")
+	for _, want := range []string{
+		"dir=in", "action=allow", "protocol=TCP",
+		"localip=10.88.0.1", "localport=51098", "remoteip=" + containerIP + "/32",
+	} {
+		if !strings.Contains(spec, want) {
+			t.Errorf("NAT host-port allow missing %q; spec = %q", want, spec)
+		}
+	}
+	if !strings.HasPrefix(r.name, hostPortRulePrefix) {
+		t.Errorf("rule name %q must start with the sweep prefix %q, or a hard-killed job leaks it", r.name, hostPortRulePrefix)
+	}
+}
+
+// TestHostPortRuleFor_NATNeverScopedToTheSubnet carries #152's guarantee onto
+// the NAT path. Every job container on a NAT node shares 10.88.0.0/16 and can
+// address the gateway, so an allow scoped to the subnet would let one job
+// port-scan the gateway's ephemeral range, find another job's dind endpoint and
+// drive its daemon — the Docker API behind these ports authenticates nothing.
+// Fixing #162 must not reintroduce the hole #152 closed.
+func TestHostPortRuleFor_NATNeverScopedToTheSubnet(t *testing.T) {
+	w := natNetworking(DefaultSubnet)
+
+	r, needed, err := w.hostPortRuleFor(51098, "10.88.10.204")
+	if err != nil || !needed {
+		t.Fatalf("hostPortRuleFor(NAT) = needed %v, err %v; want a rule", needed, err)
+	}
+	remote := specValue(r, "remoteip")
+
+	if strings.Contains(remote, DefaultSubnet) || remote == DefaultSubnet {
+		t.Fatalf("remote scope %q is the whole container subnet — every job could reach every other job's Docker API", remote)
+	}
+	_, ipnet, err := net.ParseCIDR(remote)
+	if err != nil {
+		t.Fatalf("remoteip %q is not a CIDR: %v", remote, err)
+	}
+	if ones, bits := ipnet.Mask.Size(); ones != bits {
+		t.Errorf("remoteip %q covers %d addresses; the allow must cover exactly one", remote, 1<<(bits-ones))
+	}
+	// The allow must also stay port-scoped: an all-ports allow to the gateway
+	// would expose everything else ephemerd binds there (the module proxy, and
+	// on a Linux-VM host the dispatch gRPC control plane).
+	if p := specValue(r, "localport"); p != "51098" {
+		t.Errorf("localport = %q; the allow must open exactly the dind port", p)
+	}
+}
+
+// TestHostPortLocalIP_NATTracksTheConfiguredSubnet proves the allow is scoped
+// to the address dind actually bound rather than a hard-coded 10.88.0.1.
+// networking.pickSubnet moves the container subnet when 10.88.0.0/16 is already
+// in use on the host, and Manager.GatewayIP — which is what dind binds — follows
+// it. A rule scoped to the wrong address is an allow that admits nothing, which
+// is indistinguishable from the bug being fixed here.
+func TestHostPortLocalIP_NATTracksTheConfiguredSubnet(t *testing.T) {
+	for _, tc := range []struct{ subnet, want string }{
+		{"", "10.88.0.1"},
+		{DefaultSubnet, "10.88.0.1"},
+		{"10.199.0.0/16", "10.199.0.1"},
+		{"172.20.0.0/16", "172.20.0.1"},
+		{"not-a-cidr", "10.88.0.1"}, // same fallback GatewayIP uses
+	} {
+		w := natNetworking(tc.subnet)
+		got, needed := w.hostPortLocalIP()
+		if !needed {
+			t.Errorf("subnet %q: NAT must always install an allow", tc.subnet)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("subnet %q: host-port localip = %q, want %q", tc.subnet, got, tc.want)
+		}
+		// And it must agree with what dind is told to bind to.
+		m := &Manager{cfg: Config{Subnet: tc.subnet}}
+		if gw := m.GatewayIP(); gw != got {
+			t.Errorf("subnet %q: allow scoped to %q but dind binds %q — the rule would admit nothing", tc.subnet, got, gw)
+		}
+	}
+}
+
+// TestHostPortRuleFor_L2BridgeUnchanged pins the L2Bridge behaviour the NAT fix
+// had to leave alone: scoped to the host's own LAN address (not any bridge
+// gateway, which does not exist there), and no rule at all when the address
+// plan never resolved.
+func TestHostPortRuleFor_L2BridgeUnchanged(t *testing.T) {
+	const (
+		hostIP      = "192.0.2.10"
+		containerIP = "192.0.2.200"
+	)
+	w := l2bNetworking(hostIP, "192.0.2.192/27")
+
+	r, needed, err := w.hostPortRuleFor(63933, containerIP)
+	if err != nil || !needed {
+		t.Fatalf("hostPortRuleFor(L2Bridge) = needed %v, err %v; want a rule", needed, err)
+	}
+	if got := specValue(r, "localip"); got != hostIP {
+		t.Errorf("L2Bridge allow localip = %q, want the host's LAN address %q", got, hostIP)
+	}
+	if got := specValue(r, "remoteip"); got != containerIP+"/32" {
+		t.Errorf("L2Bridge allow remoteip = %q, want %s/32", got, containerIP)
+	}
+
+	// L2Bridge enabled but no plan: init failed or the daemon is tearing down.
+	// Guessing the NAT gateway here would scope the rule to an address that
+	// exists on no interface once the NAT network is out of the picture.
+	for _, noPlan := range []*windowsNetworking{
+		{cfg: Config{L2BridgeEgress: true}},
+		{cfg: Config{L2BridgeEgress: true}, plan: &l2BridgePlan{}},
+	} {
+		if _, needed, err := noPlan.hostPortRuleFor(63933, containerIP); needed || err != nil {
+			t.Errorf("L2Bridge without a resolved plan built a rule (needed=%v, err=%v); it must install nothing", needed, err)
+		}
+	}
+}
+
+// TestHostPortRuleFor_TeardownTargetsExactlyWhatSetupAdded proves closeHostPort
+// removes the rule openHostPort added and no other. Both go through
+// hostPortRuleFor, so the property to pin is that the same inputs yield the
+// same rule name — which is what netsh delete matches on — and that any
+// different container or port yields a different one.
+func TestHostPortRuleFor_TeardownTargetsExactlyWhatSetupAdded(t *testing.T) {
+	w := natNetworking(DefaultSubnet)
+
+	opened, _, err := w.hostPortRuleFor(51098, "10.88.10.204")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	closed, _, err := w.hostPortRuleFor(51098, "10.88.10.204")
+	if err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if closed.name != opened.name {
+		t.Fatalf("teardown targets %q but setup added %q — the allow leaks", closed.name, opened.name)
+	}
+	// netsh deletes by name, so the delete argv must name exactly that rule.
+	del := strings.Join(closed.deleteArgs(), " ")
+	if !strings.Contains(del, "name="+opened.name) {
+		t.Errorf("delete argv %q does not target the rule setup added (%q)", del, opened.name)
+	}
+
+	// A concurrent job must not be able to delete this one's allow. max_concurrent
+	// is routinely > 1, and every open does a delete-by-name first.
+	for _, other := range []struct {
+		ip   string
+		port int
+	}{
+		{"10.88.10.205", 51098}, // same port, different container
+		{"10.88.10.204", 51099}, // same container, different port
+		{"10.88.10.205", 51099},
+	} {
+		r, _, err := w.hostPortRuleFor(other.port, other.ip)
+		if err != nil {
+			t.Fatalf("hostPortRuleFor(%d, %s): %v", other.port, other.ip, err)
+		}
+		if r.name == opened.name {
+			t.Errorf("job (%s, %d) shares the rule name %q — its teardown would revoke a running job's allow", other.ip, other.port, r.name)
+		}
+	}
+}
+
+// TestHostPortRuleFor_NATFailsClosed proves the NAT path inherits the
+// fail-closed gate rather than quietly installing nothing (its old behaviour)
+// or widening to the subnet. An unknown address costs this job its Docker
+// access; it must never cost every other job its isolation.
+func TestHostPortRuleFor_NATFailsClosed(t *testing.T) {
+	w := natNetworking(DefaultSubnet)
+
+	for _, bad := range []string{
+		"",               // no address plumbed through from the HCN endpoint
+		"   ",            //
+		"10.88.0.0/16",   // the subnet, not a host — the exact bug #152 closed
+		"10.88.0.1-10.88.0.9", // a range
+		"not-an-ip",
+		"2001:db8::1", // IPv6: the Windows container stack has no v6 path
+	} {
+		r, needed, err := w.hostPortRuleFor(51098, bad)
+		if err == nil {
+			t.Errorf("hostPortRuleFor(%q) succeeded; must fail closed", bad)
+		}
+		if needed {
+			t.Errorf("hostPortRuleFor(%q) reported a rule is needed; it must install nothing", bad)
+		}
+		if r.name != "" || len(r.spec) != 0 {
+			t.Errorf("hostPortRuleFor(%q) returned a rule %+v; must return none", bad, r)
+		}
+	}
+}
+
 // TestHostPortAllowRule_ScopedToOneContainerAndPort proves the dind-over-
 // L2Bridge allow opens exactly one host port to exactly ONE container. The VFP
 // host /32 allow lets a container's packet leave toward the host, but the

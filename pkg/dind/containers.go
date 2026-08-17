@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
@@ -282,7 +283,11 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		pullRef := qualifyDockerHubRef(req.Image)
 		s.log.Info("image not found, pulling for container create", "image", req.Image, "pull_ref", pullRef)
-		img, err = s.client.Pull(ctx, pullRef, client.WithPullUnpack)
+		// Same mirror + credential routing as handleImagePull; both are
+		// no-ops when neither is configured. See Server.pullRemoteOpts.
+		s.mirror.LogPull(pullRef)
+		pullOpts := append([]client.RemoteOpt{client.WithPullUnpack}, s.pullRemoteOpts(r, pullRef)...)
+		img, err = s.client.Pull(ctx, pullRef, pullOpts...)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{
 				"message": fmt.Sprintf("image %s not found: %v", req.Image, err),
@@ -294,7 +299,8 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 		if s.cacheNamespace != "" {
 			for _, name := range dedup(pullRef, req.Image) {
 				if merr := MirrorImageToCache(r.Context(), s.client, s.jobNamespace, s.cacheNamespace, name, s.log); merr != nil {
-					s.log.Debug("dind cache: mirror after container-create pull", "image", name, "error", merr)
+					s.log.Warn("dind cache: mirror after container-create pull failed, next job will re-pull",
+						"image", name, "error", merr)
 				}
 			}
 		}
@@ -433,7 +439,7 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	// entrypoint, for example, runs `getent ahostsv4 $(hostname)` to detect
 	// its IPv4 address and then writes empty values to its kubelet config,
 	// causing kubeadm to fail with "unable to select an IP from lo".
-	hostsPath := filepath.Join(filepath.Dir(s.sockPath), "containers", id, "hosts")
+	hostsPath := filepath.Join(s.dockerDir, "containers", id, "hosts")
 	if err := os.MkdirAll(filepath.Dir(hostsPath), 0o755); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"message": fmt.Sprintf("creating hosts dir: %v", err),
@@ -461,7 +467,7 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	if hostname == "" && len(id) >= 12 {
 		hostname = id[:12]
 	}
-	hostnamePath := filepath.Join(filepath.Dir(s.sockPath), "containers", id, "hostname")
+	hostnamePath := filepath.Join(s.dockerDir, "containers", id, "hostname")
 	if err := os.WriteFile(hostnamePath, []byte(hostname+"\n"), 0o644); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"message": fmt.Sprintf("writing hostname file: %v", err),
@@ -473,7 +479,7 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	// Provision /etc/resolv.conf with public DNS so containers can resolve
 	// external hostnames. The default resolv.conf inside a fresh mount
 	// namespace often points to localhost (::1) which has no DNS server.
-	resolvPath := filepath.Join(filepath.Dir(s.sockPath), "containers", id, "resolv.conf")
+	resolvPath := filepath.Join(s.dockerDir, "containers", id, "resolv.conf")
 	if err := os.WriteFile(resolvPath, []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"), 0o644); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"message": fmt.Sprintf("writing resolv.conf: %v", err),
@@ -495,7 +501,7 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	// they can use overlayfs instead of the native snapshotter.  The native
 	// snapshotter does full file copies per layer and quickly exhausts disk.
 	if strings.Contains(req.Image, "buildkit") {
-		buildkitDir := filepath.Join(filepath.Dir(s.sockPath), "buildkit", id)
+		buildkitDir := filepath.Join(s.dockerDir, "buildkit", id)
 		if err := os.MkdirAll(buildkitDir, 0o755); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{
 				"message": fmt.Sprintf("creating buildkit dir: %v", err),
@@ -605,7 +611,7 @@ func (s *Server) handleContainerStart(w http.ResponseWriter, r *http.Request, id
 	ctx := namespaces.WithNamespace(r.Context(), s.jobNamespace)
 
 	// Create log directory for capturing stdout/stderr.
-	logDir := filepath.Join(filepath.Dir(s.sockPath), "containers", id)
+	logDir := filepath.Join(s.dockerDir, "containers", id)
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"message": fmt.Sprintf("creating log dir: %v", err),
@@ -1301,7 +1307,7 @@ func (s *Server) cleanupContainer(ctx context.Context, id string, entry *contain
 		}
 	}
 
-	buildkitDir := filepath.Join(filepath.Dir(s.sockPath), "buildkit", id)
+	buildkitDir := filepath.Join(s.dockerDir, "buildkit", id)
 	if err := os.RemoveAll(buildkitDir); err != nil {
 		s.log.Debug("buildkit dir cleanup", "id", id, "error", err)
 	}
@@ -1377,6 +1383,10 @@ func (s *Server) buildBindMounts(ctx context.Context, binds []string) ([]oci.Spe
 		src, dst := parts[0], parts[1]
 		requestedRO := len(parts) == 3 && parts[2] == "ro"
 
+		if err := s.rejectUnbackedGuestBind(src, runnerBinds); err != nil {
+			return nil, fmt.Errorf("bind mount %s -> %s rejected: %w", src, dst, err)
+		}
+
 		resolved, terr := translateBindSource(src, runnerBinds, runnerRootfs, upperdir, lowerdirs)
 		if terr != nil {
 			return nil, fmt.Errorf("bind mount %s -> %s rejected: %w", src, dst, terr)
@@ -1388,6 +1398,46 @@ func (s *Server) buildBindMounts(ctx context.Context, binds []string) ([]oci.Spe
 		out = append(out, withBindMount(resolved.HostPath, dst, mountOpts))
 	}
 	return out, nil
+}
+
+// rejectUnbackedGuestBind refuses a sibling -v source whose contents this
+// daemon cannot actually see, which is every rootfs-relative source when the
+// job container is VM-isolated.
+//
+// Sibling bind translation works by addressing the runner's merged overlay
+// through the host path where the runtime mounted it. That only holds when
+// the runner shares the host kernel. Under a VM-isolated runtime the guest
+// has its own kernel and its own view of the container filesystem: files the
+// job writes to, say, /home/runner/_work land in the guest, and the host path
+// of the same name holds the untouched image content — or, for a path the
+// image never had, nothing at all. Measured on the amd64 fleet node: a file
+// written inside a Kata job container to /tmp/x was invisible at the host
+// bundle rootfs, and the sibling container came up with an empty /tmp/x
+// mounted instead.
+//
+// So the translation does not merely degrade here, it produces a confidently
+// wrong answer — an empty directory where the job expects its build context,
+// with no error anywhere. That is the failure mode worth spending an explicit
+// rejection on. The mount is refused with an error naming the source, which
+// surfaces to the job as an HTTP 400 from docker create.
+//
+// Sources covered by the runner's non-rootfs bind table are unaffected: those
+// resolve to real host directories that the runtime shares into the guest, so
+// both sides see the same bytes.
+func (s *Server) rejectUnbackedGuestBind(src string, runnerBinds map[string]string) error {
+	if s.transport != TransportTCP || goruntime.GOOS == "windows" {
+		return nil
+	}
+	if !strings.HasPrefix(src, "/") {
+		return nil // translateBindSource reports the malformed path itself
+	}
+	if _, _, ok := matchBindPrefix(path.Clean(src), runnerBinds); ok {
+		return nil
+	}
+	return fmt.Errorf("source %q lives in the job container's own filesystem, which is inside "+
+		"a guest VM this daemon cannot read (runner.linux.runtime = \"kata\"); only paths under "+
+		"a host-backed mount can be bind-mounted into a sibling container. Mounting it would "+
+		"silently give the sibling an empty directory, so it is refused instead", src)
 }
 
 func withBindMount(src, dst string, options []string) oci.SpecOpts {

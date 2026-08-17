@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	goruntime "runtime"
 	"sort"
@@ -31,11 +32,18 @@ type Config struct {
 	BuildKit    BuildKitConfig    `toml:"buildkit"`
 	ImageGC     ImageGCConfig     `toml:"image_gc"`
 	ModuleProxy ModuleProxyConfig `toml:"module_proxy"`
-	Runtime     RuntimeConfig     `toml:"runtime"`
-	Runner      RunnerConfig      `toml:"runner"`
-	Metrics     MetricsConfig     `toml:"metrics"`
-	Dispatch    DispatchConfig    `toml:"dispatch"`
-	Log         LogConfig         `toml:"log"`
+	CargoProxy  CargoProxyConfig  `toml:"cargo_proxy"`
+	NpmProxy    PkgProxyConfig    `toml:"npm_proxy"`
+	PipProxy    PkgProxyConfig    `toml:"pip_proxy"`
+	PubProxy    PkgProxyConfig    `toml:"pub_proxy"`
+	// RegistryMirror routes container image pulls through a LAN pull-through
+	// cache instead of the origin registry. See RegistryMirrorConfig.
+	RegistryMirror RegistryMirrorConfig `toml:"registry_mirror"`
+	Runtime        RuntimeConfig        `toml:"runtime"`
+	Runner         RunnerConfig         `toml:"runner"`
+	Metrics        MetricsConfig        `toml:"metrics"`
+	Dispatch       DispatchConfig       `toml:"dispatch"`
+	Log            LogConfig            `toml:"log"`
 }
 
 // DispatchConfig configures the host<->VM dispatch gRPC channel. On Windows
@@ -672,11 +680,431 @@ func (c *Config) PinnedRunnerImages() []string {
 // ModuleProxyConfig configures the Go module caching proxy.
 // When enabled, ephemerd runs a local GOPROXY on the bridge gateway that
 // caches module downloads. Containers receive GOPROXY env var automatically.
+//
+// The cache is SHARED by every job on the node — that is the point of it,
+// and it is safe because jobs only ever speak HTTP to the proxy (they cannot
+// write the cache), because the proxy stores upstream's response under the
+// key derived from the same path it fetched, and because the `go` client
+// authenticates modules itself via go.sum and the checksum database. What
+// sharing does expose is DISK: any job can ask for arbitrarily many module
+// versions, so the cache needs a bound of its own. See MaxCacheGB.
 type ModuleProxyConfig struct {
 	Enabled  bool   `toml:"enabled"`  // enable Go module caching proxy
 	Port     int    `toml:"port"`     // listen port on bridge gateway (default 8082)
 	Upstream string `toml:"upstream"` // upstream proxy URL (default "https://proxy.golang.org")
-	Cleanup  bool   `toml:"cleanup"`  // wipe cache on shutdown (default true)
+	Cleanup  *bool  `toml:"cleanup"`  // wipe cache on shutdown (default true)
+
+	// MaxCacheGB is the ceiling, in GiB, on the on-disk module cache.
+	// A prune pass evicts least-recently-used files until the directory is
+	// back under it. Default 20.
+	//
+	// 20 GiB is chosen to sit alongside the node's other disk bounds
+	// rather than compete with them: [buildkit].gc_max_used_gb defaults to
+	// 25 and [image_gc].min_free_gb to 20, so on the ~100 GB CI nodes this
+	// runs on the three together still leave headroom. It is also far
+	// larger than any single repo's module closure (a big Go service is a
+	// few GB with all its versions), so the cache stays warm in normal
+	// operation and the bound only bites when something pathological —
+	// or hostile — is filling it.
+	MaxCacheGB uint64 `toml:"max_cache_gb"`
+
+	// PruneInterval is how often the eviction pass runs. Default 1h.
+	// A pass is a directory walk plus a stat per file, so it is cheap;
+	// hourly is frequent enough that a job downloading modules in a loop
+	// cannot sit far above the cap for long. Set to a negative value to
+	// disable periodic pruning entirely (the cache is then unbounded
+	// again — only do this while debugging).
+	PruneInterval time.Duration `toml:"prune_interval"`
+}
+
+// ModuleProxyMaxCacheBytes returns the module cache ceiling in bytes,
+// default 20 GiB.
+func (m *ModuleProxyConfig) ModuleProxyMaxCacheBytes() int64 {
+	return gbOrDefault(m.MaxCacheGB, 20)
+}
+
+// ModuleProxyPruneInterval returns the eviction interval, default 1h.
+// A negative value means disabled and is returned as 0, matching
+// ImageGCConfig.ImageGCCheckInterval.
+func (m *ModuleProxyConfig) ModuleProxyPruneInterval() time.Duration {
+	if m.PruneInterval < 0 {
+		return 0
+	}
+	if m.PruneInterval == 0 {
+		return time.Hour
+	}
+	return m.PruneInterval
+}
+
+// CleanupEnabled reports whether the Go module cache is wiped on shutdown.
+// Defaults to true, preserving the historical behavior.
+//
+// Pointer-typed so "unset" is distinguishable from an explicit false. The
+// previous plain bool could not express that: the call site coerced any
+// false value back to true, which silently ignored `cleanup = false`.
+//
+// Now that the cache is size-bounded (see MaxCacheGB), `cleanup = false` is
+// the better setting for a long-lived node — it keeps the cache warm across
+// restarts and version bumps, which is the whole point of a pull-through
+// cache. Flipping the default silently would change every existing node's
+// disk profile, so it stays opt-in.
+func (m *ModuleProxyConfig) CleanupEnabled() bool {
+	if m.Cleanup == nil {
+		return true
+	}
+	return *m.Cleanup
+}
+
+// CargoProxyConfig configures the Cargo/crates caching proxy.
+//
+// When enabled, ephemerd runs a pull-through cache for the crates.io sparse
+// index, .crate tarballs, and rustup toolchain artifacts on the bridge
+// gateway. Job containers are pointed at it automatically: rustup via
+// RUSTUP_DIST_SERVER, and Cargo via a generated .cargo/config.toml that is
+// bind-mounted read-only at the container's filesystem root (Cargo ignores
+// CARGO_SOURCE_* environment variables, so a file is the only mechanism).
+type CargoProxyConfig struct {
+	// Enabled turns the proxy on. Default false.
+	Enabled bool `toml:"enabled"`
+	// Port is the listen port on the bridge gateway. Default 8083.
+	Port int `toml:"port"`
+	// Upstream is the sparse registry index base URL.
+	// Default "https://index.crates.io".
+	Upstream string `toml:"upstream"`
+	// RustupUpstream is the toolchain distribution server.
+	// Default "https://static.rust-lang.org".
+	RustupUpstream string `toml:"rustup_upstream"`
+	// IndexTTL is how long a cached sparse-index entry is served before a
+	// conditional revalidation. Default 10m. Crate tarballs ignore this —
+	// they are immutable and cached permanently.
+	IndexTTL time.Duration `toml:"index_ttl"`
+	// Cleanup wipes the cache on shutdown. Default FALSE, unlike the Go
+	// module proxy: the whole point of a pull-through cache is to survive
+	// restarts, and wiping it on every shutdown is what made the module
+	// proxy's cache worthless.
+	Cleanup *bool `toml:"cleanup"`
+}
+
+// CleanupEnabled reports whether the Cargo cache is wiped on shutdown.
+// Defaults to false — see the field comment.
+func (c *CargoProxyConfig) CleanupEnabled() bool {
+	if c.Cleanup == nil {
+		return false
+	}
+	return *c.Cleanup
+}
+
+// RegistryMirrorConfig points container image pulls at a pull-through
+// registry cache on the LAN instead of the origin registry.
+//
+// Every pull ephemerd performs — the runner image, images a job pulls
+// through the fake Docker daemon (dind), and images a sibling container
+// is created from — is routed through the mirror when the reference's
+// registry host is one of the mirrored ones. The first pull of a given
+// layer crosses the WAN once; every later pull of the same layer, from
+// any job on any node pointed at the same cache, is served at LAN speed.
+// It also takes the node out of Docker Hub's anonymous rate limit, since
+// only the cache talks to Hub.
+//
+// The mirror is a read path only. Pushes (docker push from a job) always
+// go to the origin registry: a pull-through cache is not a place to
+// publish, and containerd's own host model marks mirrors pull-only for
+// the same reason.
+//
+// SECURITY: credentials are NOT sent to the mirror unless
+// forward_credentials is set. A pull-through cache normally holds its own
+// upstream credentials and needs none from the client, and a mirror that
+// answered with a Basic challenge would otherwise harvest the registry
+// PAT a job just logged in with — over plaintext when the endpoint is
+// http://.
+type RegistryMirrorConfig struct {
+	// Enabled turns mirroring on. Everything else in this block is inert
+	// when false, and the pull path is exactly what it was before this
+	// feature existed.
+	Enabled bool `toml:"enabled"`
+
+	// Endpoint is the base URL of the pull-through cache, including the
+	// scheme — "http://registry.lan:5000" or "https://cache.example.com".
+	// A path prefix is allowed ("https://harbor.lan/v2/dockerhub-proxy")
+	// and is joined ahead of the /v2 API root.
+	//
+	// It serves every host listed in Registries. Use Mirrors instead (or
+	// as well) when different registries need different caches.
+	Endpoint string `toml:"endpoint"`
+
+	// Registries are the upstream registry hosts Endpoint mirrors.
+	// Defaults to ["docker.io"] when Endpoint is set and this is empty —
+	// Docker Hub is where the rate limit and the big shared base images
+	// are. Add "ghcr.io" etc. when the cache is configured to proxy them.
+	//
+	// Values are normalized: a scheme is stripped, and "index.docker.io" /
+	// "registry-1.docker.io" both fold to "docker.io" (the name containerd
+	// resolves references under).
+	Registries []string `toml:"registries"`
+
+	// Mirrors maps a single upstream registry host to its own cache URL,
+	// for setups where one endpoint cannot serve everything:
+	//
+	//	[registry_mirror.mirrors]
+	//	"ghcr.io" = "http://ghcr-cache.lan:5000"
+	//
+	// An entry here wins over Endpoint/Registries for that host.
+	Mirrors map[string]string `toml:"mirrors"`
+
+	// FallbackToOrigin keeps the origin registry in the host list behind
+	// the mirror, so a cache that is down, wedged, or missing the image
+	// costs a failed request and not a failed job. Pointer so an explicit
+	// `fallback_to_origin = false` is distinguishable from the key being
+	// absent; the default is TRUE — fail open. See
+	// ResolvedFallbackToOrigin.
+	//
+	// Setting false makes the mirror authoritative: a job whose image the
+	// cache cannot serve fails instead of reaching the WAN. That is a
+	// deliberate egress-control posture, not a performance setting.
+	FallbackToOrigin *bool `toml:"fallback_to_origin"`
+
+	// ForwardCredentials sends the credentials ephemerd would have used
+	// against the origin registry to the mirror as well. Off by default —
+	// see the SECURITY note on the type. Turn it on only for a mirror you
+	// operate that requires authentication (Harbor with a robot account,
+	// a Zot instance behind htpasswd).
+	ForwardCredentials bool `toml:"forward_credentials"`
+}
+
+// ResolvedFallbackToOrigin reports whether the origin registry stays in the
+// pull host list behind the mirror. Defaults to true: a dead cache must
+// degrade a node to today's WAN pull speed, never break every job on it.
+func (r *RegistryMirrorConfig) ResolvedFallbackToOrigin() bool {
+	if r.FallbackToOrigin == nil {
+		return true
+	}
+	return *r.FallbackToOrigin
+}
+
+// ResolvedMirrors flattens Endpoint/Registries and Mirrors into a single
+// upstream-host -> mirror-URL table with both sides normalized. Per-host
+// Mirrors entries override the Endpoint/Registries default.
+//
+// Returns nil when mirroring is disabled or nothing is mapped, which every
+// consumer treats as "no mirror configured" and leaves the pull untouched.
+// Only call after validate has accepted the config — it assumes the URLs
+// parse.
+func (r *RegistryMirrorConfig) ResolvedMirrors() map[string]string {
+	if !r.Enabled {
+		return nil
+	}
+	out := make(map[string]string)
+	if ep := normalizeMirrorURL(r.Endpoint); ep != "" {
+		regs := r.Registries
+		if len(regs) == 0 {
+			regs = []string{"docker.io"}
+		}
+		for _, reg := range regs {
+			if h := NormalizeRegistryHost(reg); h != "" {
+				out[h] = ep
+			}
+		}
+	}
+	for reg, endpoint := range r.Mirrors {
+		h := NormalizeRegistryHost(reg)
+		ep := normalizeMirrorURL(endpoint)
+		if h == "" || ep == "" {
+			continue
+		}
+		out[h] = ep
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// NormalizeRegistryHost reduces an upstream registry name to the form
+// containerd resolves references under: no scheme, no path, lowercase, and
+// Docker Hub's several spellings folded to "docker.io". Exported because
+// the pull paths have to look up a mirror by the host containerd hands
+// them.
+func NormalizeRegistryHost(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return ""
+	}
+	// Strip a scheme the operator may have written out of habit.
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	// Drop any path ("docker.io/v2/" -> "docker.io").
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		s = s[:i]
+	}
+	switch s {
+	case "index.docker.io", "registry-1.docker.io":
+		return "docker.io"
+	}
+	return s
+}
+
+// normalizeMirrorURL trims whitespace and any trailing slashes so the /v2
+// API root can be joined onto it unambiguously.
+func normalizeMirrorURL(s string) string {
+	return strings.TrimRight(strings.TrimSpace(s), "/")
+}
+
+// validate rejects a registry-mirror block that would silently do nothing or
+// would produce an unusable endpoint at pull time. It runs at config load on
+// every platform, so a typo'd URL kills the daemon at startup with a message
+// naming the exact key instead of surfacing as a mystery pull failure on the
+// first job of the day.
+//
+// Endpoint values are checked whenever they are set, even with
+// `enabled = false`, so a mirror staged ahead of a rollout is known-good
+// before the toggle is flipped.
+func (r *RegistryMirrorConfig) validate() error {
+	if err := validateMirrorURL("registry_mirror.endpoint", r.Endpoint); err != nil {
+		return err
+	}
+	for reg, endpoint := range r.Mirrors {
+		key := fmt.Sprintf("registry_mirror.mirrors[%q]", reg)
+		if NormalizeRegistryHost(reg) == "" {
+			return fmt.Errorf("%s: the registry host key must not be empty — "+
+				`use the host containerd resolves references under, e.g. "docker.io" or "ghcr.io"`, key)
+		}
+		if strings.TrimSpace(endpoint) == "" {
+			return fmt.Errorf("%s is empty: set it to the mirror's base URL, "+
+				`e.g. "http://registry.lan:5000", or remove the entry`, key)
+		}
+		if err := validateMirrorURL(key, endpoint); err != nil {
+			return err
+		}
+	}
+	if r.Enabled && len(r.ResolvedMirrors()) == 0 {
+		return fmt.Errorf(`registry_mirror.endpoint is required when registry_mirror.enabled = true: ` +
+			`set it to the base URL of your LAN pull-through cache, e.g. ` +
+			`endpoint = "http://registry.lan:5000" — or map individual registries under ` +
+			`[registry_mirror.mirrors]. There is no default; the cache is site-specific`)
+	}
+	if !r.Enabled && (r.Endpoint != "" || len(r.Mirrors) > 0) {
+		// Not an error — staging a mirror before turning it on is normal —
+		// but the operator should know nothing is being routed yet.
+		slog.Debug("registry mirror configured but registry_mirror.enabled = false; pulls go to the origin registry")
+	}
+	return nil
+}
+
+// validateMirrorURL enforces that a configured mirror endpoint is an
+// absolute http(s) URL with a host. An empty value is fine (the key is
+// optional); anything else must be usable as a registry base URL.
+func validateMirrorURL(key, raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	// Check for the scheme textually rather than trusting url.Parse. The most
+	// common typo is a bare "registry.lan:5000", which url.Parse happily
+	// reports as Scheme "registry.lan" with Opaque "5000" — a scheme error
+	// message built from that is actively confusing.
+	if !strings.Contains(raw, "://") {
+		return fmt.Errorf("%s = %q is missing a scheme: write it as %q (plaintext — LAN only) or %q",
+			key, raw, "http://"+raw, "https://"+raw)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s = %q is not a valid URL: %w", key, raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("%s = %q has unsupported scheme %q: a registry mirror must be http:// or https://",
+			key, raw, u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%s = %q has no host: it must be an absolute URL, e.g. %q",
+			key, raw, "http://registry.lan:5000")
+	}
+	return nil
+}
+
+// PkgProxyConfig configures one language package caching proxy. The
+// same shape serves [npm_proxy], [pip_proxy] and [pub_proxy]: all three are
+// pull-through HTTP caches with an immutable-artifact half and a mutable-
+// metadata half, and differ only in their upstream and their defaults.
+//
+// Disabled by default, matching [module_proxy]'s opt-in posture.
+//
+// Unlike [module_proxy], `cleanup` defaults to FALSE. A pull-through cache
+// that empties itself on every daemon restart saves nothing, and these are
+// bounded by max_size_gb rather than by being thrown away.
+type PkgProxyConfig struct {
+	// Enabled turns the proxy on. Default false.
+	Enabled bool `toml:"enabled"`
+
+	// Port is the listen port on the bridge gateway. Zero takes the
+	// per-ecosystem default (npm 8084, pip 8085, pub 8086).
+	Port int `toml:"port"`
+
+	// Upstream overrides the registry to pull through to (npm:
+	// https://registry.npmjs.org, pip: https://pypi.org, pub:
+	// https://pub.dev). The upstream's own host is always permitted to
+	// serve artifacts, so an override needs no matching allowed_hosts entry.
+	Upstream string `toml:"upstream"`
+
+	// IndexTTL is how long cached MUTABLE metadata (an npm packument, a PEP
+	// 503 index page, a pub version listing) is served before it is
+	// revalidated with a conditional GET. Zero takes the 5m default; a
+	// negative value revalidates on every request.
+	//
+	// Immutable artifacts — tarballs, wheels, sdists, archives — ignore
+	// this entirely: they are cached permanently and never revalidated.
+	IndexTTL time.Duration `toml:"index_ttl"`
+
+	// MaxSizeGB is the cache's disk budget in GiB. When it is exceeded, the
+	// least-recently-used entries are evicted until the cache is back to
+	// 90% of the budget. Zero takes the 5 GiB default; a NEGATIVE value
+	// disables the budget entirely.
+	//
+	// There is no "unlimited by default" option on purpose: an unbounded
+	// package cache is how a node fills its disk (see [image_gc] and
+	// [buildkit] for the two previous instances of that lesson).
+	MaxSizeGB int64 `toml:"max_size_gb"`
+
+	// AllowedHosts extends the set of hosts the proxy will fetch package
+	// ARTIFACTS from. Metadata documents carry absolute download URLs which
+	// the proxy rewrites to point at itself; this list is what stops a job
+	// from hand-crafting such a URL and using the daemon as an open relay
+	// into the host's network. Entries match a host exactly or as a parent
+	// domain. The ecosystem's own CDNs and the configured upstream are
+	// always allowed.
+	AllowedHosts []string `toml:"allowed_hosts"`
+
+	// Cleanup wipes the cache directory on shutdown. Default false.
+	Cleanup bool `toml:"cleanup"`
+}
+
+// ProxyPort returns the configured port, or def when unset.
+func (p *PkgProxyConfig) ProxyPort(def int) int {
+	if p.Port <= 0 {
+		return def
+	}
+	return p.Port
+}
+
+// ProxyIndexTTL returns the metadata revalidation interval, defaulting to
+// 5 minutes. A negative value is preserved: it means "always revalidate".
+func (p *PkgProxyConfig) ProxyIndexTTL() time.Duration {
+	if p.IndexTTL == 0 {
+		return 5 * time.Minute
+	}
+	return p.IndexTTL
+}
+
+// ProxyMaxBytes returns the cache disk budget in bytes: 5 GiB by default,
+// and a negative value (meaning unbounded) passed through as-is.
+func (p *PkgProxyConfig) ProxyMaxBytes() int64 {
+	if p.MaxSizeGB == 0 {
+		return 5 << 30
+	}
+	if p.MaxSizeGB < 0 {
+		return -1
+	}
+	return p.MaxSizeGB << 30
 }
 
 // VMConfig configures virtual machines for cross-OS job execution.
@@ -939,6 +1367,7 @@ type RunnerConfig struct {
 	JobTimeout      string            `toml:"job_timeout"`
 	ShutdownTimeout string            `toml:"shutdown_timeout"`
 	Windows         WindowsRunnerToml `toml:"windows"`
+	Linux           LinuxRunnerToml   `toml:"linux"`
 
 	// ClaimRetry controls the in-memory retry queue for jobs whose
 	// initial claim / provision attempt fails with a transient error
@@ -1009,6 +1438,87 @@ type ClaimRetryToml struct {
 type WindowsRunnerToml struct {
 	MemoryMB uint64 `toml:"memory_mb"` // memory in MB (default: 4096)
 	CPUs     uint64 `toml:"cpus"`      // virtual CPUs (default: 2)
+}
+
+// Container runtimes selectable for Linux job containers via
+// [runner.linux] runtime. These are the TOML values, not the containerd
+// runtime handler names — see LinuxRunnerToml.ContainerdRuntime.
+const (
+	// LinuxRuntimeRunc is the default: an ordinary OCI container sharing
+	// the host kernel, run by io.containerd.runc.v2.
+	LinuxRuntimeRunc = "runc"
+
+	// LinuxRuntimeKata runs each job container inside its own lightweight
+	// VM with its own kernel, via io.containerd.kata.v2.
+	LinuxRuntimeKata = "kata"
+)
+
+// LinuxRunnerToml configures how Linux job containers are isolated.
+//
+// Linux is the weakest of the three platforms today: Windows jobs get
+// Hyper-V isolation and macOS jobs get a full VM, but Linux jobs are
+// ordinary containers on the host kernel, so a kernel-level escape is a
+// host compromise. Setting runtime = "kata" gives each job container its
+// own kernel in a lightweight VM, which makes isolation uniform across
+// platforms.
+//
+// Default is "runc" — Kata is opt-in. Measured on an 8-core amd64 node
+// with Kata 4.0.0 + QEMU, it costs seconds of extra container start
+// latency (0.14s -> 4.1s median), ~310 MB of guest memory per running
+// job instead of ~14 MB, ~35% on CPU-bound work and 8-40x on file-heavy
+// work.
+//
+// [dind] works under Kata. The Docker API cannot be handed over as a
+// bind-mounted unix socket — the guest has its own kernel, so the socket
+// inode arrives with no endpoint behind it and connect(2) returns
+// ECONNREFUSED — so those jobs get the same DOCKER_HOST=tcp:// transport
+// dind has always used for Hyper-V-isolated Windows containers, with the
+// port firewalled to the owning container's address. The transport is
+// chosen from this key at container-create time; see
+// runtime.resolveDindTransport.
+type LinuxRunnerToml struct {
+	// Runtime selects the container runtime for Linux job containers:
+	// "runc" (default) or "kata". Empty means "runc".
+	Runtime string `toml:"runtime"`
+}
+
+// ResolvedRuntime returns the configured Linux job-container runtime,
+// applying the default when the key is unset. Always returns one of the
+// LinuxRuntime* constants; validate() rejects anything else at load time.
+func (l LinuxRunnerToml) ResolvedRuntime() string {
+	if strings.TrimSpace(l.Runtime) == "" {
+		return LinuxRuntimeRunc
+	}
+	return strings.TrimSpace(l.Runtime)
+}
+
+// ContainerdRuntime returns the containerd runtime handler name for the
+// configured runtime — the string passed to containerd's WithRuntime.
+func (l LinuxRunnerToml) ContainerdRuntime() string {
+	if l.ResolvedRuntime() == LinuxRuntimeKata {
+		return "io.containerd.kata.v2"
+	}
+	return "io.containerd.runc.v2"
+}
+
+// validate rejects an unknown runtime name. A typo must not silently fall
+// back to runc: that would quietly drop the isolation the operator asked
+// for, which is the whole point of the key.
+//
+// Kata alongside dind used to be rejected here, on the grounds that the
+// bind-mounted /var/run/docker.sock is unreachable from inside the guest.
+// That part is still true and unfixable, but it was only ever a property
+// of the transport, not of dind: VM-isolated jobs now get the same
+// DOCKER_HOST=tcp:// transport that Hyper-V-isolated Windows containers
+// have always used. The combination is supported and no longer refused.
+func (l LinuxRunnerToml) validate() error {
+	switch l.ResolvedRuntime() {
+	case LinuxRuntimeRunc, LinuxRuntimeKata:
+		return nil
+	default:
+		return fmt.Errorf("runner.linux.runtime is %q (supported: %s, %s)",
+			l.Runtime, LinuxRuntimeRunc, LinuxRuntimeKata)
+	}
 }
 
 // MemoryBytes returns the memory limit in bytes, applying the default if unset.
@@ -1327,6 +1837,14 @@ func (c *Config) validate() error {
 	}
 
 	if err := c.Network.validate(); err != nil {
+		return err
+	}
+
+	if err := c.RegistryMirror.validate(); err != nil {
+		return err
+	}
+
+	if err := c.Runner.Linux.validate(); err != nil {
 		return err
 	}
 

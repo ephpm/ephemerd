@@ -165,6 +165,70 @@ owner = "your-org"
 # no egress, runners register then go offline, service stop hangs on drain).
 # Drain the node, set the keys, reboot.
 
+# Container-registry pull-through cache.
+#
+# Every image pull ephemerd makes — the runner image, images a job pulls
+# through the fake Docker socket, images a sibling container is created from —
+# is sent to this cache instead of the origin registry. The first pull of a
+# layer crosses the WAN once; every later pull of it, from any job on any node
+# pointed at the same cache, is served at LAN speed. It also removes the node
+# from Docker Hub's anonymous rate limit, since only the cache talks to Hub.
+#
+# The saving scales with how much jobs share a base image. On a node measured
+# at ~71 GB/day inbound across ~80 jobs, one 1.1 GB CI image accounted for
+# 163 pulls in seven days — dind pulls into a per-job containerd namespace, so
+# that image crossed the WAN for essentially every job.
+#
+# Stand up any OCI pull-through cache on the LAN. The off-the-shelf choice is
+# the upstream registry image in proxy mode:
+#
+#   docker run -d --restart=always -p 5000:5000 \
+#     -v /srv/registry:/var/lib/registry \
+#     -e REGISTRY_PROXY_REMOTEURL=https://registry-1.docker.io \
+#     --name registry-cache registry:2
+#
+# See docs/guides/registry-cache.md for sizing, Zot/Harbor alternatives, and
+# how to verify it is being used.
+# [registry_mirror]
+#
+# Turn mirroring on. Everything else here is inert while this is false, and
+# pulls behave exactly as they do with no [registry_mirror] block at all.
+# enabled = true
+#
+# Base URL of the cache, INCLUDING the scheme. There is no default — the cache
+# is site-specific. A path prefix is allowed for caches published under one
+# (e.g. a Harbor proxy project).
+# endpoint = "http://registry.lan:5000"
+#
+# Which upstream registries this endpoint serves. Defaults to ["docker.io"],
+# which is where the rate limit and the large shared base images are. Add
+# others only if the cache is configured to proxy them — registry:2 in proxy
+# mode serves exactly one upstream per instance.
+# registries = ["docker.io"]
+#
+# Keep the origin registry behind the mirror. DEFAULT TRUE, and you almost
+# certainly want it: a cache that is down, wedged, or simply does not have the
+# image then costs one failed request and the pull completes against the
+# origin. The node degrades to the WAN speed it had before the mirror existed
+# instead of failing every job on it.
+#
+# Set false to make the mirror authoritative — a deliberate egress-control
+# posture (jobs can only run images the cache holds), not a performance knob.
+# fallback_to_origin = true
+#
+# Send the credentials ephemerd would use against the origin registry to the
+# mirror too. DEFAULT FALSE. A pull-through cache normally holds its own
+# upstream credentials and needs none from the client, and a mirror that
+# answered with a Basic challenge would otherwise harvest the registry PAT a
+# job just logged in with — in plaintext when the endpoint is http://. Turn it
+# on only for a mirror you operate that requires authentication.
+# forward_credentials = false
+#
+# Per-registry caches, for sites that cannot serve everything from one
+# endpoint. An entry here wins over endpoint/registries for that host.
+# [registry_mirror.mirrors]
+# "ghcr.io" = "http://ghcr-cache.lan:5000"
+
 [runner]
 
 # Max concurrent jobs
@@ -184,6 +248,31 @@ job_timeout = "2h"
 
 # Time to wait for running jobs during graceful shutdown
 shutdown_timeout = "5m"
+
+# Container runtime for Linux job containers.
+#
+# "runc" (default) runs jobs as ordinary containers on the host kernel.
+# "kata" runs each job container inside its own lightweight VM with its
+# own kernel (Kata Containers), which makes a kernel-level container
+# escape a guest-VM escape instead of a host compromise, and brings Linux
+# in line with the Hyper-V isolation Windows jobs already get.
+#
+# Requirements for "kata": Kata Containers installed with
+# containerd-shim-kata-v2 on PATH, and a usable /dev/kvm (on a VM that
+# means nested virtualization must be enabled). ephemerd REFUSES TO START
+# if either is missing rather than silently falling back to runc.
+#
+# Costs, measured on an 8-core Proxmox guest with Kata 4.0.0 + QEMU:
+# container start goes from 0.14s to 4.1s (medians), each running job
+# carries ~310 MB of guest-VM memory instead of ~14 MB, CPU-bound work is
+# ~35% slower, and file-heavy work is 8-40x slower because both the
+# rootfs and the bind-mounted runner dir cross virtio-fs.
+#
+# NOT compatible with [dind] — the Docker API is passed to jobs through a
+# bind-mounted unix socket, which a Kata guest cannot connect to. Enabling
+# both is a config error.
+# [runner.linux]
+# runtime = "runc"
 
 # Claim retry queue.
 #
@@ -293,6 +382,120 @@ shutdown_timeout = "5m"
 # on first run and persists it here. Set explicitly only to pin/rotate it.
 # [dispatch]
 # token = "..."
+
+# Go module caching proxy. Runs a GOPROXY on the bridge gateway and injects
+# GOPROXY into every job container, so `go mod download` hits the local cache
+# instead of proxy.golang.org on each build.
+# [module_proxy]
+# enabled  = false
+# port     = 8082                            # listen port on the bridge gateway
+# upstream = "https://proxy.golang.org"      # fetched from on a cache miss
+# cleanup  = true                            # wipe the cache on shutdown
+
+# Cargo/crates caching proxy. A pull-through cache for the crates.io sparse
+# index, .crate tarballs, and rustup toolchain artifacts.
+#
+# Jobs need no workflow changes: rustup is pointed at the proxy with
+# RUSTUP_DIST_SERVER, and Cargo with a generated .cargo/config.toml that
+# ephemerd bind-mounts read-only at the container's filesystem root. A repo
+# that ships its own .cargo/config.toml still wins.
+#
+# Fails open, which matters more here than for [module_proxy]: GOPROXY has
+# "|direct" to fall back on, a Cargo source replacement has nothing. So:
+#   - proxy does not start        -> nothing injected, jobs go direct
+#   - upstream down, copy cached  -> the stale copy is served
+#   - upstream down, nothing      -> 307 to the real origin (index, config.json,
+#                                    crates and rustup alike); never a 5xx
+#   - proxy up but not answering  -> a watchdog notices within ~30s and rewrites
+#                                    the mounted config to one with no source
+#                                    replacement, so cargo goes direct until it
+#                                    recovers
+# [cargo_proxy]
+# enabled         = false
+# port            = 8083                          # listen port on the bridge gateway
+# upstream        = "https://index.crates.io"     # sparse registry index
+# rustup_upstream = "https://static.rust-lang.org" # toolchain distribution
+# index_ttl       = "10m"                         # index revalidation interval;
+#                                                 # .crate tarballs are immutable
+#                                                 # and cached permanently
+# cleanup         = false                         # keep the cache across restarts
+# ==============================================================================
+# Language package caches
+# ==============================================================================
+#
+# Pull-through HTTP caches for npm, pip and pub, so CI jobs stop re-downloading
+# the same dependencies on every ephemeral runner. Each runs on the bridge
+# gateway and injects one env var into every job container — no workflow
+# changes.
+#
+# All three are OFF by default (same posture as [module_proxy]).
+#
+# Shared design, per ecosystem:
+#   * IMMUTABLE artifacts (npm tarballs, Python wheels/sdists, pub archives)
+#     are cached permanently and never revalidated. These are the bytes.
+#   * MUTABLE metadata (npm packuments, PEP 503 index pages, pub version
+#     listings) is cached for index_ttl and then revalidated with a
+#     conditional GET, so a package published minutes ago is still visible.
+#   * Download URLs inside metadata are rewritten to point back at the proxy,
+#     which is what makes the artifact bytes flow through the cache at all.
+#     Integrity hashes are left untouched and still verified by the client.
+#   * FAIL OPEN. A dead cache degrades to "normal speed", never "build fails":
+#     an unreachable upstream serves the stale copy, an uncached download is
+#     307-redirected to the real origin, and a proxy that does not answer its
+#     health probe at startup has its env var withheld entirely.
+#   * BOUNDED. max_size_gb caps each cache; the least-recently-used entries are
+#     evicted back to 90% of the cap. Inspect with `ephemerd cache list`.
+#
+# Shared keys (defaults shown):
+#   enabled       = false     turn the cache on
+#   port          = <see below on the bridge gateway>
+#   upstream      = <the ecosystem's public registry>
+#   index_ttl     = "5m"      metadata revalidation interval; a negative value
+#                             revalidates on every request. Artifacts ignore it.
+#   max_size_gb   = 5         disk budget; -1 disables the bound (not advised)
+#   allowed_hosts = []        EXTRA hosts the proxy may fetch artifacts from.
+#                             The ecosystem CDNs and the configured upstream are
+#                             always allowed. This list is the SSRF fence around
+#                             the rewritten download URLs.
+#   cleanup       = false     wipe the cache on shutdown
+
+# npm / pnpm / Yarn. Injects npm_config_registry (npm, pnpm, Yarn Classic) and
+# YARN_NPM_REGISTRY_SERVER (Yarn Berry). A repo-committed .npmrc or
+# .yarnrc.yml with an explicit registry still wins. Authenticated/private
+# registries are not proxied — this cache forwards no credentials.
+# [npm_proxy]
+# enabled     = false
+# port        = 8084
+# upstream    = "https://registry.npmjs.org"
+# index_ttl   = "5m"
+# max_size_gb = 5
+# cleanup     = false
+
+# pip / Poetry / pip-tools. Injects PIP_INDEX_URL (pointing at the proxy's
+# PEP 503 simple index) and PIP_TRUSTED_HOST, which is required because the
+# proxy speaks plain HTTP on a private address. A pip.conf or a
+# requirements.txt "--index-url" line still wins; uv reads UV_INDEX_URL rather
+# than PIP_INDEX_URL and is not covered.
+# [pip_proxy]
+# enabled     = false
+# port        = 8085
+# upstream    = "https://pypi.org"
+# index_ttl   = "5m"
+# max_size_gb = 5
+# cleanup     = false
+
+# Dart / Flutter. Injects PUB_HOSTED_URL, honoured by both `dart pub` and
+# `flutter pub`. A dependency with an explicit `hosted:` URL in pubspec.yaml
+# still wins, and the Flutter SDK's own artifact downloads follow
+# FLUTTER_STORAGE_BASE_URL instead — those are not cached here. Publishing is
+# never proxied.
+# [pub_proxy]
+# enabled     = false
+# port        = 8086
+# upstream    = "https://pub.dev"
+# index_ttl   = "5m"
+# max_size_gb = 5
+# cleanup     = false
 
 [log]
 # Log level: debug, info, warn, error

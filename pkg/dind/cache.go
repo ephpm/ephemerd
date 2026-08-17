@@ -8,9 +8,14 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/errdefs"
 	"github.com/ephpm/ephemerd/pkg/imagegc"
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // DindCacheNamespacePrefix prefixes every per-repo image cache namespace.
@@ -94,12 +99,36 @@ func sanitizeForNamespace(s string) string {
 	return strings.Trim(string(collapsed), "_-.")
 }
 
-// MirrorImageToCache copies an Image record from the per-job namespace into
-// the per-repo cache namespace (creating it if needed), refreshing the
-// LastAccessedLabel on the cache record. The underlying content blobs are
-// already in the global content store from the original pull; this only
-// adds metadata so the cache record's gc.ref labels keep the content alive
-// after the per-job namespace is cleaned up.
+// mirrorLeaseTTL bounds how long the temporary lease taken during a mirror
+// can survive if the process dies mid-copy. containerd expires the lease on
+// its own after this, so a crashed mirror can't pin blobs forever.
+const mirrorLeaseTTL = time.Hour
+
+// MirrorImageToCache copies an image from the per-job namespace into the
+// per-repo cache namespace (creating it if needed): every content reference
+// in the image's DAG first, then the Image record itself, with the
+// LastAccessedLabel refreshed.
+//
+// Copying the *content references* — not just the Image record — is what
+// makes the cache a cache. containerd's GC works on (namespace, digest)
+// nodes, and `metadata.contentStore.garbageCollect` deletes a backing blob
+// as soon as no namespace holds a blob bucket for it. An Image record's
+// target and gc.ref labels only nominate nodes; if the cache namespace has
+// no bucket for a digest there is nothing for the mark phase to keep, so
+// dropping the per-job namespace made the whole image collectable and the
+// next job re-pulled it over the network.
+//
+// The copy costs no bytes and no network. containerd's default content
+// sharing policy is "shared", so opening a writer in the cache namespace
+// for a digest that is already in the backing store short-circuits
+// (metadata.contentStore.Writer's `cs.shared` branch) and Commit only
+// creates the bucket. Under an "isolated" policy there is no short-circuit,
+// so we stream the bytes from the job namespace — still local disk, never
+// the registry.
+//
+// Once the buckets exist, the next job's pull into a fresh namespace hits
+// the same short-circuit in remotes.fetch (`ws.Offset == desc.Size`) and
+// downloads nothing.
 //
 // Returns nil if the cache namespace name is empty (no provider/repo set).
 func MirrorImageToCache(ctx context.Context, c *client.Client, jobNS, cacheNS, imageName string, log *slog.Logger) error {
@@ -113,6 +142,22 @@ func MirrorImageToCache(ctx context.Context, c *client.Client, jobNS, cacheNS, i
 	}
 
 	cacheCtx := namespaces.WithNamespace(ctx, cacheNS)
+
+	// Content first, under a lease. Between the first blob bucket landing
+	// in the cache namespace and the Image record that will reference it
+	// being created, nothing else roots those buckets — a GC pass in that
+	// window would sweep them straight back out. Every bucket created
+	// under a leased context is attached to the lease
+	// (metadata.contentStore.Writer -> addContentLease), so the lease
+	// covers exactly the gap.
+	release, leasedCtx := beginMirrorLease(c, cacheCtx, log)
+	defer release()
+
+	copied, err := mirrorContentRefs(jobCtx, leasedCtx, c.ContentStore(), jobImg.Target, log)
+	if err != nil {
+		return fmt.Errorf("mirror content for %q into %s: %w", imageName, cacheNS, err)
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339)
 	if jobImg.Labels == nil {
 		jobImg.Labels = map[string]string{}
@@ -131,7 +176,172 @@ func MirrorImageToCache(ctx context.Context, c *client.Client, jobNS, cacheNS, i
 			return fmt.Errorf("update image %q in %s: %w", imageName, cacheNS, uerr)
 		}
 	}
-	log.Debug("dind cache: mirrored image", "image", imageName, "cache", cacheNS)
+	log.Debug("dind cache: mirrored image",
+		"image", imageName, "cache", cacheNS, "content_refs", copied)
+	return nil
+}
+
+// beginMirrorLease creates a short-lived lease in the cache namespace and
+// returns a context carrying it plus a release func. If the lease can't be
+// created the mirror still proceeds — an unleased copy is racy against a
+// concurrent GC pass but strictly better than not copying at all — so this
+// degrades rather than failing.
+func beginMirrorLease(c *client.Client, cacheCtx context.Context, log *slog.Logger) (func(), context.Context) {
+	lm := c.LeasesService()
+	if lm == nil {
+		return func() {}, cacheCtx
+	}
+	l, err := lm.Create(cacheCtx,
+		leases.WithRandomID(),
+		leases.WithExpiration(mirrorLeaseTTL),
+	)
+	if err != nil {
+		log.Debug("dind cache: lease unavailable, mirroring unleased", "error", err)
+		return func() {}, cacheCtx
+	}
+	return func() {
+		// Non-synchronous delete: by now the Image record roots the
+		// content, so there is nothing to wait for.
+		if derr := lm.Delete(cacheCtx, l); derr != nil && !errdefs.IsNotFound(derr) {
+			log.Debug("dind cache: releasing mirror lease", "lease", l.ID, "error", derr)
+		}
+	}, leases.WithLease(cacheCtx, l.ID)
+}
+
+// mirrorContentRefs walks the image DAG rooted at target in the source
+// namespace and gives the destination namespace its own content reference
+// (blob bucket) for every descriptor. Returns how many descriptors were
+// handled.
+func mirrorContentRefs(srcCtx, dstCtx context.Context, cs content.Store, target ocispec.Descriptor, log *slog.Logger) (int, error) {
+	if cs == nil {
+		return 0, fmt.Errorf("no content store")
+	}
+	descs, err := presentDescriptors(srcCtx, cs, target)
+	if err != nil {
+		return 0, err
+	}
+	for _, d := range descs {
+		info, ierr := cs.Info(srcCtx, d.Digest)
+		if ierr != nil {
+			if errdefs.IsNotFound(ierr) {
+				continue
+			}
+			return 0, fmt.Errorf("source info %s: %w", d.Digest, ierr)
+		}
+		if cerr := copyContentRef(srcCtx, dstCtx, cs, d, info.Labels, log); cerr != nil {
+			return 0, fmt.Errorf("copy content ref %s: %w", d.Digest, cerr)
+		}
+	}
+	return len(descs), nil
+}
+
+// presentDescriptors returns every descriptor reachable from root whose blob
+// actually exists in the given namespace's content store, root first.
+//
+// Absent descriptors are skipped, not errors: a multi-platform index names
+// manifests for platforms this node never pulled, and images can carry
+// foreign/URL layers that are never in the local store.
+func presentDescriptors(ctx context.Context, cs content.Store, root ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+	var (
+		out   []ocispec.Descriptor
+		seen  = map[digest.Digest]bool{}
+		queue = []ocispec.Descriptor{root}
+	)
+	for len(queue) > 0 {
+		d := queue[0]
+		queue = queue[1:]
+		if d.Digest == "" || seen[d.Digest] {
+			continue
+		}
+		seen[d.Digest] = true
+
+		if _, err := cs.Info(ctx, d.Digest); err != nil {
+			if errdefs.IsNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("info %s: %w", d.Digest, err)
+		}
+		out = append(out, d)
+
+		children, err := images.Children(ctx, cs, d)
+		if err != nil {
+			if errdefs.IsNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("children of %s: %w", d.Digest, err)
+		}
+		queue = append(queue, children...)
+	}
+	return out, nil
+}
+
+// copyContentRef makes desc resolvable in dstCtx's namespace, carrying over
+// the source blob's labels — which include the containerd.io/gc.ref.content.*
+// entries the mark phase follows from a manifest to its config and layers.
+// Without those the manifest bucket would survive a GC pass and its children
+// would not.
+func copyContentRef(srcCtx, dstCtx context.Context, cs content.Store, desc ocispec.Descriptor, labels map[string]string, log *slog.Logger) error {
+	// Already bucketed in the destination (re-mirror of a cached tag).
+	// Still refresh the labels so an entry written by an older ephemerd,
+	// or one whose gc.ref labels were incomplete, gets repaired.
+	if _, err := cs.Info(dstCtx, desc.Digest); err == nil {
+		if len(labels) == 0 {
+			return nil
+		}
+		if _, uerr := cs.Update(dstCtx, content.Info{
+			Digest: desc.Digest,
+			Labels: labels,
+		}, "labels"); uerr != nil && !errdefs.IsNotFound(uerr) {
+			return fmt.Errorf("refresh labels: %w", uerr)
+		}
+		return nil
+	} else if !errdefs.IsNotFound(err) {
+		return fmt.Errorf("destination info: %w", err)
+	}
+
+	w, err := cs.Writer(dstCtx,
+		content.WithRef("ephemerd-dind-cache-"+desc.Digest.String()),
+		content.WithDescriptor(desc),
+	)
+	if err != nil {
+		if errdefs.IsAlreadyExists(err) {
+			return nil
+		}
+		return fmt.Errorf("open writer: %w", err)
+	}
+	defer func() {
+		// Close after a successful Commit is a no-op; anything else here
+		// is an ingest that will expire on its own, so log and move on.
+		if cerr := w.Close(); cerr != nil {
+			log.Debug("dind cache: closing content writer", "digest", desc.Digest, "error", cerr)
+		}
+	}()
+
+	// Under the default "shared" sharing policy the writer comes back
+	// already at full offset and Commit just creates the bucket. Under
+	// "isolated" it doesn't, and we have to supply the bytes — read them
+	// back out of the source namespace rather than the network.
+	if st, serr := w.Status(); serr == nil && st.Offset != desc.Size {
+		ra, rerr := cs.ReaderAt(srcCtx, desc)
+		if rerr != nil {
+			return fmt.Errorf("source reader: %w", rerr)
+		}
+		defer func() {
+			if cerr := ra.Close(); cerr != nil {
+				log.Debug("dind cache: closing source reader", "digest", desc.Digest, "error", cerr)
+			}
+		}()
+		if cerr := content.CopyReaderAt(w, ra, desc.Size); cerr != nil {
+			return fmt.Errorf("copy blob: %w", cerr)
+		}
+	}
+
+	if cerr := w.Commit(dstCtx, desc.Size, desc.Digest, content.WithLabels(labels)); cerr != nil {
+		if errdefs.IsAlreadyExists(cerr) {
+			return nil
+		}
+		return fmt.Errorf("commit: %w", cerr)
+	}
 	return nil
 }
 

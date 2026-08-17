@@ -29,7 +29,9 @@ import (
 	"github.com/ephpm/ephemerd/pkg/providers/gitea"
 	githubProv "github.com/ephpm/ephemerd/pkg/providers/github"
 	"github.com/ephpm/ephemerd/pkg/proxies"
+	cargoproxy "github.com/ephpm/ephemerd/pkg/proxies/cargo"
 	goproxy "github.com/ephpm/ephemerd/pkg/proxies/go"
+	"github.com/ephpm/ephemerd/pkg/registrymirror"
 	"github.com/ephpm/ephemerd/pkg/runner"
 	"github.com/ephpm/ephemerd/pkg/runtime"
 	"github.com/ephpm/ephemerd/pkg/scheduler"
@@ -192,6 +194,29 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	log := cfg.Logger()
 	log.Info("starting ephemerd", "version", version, "data_dir", configDir)
 
+	// Resolve the registry-mirror policy once and share it with every pull
+	// path (runtime, each per-job dind server, the macOS artifact
+	// extractor). Nil when unconfigured, and every consumer is nil-safe, so
+	// a node without a mirror pulls exactly as it did before.
+	//
+	// This is constructed in BOTH the containerd-only (in-VM worker) branch
+	// and the full-scheduler branch below, off the same cfg. On a Windows
+	// host the config.toml is staged into the Linux VM's initrd at
+	// /etc/ephemerd/config.toml on every boot, so a [registry_mirror] block
+	// reaches the in-VM ephemerd with no extra plumbing (see
+	// docs/arch/host-config-initrd.md). The macOS Vz VM does not yet receive
+	// the host config — see docs/guides/registry-cache.md.
+	registryMirror := registrymirror.New(cfg.RegistryMirror, log)
+
+	// Refuse to start if the operator asked for VM-isolated Linux jobs but
+	// this host can't deliver them. Falling back to runc here would run
+	// untrusted CI code on the host kernel while the config says otherwise
+	// — a silent downgrade of an isolation guarantee, which is strictly
+	// worse than not starting.
+	if err := checkKataPrereqs(cfg, log); err != nil {
+		return err
+	}
+
 	// Ensure data directory exists
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		return fmt.Errorf("creating data directory %s: %w", configDir, err)
@@ -329,11 +354,13 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			DindAllowPrivileged: cfg.Dind.ResolvedAllowPrivileged(),
 			Rlimits:             cfg.Runtime.Rlimits.Resolved(),
 			AllowNewPrivileges:  cfg.Runtime.ResolvedAllowNewPrivileges(),
+			LinuxRuntime:        cfg.Runner.Linux.ContainerdRuntime(),
 			Network:             net,
 			WindowsMemoryBytes:  cfg.Runner.Windows.MemoryBytes(),
 			WindowsCPUs:         cfg.Runner.Windows.CPUCount(),
 			BuildKit:            bk,
 			ImageGC:             imageGC,
+			RegistryMirror:      registryMirror,
 			Log:                 log,
 		})
 		if err != nil {
@@ -431,6 +458,15 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	if cfg.ModuleProxy.Enabled {
 		gatewayPorts = append(gatewayPorts, modProxyPort)
 	}
+	cargoProxyPort := cfg.CargoProxy.Port
+	if cargoProxyPort == 0 {
+		cargoProxyPort = 8083
+	}
+	if cfg.CargoProxy.Enabled {
+		gatewayPorts = append(gatewayPorts, cargoProxyPort)
+	}
+	// Language package caches (npm, pip, pub) — see pkgproxies.go.
+	gatewayPorts = append(gatewayPorts, pkgProxyPorts(cfg)...)
 
 	// Initialize container networking
 	net, err := networking.New(networking.Config{
@@ -465,17 +501,14 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		if upstream == "" {
 			upstream = "https://proxy.golang.org"
 		}
-		cleanup := cfg.ModuleProxy.Cleanup
-		if !cleanup {
-			cleanup = true
-		}
-
 		goProxy := goproxy.New(goproxy.Config{
-			CacheDir:   joinPath(configDir, "cache", "gomod"),
-			Upstream:   upstream,
-			ListenAddr: fmt.Sprintf("%s:%d", net.GatewayIP(), modProxyPort),
-			Cleanup:    cleanup,
-			Log:        log,
+			CacheDir:      joinPath(configDir, "cache", "gomod"),
+			Upstream:      upstream,
+			ListenAddr:    fmt.Sprintf("%s:%d", net.GatewayIP(), modProxyPort),
+			Cleanup:       cfg.ModuleProxy.CleanupEnabled(),
+			MaxCacheBytes: cfg.ModuleProxy.ModuleProxyMaxCacheBytes(),
+			PruneInterval: cfg.ModuleProxy.ModuleProxyPruneInterval(),
+			Log:           log,
 		})
 		if err := goProxy.Start(); err != nil {
 			log.Warn("failed to start Go module proxy, continuing without it", "error", err)
@@ -489,10 +522,50 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		}
 	}
 
-	// Collect env vars from all cache proxies for injection into containers.
+	// Start Cargo/crates caching proxy if enabled
+	if cfg.CargoProxy.Enabled {
+		cargoProxy := cargoproxy.New(cargoproxy.Config{
+			CacheDir: joinPath(configDir, "cache", "cargo"),
+			// Config dir sits OUTSIDE the cache so `ephemerd cache clear
+			// cargo` cannot delete the file mounted into running jobs.
+			ConfDir:        joinPath(configDir, "cargo"),
+			IndexUpstream:  cfg.CargoProxy.Upstream,
+			RustupUpstream: cfg.CargoProxy.RustupUpstream,
+			ListenAddr:     fmt.Sprintf("%s:%d", net.GatewayIP(), cargoProxyPort),
+			IndexTTL:       cfg.CargoProxy.IndexTTL,
+			Cleanup:        cfg.CargoProxy.CleanupEnabled(),
+			Log:            log,
+		})
+		if err := cargoProxy.Start(); err != nil {
+			log.Warn("failed to start Cargo proxy, continuing without it", "error", err)
+		} else {
+			cacheProxies = append(cacheProxies, cargoProxy)
+			defer func() {
+				if err := cargoProxy.Stop(); err != nil {
+					log.Warn("error stopping Cargo proxy", "error", err)
+				}
+			}()
+		}
+	}
+
+	// Start the language package caches (npm, pip, pub). Only those that
+	// start AND answer a health probe are returned, so an unhealthy cache is
+	// never advertised to a job — see startPkgProxies for the fail-open story.
+	pkgProxies, stopPkgProxies := startPkgProxies(cfg, configDir, net, log)
+	defer stopPkgProxies()
+	cacheProxies = append(cacheProxies, pkgProxies...)
+
+	// Collect env vars and mounts from all cache proxies for injection into
+	// containers. Only proxies that actually STARTED are in cacheProxies, so
+	// a failed proxy is never advertised to a job — that is the outer
+	// fail-open: jobs go straight to the upstream registry instead.
 	var cacheProxyEnvVars []string
+	var cacheProxyMounts []proxies.Mount
 	for _, cp := range cacheProxies {
 		cacheProxyEnvVars = append(cacheProxyEnvVars, cp.EnvVars()...)
+		if mp, ok := cp.(proxies.MountProvider); ok {
+			cacheProxyMounts = append(cacheProxyMounts, mp.Mounts()...)
+		}
 	}
 
 	// Start the shared embedded BuildKit solver. One solver serves every
@@ -548,13 +621,16 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		DindEnabled:         cfg.Dind.Enabled,
 		DindAllowPrivileged: cfg.Dind.ResolvedAllowPrivileged(),
 		CacheProxyEnv:       cacheProxyEnvVars,
+		CacheProxyMounts:    cacheProxyMounts,
 		Rlimits:             cfg.Runtime.Rlimits.Resolved(),
 		AllowNewPrivileges:  cfg.Runtime.ResolvedAllowNewPrivileges(),
+		LinuxRuntime:        cfg.Runner.Linux.ContainerdRuntime(),
 		Network:             net,
 		WindowsMemoryBytes:  cfg.Runner.Windows.MemoryBytes(),
 		WindowsCPUs:         cfg.Runner.Windows.CPUCount(),
 		BuildKit:            bk,
 		ImageGC:             imageGC,
+		RegistryMirror:      registryMirror,
 		Log:                 log,
 	})
 	if err != nil {
@@ -618,7 +694,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	// lets a job's `container: { image: ... }` pull OCI images and extract
 	// their layers into the shared data directory (available inside macOS
 	// VMs via virtio-fs).
-	artifactExtractor := artifacts.NewExtractor(ctrdClient, log)
+	artifactExtractor := artifacts.NewExtractor(ctrdClient, registryMirror, log)
 
 	// Wait for Linux dispatch client if the VM is booting in the background.
 	linuxDispatcher, _ := waitDispatch()
@@ -1150,13 +1226,15 @@ func crictlCmd() *cli.Command {
 //   - dind: the per-job Docker API listener, which on Windows is a TCP listener
 //     on the host address handed to the job as DOCKER_HOST.
 //   - the Go module proxy: bound to the same address and injected as GOPROXY.
+//   - the Cargo proxy: likewise, and unlike GOPROXY a Cargo source replacement
+//     has no fallback, so a container that cannot reach it fails the build.
 //
 // It only affects the Windows L2Bridge egress path, where the ACL ladder
-// otherwise blocks the host along with the rest of RFC1918 — with neither
-// feature enabled the strictest posture (host unreachable) applies. On NAT and
-// on Linux the gateway is already reachable and this changes nothing.
+// otherwise blocks the host along with the rest of RFC1918 — with none of
+// these features enabled the strictest posture (host unreachable) applies. On
+// NAT and on Linux the gateway is already reachable and this changes nothing.
 func needsHostAccess(cfg *config.Config) bool {
-	return cfg.Dind.Enabled || cfg.ModuleProxy.Enabled
+	return cfg.Dind.Enabled || cfg.ModuleProxy.Enabled || cfg.CargoProxy.Enabled
 }
 
 func joinPath(parts ...string) string {

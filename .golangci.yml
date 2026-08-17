@@ -26,6 +26,19 @@ linters:
         linters:
           - errorlint
           - bodyclose
+      # The caching-proxy tests route every request through a get() helper that
+      # returns the *http.Response, and close it either via the body() helper's
+      # defer or an explicit defer at the call site. bodyclose tracks the
+      # response the helper returns, not what the caller does with it, so it
+      # flags every call site. Same reasoning as localtunnel above.
+      #
+      # npm/pip/pub share the pkgcache core and copy cargo's test helpers
+      # verbatim, so they need the same exclusion. Listing them by name rather
+      # than globbing pkg/proxies/ keeps a future proxy that does NOT use the
+      # helper pattern honest — it would have to opt in here deliberately.
+      - path: "pkg/proxies/(cargo|npm|pip|pub)/.*_test\\.go"
+        linters:
+          - bodyclose
       - path: "api/v1"
         linters:
           - errorlint

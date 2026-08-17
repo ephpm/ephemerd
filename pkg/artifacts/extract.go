@@ -21,6 +21,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/platforms"
+	"github.com/ephpm/ephemerd/pkg/registrymirror"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -29,13 +30,19 @@ const namespace = "ephemerd"
 // Extractor pulls OCI images and extracts their layers into host directories.
 type Extractor struct {
 	client *client.Client
+	// mirror routes the pull through a LAN pull-through cache when one is
+	// configured. Nil means no mirror and the pull is unchanged.
+	mirror *registrymirror.Mirror
 	log    *slog.Logger
 }
 
-// NewExtractor creates an artifact extractor using the given containerd client.
-func NewExtractor(c *client.Client, log *slog.Logger) *Extractor {
+// NewExtractor creates an artifact extractor using the given containerd
+// client. mirror may be nil, in which case pulls go straight to the origin
+// registry exactly as they did before registry mirroring existed.
+func NewExtractor(c *client.Client, mirror *registrymirror.Mirror, log *slog.Logger) *Extractor {
 	return &Extractor{
 		client: c,
+		mirror: mirror,
 		log:    log,
 	}
 }
@@ -52,7 +59,9 @@ func (e *Extractor) Extract(ctx context.Context, imageRef string, destDir string
 	img, err := e.client.GetImage(ctx, imageRef)
 	if err != nil {
 		e.log.Info("image not cached, pulling", "image", imageRef)
-		img, err = e.client.Pull(ctx, imageRef, client.WithPullUnpack)
+		e.mirror.LogPull(imageRef)
+		pullOpts := append([]client.RemoteOpt{client.WithPullUnpack}, e.mirror.PullOpts(nil)...)
+		img, err = e.client.Pull(ctx, imageRef, pullOpts...)
 		if err != nil {
 			return fmt.Errorf("pulling image %s: %w", imageRef, err)
 		}

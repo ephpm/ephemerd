@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/ephpm/ephemerd/pkg/config"
+	"github.com/ephpm/ephemerd/pkg/registrymirror"
 	"github.com/ephpm/ephemerd/pkg/vm"
 	"github.com/ephpm/ephemerd/pkg/workflow"
 	"github.com/urfave/cli/v3"
@@ -170,7 +171,11 @@ func runWorkflow(ctx context.Context, workflowPath string, jobFilter string, ima
 		SocketPath: socketPath,
 		Image:      resolveRunImage(imageFlag, platform, cfg),
 		Network:    runNetworkOptions(cfg, log),
-		Log:        log,
+		// Honor the node's [registry_mirror] block for local runs too, so
+		// `ephemerd run` pulls from the same LAN cache the daemon uses.
+		// cfg is nil when config.toml is missing or unreadable.
+		RegistryMirror: runRegistryMirror(cfg, log),
+		Log:            log,
 	}
 
 	return runner.RunJob(ctx, jobName, job, repoDir)
@@ -186,6 +191,17 @@ func loadRunConfig() *config.Config {
 		return nil
 	}
 	return cfg
+}
+
+// runRegistryMirror builds the pull-through mirror policy for a local run
+// from the host's [registry_mirror] block. Returns nil — meaning "pull from
+// the origin registry" — when there is no readable config or no mirror is
+// configured.
+func runRegistryMirror(cfg *config.Config, log *slog.Logger) *registrymirror.Mirror {
+	if cfg == nil {
+		return nil
+	}
+	return registrymirror.New(cfg.RegistryMirror, log)
 }
 
 // runNetworkOptions maps the host's [network] config onto a local run and warns

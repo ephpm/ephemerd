@@ -387,7 +387,19 @@ max_concurrent = 2                    # max simultaneous macOS VMs (default: aut
 enabled = true                        # run a GOPROXY on the bridge gateway
 # port = 8082                         # default listen port
 # upstream = "https://proxy.golang.org"  # upstream to fetch from on cache miss
-# cleanup = true                      # wipe cache on shutdown
+# cleanup = true                      # wipe cache on shutdown; set false to keep it warm across restarts
+# max_cache_gb = 20                   # LRU eviction down to this ceiling
+# prune_interval = "1h"               # how often eviction runs (negative disables it)
+
+# Cargo/crates caching proxy — pull-through cache for the crates.io sparse
+# index, .crate tarballs, and rustup toolchains. No workflow changes needed.
+[cargo_proxy]
+enabled = true                        # run the Cargo proxy on the bridge gateway
+# port = 8083                         # default listen port
+# upstream = "https://index.crates.io"        # sparse registry index
+# rustup_upstream = "https://static.rust-lang.org"
+# index_ttl = "10m"                   # index revalidation (tarballs are immutable)
+# cleanup = false                     # keep the cache across restarts
 
 [log]
 level = "info"                        # debug, info, warn, error

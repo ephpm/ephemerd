@@ -78,6 +78,8 @@ By default, Windows job containers attach to an HNS **NAT** network on the Hyper
 - **The Hyper-V firewall** (`New-NetFirewallHyperVRule`) has nothing to bind to: Hyper-V-isolated containers on the NAT switch never register a VM creator, so `Get-NetFirewallHyperVVMCreator` returns nothing.
 - **`netsh` host rules** are post-NAT. Container traffic is indistinguishable from the host's own by then, so any rule broad enough to catch a container also blackholes the host — including the host's own DNS if your resolver is a LAN address.
 
+**Inbound is a different question.** The last point above is about *egress*, which is forwarded and SNAT'd. Traffic a container sends to the NAT **gateway** (`10.88.0.1`) is not forwarded — it terminates on the host, arriving as ordinary inbound traffic that still carries the container's own `10.88.x.y` source. The host firewall both sees it and, by default, denies it. That matters because on Windows the per-job dind Docker API listens on that gateway over TCP (`runhcs` supports neither a bind-mounted unix socket nor named-pipe sharing), so ephemerd installs one **inbound** allow per job, scoped to `remoteip=<container>/32` and the single dind port. It is scoped to the individual container, never to `10.88.0.0/16`: that API authenticates nothing, so a subnet-wide allow would let any job port-scan the gateway and drive another job's Docker daemon. The rules are named `ephemerd-egress-l2b-hostport-*` and are swept by prefix on startup and shutdown, so a hard-killed daemon cannot leak them.
+
 There is no configuration that makes the NAT path filterable. If you need enforced egress on Windows, use L2Bridge.
 
 ### Windows L2Bridge — the enforcing path

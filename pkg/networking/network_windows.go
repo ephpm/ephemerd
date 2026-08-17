@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"github.com/Microsoft/hcsshim/hcn"
@@ -377,8 +378,65 @@ func (w *windowsNetworking) setup(ctx context.Context, id string, netns string) 
 		return nil, fmt.Errorf("attaching endpoint to namespace for %s: %w", id, err)
 	}
 
-	w.cfg.Log.Debug("HCN endpoint created", "id", id, "endpoint", created.Id, "namespace", ns.Id, "ip", allocatedIP)
-	return &SetupResult{NetNS: ns.Id, EndpointID: created.Id, IP: allocatedIP}, nil
+	// The address the container will actually carry. On L2Bridge that is the
+	// one ephemerd pinned. On NAT ephemerd does not choose it — HNS allocates
+	// out of the NAT subnet — so read it back off the created endpoint.
+	//
+	// It has to be reported either way: SetupResult.IP is what the runtime hands
+	// to dind.SetRunnerIP, which scopes the host-firewall allow for that job's
+	// Docker API to exactly this /32. Leaving it empty on NAT (as it was) means
+	// no allow can be scoped and no allow gets installed — #162.
+	containerIP := allocatedIP
+	if containerIP == "" {
+		containerIP = endpointIPv4(created)
+	}
+	if containerIP == "" {
+		w.cfg.Log.Warn("HCN endpoint reported no IPv4 address; the per-job dind host-port allow cannot be scoped and job provisioning will fail closed",
+			"id", id, "endpoint", created.Id)
+	}
+
+	w.cfg.Log.Debug("HCN endpoint created", "id", id, "endpoint", created.Id, "namespace", ns.Id, "ip", containerIP)
+	return &SetupResult{NetNS: ns.Id, EndpointID: created.Id, IP: containerIP}, nil
+}
+
+// endpointIPv4 returns the IPv4 address HNS assigned to an endpoint.
+//
+// CreateEndpoint normally returns the endpoint with IpConfigurations already
+// populated — that is how the Windows CNI plugins read the allocation back —
+// but the field is filled in by HNS rather than by the caller, so this re-reads
+// the endpoint by ID and then by name before giving up. An empty result is a
+// hard problem for the caller (no address means no scoped dind allow), not
+// something to paper over with a guess.
+func endpointIPv4(ep *hcn.HostComputeEndpoint) string {
+	if ep == nil {
+		return ""
+	}
+	if ip := firstIPv4(ep.IpConfigurations); ip != "" {
+		return ip
+	}
+	if fresh, err := hcn.GetEndpointByID(ep.Id); err == nil {
+		if ip := firstIPv4(fresh.IpConfigurations); ip != "" {
+			return ip
+		}
+	}
+	if fresh, err := hcn.GetEndpointByName(ep.Name); err == nil {
+		if ip := firstIPv4(fresh.IpConfigurations); ip != "" {
+			return ip
+		}
+	}
+	return ""
+}
+
+// firstIPv4 returns the first parseable IPv4 address in an endpoint's IP
+// configurations. IPv6 entries are skipped: the Windows container stack has no
+// IPv6 path, and a v6 address would fail normalizeContainerIP downstream.
+func firstIPv4(cfgs []hcn.IpConfig) string {
+	for _, ipc := range cfgs {
+		if _, err := parseIPv4(strings.TrimSpace(ipc.IpAddress)); err == nil {
+			return strings.TrimSpace(ipc.IpAddress)
+		}
+	}
+	return ""
 }
 
 // releaseIP returns a container's pool address, if it holds one. Safe on the NAT

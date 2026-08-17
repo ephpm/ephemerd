@@ -270,6 +270,33 @@ func TestSetupResult_ZeroValue(t *testing.T) {
 	}
 }
 
+// TestGatewayForSubnet_IsTheAddressGatewayIPReports pins the two callers
+// together. gatewayForSubnet was split out of Manager.GatewayIP so the Windows
+// NAT dind host-port allow (firewall_windows.go) is scoped to the same address
+// dind binds its listener to. If the two ever disagree, the firewall rule names
+// an address nothing is listening on — an allow that admits nothing, which is
+// exactly the silent failure mode of #162.
+func TestGatewayForSubnet_IsTheAddressGatewayIPReports(t *testing.T) {
+	for _, tc := range []struct{ subnet, want string }{
+		{"", "10.88.0.1"},
+		{DefaultSubnet, "10.88.0.1"},
+		{"10.199.0.0/16", "10.199.0.1"},
+		{"172.20.0.0/16", "172.20.0.1"},
+		{"192.168.5.0/24", "192.168.5.1"},
+		{"not-a-cidr", "10.88.0.1"},
+		{"2001:db8::/64", "10.88.0.1"}, // no IPv6 container path anywhere
+	} {
+		if got := gatewayForSubnet(tc.subnet); got != tc.want {
+			t.Errorf("gatewayForSubnet(%q) = %q, want %q", tc.subnet, got, tc.want)
+		}
+		// Manager.GatewayIP with no platform must agree exactly.
+		m := &Manager{cfg: Config{Subnet: tc.subnet}}
+		if got := m.GatewayIP(); got != tc.want {
+			t.Errorf("Manager.GatewayIP() with subnet %q = %q, want %q", tc.subnet, got, tc.want)
+		}
+	}
+}
+
 func TestConfig_Defaults(t *testing.T) {
 	cfg := Config{}
 	if cfg.Subnet != "" {
