@@ -114,6 +114,22 @@ func (s *Scheduler) resolveImage(ctx context.Context, event *providers.JobEvent,
 		return ""
 	}
 	if img := event.Provider.FetchJobImage(ctx, event); img != "" {
+		// A non-empty FetchJobImage means the job declared `container:` in
+		// its workflow. ephemerd honors that by making it the RUNNER image,
+		// which is the whole of the support on Windows — the Actions runner
+		// then goes on to do its own container setup for the same directive
+		// (docker pull/create/exec), and neither half of that works there:
+		// the stock Windows images carry no docker CLI, and pkg/dind cannot
+		// create Windows sibling containers at all (checkWindowsSiblingGate).
+		// The job fails with "docker: command not found" in Set up job, which
+		// says nothing about why — so say it here, where we know.
+		if os == "windows" && s.cfg.Log != nil {
+			s.cfg.Log.Warn("job declares container: on a Windows runner — expect it to fail in Set up job",
+				"image", img, "repo", event.Repo, "job_id", event.JobID,
+				"reason", "ephemerd runs the job inside this image, but the Actions runner also "+
+					"performs its own container setup, which is not supported on Windows",
+				"workaround", "drop container: from the Windows leg and select the image with [runner.images.<repo>].windows")
+		}
 		return img
 	}
 	if s.cfg.RunnerImageForRepo != nil {

@@ -124,7 +124,9 @@ func (s *Server) EndpointPort() int {
 	return s.listenPort
 }
 
-// platformGOOS is the OS whose transport rules apply. A variable rather than
-// a direct runtime.GOOS reference so tests can exercise the Windows rules
-// from a Linux test run.
+// platformGOOS is the OS whose platform rules apply — the transport choice in
+// resolveTransport and the sibling-container gate in checkWindowsSiblingGate.
+// A variable rather than a direct runtime.GOOS reference so tests can exercise
+// the Windows rules from a Linux test run, and the Linux rules from a Windows
+// one (this repo is developed on both).
 var platformGOOS = goruntime.GOOS

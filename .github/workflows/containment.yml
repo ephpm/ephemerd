@@ -1045,6 +1045,74 @@ jobs:
           if ($global:fail -eq 0) { Write-Output '== network: all checks passed' }
           else { Write-Output "== network: $global:fail FAILURE(S)"; exit 1 }
 
+      # Sibling containers do not exist on a Windows host, and a job must not
+      # be able to talk itself into believing otherwise. pkg/dind builds every
+      # sibling as a LINUX container (linux/<arch> spec, overlayfs snapshotter,
+      # io.containerd.runc.v2) — none of which Windows containerd has — so
+      # `docker create` cannot succeed here and is refused at request time by
+      # checkWindowsSiblingGate.
+      #
+      # This is why a GitHub Actions job that declares `container:` on a
+      # Windows runner does not work end to end: ephemerd resolves the image to
+      # the runner image and the steps do run inside it, but the Actions runner
+      # additionally drives docker create/exec against this daemon, and that
+      # half is unimplemented. Nothing in .github/workflows uses `container:`
+      # on any platform, so this probe is the only thing standing between that
+      # fact and the next person re-deriving it from a job log.
+      #
+      # GATES on "create must not succeed" — true on every build, so this can
+      # never go red merely because a node is running an older ephemerd. Which
+      # error came back is REPORTED, not asserted: the pre-gate builds fail
+      # somewhere down in containerd instead, which is the confusing shape this
+      # existed to replace. A deliberately nonexistent ref keeps the probe
+      # cheap: the gate fires before image resolution, and on an older build
+      # the pull fails fast instead of dragging an image over the wire.
+      - name: Windows sibling containers must be refused, not half-attempted
+        id: sibling
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $global:fail = 0
+          function Ok($l, $d)   { '  {0,-52} PASS  {1}' -f $l, $d }
+          function Bad($l, $d)  { $global:fail++; '  {0,-52} FAIL  {1}' -f $l, $d }
+          function Skip($l, $d) { '  {0,-52} SKIP  {1}' -f $l, $d }
+          function Info($l, $d) { '  {0,-52} INFO  {1}' -f $l, $d }
+
+          Write-Output '=== docker create on a Windows host ==='
+          if (-not $env:DOCKER_HOST) {
+            Skip 'sibling create refused' 'no DOCKER_HOST; dind disabled on this node'
+          } elseif (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+            # Expected on a stock image: nothing in ephemerd puts a docker CLI
+            # on PATH, it comes from the runner image (images/runner-ci-windows).
+            Skip 'sibling create refused' 'no docker CLI in this job image'
+          } else {
+            $o = Join-Path $env:RUNNER_TEMP 'sibling.out'
+            $e = Join-Path $env:RUNNER_TEMP 'sibling.err'
+            docker create --name ephemerd-sibling-probe ephemerd-sibling-probe-nonexistent:latest > $o 2> $e
+            $code = $LASTEXITCODE
+            $raw = (Get-Content $e -Raw -ErrorAction SilentlyContinue) + (Get-Content $o -Raw -ErrorAction SilentlyContinue)
+            $msg = ($raw -replace '\s+', ' ').Trim()
+
+            if ($code -eq 0) {
+              Bad 'docker create must not succeed' "exit 0 - a sibling container was created on Windows"
+              docker rm -f ephemerd-sibling-probe 2> $null | Out-Null
+            } else {
+              Ok 'docker create must not succeed' "exit $code"
+            }
+
+            if ($msg -match 'cannot create containers on a Windows host') {
+              Info 'rejection shape' 'explanatory (checkWindowsSiblingGate)'
+            } else {
+              Info 'rejection shape' 'NOT the explanatory one - node predates the gate?'
+            }
+            Info 'daemon said' $msg
+          }
+
+          Write-Output ''
+          if ($global:fail -eq 0) { Write-Output '== sibling: all checks passed' }
+          else { Write-Output "== sibling: $global:fail FAILURE(S)"; exit 1 }
+
       - name: Egress and host admin ports (gates only on L2Bridge)
         id: egress
         if: always()
@@ -1148,6 +1216,7 @@ jobs:
           Row 'mode / identity'      '${{ steps.identity.outcome }}'
           Row 'Hyper-V isolation'    '${{ steps.isolation.outcome }}'
           Row 'internet + dind'      '${{ steps.network.outcome }}'
+          Row 'sibling containers'   '${{ steps.sibling.outcome }}'
           Row 'egress + admin ports' '${{ steps.egress.outcome }}'
           Write-Output ''
           if ($global:fail -eq 0) { Write-Output 'ALL WINDOWS CONTAINMENT CHECKS PASSED' }

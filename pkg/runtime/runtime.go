@@ -44,7 +44,13 @@ const (
 
 // containerCapabilities is the minimum set of Linux capabilities for CI jobs.
 // Covers apt-get install, sudo, adduser, and service management.
-// Docker-in-Docker is not supported — use Kaniko or Buildah for image builds.
+//
+// A real nested dockerd is deliberately out of reach with this set — that is
+// what the missing CAP_SYS_ADMIN/CAP_NET_ADMIN buy. Jobs still get a working
+// `docker`: pkg/dind serves a per-job Docker API from the host and creates
+// sibling containers on the host containerd, so no capability inside the job
+// container is involved. (An older revision of this comment said to use
+// Kaniko or Buildah instead; that predates pkg/dind.)
 //
 // CAP_MKNOD is deliberately absent. It lets a process create device nodes,
 // which is the first step of the classic "mknod a block device for the host
@@ -882,7 +888,9 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		oci.WithEnv(envVars),
 		// Restrict capabilities to the minimum needed for CI jobs.
 		// This covers apt-get install, adduser, sudo, and service management.
-		// Docker-in-Docker is not supported (no CAP_SYS_ADMIN/CAP_NET_ADMIN).
+		// A nested dockerd is out of reach here (no CAP_SYS_ADMIN/CAP_NET_ADMIN);
+		// `docker` in the job is served by pkg/dind from the host instead —
+		// see containerCapabilities.
 		oci.WithCapabilities(containerCapabilities),
 	}
 	// Point the runner's tool cache at a path inside the image. Applied after
@@ -920,9 +928,21 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		opts = append(opts, oci.WithProcessArgs(cfg.Entrypoint...))
 	case jitConfig != "" && goruntime.GOOS == "windows":
 		// GitHub on Windows: wrap in cmd.exe redirect for log capture.
-		// Prepend C:\actions-runner to PATH so the docker.exe we copy into
-		// the runner dir (alongside run.cmd) is discoverable by job steps —
-		// docker/setup-buildx-action and friends look up `docker` in PATH.
+		//
+		// C:\actions-runner (RunnerMount) is prepended to PATH so anything a
+		// job drops next to run.cmd is on PATH for later steps.
+		//
+		// It does NOT put a docker CLI there, and no code in this repo ever
+		// has: a previous version of this comment claimed "the docker.exe we
+		// copy into the runner dir", which sent one investigation looking for
+		// a copy that does not exist. On Windows the docker CLI comes from the
+		// runner IMAGE (images/runner-ci-windows installs it at C:\go\bin) —
+		// so a Windows job running on a stock image, including the servercore
+		// default in image_windows.go and any image a workflow names in
+		// `container:`, has no `docker` on PATH and fails with
+		// "docker: command not found" the moment anything looks for one.
+		// Adding the binary would not by itself make `container:` work; see
+		// checkWindowsSiblingGate in pkg/dind for the half that is missing.
 		cmdLine := fmt.Sprintf(`set PATH=C:\actions-runner;%%PATH%% && %s --jitconfig %s > C:\actions-runner\runner.log 2>&1`, entrypoint, jitConfig)
 		opts = append(opts, oci.WithProcessArgs("cmd.exe", "/c", cmdLine))
 	case jitConfig != "":
