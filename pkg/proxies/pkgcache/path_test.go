@@ -223,8 +223,15 @@ func TestArtifactKeyIsStableAndSafe(t *testing.T) {
 			t.Errorf("artifact key for %q escaped the root: %q", u, p)
 		}
 	}
-	if ArtifactKey("https://a.test/x") != ArtifactKey("https://a.test/x") {
-		t.Error("ArtifactKey is not deterministic")
+	// Determinism: the same URL must key to the same artifact across calls, or
+	// a cached artifact becomes unfindable on the next request. Bound to
+	// variables rather than compared inline so this reads as two independent
+	// results — and so staticcheck can tell it apart from a self-comparison
+	// typo (SA4000).
+	firstKey := ArtifactKey("https://a.test/x")
+	againKey := ArtifactKey("https://a.test/x")
+	if firstKey != againKey {
+		t.Errorf("ArtifactKey is not deterministic: %q then %q", firstKey, againKey)
 	}
 	if ArtifactKey("https://a.test/x") == ArtifactKey("https://a.test/y") {
 		t.Error("ArtifactKey collided for different URLs")
