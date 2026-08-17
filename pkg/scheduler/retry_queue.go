@@ -461,6 +461,15 @@ func classifyErr(err error) errClass {
 		return errNonRetryable
 	}
 
+	// Cordon is a local refusal, not a platform failure. Retrying it would
+	// keep a cordoned node's retry ladder alive (and burn attempts) against
+	// a node that has been told to stop taking work, so drop it outright.
+	// The job stays queued on the platform for another node, or for this one
+	// after Uncordon.
+	if errors.Is(err, errCordoned) {
+		return errNonRetryable
+	}
+
 	// GitHub-specific rate limit errors  -  these are ALWAYS retryable.
 	var rle *gh.RateLimitError
 	if errors.As(err, &rle) {
