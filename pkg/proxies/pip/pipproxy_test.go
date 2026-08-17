@@ -1,4 +1,4 @@
-package pipproxy
+﻿package pipproxy
 
 import (
 	"encoding/json"
@@ -21,7 +21,7 @@ import (
 // --- harness ---------------------------------------------------------------
 
 // fakeIndex is a PEP 503/691 index that also serves the files it points at,
-// so the whole rewrite → download → cache path can be exercised end to end.
+// so the whole rewrite â†’ download â†’ cache path can be exercised end to end.
 type fakeIndex struct {
 	*httptest.Server
 	indexHits atomic.Int64
@@ -99,7 +99,7 @@ func newFakeIndex(t *testing.T) *fakeIndex {
 			      "hashes": {}
 			    }
 			  ]
-			}`, wheelName, idx.Server.URL, wheelName)
+			}`, wheelName, idx.URL, wheelName)
 			return
 		}
 
@@ -109,7 +109,7 @@ func newFakeIndex(t *testing.T) *fakeIndex {
 			`<a href="%s/packages/aa/bb/%s#sha256=cafebabe" data-core-metadata="sha256=d00dfeed">%s</a>`+
 			`<a href="../../packages/cc/dd/requests-2.30.0.tar.gz#sha256=beefcafe">requests-2.30.0.tar.gz</a>`+
 			`<a href="https://third-party.invalid/requests-9.9.9.tar.gz">requests-9.9.9.tar.gz</a>`+
-			`</body></html>`, idx.Server.URL, wheelName, wheelName)
+			`</body></html>`, idx.URL, wheelName, wheelName)
 	})
 
 	idx.Server = httptest.NewServer(mux)
@@ -326,7 +326,7 @@ func TestWheelIsCachedOnce(t *testing.T) {
 
 // TestPEP658MetadataFetch pins the subtle part of the artifact route: pip
 // appends ".metadata" to the URL WE advertised, and that must resolve to the
-// upstream .metadata file — not to the whole wheel.
+// upstream .metadata file â€” not to the whole wheel.
 func TestPEP658MetadataFetch(t *testing.T) {
 	t.Parallel()
 	idx := newFakeIndex(t)

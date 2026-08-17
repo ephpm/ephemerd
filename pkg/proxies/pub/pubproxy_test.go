@@ -1,4 +1,4 @@
-package pubproxy
+﻿package pubproxy
 
 import (
 	"encoding/json"
@@ -84,7 +84,7 @@ func newFakePub(t *testing.T) *fakePub {
 		      "retracted": true
 		    }
 		  ]
-		}`, pub.Server.URL, pub.Server.URL)
+		}`, pub.URL, pub.URL)
 	})
 
 	pub.Server = httptest.NewServer(mux)
