@@ -1,4 +1,4 @@
-package npmproxy
+﻿package npmproxy
 
 import (
 	"encoding/json"
@@ -74,7 +74,7 @@ func newFakeRegistry(t *testing.T) *fakeRegistry {
 		      "dist": {"tarball": "https://third-party.invalid/express-4.18.1.tgz"}
 		    }
 		  }
-		}`, reg.Server.URL)
+		}`, reg.URL)
 	})
 	reg.Server = httptest.NewServer(mux)
 	t.Cleanup(reg.Close)
@@ -205,7 +205,7 @@ func TestPackumentTarballsAreRewritten(t *testing.T) {
 	if !strings.HasPrefix(tarball, base+pkgcache.ArtifactRoute+"/") {
 		t.Errorf("dist.tarball = %q, want it rewritten to this proxy", tarball)
 	}
-	// Integrity metadata must survive untouched — npm verifies the bytes we
+	// Integrity metadata must survive untouched â€” npm verifies the bytes we
 	// serve against it, which is what makes the rewrite safe.
 	if got["integrity"] != "sha512-deadbeef" || got["shasum"] != "abc123" {
 		t.Errorf("integrity metadata was altered: %v", got)

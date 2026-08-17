@@ -305,7 +305,7 @@ func RegistryHostFromRef(ref string) string {
 	if i := strings.IndexByte(ref, '@'); i >= 0 {
 		ref = ref[:i]
 	}
-	first := ref
+	var first string
 	if i := strings.IndexByte(ref, '/'); i >= 0 {
 		first = ref[:i]
 	} else {
