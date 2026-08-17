@@ -234,7 +234,7 @@ runs-on: [self-hosted, linux, x64]
 
 ## Choosing the Image
 
-### Linux and Windows jobs (OCI containers)
+### Linux jobs (OCI containers)
 
 Use the standard `container:` key in your workflow. ephemerd's containerd pulls the image and runs the job inside it:
 
@@ -247,15 +247,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: make build
-
-  build-windows:
-    runs-on: [self-hosted, windows, x64]
-    container:
-      image: ghcr.io/myorg/windows-build:latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: nmake
 ```
+
+### Windows jobs (OCI containers)
+
+Windows jobs also run in OCI containers (Hyper-V isolated). The image is
+resolved the same way for every OS — workflow `container.image`, then the
+per-repo `[runner.images]` override, then the per-OS default, then a
+host-matched `mcr.microsoft.com/windows/servercore:ltsc20XX` fallback
+(`pkg/scheduler/scheduler.go`, `pkg/runtime/image_windows.go`).
+
+The configured default is the well-trodden path on Windows. Setting
+`container:` on a Windows job is **not** — see
+[Known Limitations](#known-limitations) before you reach for it.
 
 ### macOS jobs (VMs)
 
@@ -578,17 +582,26 @@ docker build -t ghcr.io/your-org/ephemerd-build:latest .
 docker push ghcr.io/your-org/ephemerd-build:latest
 ```
 
-The same image runs on every host — Linux directly, Windows via Hyper-V Linux VM, macOS via Virtualization.framework Linux VM.
+The same *Linux* image runs on every host — Linux directly, Windows via Hyper-V Linux VM, macOS via Virtualization.framework Linux VM. Windows-native jobs need a separate Windows-base image; see [docs/guides/runner-images.md](docs/guides/runner-images.md).
 
 ## Known Limitations
 
-**Windows `services:` / `container:` YAML keys** — GitHub's runner binary blocks these on Windows. Use `docker run` in job steps instead:
+**Windows `services:` / `container:` YAML keys — unverified, treat as unsupported.** These are not refused, and ephemerd has no code path that rejects them on Windows; they are simply not known to work end to end. What is actually known:
+
+- ephemerd *does* honour `container.image` on Windows for picking the runner container's image — image resolution is OS-agnostic (`pkg/scheduler/scheduler.go` `resolveImage`, `pkg/github/client.go` `FetchJobImage`).
+- The GitHub runner binary then does its own thing with `container:` / `services:`: it shells out to a Docker CLI and asks for a sibling container (`docker pull`, `docker create` with a long `-v` list, `docker exec` per step). It does not refuse on Windows — an observed Windows `container:` job got as far as looking for `docker.exe`.
+- The auto-detected Windows default image (`mcr.microsoft.com/windows/servercore:ltsc20XX`) ships **no Docker CLI**, so that lookup fails there. `images/runner-ci-windows/Dockerfile` installs one; a custom image would have to do the same.
+- Even with a Docker CLI present, the piece that makes sibling containers work — dind bind-mount translation — is written for a Linux runner container on overlayfs and takes POSIX source paths (`pkg/dind/bindtranslate.go`, `pkg/dind/containers.go` `buildBindMounts`). Windows-native `container:` is an explicit deferred follow-up in [docs/arch/dind-bind-translation.md](docs/arch/dind-bind-translation.md) ("needs its own translation layer or a clean 'not supported' rejection at request time"), and nothing in ephemerd's own CI exercises `container:` on any platform.
+
+So: no verdict either way. If you need sidecars on Windows today, drive them from job steps, which does not depend on any of the above:
 
 ```yaml
 - run: docker run -d --name mysql -p 3306:3306 mysql:8
 - run: run-tests.sh
 - run: docker stop mysql
 ```
+
+(This still needs a Docker CLI in the job image and `dind.enabled = true`.)
 
 **macOS builds require macOS** — the darwin binary uses Virtualization.framework (CGO + Apple SDK). Cross-compilation from Linux isn't possible. Build on a Mac or use GitHub's macOS hosted runners for the darwin release.
 
