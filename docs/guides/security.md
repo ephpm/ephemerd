@@ -40,7 +40,24 @@ This keeps jobs from scanning or reaching other machines on your LAN, cloud meta
 
 ### Linux and macOS — enforced
 
-On Linux this is enforced with iptables rules in the CNI bridge configuration. The container's own subnet (default `10.88.0.0/16`) is excluded so containers can reach their gateway for DNS and outbound NAT.
+On Linux this is enforced with iptables rules in the CNI bridge configuration. The container's own subnet (default `10.88.0.0/16`) is excluded so containers can talk to each other.
+
+There are two chains, because Linux routes the two kinds of traffic differently:
+
+- **`EPHEMERD-FORWARD`**, jumped from `FORWARD`, governs traffic the host *routes* on a container's behalf — everything bound for another machine. This is where the four private ranges above are rejected.
+- **`EPHEMERD-INPUT`**, jumped from `INPUT`, governs traffic a container addresses to the *host itself* — the bridge gateway (`10.88.0.1`), the host's own LAN address, or any other address the host owns. That traffic is delivered locally and never reaches `FORWARD`, so the rules above do not apply to it and a separate policy is required.
+
+`EPHEMERD-INPUT` is **default deny**. It allows only:
+
+- DNS (udp/tcp 53) to the bridge gateway;
+- the gateway ports ephemerd serves to jobs — today that is the Go module proxy's port, added only when `[module_proxy] enabled = true`;
+- replies to connections the host itself opened toward a container, and the host's own loopback traffic.
+
+Everything else a container sends to the host is dropped, including the rest of the gateway's ports, the host's LAN address, and the ephemerd control plane. The deny is a rule in ephemerd's own chain rather than a reliance on the host's `INPUT` policy, so a node whose policy is the usual `ACCEPT` is still covered. The Docker API that `dind` exposes to a job is a unix socket bind-mounted into the container on Linux, not a TCP port, so it is unaffected either way.
+
+The gateway allow-list is exposed to hostile job code with no authentication in front of it, so it stays as short as the features in use require. Control-plane ports are ignored rather than opened, even if something asks for them.
+
+IPv6 has no equivalent `INPUT` chain, deliberately: the CNI bridge is IPv4-only, so containers have no v6 address and no v6 path to the host. A v6 default-deny would have to match by destination and would break the host's own link-local traffic.
 
 On a Mac host there are two distinct job types, and they are enforced by two different mechanisms:
 
@@ -89,6 +106,20 @@ ip_pool         = "192.0.2.192/27"      # reserved range, see below
 - If `dind` or the Go module proxy is enabled, containers must be able to reach the host (that is how they reach the Docker API and `GOPROXY`), so a `/32` allow for the host is added automatically. Because a port-scoped Switch ACL disables the whole VFP port, that allow covers **all** host ports — so do not run anything on a Windows runner host that you would not expose to job containers. With both features disabled, the host stays blocked.
 - **Migrating an existing node requires a reboot**, not just a service restart: creating an L2Bridge network beside a live NAT network leaves HNS in a broken state. Reserve the pool, drain the node, set the keys, then reboot.
 - Anti-spoofing is not currently enforced — a container can forge a source address on the segment.
+
+#### What L2Bridge contains, and what it does not
+
+L2Bridge enforces where a container may send **unicast IP traffic**. The VFP ACL ladder blocks the RFC1918 ranges, the container's own subnet, and the default gateway, and job containers cannot address other machines on your LAN. That is the guarantee, and it holds.
+
+Because the host's `/32` allow cannot be port-scoped at the VFP layer, ephemerd adds a host-firewall backstop that blocks the dangerous Windows management ports from the container pool, on **both TCP and UDP**: 135 (RPC endpoint mapper), 139, 445 (SMB), 3389 (RDP, which negotiates a UDP transport on the same number), 5985/5986 (WinRM) and 47001 (WSMan). It also blocks the broadcast/multicast name-resolution protocols from the pool — NBNS (UDP 137), the NetBIOS datagram service (138), mDNS (5353) and LLMNR (5355) — so a job cannot poison the *host's* name resolution or answer its queries. The per-job `dind` allow is unaffected: it is a single TCP port scoped to the owning container's `/32`.
+
+What none of that contains:
+
+> **A job container on L2Bridge is a real L2 peer of your network for broadcast and multicast purposes.** It shares a broadcast domain with every other device on the segment. It can emit ARP, LLMNR, NBNS and mDNS onto that segment and see the broadcast and multicast traffic on it — including other hosts' name-resolution queries. The classic responder-style attack (answer a query first, capture a Net-NTLMv2 challenge/response from the asker, relay or crack it offline) is available against **other machines on the segment**, not against the ephemerd host.
+
+This is not a bug in the rule set and no host-side rule can fix it: a host firewall on the ephemerd node never sees traffic between two *other* L2 peers. It is inherent to putting containers on the LAN, which is the same property that makes VFP egress enforcement possible in the first place.
+
+**An isolated VLAN for the container pool is the real mitigation for that class**, and it pairs with L2Bridge rather than replacing it. Put `host_nic` on a VLAN (or a physically separate segment) that carries nothing but the container pool and the host's bridged address, with an uplink that denies RFC1918. The broadcast domain then contains only job containers, which have nothing to poison, and the VLAN's uplink policy backstops the VFP ladder with a control the job cannot reach at all. If your Windows runners handle untrusted code — public forks, third-party contributors — treat the VLAN as required rather than optional.
 
 ### Local runs
 

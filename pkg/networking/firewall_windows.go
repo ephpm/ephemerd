@@ -163,22 +163,92 @@ var windowsHostHardenPorts = []int{
 	47001, // WSMan / WinRM listener
 }
 
+// windowsHostHardenUDPPorts are the UDP counterparts of the management set.
+// The harden rules used to be TCP-only (issue #153), which left the host's UDP
+// listeners on the same services reachable from the pool even though the
+// documentation claimed "the dangerous management ports are blocked". Several
+// of these are real UDP services, not just symmetry: RDP negotiates a UDP
+// transport on 3389, and the RPC/NetBIOS/SMB stack has historically listened on
+// UDP 135/138/445. Blocking the rest costs nothing — the host has no reason to
+// serve a job container on any of them.
+var windowsHostHardenUDPPorts = []int{135, 139, 445, 3389, 5985, 5986, 47001}
+
+// windowsNameResolutionUDPPorts are the broadcast/multicast name-resolution
+// protocols a job container can use from its LAN-peer position on L2Bridge:
+// NBNS/NBT-NS (137), the NetBIOS datagram service (138), mDNS (5353) and LLMNR
+// (5355). This is the classic responder-style poisoning position — a container
+// that answers one of these first can capture a Net-NTLMv2 challenge/response
+// from whoever asked.
+//
+// These get rules with NO localip scope, unlike everything else in this file.
+// That is load-bearing: LLMNR and mDNS arrive at the multicast groups
+// (224.0.0.252, 224.0.0.251) and NBNS at the subnet broadcast, so the local
+// address on the packet is the group/broadcast address, not the host's unicast
+// address. A localip=<hostIP> rule would not match them at all — which is
+// exactly how a "we block those ports" rule set can block nothing. remoteip is
+// still the pool, so the block applies only to container-sourced traffic.
+//
+// Scope note: this stops the HOST from answering (and from being poisoned by) a
+// job container. It cannot stop a container from poisoning OTHER hosts on the
+// segment — a host firewall does not see traffic between two other L2 peers.
+// An isolated VLAN for the pool is the only thing that removes that; see
+// docs/guides/security.md.
+var windowsNameResolutionUDPPorts = []int{
+	137,  // NetBIOS name service (NBT-NS)
+	138,  // NetBIOS datagram service
+	5353, // mDNS
+	5355, // LLMNR
+}
+
+// hardenRulePrefix is the DisplayName prefix of every host-harden block. Swept
+// by prefix on removal so rules written by an older ephemerd — which named them
+// without a protocol segment — do not survive an upgrade.
+const hardenRulePrefix = firewallRulePrefix + "-l2b-harden-"
+
 // l2BridgeHostHardenRules returns the inbound host-firewall blocks that fence
-// the dangerous Windows management ports off from the container pool. Pure so
-// the set is unit-testable without netsh.
+// the dangerous Windows management ports off from the container pool, on TCP
+// and UDP, plus the unscoped-localip blocks for the multicast/broadcast name
+// resolution protocols. Pure so the set is unit-testable without netsh.
 func l2BridgeHostHardenRules(hostIP, ipPool string) []winFirewallRule {
 	if hostIP == "" || ipPool == "" {
 		return nil
 	}
-	rules := make([]winFirewallRule, 0, len(windowsHostHardenPorts))
-	for _, port := range windowsHostHardenPorts {
+
+	// Host management services: unicast to the host's bridged LAN address.
+	unicast := func(proto string, ports []int) []winFirewallRule {
+		out := make([]winFirewallRule, 0, len(ports))
+		for _, port := range ports {
+			out = append(out, winFirewallRule{
+				name: fmt.Sprintf("%s%s-%d", hardenRulePrefix, strings.ToLower(proto), port),
+				spec: []string{
+					"dir=in",
+					"action=block",
+					"protocol=" + proto,
+					"localip=" + hostIP,
+					"localport=" + strconv.Itoa(port),
+					"remoteip=" + ipPool,
+					"profile=any",
+					"enable=yes",
+				},
+			})
+		}
+		return out
+	}
+
+	rules := make([]winFirewallRule, 0,
+		len(windowsHostHardenPorts)+len(windowsHostHardenUDPPorts)+len(windowsNameResolutionUDPPorts))
+	rules = append(rules, unicast("TCP", windowsHostHardenPorts)...)
+	rules = append(rules, unicast("UDP", windowsHostHardenUDPPorts)...)
+
+	// Name resolution: no localip, so the multicast/broadcast destinations
+	// these actually arrive on are covered. See the var comment.
+	for _, port := range windowsNameResolutionUDPPorts {
 		rules = append(rules, winFirewallRule{
-			name: fmt.Sprintf("%s-l2b-harden-%d", firewallRulePrefix, port),
+			name: fmt.Sprintf("%snameres-udp-%d", hardenRulePrefix, port),
 			spec: []string{
 				"dir=in",
 				"action=block",
-				"protocol=TCP",
-				"localip=" + hostIP,
+				"protocol=UDP",
 				"localport=" + strconv.Itoa(port),
 				"remoteip=" + ipPool,
 				"profile=any",
@@ -186,6 +256,7 @@ func l2BridgeHostHardenRules(hostIP, ipPool string) []winFirewallRule {
 			},
 		})
 	}
+
 	return rules
 }
 
@@ -214,7 +285,10 @@ func (w *windowsNetworking) installL2BridgeFirewallRules() error {
 		installed++
 	}
 	w.cfg.Log.Info("L2Bridge host-firewall backstop installed",
-		"rules", installed, "hardened_ports", windowsHostHardenPorts)
+		"rules", installed,
+		"hardened_tcp_ports", windowsHostHardenPorts,
+		"hardened_udp_ports", windowsHostHardenUDPPorts,
+		"name_resolution_udp_ports", windowsNameResolutionUDPPorts)
 	return nil
 }
 
@@ -415,6 +489,13 @@ func (w *windowsNetworking) removeL2BridgeFirewallRules() {
 	// startup Cleanup must still reclaim them.
 	if err := powershell("Get-NetFirewallRule -DisplayName '" + hostPortRulePrefix + "*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue"); err != nil {
 		w.cfg.Log.Debug("failed to prefix-sweep L2Bridge host-port allows", "error", err)
+	}
+	// Prefix-sweep the host-harden blocks too. The delete-by-name loop above
+	// only knows the CURRENT names; an ephemerd that predates the UDP work
+	// wrote them as "<prefix>-l2b-harden-<port>" with no protocol segment, and
+	// those would otherwise survive every subsequent Cleanup.
+	if err := powershell("Get-NetFirewallRule -DisplayName '" + hardenRulePrefix + "*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue"); err != nil {
+		w.cfg.Log.Debug("failed to prefix-sweep L2Bridge host-harden blocks", "error", err)
 	}
 }
 

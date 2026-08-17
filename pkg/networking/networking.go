@@ -13,11 +13,18 @@ const DefaultSubnet = "10.88.0.0/16"
 
 // Config for container networking.
 type Config struct {
-	DataDir      string
-	Subnet       string // container subnet (auto-selected if empty)
-	MTU          int    // bridge MTU (auto-detected from host if 0)
-	CNIBinDir    string // path to CNI plugin binaries (Linux only, ignored elsewhere)
-	GatewayPorts []int  // extra TCP ports to allow from containers to the gateway (e.g., module proxy)
+	DataDir   string
+	Subnet    string // container subnet (auto-selected if empty)
+	MTU       int    // bridge MTU (auto-detected from host if 0)
+	CNIBinDir string // path to CNI plugin binaries (Linux only, ignored elsewhere)
+
+	// GatewayPorts are the extra TCP ports on the host/gateway address that a
+	// container may reach (e.g. the Go module proxy). On Linux this is a true
+	// allow-list: EPHEMERD-INPUT default-denies container→host traffic and
+	// admits only DNS plus these ports. Anything listed here is exposed to
+	// hostile job code, so list only services meant for jobs. Ports that are
+	// also ControlPorts are ignored rather than opened.
+	GatewayPorts []int
 
 	// ControlPorts are TCP ports the ephemerd control plane binds on the
 	// gateway (bridge) address that MUST NOT be reachable from inside
