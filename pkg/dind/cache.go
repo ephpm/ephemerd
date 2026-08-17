@@ -176,6 +176,17 @@ func MirrorImageToCache(ctx context.Context, c *client.Client, jobNS, cacheNS, i
 			return fmt.Errorf("update image %q in %s: %w", imageName, cacheNS, uerr)
 		}
 	}
+	if copied == 0 && jobImg.Target.Digest != "" {
+		// An Image record with no content buckets behind it is precisely
+		// the #138 state: the cache namespace pins nothing and the next
+		// job re-downloads the whole image. It is legitimate when the
+		// job namespace genuinely has no local blobs for the target (see
+		// TestMirrorImageToCache_ToleratesMissingContent), but it is never
+		// what we want, and at Debug nobody would ever see it.
+		log.Warn("dind cache: mirrored an image record with no content, next job will re-pull",
+			"image", imageName, "cache", cacheNS, "target", jobImg.Target.Digest)
+		return nil
+	}
 	log.Debug("dind cache: mirrored image",
 		"image", imageName, "cache", cacheNS, "content_refs", copied)
 	return nil
@@ -275,37 +286,117 @@ func presentDescriptors(ctx context.Context, cs content.Store, root ocispec.Desc
 	return out, nil
 }
 
+// mirrorAttempts bounds how many times copyContentRef will try to land a blob
+// bucket in the destination namespace. A retry only happens when containerd
+// reported the content as already present but the destination namespace turned
+// out not to hold a bucket for it, so one extra attempt is plenty.
+const mirrorAttempts = 2
+
 // copyContentRef makes desc resolvable in dstCtx's namespace, carrying over
 // the source blob's labels — which include the containerd.io/gc.ref.content.*
 // entries the mark phase follows from a manifest to its config and layers.
 // Without those the manifest bucket would survive a GC pass and its children
 // would not.
+//
+// Every path out of here either leaves a blob bucket for desc in dstCtx's
+// namespace or returns an error. AlreadyExists is never taken on trust: the
+// failure mode of #138 is a cache namespace holding an Image record and no
+// content, and swallowing an AlreadyExists we did not verify is the one way
+// this function could recreate it silently.
 func copyContentRef(srcCtx, dstCtx context.Context, cs content.Store, desc ocispec.Descriptor, labels map[string]string, log *slog.Logger) error {
-	// Already bucketed in the destination (re-mirror of a cached tag).
-	// Still refresh the labels so an entry written by an older ephemerd,
-	// or one whose gc.ref labels were incomplete, gets repaired.
-	if _, err := cs.Info(dstCtx, desc.Digest); err == nil {
-		if len(labels) == 0 {
+	var lastErr error
+	for attempt := range mirrorAttempts {
+		// Already bucketed in the destination (re-mirror of a cached tag).
+		// Still refresh the labels so an entry written by an older ephemerd,
+		// or one whose gc.ref labels were incomplete, gets repaired.
+		switch _, err := cs.Info(dstCtx, desc.Digest); {
+		case err == nil:
+			return refreshContentLabels(dstCtx, cs, desc, labels)
+		case !errdefs.IsNotFound(err):
+			return fmt.Errorf("destination info: %w", err)
+		}
+
+		err := writeContentRef(srcCtx, dstCtx, cs, desc, labels, ingestRef(desc, attempt), log)
+		if err == nil {
+			// containerd's Commit creates the bucket inside the same bolt
+			// transaction that records the blob, so this should always hold.
+			// Confirm it anyway — a mirror that reports success while the
+			// namespace pins nothing is exactly the bug being guarded here.
+			if _, ierr := cs.Info(dstCtx, desc.Digest); ierr != nil {
+				return fmt.Errorf("commit reported success but %s has no content reference: %w",
+					namespaceOf(dstCtx), ierr)
+			}
 			return nil
 		}
-		if _, uerr := cs.Update(dstCtx, content.Info{
-			Digest: desc.Digest,
-			Labels: labels,
-		}, "labels"); uerr != nil && !errdefs.IsNotFound(uerr) {
-			return fmt.Errorf("refresh labels: %w", uerr)
+		if !errdefs.IsAlreadyExists(err) {
+			return err
 		}
-		return nil
-	} else if !errdefs.IsNotFound(err) {
-		return fmt.Errorf("destination info: %w", err)
+		// containerd only answers AlreadyExists once it has seen a blob
+		// bucket for the digest in *this* namespace — both the metadata
+		// content store (metadata.contentStore.Writer's getBlobBucket
+		// branch) and the content gRPC service (which gates it on
+		// store.Info in the request's namespace) work that way. The
+		// backing-store hit under the "shared" sharing policy does not
+		// come back as AlreadyExists; it hands back a writer already at
+		// full offset. So AlreadyExists means the loop's next Info call
+		// finds the bucket and refreshes its labels. If it somehow does
+		// not, we retry the copy under a fresh ingest ref rather than
+		// returning a success that pinned nothing.
+		lastErr = err
+		log.Debug("dind cache: content reported as already present, re-checking",
+			"digest", desc.Digest, "attempt", attempt+1, "error", err)
 	}
+	return fmt.Errorf("content reported as already present but %s never got a content reference: %w",
+		namespaceOf(dstCtx), lastErr)
+}
 
+// ingestRef names the ingest used to copy desc. Stable across mirror passes so
+// an interrupted copy resumes rather than restarting; the attempt suffix only
+// appears on a retry, where reusing the ref would hit the same state again.
+func ingestRef(desc ocispec.Descriptor, attempt int) string {
+	ref := "ephemerd-dind-cache-" + desc.Digest.String()
+	if attempt > 0 {
+		ref = fmt.Sprintf("%s-retry%d", ref, attempt)
+	}
+	return ref
+}
+
+// namespaceOf is for error messages only; an unnamespaced context can't reach
+// here, but formatting an error is no place to fail.
+func namespaceOf(ctx context.Context) string {
+	ns, _ := namespaces.Namespace(ctx)
+	if ns == "" {
+		return "the cache namespace"
+	}
+	return ns
+}
+
+// refreshContentLabels re-stamps the source blob's labels onto a destination
+// bucket that already exists, repairing entries written by an older ephemerd
+// whose gc.ref labels were absent or incomplete.
+func refreshContentLabels(dstCtx context.Context, cs content.Store, desc ocispec.Descriptor, labels map[string]string) error {
+	if len(labels) == 0 {
+		return nil
+	}
+	if _, err := cs.Update(dstCtx, content.Info{
+		Digest: desc.Digest,
+		Labels: labels,
+	}, "labels"); err != nil && !errdefs.IsNotFound(err) {
+		return fmt.Errorf("refresh labels: %w", err)
+	}
+	return nil
+}
+
+// writeContentRef performs one copy attempt. It returns an AlreadyExists error
+// unwrapped so the caller can distinguish it; every other failure is wrapped.
+func writeContentRef(srcCtx, dstCtx context.Context, cs content.Store, desc ocispec.Descriptor, labels map[string]string, ref string, log *slog.Logger) error {
 	w, err := cs.Writer(dstCtx,
-		content.WithRef("ephemerd-dind-cache-"+desc.Digest.String()),
+		content.WithRef(ref),
 		content.WithDescriptor(desc),
 	)
 	if err != nil {
 		if errdefs.IsAlreadyExists(err) {
-			return nil
+			return err
 		}
 		return fmt.Errorf("open writer: %w", err)
 	}
@@ -338,7 +429,7 @@ func copyContentRef(srcCtx, dstCtx context.Context, cs content.Store, desc ocisp
 
 	if cerr := w.Commit(dstCtx, desc.Size, desc.Digest, content.WithLabels(labels)); cerr != nil {
 		if errdefs.IsAlreadyExists(cerr) {
-			return nil
+			return cerr
 		}
 		return fmt.Errorf("commit: %w", cerr)
 	}

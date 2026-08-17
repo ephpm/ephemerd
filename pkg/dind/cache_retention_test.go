@@ -51,10 +51,38 @@ func (s stagedImage) all() []ocispec.Descriptor {
 	return []ocispec.Descriptor{s.manifest, s.config, s.layer}
 }
 
+// stageImage writes the blobs under a lease and only drops it once the Image
+// record roots them.
+//
+// The lease is not decoration. Between `content.WriteBlob` committing a blob
+// and the Image record below naming it, nothing in the namespace roots that
+// blob, and containerd's GC scheduler fires on its own schedule — 100ms after
+// the daemon starts, and again every 100 metadata mutations
+// (plugins/gc/scheduler.go defaults). A pass landing in that window sweeps the
+// freshly staged blobs, `MirrorImageToCache` then finds nothing in the source
+// namespace to copy, and the test fails claiming the *cache* holds no content.
+// That is exactly how this test failed on Linux CI while passing locally: the
+// shared test daemon happened to start ~100ms before this test ran, so its
+// startup GC landed mid-staging. containerd's own pull path holds a lease over
+// the same window; so does MirrorImageToCache. Do the same here.
 func stageImage(t *testing.T, c *client.Client, ns, name, salt string) stagedImage {
 	t.Helper()
-	ctx := namespaces.WithNamespace(context.Background(), ns)
+	nsCtx := namespaces.WithNamespace(context.Background(), ns)
 	cs := c.ContentStore()
+
+	lm := c.LeasesService()
+	lease, err := lm.Create(nsCtx, leases.WithRandomID(), leases.WithExpiration(time.Hour))
+	if err != nil {
+		t.Fatalf("create staging lease in %s: %v", ns, err)
+	}
+	ctx := leases.WithLease(nsCtx, lease.ID)
+	defer func() {
+		// Runs after the Image record below exists, so the blobs stay
+		// rooted when the lease goes away.
+		if err := lm.Delete(nsCtx, lease); err != nil && !errdefs.IsNotFound(err) {
+			t.Errorf("release staging lease in %s: %v", ns, err)
+		}
+	}()
 
 	layerBytes := []byte("ephemerd-dind-cache-test-layer-" + salt + strings.Repeat("L", 8192))
 	layer := descFor(ocispec.MediaTypeImageLayer, layerBytes)
@@ -245,6 +273,26 @@ func TestCache_MirrorRetainsContentAcrossGC(t *testing.T) {
 
 	cached := stageImage(t, c, cachedJobNS, cachedName, "cached")
 	control := stageImage(t, c, controlJobNS, controlName, "control")
+
+	// Precondition, asserted rather than assumed: both job namespaces still
+	// hold the blobs they staged. A GC pass here is a no-op because the
+	// Image records root them — firing one deliberately takes the timing of
+	// containerd's own scheduler out of the picture, and turns "staging lost
+	// the blobs" into a failure that says so instead of one that blames the
+	// cache. This is what the Linux CI failure actually was.
+	forceContainerdGC(t, c)
+	for _, staged := range []struct {
+		ns  string
+		img stagedImage
+	}{{cachedJobNS, cached}, {controlJobNS, control}} {
+		stagedCtx := namespaces.WithNamespace(ctx, staged.ns)
+		for _, d := range staged.img.all() {
+			if _, err := cs.Info(stagedCtx, d.Digest); err != nil {
+				t.Fatalf("precondition: job namespace %s lost its staged %s (%s) before the mirror ran: %v",
+					staged.ns, d.MediaType, d.Digest, err)
+			}
+		}
+	}
 
 	// Only one of them goes through the cache.
 	if err := MirrorImageToCache(ctx, c, cachedJobNS, cacheNS, cachedName, log); err != nil {
