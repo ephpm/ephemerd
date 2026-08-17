@@ -27,9 +27,9 @@ func uninstallPlan(goos, dataDir string, keepData bool) string {
 		b.WriteString("  - remove leftover runtime state (network bridges, VM clones, CNI state)\n")
 	}
 	if keepData {
-		b.WriteString(fmt.Sprintf("  - KEEP the data directory: %s\n", dataDir))
+		fmt.Fprintf(&b, "  - KEEP the data directory: %s\n", dataDir)
 	} else {
-		b.WriteString(fmt.Sprintf("  - DELETE the entire data directory: %s\n", dataDir))
+		fmt.Fprintf(&b, "  - DELETE the entire data directory: %s\n", dataDir)
 		b.WriteString("    (config, logs, container images, job history — this is not recoverable)\n")
 	}
 	return b.String()

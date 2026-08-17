@@ -294,16 +294,13 @@ func (c *Cache) admit(key, path string, bytes int64) {
 	c.mu.Unlock()
 }
 
-// forget drops an entry from the index (used when a removal succeeds, and
-// when a body turns out to be unreadable).
-func (c *Cache) forget(key string) {
-	c.mu.Lock()
-	if e, ok := c.entries[key]; ok {
-		c.total -= e.bytes
-		delete(c.entries, key)
-	}
-	c.mu.Unlock()
-}
+// Removed: forget(key). Its doc claimed it ran "when a removal succeeds, and
+// when a body turns out to be unreadable", but it had no callers and neither
+// case would use it today. Eviction does its own accounting inline (see
+// evictLocked, which decrements and deletes under the lock it already holds),
+// and an unreadable sidecar deliberately leaves the entry indexed and servable
+// rather than dropping it (see readMeta). It was a leftover from an earlier
+// design, kept alive only by its comment.
 
 // evictLocked frees least-recently-used entries until the total is at or
 // below evictTarget of the budget. Caller must hold c.mu (New calls it
