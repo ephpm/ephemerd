@@ -90,7 +90,7 @@ graph TB
 
 ### One Image, Every Host
 
-OCI container images work everywhere. The same Dockerfile builds an image that runs on Linux directly, inside a Hyper-V Linux VM on Windows, and inside a Virtualization.framework Linux VM on macOS.
+Linux OCI images work everywhere. The same Dockerfile builds an image that runs on Linux directly, inside a Hyper-V Linux VM on Windows, and inside a Virtualization.framework Linux VM on macOS. (Windows-native jobs run Windows containers and need their own Windows-base image.)
 
 ```mermaid
 graph LR
@@ -257,9 +257,10 @@ per-repo `[runner.images]` override, then the per-OS default, then a
 host-matched `mcr.microsoft.com/windows/servercore:ltsc20XX` fallback
 (`pkg/scheduler/scheduler.go`, `pkg/runtime/image_windows.go`).
 
-The configured default is the well-trodden path on Windows. Setting
-`container:` on a Windows job is **not** — see
-[Known Limitations](#known-limitations) before you reach for it.
+Set the image through config, not through `container:`. Setting `container:`
+on a Windows job also drags in the runner's own sibling-container handling,
+which does not work on Windows — see
+[Known Limitations](#known-limitations).
 
 ### macOS jobs (VMs)
 
@@ -586,26 +587,21 @@ The same *Linux* image runs on every host — Linux directly, Windows via Hyper-
 
 ## Known Limitations
 
-**Windows `services:` / `container:` YAML keys — unverified, treat as unsupported.** These are not refused, and ephemerd has no code path that rejects them on Windows; they are simply not known to work end to end. What is actually known:
+**Windows `services:` / `container:` YAML keys — not supported.** A Windows-native job that sets either key fails. *Where* it fails depends on your image and on your ephemerd version; *that* it fails is structural. The reason is not the one this section used to give: GitHub's runner binary does not block container operations on Windows. It tries, and the attempt fails further down. What actually happens:
 
-- ephemerd *does* honour `container.image` on Windows for picking the runner container's image — image resolution is OS-agnostic (`pkg/scheduler/scheduler.go` `resolveImage`, `pkg/github/client.go` `FetchJobImage`).
-- The GitHub runner binary then does its own thing with `container:` / `services:`: it shells out to a Docker CLI and asks for a sibling container (`docker pull`, `docker create` with a long `-v` list, `docker exec` per step). It does not refuse on Windows — an observed Windows `container:` job got as far as looking for `docker.exe`.
-- The auto-detected Windows default image (`mcr.microsoft.com/windows/servercore:ltsc20XX`) ships **no Docker CLI**, so that lookup fails there. `images/runner-ci-windows/Dockerfile` installs one; a custom image would have to do the same.
-- Even with a Docker CLI present, the piece that makes sibling containers work — dind bind-mount translation — is written for a Linux runner container on overlayfs and takes POSIX source paths (`pkg/dind/bindtranslate.go`, `pkg/dind/containers.go` `buildBindMounts`). Windows-native `container:` is an explicit deferred follow-up in [docs/arch/dind-bind-translation.md](docs/arch/dind-bind-translation.md) ("needs its own translation layer or a clean 'not supported' rejection at request time"), and nothing in ephemerd's own CI exercises `container:` on any platform.
+- ephemerd *does* honour `container.image` on Windows for picking the runner container's image — image resolution is OS-agnostic (`pkg/scheduler/scheduler.go` `resolveImage`, `pkg/github/client.go` `FetchJobImage`). That part works, and is the only part that does.
+- The runner binary then handles `container:` / `services:` itself: it shells out to a Docker CLI and asks for a *sibling* container (`docker pull`, `docker create` with a long `-v` list, `docker exec` per step). It does not refuse on Windows — an observed Windows `container:` job got as far as looking for `docker.exe`.
+- The auto-detected Windows default image (`mcr.microsoft.com/windows/servercore:ltsc20XX`, `pkg/runtime/image_windows.go`) ships **no Docker CLI**, so on that image the failure is a missing `docker.exe`. `images/runner-ci-windows/Dockerfile` installs one; a custom image would have to do the same.
+- Supplying a Docker CLI only moves the failure deeper. The fake daemon's container-create path is built for Linux and only Linux: it asks containerd for a `linux/<arch>` platform spec, the `overlayfs` snapshotter and the `io.containerd.runc.v2` runtime (`pkg/dind/containers.go` `handleContainerCreate`). A Windows containerd offers none of those — its snapshotters are `windows` / `windows-lcow` (`pkg/dind/cleanup.go`). The bind-mount translation behind it is likewise written for a Linux runner container on overlayfs with POSIX source paths (`pkg/dind/bindtranslate.go`). Depending on the version you run, this surfaces either as an explicit "not implemented" from the daemon or as a raw snapshotter/runtime error out of containerd.
+- Windows-native `container:` is an explicit deferred follow-up in [docs/arch/dind-bind-translation.md](docs/arch/dind-bind-translation.md) — "needs its own translation layer or a clean 'not supported' rejection at request time". Nothing in ephemerd's CI exercises `container:` on any platform, so the failure modes above are read off the code rather than off a red test.
 
-So: no verdict either way. If you need sidecars on Windows today, drive them from job steps, which does not depend on any of the above:
+The same limit applies to the `docker run` workaround this section used to recommend: on a Windows-native job it runs into exactly the same wall. Container *creation* through the fake daemon is Linux-only. `docker build` and `docker push` are not — those route to the embedded BuildKit solver and are exercised on Windows by this repo's own `build-images.yml`.
 
-```yaml
-- run: docker run -d --name mysql -p 3306:3306 mysql:8
-- run: run-tests.sh
-- run: docker stop mysql
-```
-
-(This still needs a Docker CLI in the job image and `dind.enabled = true`.)
+Linux jobs are unaffected on every host, including Windows hosts: those run inside the Hyper-V Linux VM, where a separate ephemerd process runs as Linux against a Linux containerd. `container:` and `docker run` work there.
 
 **macOS builds require macOS** — the darwin binary uses Virtualization.framework (CGO + Apple SDK). Cross-compilation from Linux isn't possible. Build on a Mac or use GitHub's macOS hosted runners for the darwin release.
 
-**Docker-in-Docker (fake daemon)** — ephemerd mounts a fake Docker Engine API socket at `/var/run/docker.sock` inside each job container. `docker pull`, `docker run`, `docker build`, and `docker push` all work — the fake daemon translates Docker API calls into containerd operations on the host. No real Docker daemon runs, no privileged containers, no `CAP_SYS_ADMIN`. Sidecars created via `docker run` are sibling containers on the same network. Enable with `dind.enabled = true` in config. See [docs/architecture/fake-docker-daemon.md](docs/architecture/fake-docker-daemon.md) for the full design.
+**Docker-in-Docker (fake daemon)** — ephemerd mounts a fake Docker Engine API socket at `/var/run/docker.sock` inside each Linux job container (VM-isolated and Windows-native jobs get the same API over `DOCKER_HOST=tcp://…` instead, since a bind-mounted socket cannot cross a kernel boundary). For Linux jobs `docker pull`, `docker run`, `docker build`, and `docker push` all work; on Windows-native jobs `docker run` does not, per the entry above. The fake daemon translates Docker API calls into containerd operations on the host. No real Docker daemon runs, no privileged containers, no `CAP_SYS_ADMIN`. Sidecars created via `docker run` are sibling containers on the same network. Enable with `dind.enabled = true` in config. See [docs/architecture/fake-docker-daemon.md](docs/architecture/fake-docker-daemon.md) for the full design.
 
 **ARM64 Windows** — ephemerd supports it at the infrastructure level, but PHP and most build toolchains don't ship ARM64 Windows binaries yet.
 
