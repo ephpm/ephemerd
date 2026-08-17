@@ -33,6 +33,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/ephpm/ephemerd/pkg/buildkit"
 	"github.com/ephpm/ephemerd/pkg/networking"
+	"github.com/ephpm/ephemerd/pkg/registrymirror"
 )
 
 // sharedNamespace is the containerd namespace used by ephemerd for runner
@@ -47,26 +48,34 @@ type Server struct {
 	jobID          string
 	jobNamespace   string // per-job containerd namespace for isolation
 	cacheNamespace string // per-(provider,repo) shared image cache namespace; empty disables caching
-	sockPath       string // host-side unix socket path (Linux/macOS only)
-	endpoint       string // what the container should set DOCKER_HOST to (e.g. "tcp://gw:port" on Windows)
+	transport      Transport // how the API is exposed to the job container; see listen.go
+	dockerDir      string    // <DataDir>/jobs/<JobID>/docker — per-job scratch, exists on every transport
+	sockPath       string    // host-side unix socket path; empty on the TCP transport
+	endpoint       string    // what the container should set DOCKER_HOST to (e.g. "tcp://gw:port")
 	listener       net.Listener
 	server         *http.Server
 	client         *client.Client
 	network        *networking.Manager
-	// listenPort is the TCP port the Windows listener bound (0 on the unix
-	// socket transport). Recorded by listen(); the host-firewall allow for it
-	// is opened later by SetRunnerIP, once the runner container's address is
-	// known. See listen_windows.go for why the two cannot happen together.
+	// listenPort is the TCP port the listener bound (0 on the unix socket
+	// transport). Recorded by listen(); the firewall allow for it is opened
+	// later by SetRunnerIP, once the runner container's address is known.
+	// See listenTCP in listen.go for why the two cannot happen together.
 	listenPort int
-	// hostPort / hostPortIP identify the host-firewall allow opened for this
-	// job's listener on the Windows L2Bridge path: the port, and the single
-	// container address it was scoped to. Both are needed to remove it again —
-	// the rule name keys on both. hostPort == 0 means nothing is open.
+	// hostPort / hostPortIP identify the firewall allow opened for this job's
+	// TCP listener: the port, and the single container address it was scoped
+	// to. Both are needed to remove it again — the rule keys on both.
+	// hostPort == 0 means nothing is open.
 	hostPort        int
 	hostPortIP      string
 	buildkit        *buildkit.Server // shared embedded BuildKit solver (nil → fall back to platform default)
 	runnerNetNS     string           // path to runner container's net namespace; used to install DNAT rules for port bindings
 	allowPrivileged bool             // gate for docker run --privileged / --cap-add; see config.DindConfig.AllowPrivileged
+
+	// mirror routes this job's image pulls through a LAN pull-through
+	// cache. Nil means no mirror and every pull path below is unchanged.
+	// This is the hot one: dind pulls into a per-job namespace, so the
+	// same base image is re-fetched for essentially every job.
+	mirror *registrymirror.Mirror
 
 	// runnerSnapshotKey identifies the containerd snapshot backing the
 	// runner container that owns this dind socket. Used to resolve sibling
@@ -167,6 +176,20 @@ type Config struct {
 	// the threat model.
 	AllowPrivileged bool
 
+	// RegistryMirror routes this job's image pulls through a LAN
+	// pull-through cache. Nil disables mirroring, leaving the pulls
+	// identical to what they were before the feature existed.
+	RegistryMirror *registrymirror.Mirror
+
+	// Transport selects how the Docker API is exposed to the job container:
+	// a bind-mounted unix socket (the default and only supported option
+	// under runc) or a TCP port on the container network's gateway. Leave it
+	// zero for the platform default; set TransportTCP when the job container
+	// is VM-isolated and therefore has its own kernel, which is what makes a
+	// bind-mounted socket unusable. Ignored on Windows, which is always TCP.
+	// See listen.go.
+	Transport Transport
+
 	Log *slog.Logger
 }
 
@@ -177,12 +200,20 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("creating docker dir: %w", err)
 	}
 
-	// Use a short socket name — Unix sockets have a 108-byte path limit.
-	sockPath := filepath.Join(dockerDir, "d.sock")
+	transport := resolveTransport(cfg.Transport, platformGOOS)
 
-	// Remove stale socket from a previous crash (best-effort, may not exist)
-	if err := os.Remove(sockPath); err != nil && !os.IsNotExist(err) {
-		cfg.Log.Debug("removing stale socket", "path", sockPath, "error", err)
+	// Use a short socket name — Unix sockets have a 108-byte path limit.
+	// Only the unix transport gets one: on TCP, sockPath stays empty so
+	// SocketPath() reports "no socket to mount" and the runtime injects
+	// DOCKER_HOST instead of a bind mount.
+	var sockPath string
+	if transport == TransportUnixSocket {
+		sockPath = filepath.Join(dockerDir, "d.sock")
+
+		// Remove stale socket from a previous crash (best-effort, may not exist)
+		if err := os.Remove(sockPath); err != nil && !os.IsNotExist(err) {
+			cfg.Log.Debug("removing stale socket", "path", sockPath, "error", err)
+		}
 	}
 
 	s := &Server{
@@ -191,12 +222,15 @@ func New(cfg Config) (*Server, error) {
 		// rejects slashes. Use hyphens to namespace per-job dind state.
 		jobNamespace:    "ephemerd-dind-" + cfg.JobID,
 		cacheNamespace:  CacheNamespace(cfg.Provider, cfg.Repo),
+		transport:       transport,
+		dockerDir:       dockerDir,
 		sockPath:        sockPath,
 		client:          cfg.Client,
 		network:         cfg.Network,
 		buildkit:        cfg.BuildKit,
 		runnerNetNS:     cfg.RunnerNetNS,
 		allowPrivileged: cfg.AllowPrivileged,
+		mirror:          cfg.RegistryMirror,
 		log:             cfg.Log.With("component", "dind", "job_id", cfg.JobID),
 		images:          make(map[string]*imageEntry),
 		containers:      make(map[string]*containerEntry),
@@ -207,10 +241,21 @@ func New(cfg Config) (*Server, error) {
 	return s, nil
 }
 
-// SocketPath returns the host-side Unix socket path (Linux/macOS).
-// Empty on Windows — use Endpoint() to get the DOCKER_HOST value instead.
+// SocketPath returns the host-side Unix socket path to bind-mount into the
+// job container at /var/run/docker.sock.
+//
+// Empty whenever this server is on the TCP transport — always on Windows, and
+// on Linux when the job container is VM-isolated. An empty result is the
+// runtime's signal to inject DOCKER_HOST from Endpoint() instead of mounting
+// anything; it is not an error.
 func (s *Server) SocketPath() string {
 	return s.sockPath
+}
+
+// Transport reports how this server exposes the Docker API to its job
+// container.
+func (s *Server) Transport() Transport {
+	return s.transport
 }
 
 // SetRunnerNetNS records the runner container's net namespace path so the
@@ -224,12 +269,15 @@ func (s *Server) SetRunnerNetNS(netnsPath string) {
 }
 
 // SetRunnerIP records the address the network assigned to this job's runner
-// container and opens the host-firewall allow that lets exactly that container
-// — and nothing else — reach this server's TCP listener.
+// container and opens the firewall allow that lets exactly that container —
+// and nothing else — reach this server's TCP listener.
 //
-// Windows L2Bridge only. Everywhere else it is a no-op: the unix-socket
-// transport binds no TCP port at all (listenPort stays 0), and the Windows NAT
-// path has no host-firewall carve-out to make.
+// Applies to every TCP-transport server: BOTH Windows paths — L2Bridge and the
+// default NAT network, where the Docker API listens on the bridge gateway and
+// the host firewall default-denies the container's inbound connection to it
+// (#162) — and the Linux VM-isolated (Kata) path, where the allow is an
+// iptables pair scoped to containerIP/32. A no-op only on the unix-socket
+// transport, which binds no TCP port at all (listenPort stays 0).
 //
 // SECURITY. The allow is scoped to containerIP/32 rather than to the container
 // pool because the Docker API this port serves does no authentication
@@ -315,29 +363,34 @@ func (s *Server) SetRunnerRootfs(snapshotKey string, runnerRootfsPath string, bi
 }
 
 // Endpoint returns the value a container should set DOCKER_HOST to in order
-// to reach this fake daemon. Linux/macOS return the unix socket path directly
-// (e.g. "unix:///var/run/docker.sock" once bind-mounted); Windows returns a
-// "tcp://<gateway-ip>:<port>" URI pointing at a TCP listener bound on the
-// HCN NAT gateway so containers on the NAT can reach it without any mount.
+// to reach this fake daemon. On the unix-socket transport that is the host
+// socket path (the container instead sees it bind-mounted at the standard
+// location, so DOCKER_HOST is not normally needed); on the TCP transport it
+// is a "tcp://<gateway-ip>:<port>" URI the guest reaches over IP.
 func (s *Server) Endpoint() string {
 	return s.endpoint
 }
 
-// Start begins serving the fake Docker API.
+// Start begins serving the fake Docker API on the server's transport.
 //
-// Linux/macOS: listens on a per-job unix socket at <DataDir>/jobs/<jobID>/docker/d.sock.
-// Windows: listens on TCP on the HCN NAT gateway IP (picked from networking.Manager)
-// so Hyper-V-isolated runner containers on the same NAT can reach it without a
-// runhcs bind mount (which isn't supported) or named pipe sharing (which needs
-// HCS config for isolated containers).
+// Unix socket (default on Linux/macOS under runc): a per-job socket at
+// <DataDir>/jobs/<jobID>/docker/d.sock, bind-mounted into the container.
+//
+// TCP (always on Windows; on Linux when the job container is VM-isolated):
+// an ephemeral port on the container network's gateway, handed to the job as
+// DOCKER_HOST. A guest with its own kernel cannot use a bind-mounted socket,
+// and runhcs supports neither that bind nor named-pipe sharing.
 func (s *Server) Start() error {
 	ln, err := s.listen()
 	if err != nil {
 		return err
 	}
-	// Make socket world-accessible so non-root container processes can connect.
-	if err := os.Chmod(s.sockPath, 0o666); err != nil {
-		s.log.Warn("failed to chmod docker socket", "error", err)
+	// Make socket world-accessible so non-root container processes can
+	// connect. No-op on TCP, which has no socket file.
+	if s.sockPath != "" {
+		if err := os.Chmod(s.sockPath, 0o666); err != nil {
+			s.log.Warn("failed to chmod docker socket", "error", err)
+		}
 	}
 	s.listener = ln
 
@@ -352,7 +405,7 @@ func (s *Server) Start() error {
 		}
 	}()
 
-	s.log.Info("fake docker daemon started", "endpoint", s.endpoint)
+	s.log.Info("fake docker daemon started", "endpoint", s.endpoint, "transport", string(s.transport))
 	return nil
 }
 
@@ -399,10 +452,10 @@ func (s *Server) Stop() {
 			s.log.Debug("closing listener", "error", err)
 		}
 	}
-	// Remove the L2Bridge host-firewall allow opened for this job's listener.
-	// The container address is half the rule name, so it has to go back in for
-	// the delete to find the right rule — and, crucially, only that rule: a
-	// port-only name would let this teardown revoke a concurrent job's allow.
+	// Remove the firewall allow opened for this job's TCP listener. The
+	// container address is half the rule, so it has to go back in for the
+	// delete to find the right one — and, crucially, only that one: a
+	// port-only match would let this teardown revoke a concurrent job's allow.
 	if s.hostPort != 0 && s.network != nil {
 		s.network.CloseHostPort(s.hostPort, s.hostPortIP)
 		s.hostPort = 0
@@ -410,9 +463,8 @@ func (s *Server) Stop() {
 	}
 
 	// Clean up the socket and job docker directory
-	dockerDir := filepath.Dir(s.sockPath)
-	if err := os.RemoveAll(dockerDir); err != nil {
-		s.log.Warn("failed to clean docker dir", "path", dockerDir, "error", err)
+	if err := os.RemoveAll(s.dockerDir); err != nil {
+		s.log.Warn("failed to clean docker dir", "path", s.dockerDir, "error", err)
 	}
 
 	s.log.Info("fake docker daemon stopped")
@@ -679,7 +731,18 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	jobCtx := namespaces.WithNamespace(ctx, s.jobNamespace)
 
-	img, err := s.client.Pull(jobCtx, ref, client.WithPullUnpack)
+	// Route through the LAN pull-through cache when one is configured, and
+	// carry any `docker login` credentials for this registry. Both are
+	// no-ops when unconfigured/absent, leaving the call as it was.
+	//
+	// The per-job namespace re-pull described above is precisely what makes
+	// this the highest-value mirror site in the daemon: the resolve and the
+	// layer fetches happen for essentially every job, so with a mirror they
+	// land on the LAN instead of the WAN.
+	s.mirror.LogPull(ref)
+	pullOpts := append([]client.RemoteOpt{client.WithPullUnpack}, s.pullRemoteOpts(r, ref)...)
+
+	img, err := s.client.Pull(jobCtx, ref, pullOpts...)
 	if err != nil {
 		writeProgress(fmt.Sprintf("Error: %v", err))
 		return
@@ -717,18 +780,22 @@ func (s *Server) handleImagePull(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
-	// Mirror the Image record into the per-repo cache namespace so the
-	// gc.ref labels keep the manifest+config+layer blobs alive after the
-	// per-job namespace is cleaned up. Next job in the same repo gets a
-	// content-store hit. Cross-repo / cross-provider jobs do NOT see this
-	// cache record (namespace isolation), so private images don't leak.
+	// Mirror the image — Image record plus a content reference for every
+	// blob in its DAG — into the per-repo cache namespace, so the
+	// manifest+config+layer blobs survive the per-job namespace cleanup
+	// and containerd's GC. Next job in the same repo gets a content-store
+	// hit instead of a network pull. Cross-repo / cross-provider jobs do
+	// NOT see this cache namespace, so private images don't leak.
 	if s.cacheNamespace != "" {
 		// Mirror both the qualified ref (what containerd pulled under)
 		// and the unqualified docker-CLI form, so future cache hits via
 		// either name work.
 		for _, name := range dedup(ref, unqualifiedRef) {
 			if err := MirrorImageToCache(ctx, s.client, s.jobNamespace, s.cacheNamespace, name, s.log); err != nil {
-				s.log.Debug("dind cache: mirror failed", "image", name, "error", err)
+				// Not fatal to the job, but it means the next job for
+				// this repo re-downloads the whole image — worth seeing.
+				s.log.Warn("dind cache: mirror failed, next job will re-pull",
+					"image", name, "error", err)
 			}
 		}
 	}

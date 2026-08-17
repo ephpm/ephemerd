@@ -60,9 +60,48 @@ func managedCaches() []cacheEntry {
 			LiveSafe:    true,
 		},
 		{
+			// Live-safe because the proxy only ever reads these files and
+			// re-fetches on a miss. The running daemon also bounds this one
+			// itself — goproxy.Proxy.Prune evicts LRU-first down to
+			// [module_proxy].max_cache_gb every [module_proxy].prune_interval
+			// — so a manual clear here is a "start cold now", not the thing
+			// keeping the cache from filling the disk.
 			Name:        "gomod",
 			Rel:         filepath.Join("cache", "gomod"),
 			Description: "Go module proxy cache (GOPROXY) served to job containers",
+			LiveSafe:    true,
+		},
+		{
+			Name: "cargo",
+			Rel:  filepath.Join("cache", "cargo"),
+			Description: "Cargo proxy cache (crates.io sparse index, .crate tarballs, rustup toolchains) " +
+				"served to job containers",
+			// Live-safe: every entry is a pull-through copy of public
+			// registry content, so a running job that misses simply
+			// refetches it. The generated container config that jobs
+			// bind-mount deliberately lives OUTSIDE this dir (<data>/cargo),
+			// so clearing the cache cannot yank it from a running job.
+			LiveSafe: true,
+		},
+		{
+			Name:        "npm",
+			Rel:         filepath.Join("cache", "npm"),
+			Description: "npm registry proxy cache (packuments + tarballs) served to job containers",
+			// Live-safe: every entry is a pull-through copy of public
+			// registry content, so a running job that misses simply
+			// refetches it from the origin.
+			LiveSafe: true,
+		},
+		{
+			Name:        "pip",
+			Rel:         filepath.Join("cache", "pip"),
+			Description: "pip/PyPI proxy cache (simple index pages + wheels/sdists) served to job containers",
+			LiveSafe:    true,
+		},
+		{
+			Name:        "pub",
+			Rel:         filepath.Join("cache", "pub"),
+			Description: "pub.dev proxy cache (version listings + package archives) served to job containers",
 			LiveSafe:    true,
 		},
 		{

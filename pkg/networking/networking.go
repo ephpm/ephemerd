@@ -152,8 +152,14 @@ type SetupResult struct {
 	// EndpointID is the HCN endpoint ID (Windows only). Used to attach
 	// the network to the container via the OCI spec.
 	EndpointID string
-	// IP is the container's IP address on the bridge network.
-	// Populated on Linux from the CNI result; empty on other platforms.
+	// IP is the container's IP address on the container network. Populated on
+	// Linux from the CNI result, and on Windows from the HCN endpoint — the
+	// address ephemerd pinned on the L2Bridge path, the one HNS allocated on
+	// the NAT path. Empty on macOS.
+	//
+	// Not informational: it is the scope of the per-job dind host-firewall
+	// allow (see OpenHostPort). An empty IP on a platform that needs one costs
+	// the job its Docker access, by design.
 	IP string
 }
 
@@ -177,10 +183,16 @@ type platformNetworking interface {
 
 	// openHostPort / closeHostPort open and close a scoped host-firewall
 	// inbound allow for one TCP port, from ONE container to the host.
-	// Needed only on the Windows L2Bridge path: the VFP host /32 allow lets a
-	// container's packet leave its port toward the host, but the host's own
-	// inbound Windows Firewall default-denies it, so per-job services ephemerd
-	// binds on the host (the dind Docker API) are otherwise unreachable.
+	//
+	// Needed on BOTH Windows paths, because on Windows the dind Docker API is
+	// served over TCP on a host address (runhcs supports neither a bind-mounted
+	// unix socket nor named-pipe sharing), so a container reaching its own dind
+	// is making an INBOUND connection to the host — which the host's Windows
+	// Firewall default-denies. On L2Bridge the allow is scoped to the host's LAN
+	// address; on NAT to the bridge gateway (10.88.0.1). Without it the SYN is
+	// dropped and every docker command in the job dies with an i/o timeout
+	// (#162). Also used on the Linux VM-isolated (Kata) path, where the job
+	// container likewise reaches dind over TCP.
 	//
 	// containerIP is the address of the container the port is being opened FOR,
 	// and the allow is scoped to that /32 — never to the whole pool. The dind
@@ -189,7 +201,7 @@ type platformNetworking interface {
 	// malformed containerIP is an error, not a reason to widen the scope.
 	//
 	// Scoped to remoteip=<containerIP>/32, localport=<port> so ONLY that
-	// service opens — RDP/SMB/RPC stay blocked. No-op on NAT and non-Windows.
+	// service opens — RDP/SMB/RPC stay blocked. No-op on macOS.
 	openHostPort(port int, containerIP string) error
 	closeHostPort(port int, containerIP string)
 }
@@ -234,17 +246,34 @@ func (m *Manager) GatewayIP() string {
 		}
 	}
 
-	subnet := m.cfg.Subnet
+	return gatewayForSubnet(m.cfg.Subnet)
+}
+
+// fallbackGateway is the address returned when no usable container subnet is
+// configured. It is the first usable address of DefaultSubnet, and the value
+// the Windows NAT network is created with (network_windows.go).
+const fallbackGateway = "10.88.0.1"
+
+// gatewayForSubnet returns the bridge gateway address for a container subnet:
+// its first usable address (x.x.x.1). Empty or unparseable input falls back to
+// fallbackGateway.
+//
+// Split out of GatewayIP because the Windows NAT host-port allow must be scoped
+// to exactly the address dind bound its listener to. Two independent
+// derivations of "the gateway" that drifted apart would produce a firewall rule
+// for an address nothing is listening on — an allow that silently admits
+// nothing, which is precisely the failure mode of #162.
+func gatewayForSubnet(subnet string) string {
 	if subnet == "" {
 		subnet = DefaultSubnet
 	}
 	ip, _, err := net.ParseCIDR(subnet)
 	if err != nil {
-		return "10.88.0.1"
+		return fallbackGateway
 	}
 	ip4 := ip.To4()
 	if ip4 == nil {
-		return "10.88.0.1"
+		return fallbackGateway
 	}
 	ip4[3] = 1
 	return ip4.String()
@@ -258,9 +287,9 @@ func (m *Manager) InstallFirewallRules() error {
 // OpenHostPort opens a scoped host-firewall inbound allow for one TCP port from
 // the single container at containerIP to the host, so a per-job service
 // ephemerd binds on the host (dind's Docker API) is reachable from THAT job's
-// container and no other. Only the Windows L2Bridge path does anything;
-// elsewhere it is a no-op. Pair with CloseHostPort on teardown, passing the
-// same containerIP.
+// container and no other. Both Windows paths (L2Bridge and the default NAT
+// network) and the Linux VM-isolated path install a rule; macOS is a no-op.
+// Pair with CloseHostPort on teardown, passing the same containerIP.
 //
 // Returns an error rather than opening anything when containerIP is empty or
 // unparseable — see the platformNetworking doc for why widening is not a

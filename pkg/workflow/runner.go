@@ -16,6 +16,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/cni"
 	ctdpkg "github.com/ephpm/ephemerd/pkg/containerd"
 	"github.com/ephpm/ephemerd/pkg/networking"
+	"github.com/ephpm/ephemerd/pkg/registrymirror"
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -50,7 +51,10 @@ type Runner struct {
 	SocketPath string // optional: containerd socket override for isolation from the service
 	Image      string // container image; empty falls back to defaultImage
 	Network    NetworkOptions
-	Log        *slog.Logger
+	// RegistryMirror routes the image pull through a LAN pull-through cache
+	// when the node's config.toml configures one. Nil leaves the pull alone.
+	RegistryMirror *registrymirror.Mirror
+	Log            *slog.Logger
 }
 
 // gitInfo holds repository metadata sniffed from the local git repo.
@@ -125,7 +129,9 @@ func (r *Runner) RunJob(ctx context.Context, jobName string, job Job, repoDir st
 
 	r.Log.Info("pulling image", "ref", imageRef)
 	if _, err := ctrdClient.GetImage(nsCtx, imageRef); err != nil {
-		if _, err := ctrdClient.Pull(nsCtx, imageRef, client.WithPullUnpack); err != nil {
+		r.RegistryMirror.LogPull(imageRef)
+		pullOpts := append([]client.RemoteOpt{client.WithPullUnpack}, r.RegistryMirror.PullOpts(nil)...)
+		if _, err := ctrdClient.Pull(nsCtx, imageRef, pullOpts...); err != nil {
 			return fmt.Errorf("pulling image %s: %w", imageRef, err)
 		}
 	}

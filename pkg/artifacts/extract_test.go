@@ -117,7 +117,8 @@ func TestListContents_NonexistentDir(t *testing.T) {
 func TestNewExtractor_NilClient(t *testing.T) {
 	// NewExtractor should not panic with nil client
 	// (it will fail on Extract(), but construction is fine)
-	e := NewExtractor(nil, testLogger())
+	// A nil mirror is the no-mirror case: pulls go straight to the origin.
+	e := NewExtractor(nil, nil, testLogger())
 	if e == nil {
 		t.Fatal("NewExtractor() returned nil")
 	}
