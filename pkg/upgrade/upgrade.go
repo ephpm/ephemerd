@@ -33,6 +33,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -72,6 +73,50 @@ const (
 	// is safe precisely because a restart that took effect would already
 	// have terminated us.
 	restartAttempts = 2
+
+	// defaultStallTimeout is how long the release download may make NO
+	// progress before it is abandoned.
+	//
+	// This is the one hole the rest of the cordon-safety machinery could not
+	// close. Every *error* path un-cordons, but a download that neither
+	// fails nor finishes produces no error to un-cordon on: the HTTP client
+	// has no timeout by design (the asset is ~1 GB and a slow link is not a
+	// failure), the only cancellation is the caller's context, and the
+	// caller here is a hypervisor guest-agent exec that is never actually
+	// killed when the operator's side gives up polling it. A blackholed TCP
+	// connection therefore parks io.Copy forever with the scheduler
+	// cordoned — a node that looks healthy and silently takes no work.
+	//
+	// A stall, unlike a slow transfer, is unambiguous: zero bytes for two
+	// minutes on a connection that is supposed to be streaming means the
+	// path is gone. Aborting turns the hang into an ordinary error, which
+	// the existing defer un-cordons.
+	defaultStallTimeout = 2 * time.Minute
+
+	// defaultInstallTimeout bounds the cordoned-but-not-yet-swapped window:
+	// download, checksum verify, extract and probe.
+	//
+	// The stall timeout above covers the failure mode we know about, and
+	// only while bytes are supposed to be moving. This is the backstop for
+	// the rest: a transfer that dribbles forever without ever stalling, and
+	// anything future code adds between the cordon and the swap. It
+	// interrupts the downloads directly and stops everything else at the
+	// next phase boundary (see the arming site for exactly how far it
+	// reaches).
+	//
+	// 30 minutes is chosen to be unreachable by a healthy upgrade rather
+	// than tight: the fleet's slowest real one — a ~984 MB Windows zip —
+	// goes cordon-to-swap in about 40 seconds. It does imply a floor of
+	// roughly 550 KB/s sustained across the whole install phase, below which
+	// a genuinely healthy but very slow upgrade would be aborted. That is a
+	// safe way to fail (the node keeps its old binary and goes back to
+	// serving) and the fleet has three orders of magnitude of headroom, but
+	// it is a real number, not an arbitrary one: raise InstallTimeout for a
+	// node on a link that slow.
+	//
+	// It deliberately starts AFTER the drain wait, which has its own
+	// (much longer, job-length) timeout and is not a hang when it is slow.
+	defaultInstallTimeout = 30 * time.Minute
 )
 
 // versionRe matches release tags: vX.Y.Z with an optional prerelease
@@ -143,6 +188,14 @@ type RunOptions struct {
 	// evidence of success is process death.
 	Shutdown <-chan struct{}
 
+	// StallTimeout abandons the download when it makes no progress for this
+	// long. Zero means defaultStallTimeout; negative disables the check.
+	StallTimeout time.Duration
+
+	// InstallTimeout bounds everything between the end of the drain and the
+	// binary swap. Zero means defaultInstallTimeout; negative disables it.
+	InstallTimeout time.Duration
+
 	// Test/override seams.
 	InstallPath     string                            // default: resolved os.Executable()
 	StageDir        string                            // default: <installdir>/.ephemerd-upgrade
@@ -172,6 +225,15 @@ type RunOptions struct {
 // simply never restarts us — un-cordons the scheduler, because a node that is
 // drained and NOT upgraded is worse than one that never attempted the
 // upgrade: it looks healthy while quietly accepting no work.
+//
+// Those paths all assume the upgrade eventually STOPS. The remaining way to
+// hold a cordon forever is to hang, so the downloads carry a stall timeout and
+// the post-drain phase carries an install budget that interrupts them and
+// halts the local steps at the next phase boundary. Both turn a hang into an
+// error, which the un-cordon above then handles like any other.
+//
+// A hard kill of the daemon needs no handling: `draining` lives only in the
+// scheduler's memory, so a process that dies cordoned comes back up serving.
 func Run(ctx context.Context, opts RunOptions, emit Emit) (retErr error) {
 	log := opts.Log
 	if log == nil {
@@ -275,6 +337,57 @@ func Run(ctx context.Context, opts RunOptions, emit Emit) (retErr error) {
 		}
 	}
 
+	// 2b. Arm the cordon backstop. From here to the swap the node is drained
+	// and doing work that has no business taking long; if it does, the
+	// upgrade is wedged and the cordon is the damage. Cancelling this context
+	// makes that surface as an ordinary error, which runs the un-cordon above.
+	//
+	// Its reach is worth being precise about, because the cancel only bites
+	// where something reads the context:
+	//
+	//   - The two downloads (steps 4 and 5) abort mid-transfer. They are the
+	//     steps that can wedge indefinitely, and the only ones the budget
+	//     interrupts.
+	//   - Checksum verify, extract and probe do not take a context at all
+	//     (probeVersion carries its own 30s timeout). A wedge inside one of
+	//     those runs to completion; the budget then stops the upgrade at the
+	//     next phase boundary instead of mid-step.
+	//
+	// The boundary checks are what make the abort honest rather than
+	// advisory: without them the watchdog could log "aborting", have its
+	// cancel read by nobody, and the upgrade would go on to swap and restart
+	// — a log that contradicts what the daemon actually did.
+	//
+	// Armed only now, after the drain: waiting on somebody's 40-minute job is
+	// slow on purpose, and waitDrain already bounds that itself.
+	//
+	// Note the budget is armed whether or not we cordoned (NoDrain, or a nil
+	// Drainer): bounding a wedged upgrade is worth doing regardless, there is
+	// simply no cordon to release in that case.
+	installed := func() {} // disarms the backstop once the swap has landed
+	if installTimeout := orDuration(opts.InstallTimeout, defaultInstallTimeout); installTimeout > 0 {
+		var cancelInstall context.CancelFunc
+		ctx, cancelInstall = context.WithCancel(ctx)
+		defer cancelInstall()
+		expired := new(atomic.Bool)
+		watchdog := time.AfterFunc(installTimeout, func() {
+			expired.Store(true)
+			log.Error("upgrade: install phase exceeded its budget; aborting so the node does not stay cordoned",
+				"budget", installTimeout, "target", target)
+			cancelInstall()
+		})
+		installed = func() { watchdog.Stop() }
+		defer watchdog.Stop()
+		// Rewrite the cause on the way out: a bare "context canceled" from
+		// deep inside io.Copy would otherwise be the only trace of this.
+		defer func() {
+			if retErr != nil && expired.Load() {
+				retErr = fmt.Errorf("upgrade exceeded its %s install budget and was aborted (node stays on %s): %w",
+					installTimeout, current, retErr)
+			}
+		}()
+	}
+
 	// 3. Prepare a staging dir on the SAME filesystem as the install path so
 	// the swap is an atomic rename. Removed on exit; the .old backup lives
 	// beside the install path and survives.
@@ -292,8 +405,9 @@ func Run(ctx context.Context, opts RunOptions, emit Emit) (retErr error) {
 	base := baseURL(target, opts.BaseURLOverride)
 	archiveURL := base + "/" + assetName
 	archivePath := filepath.Join(stageDir, assetName)
+	stallTimeout := orDuration(opts.StallTimeout, defaultStallTimeout)
 	emit(Progress{State: StateDownloading, Message: "downloading " + assetName, CurrentVersion: current, TargetVersion: target})
-	if err := downloadFile(ctx, client, archiveURL, archivePath, func(done, total int64) {
+	if err := downloadFile(ctx, client, archiveURL, archivePath, stallTimeout, func(done, total int64) {
 		emit(Progress{State: StateDownloading, Message: "downloading " + assetName, CurrentVersion: current, TargetVersion: target, BytesDownloaded: done, BytesTotal: total})
 	}); err != nil {
 		return fail("downloading %s: %w", archiveURL, err)
@@ -304,7 +418,7 @@ func Run(ctx context.Context, opts RunOptions, emit Emit) (retErr error) {
 	// untouched.
 	emit(Progress{State: StateVerifying, Message: "verifying checksum", CurrentVersion: current, TargetVersion: target})
 	sumsPath := filepath.Join(stageDir, checksumsName)
-	if err := downloadFile(ctx, client, base+"/"+checksumsName, sumsPath, nil); err != nil {
+	if err := downloadFile(ctx, client, base+"/"+checksumsName, sumsPath, stallTimeout, nil); err != nil {
 		return fail("downloading %s: %w", checksumsName, err)
 	}
 	sumsData, err := os.ReadFile(sumsPath)
@@ -321,6 +435,9 @@ func Run(ctx context.Context, opts RunOptions, emit Emit) (retErr error) {
 	}
 	if err := verifyChecksum(archivePath, want); err != nil {
 		return fail("%w — refusing to install; node stays on %s", err, current)
+	}
+	if err := ctx.Err(); err != nil {
+		return fail("aborted before staging: %w", err)
 	}
 
 	// 6. Stage: extract the binary and, when it can run on this host, probe
@@ -347,11 +464,20 @@ func Run(ctx context.Context, opts RunOptions, emit Emit) (retErr error) {
 
 	// 7. Swap. Past this line the on-disk binary has changed; the previous
 	// one is retained as <name>.old for rollback.
+	//
+	// Last chance to honor an abort: everything above is reversible by doing
+	// nothing, and this is the step that stops being true of.
+	if err := ctx.Err(); err != nil {
+		return fail("aborted before swapping the binary: %w", err)
+	}
 	emit(Progress{State: StateSwapping, Message: "installing new binary", CurrentVersion: current, TargetVersion: target})
 	backup, err := swapBinary(installPath, stagedBin)
 	if err != nil {
 		return fail("swapping binary at %s: %w", installPath, err)
 	}
+	// The cordon is now the restart supervisor's problem, not the install
+	// backstop's; from here the node is SUPPOSED to be down briefly.
+	installed()
 	log.Info("upgrade: binary swapped", "install", installPath, "backup", backup, "from", current, "to", target)
 
 	// 8. Restart into the new binary. Emit RESTARTING first (this is the last
@@ -610,18 +736,28 @@ func verifyChecksum(path, want string) error {
 }
 
 // countingReader wraps an io.Reader, reporting cumulative bytes read through
-// onProgress at most every ~250ms (plus a final call at EOF).
+// onProgress at most every ~250ms (plus a final call at EOF), and kicking a
+// stall watchdog on every read that actually moved bytes.
+//
+// The watchdog is what makes a wedged transfer fail instead of hang. It is
+// reset per read rather than per progress tick because the progress callback
+// is rate-limited and a 250ms floor would make "no progress" and "no callback"
+// two different things.
 type countingReader struct {
 	r          io.Reader
 	total      int64
 	done       int64
 	onProgress func(done, total int64)
 	last       time.Time
+	alive      func() // reset the stall watchdog; nil when disabled
 }
 
 func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	c.done += int64(n)
+	if n > 0 && c.alive != nil {
+		c.alive()
+	}
 	if c.onProgress != nil {
 		now := time.Now()
 		if err != nil || now.Sub(c.last) >= 250*time.Millisecond {
@@ -635,37 +771,72 @@ func (c *countingReader) Read(p []byte) (int, error) {
 // downloadFile GETs url into dest, fsyncing before returning. onProgress may
 // be nil. The archive is bounded (a release binary), so it streams straight
 // to disk.
-func downloadFile(ctx context.Context, client *http.Client, url, dest string, onProgress func(done, total int64)) error {
+//
+// stallTimeout aborts the transfer when no bytes arrive for that long; <= 0
+// disables the check and restores the old wait-forever behavior. It covers
+// the response headers too, so a connection that is accepted and then goes
+// quiet fails at the same bound as one that dies mid-body.
+func downloadFile(ctx context.Context, client *http.Client, url, dest string, stallTimeout time.Duration, onProgress func(done, total int64)) error {
+	stalled := new(atomic.Bool)
+	var alive func()
+	if stallTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		watchdog := time.AfterFunc(stallTimeout, func() {
+			stalled.Store(true)
+			cancel()
+		})
+		defer watchdog.Stop()
+		alive = func() { watchdog.Reset(stallTimeout) }
+	}
+	// Translate the cancellation back into something an operator can act on;
+	// "context canceled" alone reads like the caller went away.
+	stallErr := func(err error) error {
+		if err != nil && stalled.Load() {
+			return fmt.Errorf("transfer stalled: no data for %s: %w", stallTimeout, err)
+		}
+		return err
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("building request: %w", err)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return stallErr(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("GET %s: %s", url, resp.Status)
+	}
+	if alive != nil {
+		alive()
 	}
 
 	f, err := os.Create(dest)
 	if err != nil {
 		return err
 	}
-	src := io.Reader(resp.Body)
-	if onProgress != nil {
-		src = &countingReader{r: resp.Body, total: resp.ContentLength, onProgress: onProgress}
-	}
+	src := io.Reader(&countingReader{r: resp.Body, total: resp.ContentLength, onProgress: onProgress, alive: alive})
 	if _, err := io.Copy(f, src); err != nil { //nolint:gosec // release asset, bounded size
 		_ = f.Close()
-		return err
+		return stallErr(err)
 	}
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
 		return err
 	}
 	return f.Close()
+}
+
+// orDuration resolves a zero-means-default, negative-means-disabled knob.
+func orDuration(v, def time.Duration) time.Duration {
+	if v == 0 {
+		return def
+	}
+	return v
 }
 
 // probeVersion runs `<path> --version` and extracts the reported version.
