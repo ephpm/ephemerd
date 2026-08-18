@@ -197,6 +197,11 @@ func TestContainerListEmpty(t *testing.T) {
 
 func TestContainerCreateNoClient(t *testing.T) {
 	s := newTestServer(t)
+	// Pin the Linux rules: on a Windows host checkWindowsSiblingGate short-
+	// circuits with 501 before the nil-client check ever runs, which is its
+	// own assertion (TestContainerCreateOverHTTP_RejectedOnWindowsHost) and
+	// not what this test is about.
+	setPlatformGOOS(t, "linux")
 	client := dialServer(s)
 
 	body, _ := json.Marshal(map[string]any{"Image": "alpine:latest"})

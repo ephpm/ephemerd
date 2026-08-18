@@ -228,6 +228,60 @@ func checkPrivilegedGate(allowPrivileged bool, hc *hostConfig) (msg string, bloc
 	return "", false
 }
 
+// checkWindowsSiblingGate returns a user-facing rejection message and
+// blocked=true when a sibling-container create is attempted on a Windows host.
+//
+// Everything this handler builds below is Linux-only, and not incidentally so:
+//
+//   - the OCI spec base is pinned to "linux/<arch>" (see targetPlatform below),
+//   - the snapshotter is "overlayfs", which is not a plugin Windows containerd
+//     loads at all — it has "windows" and "windows-lcow",
+//   - the runtime is "io.containerd.runc.v2"; Windows has "io.containerd.runhcs.v1",
+//   - /etc/hosts, /etc/hostname and /etc/resolv.conf are bind-mounted in as
+//     Type:"bind" mounts, which runhcs does not accept, and
+//   - buildBindMounts resolves every `-v` source through the runner snapshot's
+//     overlayfs upper/lowerdirs, which a windowsfilter snapshot does not have
+//     (see docs/arch/dind-bind-translation.md, "Windows").
+//
+// Left ungated, containerd rejects the create somewhere in that stack with a
+// message about a missing snapshotter — true, but three layers removed from
+// the thing the operator actually did. This is the "clean 'not supported'
+// rejection at request time" that dind-bind-translation.md lists as the
+// alternative to building a Windows translation layer.
+//
+// The rest of the daemon is unaffected: `docker version`, `info`, `pull`,
+// `push`, `images` and `build` (BuildKit, which does have a Windows worker —
+// see pkg/dind/buildkit_build.go) all work on Windows hosts and are what the
+// Windows legs of build-images.yml and containment.yml exercise today. Only
+// POST /containers/create routes here; see TestWindowsHost_OnlyCreateIsGated.
+//
+// SCOPE, so nobody expects more of this than it gives: this does NOT fix the
+// `container:` failure that motivated it. A stock Windows image carries no
+// docker CLI at all, so that job dies at PATH resolution ("docker: command not
+// found") without ever opening a connection here, and this gate never fires.
+// It matters only for an image that DOES ship a CLI — images/runner-ci-windows,
+// or a workflow that installs one — which is exactly the case that would
+// otherwise get an unreadable missing-snapshotter error. The operator-visible
+// signal for the stock-image case is the scheduler warning in resolveImage.
+//
+// Pure function, same rationale as checkPrivilegedGate: platform validation of
+// the request, no containerd client required, trivially testable from a Linux
+// test run.
+func checkWindowsSiblingGate(goos string) (msg string, blocked bool) {
+	if goos != "windows" {
+		return "", false
+	}
+	return "ephemerd's Docker shim cannot create containers on a Windows host: every sibling " +
+		"container it builds is a Linux container (linux/<arch> OCI spec, overlayfs snapshotter, " +
+		"io.containerd.runc.v2 runtime), none of which exist on Windows containerd. " +
+		"docker version/info/pull/push/images/build do work here. " +
+		"If this came from a GitHub Actions job that declares `container:` on a Windows runner: " +
+		"ephemerd already runs the job's steps inside that image (it resolves `container:` to the " +
+		"runner image itself), but the Actions runner additionally asks this daemon to create its " +
+		"own job container, and that half is not implemented. Drop `container:` from the Windows " +
+		"leg and select the image with [runner.images.<repo>].windows instead", true
+}
+
 func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	var req createRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -250,6 +304,14 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	if msg, blocked := checkPrivilegedGate(s.allowPrivileged, req.HostConfig); blocked {
 		s.log.Warn("rejecting elevated container request", "image", req.Image, "reason", msg)
 		writeJSON(w, http.StatusForbidden, map[string]string{"message": msg})
+		return
+	}
+
+	// Same placement rationale: a platform check on the request, not on
+	// runtime state, so it runs before the client check and needs no client.
+	if msg, blocked := checkWindowsSiblingGate(platformGOOS); blocked {
+		s.log.Warn("rejecting container create on a Windows host", "image", req.Image, "reason", msg)
+		writeJSON(w, http.StatusNotImplemented, map[string]string{"message": msg})
 		return
 	}
 
@@ -314,7 +376,10 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 		RefreshLastAccessed(r.Context(), s.client, s.cacheNamespace, req.Image, s.log)
 	}
 
-	// Build OCI spec. Always target Linux — dind containers are Linux.
+	// Build OCI spec. Always target Linux — dind containers are Linux. This
+	// is load-bearing rather than a default: checkWindowsSiblingGate above
+	// rejects the request outright on a Windows host precisely because this
+	// line, the snapshotter and the runtime below cannot be satisfied there.
 	//
 	// Apply Docker's entrypoint/cmd override semantics on top of the image config:
 	//   Entrypoint nil  + Cmd nil   → image ENTRYPOINT + image CMD       (image as-is)
