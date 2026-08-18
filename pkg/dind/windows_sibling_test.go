@@ -3,6 +3,7 @@ package dind
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -11,6 +12,11 @@ import (
 // setPlatformGOOS overrides the package's platform variable for one test and
 // restores it afterwards, so both the Linux and the Windows branch of
 // checkWindowsSiblingGate are exercised on whichever host runs the suite.
+//
+// This mutates a package-level global, so it is only safe while no test in
+// pkg/dind calls t.Parallel() — none does today. If one ever does, this has to
+// become a field on Server (plumbed from the package var at New) before the
+// parallel test lands, or these tests will flake against it.
 func setPlatformGOOS(t *testing.T, goos string) {
 	t.Helper()
 	prev := platformGOOS
@@ -134,5 +140,94 @@ func TestContainerCreateOverHTTP_RejectedOnWindowsHost(t *testing.T) {
 	}()
 	if resp.StatusCode != http.StatusNotImplemented {
 		t.Errorf("status = %d, want 501", resp.StatusCode)
+	}
+}
+
+// The gate's blast radius is the whole point of it being narrow: version,
+// info, images, pull, push and build all work on Windows hosts today, and the
+// Windows legs of build-images.yml and containment.yml depend on that. Only
+// POST /containers/create may be refused.
+//
+// Nothing else asserts this. It is structurally true — checkWindowsSiblingGate
+// has exactly one call site — but "structurally true" is what someone believes
+// right up until they hoist the check into ServeHTTP or a middleware to be
+// tidy. This fails the moment that happens.
+//
+// Assertion is deliberately "not 501 with our message" rather than a specific
+// status: these handlers legitimately return 500 with a nil containerd client,
+// and pinning their real statuses would make this a change-detector for
+// unrelated work.
+func TestWindowsHost_OnlyCreateIsGated(t *testing.T) {
+	ungated := []struct {
+		name, method, path string
+	}{
+		{"version", http.MethodGet, "/version"},
+		{"info", http.MethodGet, "/info"},
+		{"ping", http.MethodGet, "/_ping"},
+		{"image list", http.MethodGet, "/images/json"},
+		{"image pull", http.MethodPost, "/images/create?fromImage=alpine&tag=latest"},
+		{"image push", http.MethodPost, "/images/alpine%3Alatest/push"},
+		{"build", http.MethodPost, "/build"},
+		{"container list", http.MethodGet, "/containers/json"},
+		{"network list", http.MethodGet, "/networks"},
+		{"network create", http.MethodPost, "/networks/create"},
+		{"system df", http.MethodGet, "/system/df"},
+	}
+
+	for _, tc := range ungated {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServer(t)
+			setPlatformGOOS(t, "windows")
+			client := dialServer(s)
+
+			req, err := http.NewRequest(tc.method, "http://docker"+tc.path, strings.NewReader("{}"))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("%s %s: %v", tc.method, tc.path, err)
+			}
+			defer func() {
+				if err := resp.Body.Close(); err != nil {
+					t.Logf("closing response body: %v", err)
+				}
+			}()
+
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			if strings.Contains(string(body), "cannot create containers on a Windows host") {
+				t.Errorf("%s %s was refused by the sibling gate (status %d): %s",
+					tc.method, tc.path, resp.StatusCode, body)
+			}
+		})
+	}
+}
+
+// And the gate is not method-blind: only POST /containers/create routes to the
+// gated handler. A GET of the same path must fall through untouched.
+func TestWindowsHost_ContainerCreateGateIsMethodScoped(t *testing.T) {
+	s := newTestServer(t)
+	setPlatformGOOS(t, "windows")
+	client := dialServer(s)
+
+	resp, err := client.Get("http://docker/containers/create")
+	if err != nil {
+		t.Fatalf("GET /containers/create: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("closing response body: %v", err)
+		}
+	}()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if strings.Contains(string(body), "cannot create containers on a Windows host") {
+		t.Errorf("GET was gated; the gate must be scoped to POST: %s", body)
 	}
 }

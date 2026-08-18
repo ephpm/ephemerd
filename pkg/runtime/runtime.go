@@ -929,8 +929,12 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	case jitConfig != "" && goruntime.GOOS == "windows":
 		// GitHub on Windows: wrap in cmd.exe redirect for log capture.
 		//
-		// C:\actions-runner (RunnerMount) is prepended to PATH so anything a
-		// job drops next to run.cmd is on PATH for later steps.
+		// C:\actions-runner (RunnerMount) is prepended to PATH. Why is not
+		// recorded anywhere we can find, and the reason the comment used to
+		// give was false (see below) — so treat it as load-bearing-unknown
+		// rather than guessing a new rationale on top of a wrong one. It is
+		// harmless and jobs may depend on it; establish what depends on it
+		// before removing it.
 		//
 		// It does NOT put a docker CLI there, and no code in this repo ever
 		// has: a previous version of this comment claimed "the docker.exe we

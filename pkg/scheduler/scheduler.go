@@ -122,7 +122,14 @@ func (s *Scheduler) resolveImage(ctx context.Context, event *providers.JobEvent,
 		// the stock Windows images carry no docker CLI, and pkg/dind cannot
 		// create Windows sibling containers at all (checkWindowsSiblingGate).
 		// The job fails with "docker: command not found" in Set up job, which
-		// says nothing about why — so say it here, where we know.
+		// says nothing about why — so say it here, where we know. On a stock
+		// Windows image this log line is the ONLY signal: the job never gets
+		// far enough to reach dind's gate.
+		//
+		// Reached for `container:` only. A job that declares `services:` has
+		// the same problem and gets no warning, because parseContainerImage
+		// (pkg/github/client.go) reads the `container` key and nothing else.
+		// Widening it means parsing `services:` purely to warn about it.
 		if os == "windows" && s.cfg.Log != nil {
 			s.cfg.Log.Warn("job declares container: on a Windows runner — expect it to fail in Set up job",
 				"image", img, "repo", event.Repo, "job_id", event.JobID,

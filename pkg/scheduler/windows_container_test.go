@@ -80,8 +80,12 @@ func TestResolveImage_QuietWhenWindowsImageIsNotFromContainerDirective(t *testin
 }
 
 // `container:` on Linux and macOS is the path that works, and stays silent.
+//
+// Both macOS spellings are covered on purpose: handleLocalJob passes "macos"
+// (jobOS) while the mac-VM path passes "darwin" — see the two resolveImage
+// call sites. Testing only one would leave the other free to regress.
 func TestResolveImage_QuietForContainerJobsOnOtherOSes(t *testing.T) {
-	for _, jobOS := range []string{"linux", "macos"} {
+	for _, jobOS := range []string{"linux", "macos", "darwin"} {
 		t.Run(jobOS, func(t *testing.T) {
 			img, logged := resolveImageWithLog(t, "golang:1.26.6-bookworm", jobOS)
 			if img != "golang:1.26.6-bookworm" {

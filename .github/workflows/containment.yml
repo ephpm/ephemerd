@@ -1091,8 +1091,14 @@ jobs:
             $e = Join-Path $env:RUNNER_TEMP 'sibling.err'
             docker create --name ephemerd-sibling-probe ephemerd-sibling-probe-nonexistent:latest > $o 2> $e
             $code = $LASTEXITCODE
+            # WinPS 5.1 wraps a native command's stderr in a NativeCommandError
+            # record even when it is redirected to a file, so $raw carries a
+            # "+ CategoryInfo ..." backtrace after the real message. Flatten,
+            # keep the daemon's sentence, drop the wrapper.
             $raw = (Get-Content $e -Raw -ErrorAction SilentlyContinue) + (Get-Content $o -Raw -ErrorAction SilentlyContinue)
             $msg = ($raw -replace '\s+', ' ').Trim()
+            $msg = ($msg -split ' At .+?:\d+ char:\d+')[0].Trim()
+            if ($msg.Length -gt 400) { $msg = $msg.Substring(0, 400) + ' ...' }
 
             if ($code -eq 0) {
               Bad 'docker create must not succeed' "exit 0 - a sibling container was created on Windows"
@@ -1110,7 +1116,16 @@ jobs:
           }
 
           Write-Output ''
-          if ($global:fail -eq 0) { Write-Output '== sibling: all checks passed' }
+          # The `exit 0` is load-bearing, do not drop it to match the other
+          # steps. actions/runner appends
+          #   if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }
+          # to every powershell script (ScriptHandlerHelpers.FixUpScriptContents).
+          # This is the only step here whose PASS path ends with a native
+          # command that deliberately exited non-zero, so falling off the end
+          # would hand docker's exit code to that line and fail the step
+          # precisely when the assertion held. Every other step in this file is
+          # safe only by accident of ending on a cmdlet.
+          if ($global:fail -eq 0) { Write-Output '== sibling: all checks passed'; exit 0 }
           else { Write-Output "== sibling: $global:fail FAILURE(S)"; exit 1 }
 
       - name: Egress and host admin ports (gates only on L2Bridge)

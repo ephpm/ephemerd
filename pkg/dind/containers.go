@@ -252,7 +252,17 @@ func checkPrivilegedGate(allowPrivileged bool, hc *hostConfig) (msg string, bloc
 // The rest of the daemon is unaffected: `docker version`, `info`, `pull`,
 // `push`, `images` and `build` (BuildKit, which does have a Windows worker —
 // see pkg/dind/buildkit_build.go) all work on Windows hosts and are what the
-// Windows legs of build-images.yml and containment.yml exercise today.
+// Windows legs of build-images.yml and containment.yml exercise today. Only
+// POST /containers/create routes here; see TestWindowsHost_OnlyCreateIsGated.
+//
+// SCOPE, so nobody expects more of this than it gives: this does NOT fix the
+// `container:` failure that motivated it. A stock Windows image carries no
+// docker CLI at all, so that job dies at PATH resolution ("docker: command not
+// found") without ever opening a connection here, and this gate never fires.
+// It matters only for an image that DOES ship a CLI — images/runner-ci-windows,
+// or a workflow that installs one — which is exactly the case that would
+// otherwise get an unreadable missing-snapshotter error. The operator-visible
+// signal for the stock-image case is the scheduler warning in resolveImage.
 //
 // Pure function, same rationale as checkPrivilegedGate: platform validation of
 // the request, no containerd client required, trivially testable from a Linux
