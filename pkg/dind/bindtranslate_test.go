@@ -34,6 +34,9 @@ func testServer() *Server {
 	return &Server{
 		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		mu:  sync.Mutex{},
+		// Translation policy only — see unstagedTestStager for why these
+		// tests cannot exercise the real staging mount and what does.
+		stager: unstagedTestStager{},
 	}
 }
 
@@ -53,8 +56,8 @@ func TestTranslateBindSource_UpperdirMatch_ReturnsReadWrite(t *testing.T) {
 		t.Fatalf("translate: %v", err)
 	}
 	want := path.Join(upper, "home/runner/_work/_temp")
-	if got.HostPath != want {
-		t.Errorf("HostPath = %q, want %q", got.HostPath, want)
+	if got.ResolvedPath != want {
+		t.Errorf("ResolvedPath = %q, want %q", got.ResolvedPath, want)
 	}
 	if got.ForceReadOnly {
 		t.Error("ForceReadOnly = true, want false (upperdir is writable)")
@@ -77,8 +80,8 @@ func TestTranslateBindSource_LowerdirMatch_ForcesReadOnly(t *testing.T) {
 		t.Fatalf("translate: %v", err)
 	}
 	want := path.Join(lower, "home/runner/externals")
-	if got.HostPath != want {
-		t.Errorf("HostPath = %q, want %q", got.HostPath, want)
+	if got.ResolvedPath != want {
+		t.Errorf("ResolvedPath = %q, want %q", got.ResolvedPath, want)
 	}
 	if !got.ForceReadOnly {
 		t.Error("ForceReadOnly = false, want true (image layer must stay immutable)")
@@ -98,8 +101,8 @@ func TestTranslateBindSource_RunnerBind_Translates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
-	if got.HostPath != "/run/ephemerd/jobs/abc/docker/d.sock" {
-		t.Errorf("HostPath = %q, want translated socket path", got.HostPath)
+	if got.ResolvedPath != "/run/ephemerd/jobs/abc/docker/d.sock" {
+		t.Errorf("ResolvedPath = %q, want translated socket path", got.ResolvedPath)
 	}
 	if got.ForceReadOnly {
 		t.Error("ForceReadOnly = true on runner-bind translation; that path category should preserve writability")
@@ -110,16 +113,33 @@ func TestTranslateBindSource_RunnerBind_Translates(t *testing.T) {
 // requests like -v /workspace/foo:/x when the runner has /workspace bound
 // to a host scratch dir. The leftover suffix must be appended to the host
 // source.
+//
+// The scratch dir is real, not a made-up path, because the suffix is
+// job-supplied and therefore resolved beneath the host source rather than
+// string-joined onto it (issue #125: the per-job runner directory reached
+// through this branch is bind-mounted INTO the runner and is fully
+// job-writable, so `-v <runner-mount>/evil/x:/y` with `evil` a planted
+// symlink used to be a straight escape — this branch had no containment
+// check of any kind). Resolution needs the root to exist; in production
+// every entry in the bind table is a file or directory ephemerd created.
 func TestTranslateBindSource_RunnerBindSubpath_Translates(t *testing.T) {
-	binds := map[string]string{"/workspace": "/srv/ephemerd/scratch"}
+	scratch := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(scratch, "foo", "bar"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binds := map[string]string{"/workspace": scratch}
 	got, err := translateBindSource("/workspace/foo/bar", binds, "", "", nil)
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
-	want := "/srv/ephemerd/scratch/foo/bar"
-	if got.HostPath != want {
-		t.Errorf("HostPath = %q, want %q", got.HostPath, want)
+	want := path.Join(scratch, "foo/bar")
+	if got.ResolvedPath != want {
+		t.Errorf("ResolvedPath = %q, want %q", got.ResolvedPath, want)
 	}
+	if got.Pin == nil {
+		t.Error("Pin = nil for a job-supplied suffix; that source must be pinned and staged, not string-joined")
+	}
+	closeBindPins([]*bindPin{got.Pin})
 }
 
 // TestTranslateBindSource_LongestPrefixWins guards against a parent bind
@@ -134,8 +154,8 @@ func TestTranslateBindSource_LongestPrefixWins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
-	if got.HostPath != "/host/etc/hosts.runtime" {
-		t.Errorf("HostPath = %q — longest prefix /etc/hosts should win over /etc", got.HostPath)
+	if got.ResolvedPath != "/host/etc/hosts.runtime" {
+		t.Errorf("ResolvedPath = %q — longest prefix /etc/hosts should win over /etc", got.ResolvedPath)
 	}
 }
 
@@ -183,8 +203,8 @@ func TestTranslateBindSource_DotDotTraversal_StaysInsideUpperdir(t *testing.T) {
 		t.Fatalf("translate: %v", err)
 	}
 	want := path.Join(upper, "home/etc/shadow")
-	if got.HostPath != want {
-		t.Errorf("HostPath = %q, want %q (must stay inside upperdir tree)", got.HostPath, want)
+	if got.ResolvedPath != want {
+		t.Errorf("ResolvedPath = %q, want %q (must stay inside upperdir tree)", got.ResolvedPath, want)
 	}
 
 	// A path that climbs above /: path.Clean(/../../etc/shadow) = /etc/shadow.
@@ -222,8 +242,8 @@ func TestTranslateBindSource_PreferUpperOverLower(t *testing.T) {
 		t.Fatalf("translate: %v", err)
 	}
 	want := path.Join(upper, filepath.ToSlash(rel))
-	if got.HostPath != want {
-		t.Errorf("HostPath = %q, want upperdir copy %q", got.HostPath, want)
+	if got.ResolvedPath != want {
+		t.Errorf("ResolvedPath = %q, want upperdir copy %q", got.ResolvedPath, want)
 	}
 	if got.ForceReadOnly {
 		t.Error("ForceReadOnly = true, want false — upperdir copy is writable")
@@ -259,8 +279,8 @@ func TestTranslateBindSource_RootfsPathResolvesToMergedView(t *testing.T) {
 		t.Fatalf("translate: %v", err)
 	}
 	want := path.Join(rootfs, "home/runner/externals/node20/bin/node")
-	if got.HostPath != want {
-		t.Errorf("HostPath = %q, want %q (must resolve against the rootfs mount)", got.HostPath, want)
+	if got.ResolvedPath != want {
+		t.Errorf("ResolvedPath = %q, want %q (must resolve against the rootfs mount)", got.ResolvedPath, want)
 	}
 	if got.ForceReadOnly {
 		t.Error("ForceReadOnly = true on rootfs-path resolution; writes copy-up into the runner's own upperdir and shouldn't be downgraded")
@@ -268,7 +288,7 @@ func TestTranslateBindSource_RootfsPathResolvesToMergedView(t *testing.T) {
 	// Round-trip: reading through the translated path must return the
 	// planted bytes, proving the resolved host path actually points at
 	// the runner's view of this file.
-	gotBody, err := os.ReadFile(got.HostPath)
+	gotBody, err := os.ReadFile(got.ResolvedPath)
 	if err != nil {
 		t.Fatalf("read via translated path: %v", err)
 	}
@@ -297,10 +317,10 @@ func TestTranslateBindSource_RootfsPathAutoCreatesMissingSource(t *testing.T) {
 		t.Fatalf("translate: %v (auto-mkdir should have created the missing dir)", err)
 	}
 	wantPath := path.Join(rootfs, "home/runner/_work/_actions")
-	if got.HostPath != wantPath {
-		t.Errorf("HostPath = %q, want %q", got.HostPath, wantPath)
+	if got.ResolvedPath != wantPath {
+		t.Errorf("ResolvedPath = %q, want %q", got.ResolvedPath, wantPath)
 	}
-	info, err := os.Stat(got.HostPath)
+	info, err := os.Stat(got.ResolvedPath)
 	if err != nil {
 		t.Fatalf("stat auto-created dir: %v", err)
 	}
@@ -380,7 +400,8 @@ func TestBuildBindMounts_GHARunnerContainer(t *testing.T) {
 		"/home/runner/_work/_temp/_github_home:/github/home",
 		"/home/runner/_work/_temp/_github_workflow:/github/workflow",
 	}
-	opts, err := s.buildBindMounts(context.Background(), binds)
+	opts, pins, err := s.buildBindMounts(context.Background(), binds)
+	t.Cleanup(func() { closeBindPins(pins) })
 	if err != nil {
 		t.Fatalf("buildBindMounts: %v", err)
 	}
@@ -446,7 +467,7 @@ func TestBuildBindMounts_RejectsUnknownSource(t *testing.T) {
 		return []string{t.TempDir()}, nil
 	}
 
-	_, err := s.buildBindMounts(context.Background(), []string{"/etc/shadow:/x"})
+	_, _, err := s.buildBindMounts(context.Background(), []string{"/etc/shadow:/x"})
 	if err == nil {
 		t.Fatal("expected error rejecting unknown bind source, got nil")
 	}
@@ -461,7 +482,7 @@ func TestBuildBindMounts_RejectsUnknownSource(t *testing.T) {
 // already in the runner-bind table gets rejected loudly.
 func TestBuildBindMounts_NoRunnerRegistered(t *testing.T) {
 	s := testServer()
-	_, err := s.buildBindMounts(context.Background(), []string{"/home/runner/_work/_temp:/x"})
+	_, _, err := s.buildBindMounts(context.Background(), []string{"/home/runner/_work/_temp:/x"})
 	if err == nil {
 		t.Fatal("expected error when runner rootfs is unregistered, got nil")
 	}

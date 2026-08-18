@@ -197,7 +197,17 @@ func TestBindTranslation_RealContainerd(t *testing.T) {
 		}
 	}
 
-	opts, err := s.buildBindMounts(ctx, binds)
+	opts, pins, err := s.buildBindMounts(ctx, binds)
+	// The pins own real staging bind mounts here (this test constructs the
+	// server through dind.New, so it gets the production stager). Releasing
+	// them unmounts the staged sources; the stager teardown additionally
+	// releases the staging directory itself, which is a mount of its own —
+	// without it the dataDir removal below fails EBUSY. In production
+	// Server.Stop does both.
+	t.Cleanup(func() {
+		closeBindPins(pins)
+		s.stager.teardown()
+	})
 	if err != nil {
 		t.Fatalf("buildBindMounts: %v", err)
 	}
@@ -218,13 +228,21 @@ func TestBindTranslation_RealContainerd(t *testing.T) {
 		t.Errorf("docker.sock translated to %q, want %q", got, socketPath)
 	}
 
-	// _temp must resolve into the snapshot upperdir, and the marker file
-	// must be reachable from that path — proves the snapshot's actual
-	// on-disk layout is what translation hands to containerd.
+	// _temp must expose the snapshot upperdir's contents, and the marker
+	// file must be reachable from the path the spec carries — which proves
+	// the snapshot's actual on-disk layout is what translation hands to
+	// containerd.
+	//
+	// The spec source is the STAGING path, not the upperdir path: the source
+	// is job-supplied, so it is pinned and republished under
+	// <data>/dind-binds/ where the job cannot swap a component of it. See
+	// bindStager and issue #125. Asserting on the bytes reachable through it
+	// is the assertion that matters — asserting on the string would only
+	// re-encode the design.
 	tempSrc := byDest["/__w/_temp"]
-	wantTempPrefix := filepath.Join(upperdir, "home", "runner", "_work", "_temp")
-	if !strings.HasPrefix(filepath.Clean(tempSrc), filepath.Clean(wantTempPrefix)) {
-		t.Errorf("_temp source %q does not point into upperdir %q", tempSrc, wantTempPrefix)
+	wantStagingPrefix := jobStagingDir(dataDir, "bind-translate-e2e") + string(filepath.Separator)
+	if !strings.HasPrefix(tempSrc, wantStagingPrefix) {
+		t.Errorf("_temp source %q is not published under the staging dir %q — a job-supplied source must never reach the spec as a path the job can influence", tempSrc, wantStagingPrefix)
 	}
 	gotMarker, err := os.ReadFile(filepath.Join(tempSrc, "marker.sh"))
 	if err != nil {
@@ -303,7 +321,7 @@ func TestBindTranslation_RejectsForeignSource(t *testing.T) {
 	}
 	s.SetRunnerRootfs(snapshotKey, "", nil)
 
-	_, err = s.buildBindMounts(ctx, []string{"/etc/shadow:/x"})
+	_, _, err = s.buildBindMounts(ctx, []string{"/etc/shadow:/x"})
 	if err == nil {
 		t.Fatal("expected error rejecting /etc/shadow, got nil — silent-drop regression")
 	}

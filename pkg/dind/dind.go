@@ -71,6 +71,13 @@ type Server struct {
 	runnerNetNS     string           // path to runner container's net namespace; used to install DNAT rules for port bindings
 	allowPrivileged bool             // gate for docker run --privileged / --cap-add; see config.DindConfig.AllowPrivileged
 
+	// stager publishes every job-supplied bind source at a path under
+	// <DataDir>/dind-binds/<JobID>/ that only root can reach, so the path
+	// the OCI spec carries has nothing in it the job can swap between
+	// validation and runc's mount. See bindStager and issue #125. Always
+	// set by New; a nil stager makes bind translation fail closed.
+	stager bindStager
+
 	// mirror routes this job's image pulls through a LAN pull-through
 	// cache. Nil means no mirror and every pull path below is unchanged.
 	// This is the hot one: dind pulls into a per-job namespace, so the
@@ -230,6 +237,7 @@ func New(cfg Config) (*Server, error) {
 		buildkit:        cfg.BuildKit,
 		runnerNetNS:     cfg.RunnerNetNS,
 		allowPrivileged: cfg.AllowPrivileged,
+		stager:          newBindStager(cfg.DataDir, cfg.JobID, cfg.Log),
 		mirror:          cfg.RegistryMirror,
 		log:             cfg.Log.With("component", "dind", "job_id", cfg.JobID),
 		images:          make(map[string]*imageEntry),
@@ -417,6 +425,14 @@ func (s *Server) Stop() {
 	// Destroy all exec processes and containers created through this socket.
 	s.destroyAllExecs()
 	s.destroyAllContainers()
+
+	// Every container's cleanup released its own staged bind mounts; this is
+	// the backstop for anything that never made it onto a containerEntry
+	// (a create that failed between staging and registration). Leaving one
+	// behind pins the runner's rootfs mount and blocks snapshot deletion.
+	if s.stager != nil {
+		s.stager.teardown()
+	}
 
 	// Clean up the per-job containerd namespace. destroyAllContainers handles
 	// containers tracked in the in-memory map; this catches stragglers

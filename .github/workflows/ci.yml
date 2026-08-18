@@ -42,6 +42,19 @@ jobs:
             -run TestImagePull_SharedNamespaceHitIsUsableFromJobNamespace \
             -v ./pkg/dind/
 
+      # Same rationale as the step above, for the #125 bind-staging tests. The
+      # security property they cover — that a job cannot swap a bind source
+      # between validation and runc's mount — is only observable when mount(2)
+      # is available, which it is not on this unprivileged runner. Printing
+      # the SKIP keeps that on the record instead of letting a green package
+      # imply coverage it does not have; the previous attempt at #125 passed
+      # review on exactly that misreading.
+      - name: Privileged-test coverage report (dind bind staging, #125)
+        run: |
+          go test -tags containers_image_openpgp -count=1 \
+            -run 'TestBindStaging|TestSweepStagedBinds|TestEnsureTrustedAncestry' \
+            -v ./pkg/dind/
+
       - name: E2E — GitHub provider (fake server)
         run: mage e2egithub
 

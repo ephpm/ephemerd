@@ -88,6 +88,15 @@ type containerEntry struct {
 	ExtraHosts   []string // user-provided "host:ip" entries (--add-host)
 	PortForwards []func() // stop functions for port-forward proxy goroutines
 
+	// BindPins own the staging bind mounts that back this container's
+	// job-supplied -v sources (see bindPin / bindStager and issue #125).
+	//
+	// They are held for the container's whole life, not just until the task
+	// starts: `docker restart` creates a new task, and runc re-reads the
+	// spec's bind source when it does. Released in cleanupContainer, and
+	// again — Close is idempotent — by the job-wide teardown in Server.Stop.
+	BindPins []*bindPin
+
 	// started is closed by handleContainerStart once the task is created and
 	// running. handleContainerAttach blocks on it so the Docker CLI's "attach
 	// then start" sequence works correctly: attach hijacks the conn early,
@@ -298,6 +307,19 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bind sources are resolved to pinned inodes and published at staging
+	// paths ephemerd owns (see bindStager). Both the descriptors and the
+	// staging mounts have to be released if this create does not end with a
+	// registered containerEntry to own them — hence the adoption guard rather
+	// than a plain defer.
+	var bindPins []*bindPin
+	pinsAdopted := false
+	defer func() {
+		if !pinsAdopted {
+			closeBindPins(bindPins)
+		}
+	}()
+
 	// Privileged-elevation gate runs before the client check: it's a
 	// request-shape validation, not a runtime-state check. This also
 	// makes the unit tests trivial — they don't need a containerd client.
@@ -475,7 +497,8 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 		// /var/run/docker.sock). The pre-fix shim silently dropped any
 		// bind whose source didn't os.Stat — leaving GHA `container:` jobs
 		// failing downstream with "sh: cannot open /__w/_temp/<uuid>.sh".
-		bindOpts, berr := s.buildBindMounts(r.Context(), req.HostConfig.Binds)
+		bindOpts, pins, berr := s.buildBindMounts(r.Context(), req.HostConfig.Binds)
+		bindPins = pins
 		if berr != nil {
 			// Log at WARN so operators can see WHY a sibling create was
 			// rejected — the message also goes to the 400 response, but
@@ -635,6 +658,7 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 		Tty:          req.Tty,
 		HostsPath:    hostsPath,
 		ExtraHosts:   extraHosts,
+		BindPins:     bindPins,
 		started:      make(chan struct{}),
 	}
 
@@ -642,6 +666,9 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	s.containers[id] = entry
 	s.assignContainerNetwork(entry, req)
 	s.mu.Unlock()
+	// The entry now owns the pins and their staging mounts; cleanupContainer
+	// is responsible for releasing them.
+	pinsAdopted = true
 
 	s.log.Info("container created", "id", id, "name", name, "image", req.Image, "labels", entry.Labels)
 
@@ -1376,6 +1403,13 @@ func (s *Server) cleanupContainer(ctx context.Context, id string, entry *contain
 	if err := os.RemoveAll(buildkitDir); err != nil {
 		s.log.Debug("buildkit dir cleanup", "id", id, "error", err)
 	}
+
+	// Release the staged bind sources last: the container's own copies of
+	// those mounts are independent, but tearing ours down only after runc has
+	// finished with the container removes any ordering question. Close is
+	// idempotent, so Server.Stop's job-wide teardown is a no-op after this.
+	closeBindPins(entry.BindPins)
+	entry.BindPins = nil
 }
 
 // destroyAllContainers cleans up every container in the map.
@@ -1429,7 +1463,13 @@ func generateContainerID() string {
 // surface HTTP 400 — the pre-fix shim silently dropped these, which left
 // GHA `container:` jobs to fail downstream with confusing "cannot open"
 // errors. See translateBindSource for the resolution policy.
-func (s *Server) buildBindMounts(ctx context.Context, binds []string) ([]oci.SpecOpts, error) {
+//
+// The returned pins own the staging mounts that back the spec sources. They
+// MUST be closed when the container is destroyed (cleanupContainer) or the
+// node leaks a bind mount per bind — and each of those pins the runner's
+// rootfs, which blocks snapshot deletion. On error this function releases
+// everything it opened before returning.
+func (s *Server) buildBindMounts(ctx context.Context, binds []string) ([]oci.SpecOpts, []*bindPin, error) {
 	upperdir, lowerdirs, layerErr := s.runnerRootfsLayers(ctx)
 	if layerErr != nil {
 		s.log.Warn("could not load runner rootfs layers for bind translation", "error", layerErr)
@@ -1440,6 +1480,11 @@ func (s *Server) buildBindMounts(ctx context.Context, binds []string) ([]oci.Spe
 	s.mu.Unlock()
 
 	out := make([]oci.SpecOpts, 0, len(binds))
+	var pins []*bindPin
+	fail := func(format string, args ...any) ([]oci.SpecOpts, []*bindPin, error) {
+		closeBindPins(pins)
+		return nil, nil, fmt.Errorf(format, args...)
+	}
 	for _, bind := range binds {
 		parts := strings.SplitN(bind, ":", 3)
 		if len(parts) < 2 {
@@ -1449,20 +1494,39 @@ func (s *Server) buildBindMounts(ctx context.Context, binds []string) ([]oci.Spe
 		requestedRO := len(parts) == 3 && parts[2] == "ro"
 
 		if err := s.rejectUnbackedGuestBind(src, runnerBinds); err != nil {
-			return nil, fmt.Errorf("bind mount %s -> %s rejected: %w", src, dst, err)
+			return fail("bind mount %s -> %s rejected: %w", src, dst, err)
 		}
 
 		resolved, terr := translateBindSource(src, runnerBinds, runnerRootfs, upperdir, lowerdirs)
 		if terr != nil {
-			return nil, fmt.Errorf("bind mount %s -> %s rejected: %w", src, dst, terr)
+			return fail("bind mount %s -> %s rejected: %w", src, dst, terr)
 		}
+
+		// What goes in the spec. For a source with no job-controlled
+		// component there is no pin and the resolved path is already safe
+		// for runc to walk. For everything else the pinned inode is
+		// published at an ephemerd-owned staging path first — see
+		// bindStager, and issue #125 for what happens without it.
+		specSource := resolved.ResolvedPath
+		if resolved.Pin != nil {
+			pins = append(pins, resolved.Pin)
+			if s.stager == nil {
+				return fail("bind mount %s -> %s rejected: this dind server has no bind stager, so the source cannot be published at a path the job is unable to swap; refusing rather than mounting a job-controlled path (this is a wiring bug — dind.New always installs one)", src, dst)
+			}
+			staged, serr := s.stager.stage(resolved.Pin)
+			if serr != nil {
+				return fail("bind mount %s -> %s rejected: %w", src, dst, serr)
+			}
+			specSource = staged
+		}
+
 		mountOpts := []string{"rbind", "rw"}
 		if requestedRO || resolved.ForceReadOnly {
 			mountOpts = []string{"rbind", "ro"}
 		}
-		out = append(out, withBindMount(resolved.HostPath, dst, mountOpts))
+		out = append(out, withBindMount(specSource, dst, mountOpts))
 	}
-	return out, nil
+	return out, pins, nil
 }
 
 // rejectUnbackedGuestBind refuses a sibling -v source whose contents this
