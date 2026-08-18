@@ -9,14 +9,39 @@ ephemerd uses OCI container images to define the execution environment for each 
 
 ### How it works
 
-GitHub Actions jobs run inside a single container. The runner binary lives inside the image, and job steps execute in the same container. ephemerd pulls the image, starts a container, and the embedded runner picks up the job.
+GitHub Actions jobs run inside a single container: ephemerd pulls the image, starts a container, and the Actions runner inside it picks up the job. **The image does not have to contain the runner.** ephemerd ships the Actions runner archive inside its own binary (`//go:embed all:embed` — `pkg/runner/runner.go:18`), extracts it once onto the host under `<data-dir>/runners/<version>-<goos>` (`pkg/runner/runner.go:64`, path at `runner.go:43`), makes a per-job copy (`pkg/runtime/runtime.go:952`), and bind-mounts that copy into the container at `/actions-runner` — `rbind,rw` on Linux, a mapped directory on Windows (`pkg/runtime/runtime.go:1514`).
+
+There are exactly two paths, chosen by the image reference:
+
+| Image | Runner comes from | Entrypoint |
+|-------|-------------------|------------|
+| A recognized official runner ref — `ghcr.io/actions/actions-runner:*` or `@<digest>`, `ghcr.io/actions/runner-images-runner:*`, and `ephpm/ephemerd:runner-ci-linux*` with or without the `docker.io/` prefix | the image itself | `/home/runner/run.sh` |
+| **Anything else** | bind-mounted by ephemerd at `/actions-runner` | `/actions-runner/run.sh` |
+
+The branch is `customImage := image != "" && !isOfficialRunnerImage(image)` (`pkg/runtime/runtime.go:805`); the allowlist is `isOfficialRunnerImage` (`pkg/runtime/runtime.go:1660`), the entrypoint switch is `runtime.go:856-863`, and the mount decision is `runtime.go:937`.
+
+Note that the recognized-official case is the *special* one. The general case — a stock image with no runner in it — is the path everything else takes, and it is exercised by ephemerd's own Windows default (see below).
 
 ### Default images
 
-| Platform | Default image |
-|----------|--------------|
-| Linux | `ghcr.io/actions/actions-runner:latest` |
-| Windows | `mcr.microsoft.com/windows/servercore:ltsc20XX` (auto-detected) |
+| Platform | Default image | Contains a runner? |
+|----------|--------------|--------------------|
+| Linux | `ghcr.io/actions/actions-runner:latest` | Yes (`pkg/runtime/runtime.go:42`) |
+| Windows | `mcr.microsoft.com/windows/servercore:ltsc20XX` (auto-detected) | **No** (`pkg/runtime/image_windows.go:9-13`) |
+
+The Windows default is a stock Microsoft Server Core image with no Actions runner
+in it at all. Every Windows job on ephemerd is already running the "stock image"
+path — the runner is mounted in at `C:\actions-runner` and started via
+`C:\actions-runner\run.cmd` (`pkg/runtime/runtime.go:858`).
+
+It also ships **no Docker CLI**. Server Core is a bare OS image, and ephemerd
+does not add a `docker` client to it, so on the auto-detected Windows default
+there is no `docker` command available to job steps. Anything that shells out to
+`docker` — a `docker build`/`docker run` step, `docker/setup-buildx-action` —
+will not find it. If you need a Docker CLI on Windows, bring your own image and
+install it; ephemerd's own `runner-ci-windows` image does exactly that
+(`images/runner-ci-windows/Dockerfile:86-89` installs `docker.exe` into
+`C:\go\bin`, which is on `PATH` via line 79).
 
 ### Specifying an image
 
@@ -32,9 +57,177 @@ jobs:
       - run: make test
 ```
 
+### Use a stock image
+
+Reach for an off-the-shelf image before you build one. A plain upstream image
+works as a job container as-is — it does not need to derive from
+`ghcr.io/actions/actions-runner`, or from anything else:
+
+```yaml
+jobs:
+  build:
+    runs-on: [self-hosted, linux]
+    container: golang:1.26.6-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - run: go build ./...
+```
+
+Two things this buys you, both verified in practice with
+`golang:1.26.6-bookworm`:
+
+- **One tag, both architectures.** `golang:1.26.6-bookworm` is a multi-arch
+  manifest, so the same tag resolves to arm64 natively on an arm64 host and
+  amd64 on an amd64 host. You do not need per-arch tags, a matrix over
+  architectures, or a `docker buildx` pipeline of your own to get arm64
+  coverage.
+- **Delete your toolchain-install steps.** A stock language image already has
+  the toolchain, and on Debian-family images it already has a C toolchain and
+  headers too. Installing a compiler at job time — the usual
+  `apt-get install build-essential` step, or a `setup-*` action fetching an SDK
+  — is pure per-job cost that a stock image removes outright.
+
+Custom images are for caching build *dependencies* (see
+[Reference: ephemerd CI Images](#reference-ephemerd-ci-images)), not for
+supplying the runner.
+
+### What the image actually has to provide
+
+Nothing runner-related. What the runner needs from the image is a place to run:
+
+**Linux**
+
+- **`/bin/bash`.** The runner's `run.sh` and `run-helper.sh` are
+  `#!/bin/bash`, and ephemerd execs `/actions-runner/run.sh --jitconfig ...`
+  directly (`pkg/runtime/runtime.go:930`). An image with only `/bin/sh` — a
+  BusyBox/Alpine image — will not start the runner.
+- **A glibc userland with the runner's shared libraries.** The runner is a
+  .NET application; upstream's `installdependencies.sh` requires
+  `libkrb5-3`, `zlib1g`, `liblttng-ust`, `libssl`, and `libicu`. Debian- and
+  Ubuntu-family images (including `golang:*-bookworm`) satisfy this. **musl
+  images (Alpine) do not** — this is the single most common reason a stock
+  image fails to start.
+- **Standard coreutils** on `PATH`: `dirname`, `readlink`, `pwd`, `cp`, `id`.
+- **CA certificates**, so the runner can reach the forge over HTTPS. Present in
+  every mainstream base image; the thing to watch for is a hand-rolled
+  `FROM scratch` image.
+- **Not Node.js.** The runner ships its own `node20` under `externals/`, which
+  comes in with the mount and is what JavaScript actions run on. You do not
+  need Node in the image — but that bundled `node` is glibc-linked too, which
+  is the other half of the musl problem above.
+
+ephemerd sets the container's process args directly and never wraps them in
+`sh -c` (`pkg/runtime/runtime.go:930`), so the entrypoint is `execve`d as-is.
+That is why a missing `/bin/bash` shows up as an immediate startup failure
+rather than a script error. The chain from there is
+`run.sh` → `run-helper.sh` → `bin/Runner.Listener` — two bash scripts and then
+a .NET binary.
+
+Everything else is left to the image. ephemerd sets no `USER` and no
+`WORKDIR` on the container — `oci.WithImageConfig` carries the image's own
+values through (`pkg/runtime/runtime.go:881`), and `RUNNER_ALLOW_RUNASROOT=1`
+is set (`runtime.go:874`) so running as root, which most stock images do, is
+fine. The bind at `/actions-runner` is created by the runtime, so the image
+does not need that directory to exist.
+
+Two limits worth knowing:
+
+- **Capabilities are restricted** to a CI-shaped set — `CAP_CHOWN`,
+  `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_FSETID`, `CAP_KILL`, `CAP_SETGID`,
+  `CAP_SETUID`, `CAP_SYS_CHROOT`, `CAP_NET_BIND_SERVICE`
+  (`pkg/runtime/runtime.go:58-68`). `apt-get install`, `adduser` and `sudo`
+  work; a Docker daemon inside the job image does not (use ephemerd's
+  Docker-in-Docker support instead, which is served over a socket/`DOCKER_HOST`).
+- `/etc/resolv.conf` and `/etc/hosts` are bind-mounted read-only by ephemerd
+  (`pkg/runtime/runtime.go:1420`, `:1379`), so an image that ships its own
+  copies will see ephemerd's.
+
+**Windows**
+
+The runner is mounted at `C:\actions-runner` and launched through
+`cmd.exe /c` (`pkg/runtime/runtime.go:926-927`), so the image needs `cmd.exe`
+— i.e. Server Core, not Nano Server. See
+[Windows: preinstall into the tool cache](#windows-preinstall-into-the-tool-cache)
+for the one thing a Windows image really should bake in.
+
+#### Running as a non-root `USER`
+
+One requirement is easy to miss: on the mounted-runner path, **the runner
+directory must be writable by whatever uid the container runs as.** `run.sh`
+writes into its own directory before the job starts — `cp -f
+"$DIR"/run-helper.sh.template "$DIR"/run-helper.sh` — and `_work`, `_diag` and
+the listener's config are created there too.
+
+That directory arrives owned by the **ephemerd daemon's uid**, normally root,
+and ephemerd never changes it: there is no `Chown` or `Chmod` anywhere in
+`pkg/runner` or `pkg/runtime`. The runner is extracted with
+`os.MkdirAll(dir, 0o755)` as the daemon uid (`pkg/runner/runner.go:79`), and
+the per-job copy is `cp -al` (`pkg/runtime/runtime.go:1589`) — hardlinks, which
+share the source inodes and so carry ownership and mode across verbatim.
+
+So you need **either** a container running as root — the default for most stock
+images, including the `golang:` example above — **or** a uid that can write to a
+root-owned `0755` directory. ephemerd grants `CAP_DAC_OVERRIDE` for exactly this
+reason; the capability list annotates it "write to dirs owned by other users"
+(`pkg/runtime/runtime.go:60`), so a non-root `USER` is expected to work on the
+standard runc path. Treat that as the load-bearing dependency it is: if you drop
+capabilities, or run somewhere they are not propagated to a non-root uid, a
+non-root image fails at startup on that first `cp` rather than later in the job.
+Running as root has no such dependency.
+
+None of this applies to a recognized official runner ref: nothing is mounted,
+and the runner directory is the image's own, already owned by the image's
+`runner` user.
+
+### `go build` fails with "error obtaining VCS status"
+
+If a Go build inside a container dies with:
+
+```
+error obtaining VCS status: exit status 128
+```
+
+that is git refusing to operate on the checkout because it considers the
+directory to have "dubious ownership", and `go build` stamping VCS info into
+the binary is what surfaces it.
+
+The fix:
+
+```yaml
+- name: Trust the workspace
+  run: git config --global --add safe.directory "*"
+```
+
+**The obvious fix does not work.** The instinct is to name the directory
+explicitly:
+
+```yaml
+# Does NOT work
+- run: git config --global --add safe.directory "${{ github.workspace }}"
+```
+
+`${{ github.workspace }}` is expanded by the runner, and **the path it expands
+to is not reliably the path the step's shell sees.** The runner's `_work` tree
+lives under the runner root — `/actions-runner/_work` on the mounted-runner
+path this guide is about — and when steps execute against a container step host
+the workspace is presented at a different location again. The runner has logic
+to translate paths into container terms, but it does not apply everywhere, and
+part of it sits behind a server-delivered feature flag
+(`DistributedTask.UseContainerPathForTemplate`), so whether any given expansion
+comes out as the container path is not something you can determine by reading
+your workflow.
+
+The practical consequence, observed: the explicit form above **did not fix the
+build** — git kept refusing the checkout — and switching to the wildcard did.
+The wildcard does not depend on which path the expansion produced, which is why
+it is the form to use. Quote it — an unquoted `*` gets glob-expanded by the
+shell.
+
 ### Building custom images
 
-Custom images must extend the upstream GitHub Actions runner base image. This is important -- the base includes the runner binary that ephemerd needs to execute jobs.
+Extending the upstream GitHub Actions runner base image is *one* option, not a
+requirement. It is worth doing when you want the official image's preinstalled
+tooling as a starting point; it is not what makes the runner available.
 
 **Linux:**
 
@@ -54,6 +247,22 @@ RUN apt-get update && apt-get install -y \
 USER runner
 ```
 
+Note what happens to that image once you push it under your own name: the
+allowlist in `isOfficialRunnerImage` matches on the image *reference*, not on
+the contents, so `ghcr.io/your-org/ci-image:latest` is treated as a foreign
+image even though it derives from the official one. ephemerd mounts its own
+runner at `/actions-runner` and runs that, and the copy of the runner inside
+your image is never used — deriving from the official base buys you its
+*tooling*, not its runner.
+
+That also means the trailing `USER runner` above is doing more than it looks
+like. It puts the container on the non-root case described in
+[Running as a non-root `USER`](#running-as-a-non-root-user): the mounted
+`/actions-runner` is root-owned, and uid 1001 writing into it depends on
+`CAP_DAC_OVERRIDE`. If you want that dependency gone, drop the final
+`USER runner` and let the job run as root — `RUNNER_ALLOW_RUNASROOT=1` is
+already set.
+
 For multi-arch builds (amd64 + arm64):
 
 ```bash
@@ -61,11 +270,17 @@ docker buildx build --platform linux/amd64,linux/arm64 \
     -t ghcr.io/your-org/ci-image:latest --push .
 ```
 
+Stock upstream images are usually multi-arch already, which is the shortcut
+described in [Use a stock image](#use-a-stock-image).
+
 **Windows:**
 
 ```dockerfile
 # escape=`
-FROM ghcr.io/actions/actions-runner:latest-win
+# There is no Windows Actions runner base image, and none is needed — ephemerd
+# mounts the runner in at C:\actions-runner. Start from the same Server Core
+# base the auto-detected default uses.
+FROM mcr.microsoft.com/windows/servercore:ltsc2025
 
 ARG GO_VERSION=1.26.6
 
@@ -246,23 +461,43 @@ Override the default image for specific repositories in the config:
 [runner]
 default_image = "ghcr.io/your-org/ci-image:latest"
 
-[runner.repo_images]
-"my-go-project" = "ghcr.io/your-org/go-ci:latest"
-"my-rust-project" = "ghcr.io/your-org/rust-ci:latest"
+# Per repo, then per OS. A repo can specify just one OS; the rest fall
+# through to the provider default and then the built-in default.
+[runner.images.my-go-project]
+linux = "golang:1.26.6-bookworm"
+
+[runner.images.my-rust-project]
+linux   = "rust:1-bookworm"
+windows = "ghcr.io/your-org/rust-ci-windows:latest"
 ```
+
+The shape is `[runner.images.<repo>]` with `linux` / `windows` keys
+(`pkg/config/config.go:1357-1365`). Resolution order for a job's image is:
+the workflow's `container:` key, then `[runner.images.<repo>].<os>`, then the
+provider's `default_image_<os>`, then the global `[runner] default_image`, then
+the built-in default for the host platform. The last two rungs are applied in
+`pkg/runtime/runtime.go:806-811`.
 
 ## One Image, Every Host
 
-The same Linux container image runs identically on Linux, Windows (via the Hyper-V Linux VM), and macOS (via Virtualization.framework). In all three cases, containerd is the runtime that pulls and executes the image. There is no need to maintain separate images per host platform.
+The same Linux container image runs identically on Linux, Windows (via the Hyper-V Linux VM), and macOS (via Virtualization.framework). In all three cases, containerd is the runtime that pulls and executes the image. One Linux image covers Linux jobs on every host platform — you do not need a per-host variant of it.
+
+This is about *Linux* jobs. A job that asks for a Windows runner runs in a Windows container and needs a Windows image; that one is genuinely separate, and its requirements differ (see the Windows notes above).
 
 ## Reference: ephemerd CI Images
 
-ephemerd's own CI uses custom runner images that pre-cache all build dependencies. These live in the [`images/`](https://github.com/ephpm/ephemerd/tree/feat/ci-runner-images/images) directory and serve as a real-world example:
+ephemerd's own CI uses custom runner images that pre-cache all build dependencies. These live in the [`images/`](https://github.com/ephpm/ephemerd/tree/main/images) directory and serve as a real-world example:
 
 | Image | Base | What it caches |
 |-------|------|----------------|
 | `runner-ci-linux` | `ghcr.io/actions/actions-runner:latest` | Go, Mage, runner archive, CNI plugins, containerd shim, runc, golangci-lint |
-| `runner-ci-windows` | `ghcr.io/actions/actions-runner:latest-win` | Go (in the tool cache, so `actions/setup-go` hits it), Mage, runner archive (Windows + Linux), golangci-lint |
+| `runner-ci-windows` | `mcr.microsoft.com/windows/servercore:ltsc2025` | Go (in the tool cache, so `actions/setup-go` hits it), Mage, Docker CLI, runner archive (Windows + Linux), golangci-lint |
 | `runner-ci-macos` | `scratch` | Runner archive (macOS), Mage, golangci-lint (cross-compiled for darwin) |
+
+Note the three different bases. Each is chosen for what it *caches*, not to
+supply a runner: the Linux image starts from the official runner image because
+its preinstalled tooling is a convenient starting point, the Windows image
+starts from bare Server Core, and the macOS artifact image starts from
+`scratch`. All three work.
 
 The Linux image supports multi-arch (amd64 + arm64) via `docker buildx`. Each image includes an entrypoint script that copies the cached dependencies into the workspace so `mage ci` runs without downloading anything. The Go module cache is also enabled -- after the first CI job runs, the module cache is warm and all subsequent jobs skip the `go mod download` entirely. The first job downloads and builds everything; every job after that just copies in the cached assets and runs `mage ci`.
