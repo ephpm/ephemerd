@@ -259,7 +259,13 @@ jobs:
 }
 
 func TestPoll_ContextCancellation(t *testing.T) {
-	fetchCount := 0
+	// Atomic, not a plain int: Run returns the moment the context deadline
+	// fires, which can leave a FetchTask handler still executing on the
+	// httptest server's goroutine. The assertion below then reads this counter
+	// with no happens-before edge to that write — a genuine data race, and one
+	// the detector catches intermittently (it fired on a full-suite -race run
+	// but not on a package-scoped one).
+	var fetchCount atomic.Int64
 	srv := newTestForge(t, map[string]http.HandlerFunc{
 		"Register": func(w http.ResponseWriter, _ *http.Request) {
 			jsonResponse(w, `{"runner":{"id":1,"uuid":"u","name":"n","token":"t"}}`)
@@ -268,7 +274,7 @@ func TestPoll_ContextCancellation(t *testing.T) {
 			jsonResponse(w, `{}`)
 		},
 		"FetchTask": func(w http.ResponseWriter, _ *http.Request) {
-			fetchCount++
+			fetchCount.Add(1)
 			jsonResponse(w, `{"tasksVersion":0}`)
 		},
 	})
@@ -290,7 +296,7 @@ func TestPoll_ContextCancellation(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("expected context.DeadlineExceeded, got %v", err)
 	}
-	if fetchCount == 0 {
+	if fetchCount.Load() == 0 {
 		t.Error("expected at least one FetchTask call")
 	}
 }

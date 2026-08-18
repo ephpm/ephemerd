@@ -31,6 +31,22 @@ func Test() error {
 	return sh.RunV("go", "test", "-tags", "containers_image_openpgp", "-count=1", "./...")
 }
 
+// TestRace runs all Go tests under the race detector.
+//
+// Deliberately NOT part of `mage ci`: -race requires cgo, and the Windows dev
+// toolchain in this project cannot preprocess the cgo deps (see AGENTS.md), so
+// folding it into `mage ci` would break the "run CI locally before pushing"
+// rule for every Windows engineer. CI calls this target directly on the Linux
+// runner, which is the only image with a C compiler (images/runner-ci-linux).
+//
+// Runs the whole tree rather than a hand-picked package list: the full suite
+// takes ~1 minute under -race, and a scoped list silently stops covering
+// whatever concurrency gets added next.
+func TestRace() error {
+	mg.Deps(download.All)
+	return sh.RunV("go", "test", "-race", "-tags", "containers_image_openpgp", "-count=1", "./...")
+}
+
 // Lint runs golangci-lint (downloads linter and embedded deps first if needed).
 func Lint() error {
 	mg.Deps(download.Golangcilint, download.All)
