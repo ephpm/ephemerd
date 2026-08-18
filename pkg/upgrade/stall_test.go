@@ -182,6 +182,54 @@ func TestRun_DrainTimeoutStillUncordons(t *testing.T) {
 	}
 }
 
+// TestRun_ExpiredBudgetNeverSwaps guards the gap between what the watchdog
+// logs and what the daemon does. Checksum verify, extract and probe take no
+// context, so a budget that expires during them cannot interrupt the step —
+// but it must still stop the upgrade at the next phase boundary. Otherwise
+// the daemon logs "install phase exceeded its budget; aborting" and then goes
+// on to swap the binary and restart, which is worse than either outcome alone.
+func TestRun_ExpiredBudgetNeverSwaps(t *testing.T) {
+	const target = "v0.2.3"
+	// Native GOOS/GOARCH so Run takes the probe branch at all.
+	goos, goarch := runtime.GOOS, runtime.GOARCH
+	fr := newFakeRelease(t, target, goos, goarch, []byte("NEW-BINARY"), false)
+	install := setupInstall(t)
+	drainer := &fakeDrainer{counts: []int{0}}
+
+	// Burn the budget inside the PROBE, which takes no context and so cannot
+	// be interrupted. The download and verify both succeed; the only thing
+	// that can stop the swap is the boundary check.
+	err := Run(context.Background(), RunOptions{
+		TargetVersion:   target,
+		CurrentVersion:  "v0.2.2",
+		BaseURLOverride: fr.server.URL,
+		Drainer:         drainer,
+		DrainPoll:       time.Millisecond,
+		InstallPath:     install,
+		GOOS:            goos,
+		GOARCH:          goarch,
+		InstallTimeout:  50 * time.Millisecond,
+		Probe: func(string) (string, error) {
+			time.Sleep(250 * time.Millisecond) // outlives the budget, uninterruptible
+			return target, nil
+		},
+		Restart: func() error { t.Error("restart must not run after the budget expired"); return nil },
+	}, nil)
+
+	if err == nil {
+		t.Fatal("Run returned nil despite an expired install budget")
+	}
+	if got, _ := os.ReadFile(install); string(got) != "OLD-BINARY" {
+		t.Errorf("install binary = %q, want it untouched — the swap ran after the abort", got)
+	}
+	if _, statErr := os.Stat(install + ".old"); statErr == nil {
+		t.Error("a .old backup exists, so the swap ran despite the abort")
+	}
+	if got := drainer.uncordonCount(); got != 1 {
+		t.Errorf("uncordoned %d times, want exactly 1", got)
+	}
+}
+
 func TestDownloadFile_StallTimeoutFires(t *testing.T) {
 	srv := hangingRelease(t, "v0.0.1", "linux", "amd64")
 	dest := filepath.Join(t.TempDir(), "asset")

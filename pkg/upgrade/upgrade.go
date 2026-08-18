@@ -93,16 +93,26 @@ const (
 	// the existing defer un-cordons.
 	defaultStallTimeout = 2 * time.Minute
 
-	// defaultInstallTimeout bounds the whole cordoned-but-not-yet-swapped
-	// window: download, checksum verify, extract and probe.
+	// defaultInstallTimeout bounds the cordoned-but-not-yet-swapped window:
+	// download, checksum verify, extract and probe.
 	//
-	// The stall timeout above covers the failure mode we know about. This
-	// covers the ones we do not — a verify or probe that wedges, a
-	// pathologically slow but never-quite-stalled transfer, anything future
-	// code adds between the cordon and the swap. It is a backstop, so it is
-	// set well above any plausible healthy run: the fleet's slowest real
-	// upgrade (a ~984 MB Windows zip) goes cordon-to-swap in about 40
-	// seconds.
+	// The stall timeout above covers the failure mode we know about, and
+	// only while bytes are supposed to be moving. This is the backstop for
+	// the rest: a transfer that dribbles forever without ever stalling, and
+	// anything future code adds between the cordon and the swap. It
+	// interrupts the downloads directly and stops everything else at the
+	// next phase boundary (see the arming site for exactly how far it
+	// reaches).
+	//
+	// 30 minutes is chosen to be unreachable by a healthy upgrade rather
+	// than tight: the fleet's slowest real one — a ~984 MB Windows zip —
+	// goes cordon-to-swap in about 40 seconds. It does imply a floor of
+	// roughly 550 KB/s sustained across the whole install phase, below which
+	// a genuinely healthy but very slow upgrade would be aborted. That is a
+	// safe way to fail (the node keeps its old binary and goes back to
+	// serving) and the fleet has three orders of magnitude of headroom, but
+	// it is a real number, not an arbitrary one: raise InstallTimeout for a
+	// node on a link that slow.
 	//
 	// It deliberately starts AFTER the drain wait, which has its own
 	// (much longer, job-length) timeout and is not a hang when it is slow.
@@ -217,9 +227,11 @@ type RunOptions struct {
 // upgrade: it looks healthy while quietly accepting no work.
 //
 // Those paths all assume the upgrade eventually STOPS. The remaining way to
-// hold a cordon forever is to hang, so the download carries a stall timeout
-// and the whole post-drain phase carries an install budget; both turn a hang
-// into an error, which the un-cordon above then handles like any other.
+// hold a cordon forever is to hang, so the downloads carry a stall timeout and
+// the post-drain phase carries an install budget that interrupts them and
+// halts the local steps at the next phase boundary. Both turn a hang into an
+// error, which the un-cordon above then handles like any other.
+//
 // A hard kill of the daemon needs no handling: `draining` lives only in the
 // scheduler's memory, so a process that dies cordoned comes back up serving.
 func Run(ctx context.Context, opts RunOptions, emit Emit) (retErr error) {
@@ -327,12 +339,31 @@ func Run(ctx context.Context, opts RunOptions, emit Emit) (retErr error) {
 
 	// 2b. Arm the cordon backstop. From here to the swap the node is drained
 	// and doing work that has no business taking long; if it does, the
-	// upgrade is wedged and the cordon is the damage. Cancelling this
-	// context aborts the download/verify in flight, which surfaces as an
-	// ordinary error and runs the un-cordon above.
+	// upgrade is wedged and the cordon is the damage. Cancelling this context
+	// makes that surface as an ordinary error, which runs the un-cordon above.
 	//
-	// It is armed only now, after the drain: waiting on somebody's 40-minute
-	// job is slow on purpose, and waitDrain already bounds that itself.
+	// Its reach is worth being precise about, because the cancel only bites
+	// where something reads the context:
+	//
+	//   - The two downloads (steps 4 and 5) abort mid-transfer. They are the
+	//     steps that can wedge indefinitely, and the only ones the budget
+	//     interrupts.
+	//   - Checksum verify, extract and probe do not take a context at all
+	//     (probeVersion carries its own 30s timeout). A wedge inside one of
+	//     those runs to completion; the budget then stops the upgrade at the
+	//     next phase boundary instead of mid-step.
+	//
+	// The boundary checks are what make the abort honest rather than
+	// advisory: without them the watchdog could log "aborting", have its
+	// cancel read by nobody, and the upgrade would go on to swap and restart
+	// — a log that contradicts what the daemon actually did.
+	//
+	// Armed only now, after the drain: waiting on somebody's 40-minute job is
+	// slow on purpose, and waitDrain already bounds that itself.
+	//
+	// Note the budget is armed whether or not we cordoned (NoDrain, or a nil
+	// Drainer): bounding a wedged upgrade is worth doing regardless, there is
+	// simply no cordon to release in that case.
 	installed := func() {} // disarms the backstop once the swap has landed
 	if installTimeout := orDuration(opts.InstallTimeout, defaultInstallTimeout); installTimeout > 0 {
 		var cancelInstall context.CancelFunc
@@ -405,6 +436,9 @@ func Run(ctx context.Context, opts RunOptions, emit Emit) (retErr error) {
 	if err := verifyChecksum(archivePath, want); err != nil {
 		return fail("%w — refusing to install; node stays on %s", err, current)
 	}
+	if err := ctx.Err(); err != nil {
+		return fail("aborted before staging: %w", err)
+	}
 
 	// 6. Stage: extract the binary and, when it can run on this host, probe
 	// its --version to confirm it executes and reports the target BEFORE the
@@ -430,6 +464,12 @@ func Run(ctx context.Context, opts RunOptions, emit Emit) (retErr error) {
 
 	// 7. Swap. Past this line the on-disk binary has changed; the previous
 	// one is retained as <name>.old for rollback.
+	//
+	// Last chance to honor an abort: everything above is reversible by doing
+	// nothing, and this is the step that stops being true of.
+	if err := ctx.Err(); err != nil {
+		return fail("aborted before swapping the binary: %w", err)
+	}
 	emit(Progress{State: StateSwapping, Message: "installing new binary", CurrentVersion: current, TargetVersion: target})
 	backup, err := swapBinary(installPath, stagedBin)
 	if err != nil {
