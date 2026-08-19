@@ -210,9 +210,67 @@ func (s *Server) resolveContainerID(nameOrID string) string {
 	return nameOrID
 }
 
+// elevatingSecurityOpt reports whether a single --security-opt value asks this
+// shim to strip a sandbox layer, and names the mechanism it strips ("seccomp"
+// or "apparmor").
+//
+// This is the single answer to "does this --security-opt ask for elevation?":
+// both checkPrivilegedGate and securityOptSpecOpts call it, so the gate cannot
+// decide one thing while the applier does another. That divergence was the bug
+// — the gate looked at Privileged/CapAdd while a separate, ungated loop applied
+// oci.WithSeccompUnconfined for `--security-opt seccomp=unconfined`, letting a
+// sibling container drop its own seccomp filter on a host configured with
+// dind.allow_privileged = false.
+//
+// Docker accepts both the `key=value` and the legacy `key:value` spelling, so
+// both are recognised here. Anything else (`label=...`, `no-new-privileges=...`,
+// a custom seccomp profile path) does not reach the OCI spec at all — see
+// securityOptSpecOpts — so it is not elevation and is not refused.
+func elevatingSecurityOpt(opt string) (mechanism string, elevating bool) {
+	key, value, ok := strings.Cut(opt, "=")
+	if !ok {
+		key, value, ok = strings.Cut(opt, ":")
+	}
+	if !ok || value != "unconfined" {
+		return "", false
+	}
+	switch key {
+	case "seccomp", "apparmor":
+		return key, true
+	}
+	return "", false
+}
+
+// securityOptSpecOpts turns HostConfig.SecurityOpt into the OCI options that
+// implement it. Only the elevating values do anything; every other
+// --security-opt is ignored, exactly as it was before this was a function.
+//
+// Reachable only with the gate open — checkPrivilegedGate refuses these same
+// values with 403 when dind.allow_privileged = false, off the same
+// elevatingSecurityOpt predicate, so refusing and applying cannot drift apart.
+func securityOptSpecOpts(securityOpt []string) []oci.SpecOpts {
+	var out []oci.SpecOpts
+	for _, opt := range securityOpt {
+		switch mechanism, _ := elevatingSecurityOpt(opt); mechanism {
+		case "seccomp":
+			out = append(out, oci.WithSeccompUnconfined)
+		case "apparmor":
+			out = append(out, oci.WithApparmorProfile(""))
+		}
+	}
+	return out
+}
+
 // checkPrivilegedGate returns a user-facing rejection message and blocked=true
-// when the request asks for elevation (Privileged=true or CapAdd) but the gate
-// is closed (allowPrivileged=false). Otherwise blocked=false and msg is empty.
+// when the request asks for elevation but the gate is closed
+// (allowPrivileged=false). Otherwise blocked=false and msg is empty.
+//
+// "Elevation" is every request field this handler turns into an OCI option that
+// loosens the sandbox: Privileged, CapAdd, and the --security-opt values that
+// disable seccomp or AppArmor. Keep new ones here rather than checking them at
+// the point of use — one place has to answer "did this request ask for the
+// elevation stack?", or a field gets applied on a path the gate never sees.
+//
 // Pure function so the handler stays simple and tests don't need a containerd
 // client to exercise the gate logic.
 func checkPrivilegedGate(allowPrivileged bool, hc *hostConfig) (msg string, blocked bool) {
@@ -224,6 +282,12 @@ func checkPrivilegedGate(allowPrivileged bool, hc *hostConfig) (msg string, bloc
 	}
 	if len(hc.CapAdd) > 0 {
 		return fmt.Sprintf("--cap-add (%v) is disabled on this host (set dind.allow_privileged = true in ephemerd config to enable)", hc.CapAdd), true
+	}
+	for _, opt := range hc.SecurityOpt {
+		if mechanism, elevating := elevatingSecurityOpt(opt); elevating {
+			return fmt.Sprintf("--security-opt %s=unconfined is disabled on this host: it removes the %s sandbox that keeps an unprivileged sibling container unprivileged (set dind.allow_privileged = true in ephemerd config to enable)",
+				mechanism, mechanism), true
+		}
 	}
 	return "", false
 }
@@ -445,21 +509,9 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 			opts = append(opts, oci.WithAddedCapabilities(req.HostConfig.CapAdd))
 		}
 
-		// Security options (seccomp=unconfined, apparmor=unconfined).
-		for _, opt := range req.HostConfig.SecurityOpt {
-			switch {
-			case opt == "seccomp=unconfined" || opt == "seccomp:unconfined":
-				opts = append(opts, oci.WithSeccompUnconfined)
-			case strings.HasPrefix(opt, "apparmor=") || strings.HasPrefix(opt, "apparmor:"):
-				profile := strings.SplitN(opt, "=", 2)
-				if len(profile) == 1 {
-					profile = strings.SplitN(opt, ":", 2)
-				}
-				if len(profile) == 2 && profile[1] == "unconfined" {
-					opts = append(opts, oci.WithApparmorProfile(""))
-				}
-			}
-		}
+		// Security options (seccomp=unconfined, apparmor=unconfined), gated
+		// by checkPrivilegedGate above.
+		opts = append(opts, securityOptSpecOpts(req.HostConfig.SecurityOpt)...)
 
 		// Private cgroup namespace (--cgroupns=private).
 		if req.HostConfig.CgroupnsMode == "private" {

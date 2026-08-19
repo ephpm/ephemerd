@@ -441,9 +441,10 @@ type DindConfig struct {
 	CacheMaxAge time.Duration `toml:"cache_max_age"`
 
 	// AllowPrivileged controls whether `docker run --privileged` (or
-	// HostConfig.Privileged=true / HostConfig.CapAdd) from inside a job
-	// is honored. When true, a sibling container can request the full
-	// elevation stack (all caps, all devices, seccomp/apparmor off,
+	// HostConfig.Privileged=true / HostConfig.CapAdd, or
+	// `--security-opt seccomp=unconfined` / `apparmor=unconfined`) from
+	// inside a job is honored. When true, a sibling container can request
+	// the full elevation stack (all caps, all devices, seccomp/apparmor off,
 	// writable sysfs/cgroupfs) — needed for KIND clusters, nested
 	// containerd, /dev/fuse-style mounts, etc. When false, such requests
 	// are rejected with HTTP 403.
