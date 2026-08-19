@@ -170,10 +170,11 @@ type Config struct {
 	RunnerNetNS string
 
 	// AllowPrivileged controls whether sibling containers may opt into
-	// the full elevation stack via HostConfig.Privileged or via
-	// HostConfig.CapAdd. When false, requests carrying either are
-	// rejected with HTTP 403. See config.DindConfig.AllowPrivileged for
-	// the threat model.
+	// the full elevation stack via HostConfig.Privileged, via
+	// HostConfig.CapAdd, or via the HostConfig.SecurityOpt values that
+	// switch off seccomp or AppArmor. When false, requests carrying any of
+	// them are rejected with HTTP 403. See config.DindConfig.AllowPrivileged
+	// for the threat model.
 	AllowPrivileged bool
 
 	// RegistryMirror routes this job's image pulls through a LAN
