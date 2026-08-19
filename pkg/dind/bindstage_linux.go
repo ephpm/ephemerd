@@ -31,9 +31,22 @@ type mountStager struct {
 	dir string
 	log *slog.Logger
 
-	mu    sync.Mutex
-	ready bool
-	seq   uint64
+	// mu serialises staging against teardown. It is held across the whole of
+	// stage() — including the mkdir and the mount — rather than just the
+	// bookkeeping, because teardown removes the directory tree and a mount
+	// appearing between its mount-check and its os.RemoveAll would have
+	// RemoveAll delete the files visible through that mount, i.e. the
+	// runner's rootfs. Staging a handful of binds per container create is not
+	// a contended path; correctness here is worth more than the concurrency.
+	mu sync.Mutex
+	// ready is set once the staging directory exists and has been proven
+	// safe. closed is set by teardown and never cleared: a stager that has
+	// been torn down must refuse to stage again rather than silently
+	// recreating the directory the caller just swept, which would leak a
+	// mount pinning the runner's rootfs until the next daemon startup.
+	ready  bool
+	closed bool
+	seq    uint64
 }
 
 // stage binds the pinned inode to <dir>/<n> and returns that path.
@@ -47,13 +60,16 @@ func (m *mountStager) stage(p *bindPin) (string, error) {
 	}
 
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.closed {
+		return "", fmt.Errorf("this job's bind staging directory has already been torn down; refusing to stage %s (the job is shutting down)", p.logical)
+	}
 	if err := m.ensureDirLocked(); err != nil {
-		m.mu.Unlock()
 		return "", err
 	}
 	m.seq++
 	target := filepath.Join(m.dir, strconv.FormatUint(m.seq, 10))
-	m.mu.Unlock()
 
 	// The mountpoint has to match the source's type: a directory for a
 	// directory, an empty regular file for anything else (bind mounts of
@@ -85,7 +101,13 @@ func (m *mountStager) stage(p *bindPin) (string, error) {
 	}
 
 	p.staged = target
-	p.unstage = func() error { return unmountAndRemove(target) }
+	// Releasing one pin takes the same lock, so a pin close can never land
+	// its unmount inside teardown's check-then-remove window either.
+	p.unstage = func() error {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return unmountAndRemove(target)
+	}
 	return target, nil
 }
 
@@ -105,7 +127,21 @@ func (m *mountStager) ensureDirLocked() error {
 	}
 	// MkdirAll honours the umask and skips existing dirs, so set the mode
 	// explicitly on both the job dir and its parent.
+	//
+	// The symlink check comes BEFORE the chmod, not after: os.Chmod follows
+	// symlinks, so chmodding first would apply 0700 to whatever a planted
+	// <data>/dind-binds symlink pointed at — modifying something outside the
+	// staging tree on the way to refusing to use it. ensureTrustedAncestry
+	// below repeats the check as part of the full ancestry walk; this is the
+	// narrower one that has to happen first.
 	for _, d := range []string{stagingRootParent(m.dir), m.dir} {
+		info, err := os.Lstat(d)
+		if err != nil {
+			return fmt.Errorf("stat bind staging dir %s: %w", d, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("bind staging dir %s is a symlink; every component of the staging path must be a real directory", d)
+		}
 		if err := os.Chmod(d, 0o700); err != nil {
 			return fmt.Errorf("securing bind staging dir %s: %w", d, err)
 		}
@@ -129,12 +165,21 @@ func (m *mountStager) ensureDirLocked() error {
 	return nil
 }
 
-// teardown removes every mount and directory this job staged. Idempotent.
+// teardown removes every mount and directory this job staged. Idempotent, and
+// final: nothing can be staged afterwards.
+//
+// The lock is held across the unmount-and-remove, not just around the flags.
+// unmountTreeAndRemove checks that no mounts remain and then calls
+// os.RemoveAll; a stage() landing a mount between those two steps would have
+// RemoveAll delete through it, destroying the runner's rootfs contents before
+// failing with EBUSY on the mountpoint.
 func (m *mountStager) teardown() {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	ready := m.ready
 	m.ready = false
-	m.mu.Unlock()
+	m.closed = true
 	if !ready {
 		// Nothing was ever staged; the directory may not even exist. Still
 		// try the removal, since a create that failed halfway can leave it.
@@ -189,7 +234,16 @@ func sweepStagedBinds(root string, log *slog.Logger) {
 // that would be the runner's own rootfs — so "could not unmount" must mean
 // "leave it alone and complain", never "delete anyway".
 func unmountTreeAndRemove(dir string) error {
-	mounts, err := mountPointsUnder(dir)
+	return unmountTreeAndRemoveWith(dir, mountPointsUnder, detachMount)
+}
+
+// unmountTreeAndRemoveWith is unmountTreeAndRemove with its two syscall-backed
+// steps injectable. The seam exists because the "still mounted → do not
+// remove" branch is the most consequential line in this file and there is no
+// way to provoke it for real: as root, MNT_DETACH does not fail, so a test
+// that tries to leave a mount behind on purpose cannot.
+func unmountTreeAndRemoveWith(dir string, list func(string) ([]string, error), detach func(string)) error {
+	mounts, err := list(dir)
 	if err != nil {
 		return err
 	}
@@ -198,9 +252,9 @@ func unmountTreeAndRemove(dir string) error {
 	// children).
 	sort.Slice(mounts, func(i, j int) bool { return len(mounts[i]) > len(mounts[j]) })
 	for _, mp := range mounts {
-		detachMount(mp)
+		detach(mp)
 	}
-	remaining, err := mountPointsUnder(dir)
+	remaining, err := list(dir)
 	if err != nil {
 		return err
 	}

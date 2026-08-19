@@ -292,6 +292,276 @@ func TestBindStaging_LegitimateBindsStillWork(t *testing.T) {
 	}
 }
 
+// TestBindStaging_RunnerBindSuffixIsStaged covers the branch that used to have
+// NO containment check of any kind: a source that matches an entry in the
+// runner's bind table with a leftover suffix.
+//
+// That branch matters as much as the rootfs one. The per-job runner directory
+// in the bind table is bind-mounted INTO the runner and is therefore fully
+// job-writable, so `-v <runner-mount>/evil/x:/y` with `evil` a planted symlink
+// was a straight escape. The other staging tests all go through the rootfs
+// branch, which left this one asserted only by the translation-policy tests
+// that do not stage at all.
+func TestBindStaging_RunnerBindSuffixIsStaged(t *testing.T) {
+	requireMountPrivilege(t)
+
+	root := t.TempDir()
+	// The per-job runner directory, as it appears in runnerBindMappings.
+	runnerDir := filepath.Join(root, "runners", "job-x")
+	if err := os.MkdirAll(runnerDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plantVictim(t, runnerDir)
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret"), []byte("host-fs"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{
+		log:    discardLog(),
+		stager: newTestStager(t, root, "job-suffix"),
+		runnerBindMappings: map[string]string{
+			"/home/runner/runner": runnerDir,
+		},
+	}
+
+	// A symlink out of the runner directory must be refused, not followed.
+	if err := os.Symlink(outside, filepath.Join(runnerDir, "esc")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.buildBindMounts(context.Background(), []string{"/home/runner/runner/esc/secret:/x"}); err == nil {
+		t.Error("a suffix escaping the runner directory through a symlink must be rejected")
+	}
+
+	// The legitimate case is staged, not string-joined.
+	opts, pins, err := s.buildBindMounts(context.Background(), []string{"/home/runner/runner/a/real:/x"})
+	t.Cleanup(func() { closeBindPins(pins) })
+	if err != nil {
+		t.Fatalf("a contained suffix under the runner directory must work: %v", err)
+	}
+	spec := applyOpts(t, opts)
+	staged := spec.Mounts[0].Source
+	if !strings.HasPrefix(staged, jobStagingDir(root, "job-suffix")+string(filepath.Separator)) {
+		t.Fatalf("runner-bind suffix source = %q, want a staging path — this branch is as job-controlled as the rootfs branch", staged)
+	}
+
+	// And it holds the validated inode across the swap, same as the rootfs
+	// branch does.
+	swapVictim(t, runnerDir)
+	if orig, _ := os.ReadFile(filepath.Join(runnerDir, "a", "real", "marker")); string(orig) != "SWAPPED" {
+		t.Fatalf("swap did not take effect (original reads %q); the test is not exercising the attack", orig)
+	}
+	got, err := os.ReadFile(filepath.Join(staged, "marker"))
+	if err != nil {
+		t.Fatalf("reading staged runner-bind source: %v", err)
+	}
+	if string(got) != "PINNED" {
+		t.Fatalf("TOCTOU on the runner-bind suffix branch: staged source reads %q, want PINNED", got)
+	}
+}
+
+// TestBindStaging_StageAfterTeardownIsRefused is the regression guard for the
+// Stop() teardown race.
+//
+// Server.Stop now shuts the HTTP listener down before tearing the stager down,
+// so an in-flight create cannot normally reach stage() at that point. This
+// asserts the stager's own half of the invariant, which is what makes the
+// ordering safe rather than merely lucky: once torn down, staging must FAIL.
+// If it instead recreated the directory (which it did before, because
+// ensureDirLocked keys off `ready` and teardown cleared it), the mount would
+// be published into a directory the caller had already swept — leaking a mount
+// that pins the runner's rootfs until the next daemon startup, and racing
+// teardown's own os.RemoveAll, which deletes THROUGH a live bind mount.
+func TestBindStaging_StageAfterTeardownIsRefused(t *testing.T) {
+	requireMountPrivilege(t)
+
+	root := t.TempDir()
+	rootfs := filepath.Join(root, "rootfs")
+	if err := os.MkdirAll(filepath.Join(rootfs, "d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stager := newTestStager(t, root, "job-closed")
+
+	pin, err := pinBindSource(rootfs, "/d", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pin.Close()
+	if _, err := stager.stage(pin); err != nil {
+		t.Fatalf("staging before teardown: %v", err)
+	}
+
+	stager.teardown()
+
+	late, err := pinBindSource(rootfs, "/d", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer late.Close()
+	if _, err := stager.stage(late); err == nil {
+		t.Fatal("staging after teardown must fail; silently recreating the staging dir leaks a mount that pins the runner rootfs")
+	}
+	if _, err := os.Stat(jobStagingDir(root, "job-closed")); !os.IsNotExist(err) {
+		t.Errorf("the refused stage recreated the staging dir (stat err = %v)", err)
+	}
+}
+
+// TestUnmountTreeAndRemove_RefusesWhileMounted covers the single most
+// consequential line in this change: the guard that refuses to os.RemoveAll a
+// directory that still has a mount under it.
+//
+// The first subtest measures WHY the guard has to exist rather than asserting
+// it, because the failure mode is counter-intuitive: os.RemoveAll does not
+// stop at the mountpoint and report EBUSY, it walks in, deletes the files
+// visible THROUGH the mount, and reports EBUSY afterwards. In production those
+// files are the runner's rootfs.
+//
+// The second subtest drives the guard itself. It has to inject the mount
+// enumeration: as root, MNT_DETACH does not fail, so there is no honest way to
+// leave a real mount behind. (Stacking more mounts at one point than
+// detachMount unwinds does not work either — mountinfo lists one entry per
+// stacked mount, so the caller invokes detachMount once per entry and the
+// whole stack comes down.)
+func TestUnmountTreeAndRemove_RefusesWhileMounted(t *testing.T) {
+	requireMountPrivilege(t)
+
+	t.Run("removeall_deletes_through_a_live_mount", func(t *testing.T) {
+		base := t.TempDir()
+		source := filepath.Join(base, "source")
+		if err := os.MkdirAll(source, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(source, "precious"), []byte("runner rootfs content"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		staging := filepath.Join(base, "staging")
+		target := filepath.Join(staging, "0")
+		if err := os.MkdirAll(target, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Mount(source, target, "", unix.MS_BIND, ""); err != nil {
+			t.Fatalf("bind: %v", err)
+		}
+		t.Cleanup(func() { _ = unix.Unmount(target, unix.MNT_DETACH) })
+
+		err := os.RemoveAll(staging)
+		if err == nil {
+			t.Skip("os.RemoveAll unexpectedly succeeded over a live bind mount; the hazard this guard exists for does not reproduce here")
+		}
+		if _, statErr := os.Stat(filepath.Join(source, "precious")); statErr == nil {
+			t.Fatalf("os.RemoveAll left the bind source intact (err was %v); if this ever becomes true the guard could be relaxed, but do not relax it on a hunch", err)
+		}
+		t.Logf("confirmed: os.RemoveAll reported %v AFTER emptying the bind source — this is what the guard prevents", err)
+	})
+
+	t.Run("guard_refuses_and_preserves_the_source", func(t *testing.T) {
+		base := t.TempDir()
+		source := filepath.Join(base, "source")
+		if err := os.MkdirAll(source, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(source, "precious"), []byte("runner rootfs content"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		staging := filepath.Join(base, "staging")
+		target := filepath.Join(staging, "0")
+		if err := os.MkdirAll(target, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Mount(source, target, "", unix.MS_BIND, ""); err != nil {
+			t.Fatalf("bind: %v", err)
+		}
+		t.Cleanup(func() { _ = unix.Unmount(target, unix.MNT_DETACH) })
+
+		// A detach that does nothing: the mount survives the unmount pass,
+		// which is exactly the state the guard is there for.
+		stubborn := func(string) {}
+		err := unmountTreeAndRemoveWith(staging, mountPointsUnder, stubborn)
+		if err == nil {
+			t.Fatal("unmountTreeAndRemove must refuse while a mount remains, not delete through it")
+		}
+		if !strings.Contains(err.Error(), "still present") {
+			t.Errorf("error %q should explain that mounts remain", err)
+		}
+		if _, statErr := os.Stat(filepath.Join(source, "precious")); statErr != nil {
+			t.Fatalf("the refusal did not protect the bind source — it was deleted: %v", statErr)
+		}
+		if _, statErr := os.Stat(staging); statErr != nil {
+			t.Errorf("staging dir was removed despite the refusal: %v", statErr)
+		}
+	})
+}
+
+// TestResolveBeneathWalk_MatchesOpenat2 pins the claim the fallback's doc
+// comment makes: that it is equivalent to openat2 with RESOLVE_IN_ROOT, not
+// merely "stricter, therefore safe".
+//
+// The case that broke it was ".." arriving from a SYMLINK TARGET — the walk
+// refused every "..", while RESOLVE_IN_ROOT resolves them clamped at the root.
+// Relative "../" targets are ordinary in real images (/etc/alternatives/*,
+// Debian multiarch), so the two resolvers disagreeing meant any node that fell
+// back would start 400ing legitimate binds.
+func TestResolveBeneathWalk_MatchesOpenat2(t *testing.T) {
+	rootfs := t.TempDir()
+	for _, d := range []string{"usr/bin", "opt", "deep/a/b/c"} {
+		if err := os.MkdirAll(filepath.Join(rootfs, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(rootfs, "usr", "bin", "tool"), []byte("TOOL"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The shapes real images contain.
+	mkSymlinkOrSkip(t, "../usr/bin/tool", filepath.Join(rootfs, "opt", "rel")) // relative, with ..
+	mkSymlinkOrSkip(t, "/usr/bin/tool", filepath.Join(rootfs, "opt", "abs"))   // container-absolute
+	mkSymlinkOrSkip(t, "../../../../usr/bin/tool", filepath.Join(rootfs, "deep", "a", "b", "climb"))
+	// An escape attempt: ".." past the root must clamp, not escape.
+	mkSymlinkOrSkip(t, "../../../../../../etc/passwd", filepath.Join(rootfs, "opt", "esc"))
+
+	for _, rel := range []string{
+		"usr/bin/tool",
+		"opt/rel",
+		"opt/abs",
+		"deep/a/b/climb",
+		"opt/esc",
+		"deep/a/../a/b/c",
+	} {
+		t.Run(rel, func(t *testing.T) {
+			rootFd, err := openPathDir(rootfs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closePinFd(rootFd)
+			comps, err := pathComponents(rel)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			viaOpenat2, err2 := resolveBeneath(rootFd, comps)
+			viaWalk, errW := resolveBeneathWalk(rootFd, comps)
+			if (err2 == nil) != (errW == nil) {
+				t.Fatalf("resolvers disagree on %q: openat2 err=%v, fallback walk err=%v", rel, err2, errW)
+			}
+			if err2 != nil {
+				return // both refused; that is agreement
+			}
+			defer closePinFd(viaOpenat2)
+			defer closePinFd(viaWalk)
+
+			var a, b unix.Stat_t
+			if err := unix.Fstat(viaOpenat2, &a); err != nil {
+				t.Fatal(err)
+			}
+			if err := unix.Fstat(viaWalk, &b); err != nil {
+				t.Fatal(err)
+			}
+			if a.Dev != b.Dev || a.Ino != b.Ino {
+				t.Fatalf("resolvers landed on different inodes for %q: openat2 %d:%d, walk %d:%d", rel, a.Dev, a.Ino, b.Dev, b.Ino)
+			}
+		})
+	}
+}
+
 // TestBindStaging_TeardownUnmountsAndRemoves covers the lifecycle: after the
 // job's stager tears down, nothing is left mounted and the directory is gone.
 // A leaked staging mount holds a reference to the runner rootfs it was bound
@@ -418,11 +688,11 @@ func TestEnsureTrustedAncestry_RejectsJobWritableParent(t *testing.T) {
 // that never gets unmounted.
 func TestUnescapeMountPath(t *testing.T) {
 	cases := map[string]string{
-		`/var/lib/ephemerd`:            "/var/lib/ephemerd",
-		`/mnt/my\040data/dind-binds`:   "/mnt/my data/dind-binds",
-		`/a\011b`:                      "/a\tb",
-		`/back\134slash`:               "/back\\slash",
-		`/not\09escaped`:               `/not\09escaped`,
+		`/var/lib/ephemerd`:          "/var/lib/ephemerd",
+		`/mnt/my\040data/dind-binds`: "/mnt/my data/dind-binds",
+		`/a\011b`:                    "/a\tb",
+		`/back\134slash`:             "/back\\slash",
+		`/not\09escaped`:             `/not\09escaped`,
 	}
 	for in, want := range cases {
 		if got := unescapeMountPath(in); got != want {

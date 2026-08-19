@@ -15,7 +15,6 @@ import (
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-
 // applyOpts invokes a list of oci.SpecOpts against an empty spec so tests
 // can assert what they produced. withBindMount and friends don't touch the
 // oci.Client / containers.Container args, so nil values are fine.

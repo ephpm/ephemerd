@@ -164,8 +164,22 @@ anchored at the branch's root (A's rootfs, or the host source from A's bind
 table). The kernel enforces containment during the walk instead of a string
 comparison afterwards, and the result is held open as an `O_PATH` descriptor,
 so renaming or replacing a component afterwards cannot change what it points
-at. Pre-5.6 kernels fall back to an equivalent `O_PATH|O_NOFOLLOW`
-component-by-component walk.
+at. Pre-5.6 kernels fall back to an `O_PATH|O_NOFOLLOW`
+component-by-component walk that holds every directory on the way down open,
+so `..` steps back to a descriptor already held rather than re-opening a
+parent by name. `TestResolveBeneathWalk_MatchesOpenat2` asserts the two
+resolvers land on the same inode — including for `..` arriving from a symlink
+target, which is the case that made an earlier version of the walk stricter
+than `openat2` while claiming equivalence. The fleet is all 6.x, so the walk
+is reached only if the latch below trips.
+
+The "no openat2" latch is process-global and permanent, so only `ENOSYS` and
+`E2BIG` set it — errors that can only mean the kernel lacks the syscall. A
+refusal (`EPERM`, e.g. a seccomp filter) falls back for that one call without
+latching, and `EACCES`/`EINVAL` are ordinary failures that fail the bind
+closed. Whichever path it takes, the first bind afterwards logs a WARN naming
+the reason; a node silently resolving binds by the fallback used to be
+indistinguishable from one that was not.
 
 `RESOLVE_IN_ROOT` rather than Go's `os.Root`: an absolute symlink is
 *reinterpreted* relative to the root, which is what a container rootfs means
@@ -203,10 +217,16 @@ mount("/proc/self/fd/N" -> <data>/dind-binds/<job>/<n>)  (same ns: works)
 spec.Source = <data>/dind-binds/<job>/<n>
 ```
 
-runc re-walks the staging path, which is fine: every component is root-owned
-and 0700, and nothing in the name is derived from the job's request (the leaf
-is a bare counter). `ensureTrustedAncestry` checks that precondition on first
-use and fails the bind rather than assuming it. Sources with no job-supplied
+runc re-walks the staging path, which is fine: nothing in the name is derived
+from the job's request (the leaf is a bare counter), and no component of it is
+swappable by anyone but root. `ensureTrustedAncestry` checks that precondition
+on first use and fails the bind rather than assuming it — every component must
+be a real directory (not a symlink) owned by root or by ephemerd's own euid,
+and not group- or other-writable unless it carries the sticky bit, which is
+what makes a data dir under `/tmp` acceptable while a plain group-writable one
+is not. The staging directories ephemerd creates itself are 0700.
+
+Sources with no job-supplied
 component — `/var/run/docker.sock`, `/etc/hosts`, `/etc/resolv.conf`, the
 runner-mount root itself — are still passed through unpinned and unstaged;
 their paths are entirely ephemerd's.
@@ -230,6 +250,14 @@ silently. Now a source that cannot be staged fails the `docker create` with a
 400. That is the correct direction, but it is a new way for a job to break, so
 the error names the staging directory and the requirement (root with
 `CAP_SYS_ADMIN`, writable data dir).
+
+**Operator note.** `ensureTrustedAncestry` is the one new way an otherwise
+working deployment can start rejecting every bind: an ephemerd whose
+`--data-dir` sits under a group- or world-writable directory without the
+sticky bit now fails `docker create` instead of staging into a path someone
+else could swap. The default `/var/lib/ephemerd` is fine, and so is anything
+under `/tmp` (sticky). A custom data dir on a shared or relaxed-permission
+mount is not, and the error says which component and why.
 
 **Windows and macOS are unaffected.** Bind translation is not wired into
 either native container path; `bindpin_other.go` / `bindstage_other.go` exist

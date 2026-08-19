@@ -14,9 +14,10 @@ package dind
 // The security property staging provides is therefore NOT covered by these
 // tests, by construction. It is covered by:
 //
-//   - TestMountStager_* in bindstage_linux_test.go (Linux, root-gated), which
-//     performs the real bind and proves the staged content survives an
-//     adversarial swap of the original path;
+//   - TestBindStaging_* and TestUnmountTreeAndRemove_* in
+//     bindstage_linux_test.go (Linux, root-gated), which perform the real bind
+//     and prove the staged content survives an adversarial swap of the
+//     original path;
 //   - TestBindStaging_RealRunc_* in bindstage_runc_linux_test.go (Linux, root,
 //     EPHEMERD_TEST_RUNC=<path to runc>), which drives the whole path through
 //     a real runc and asserts what the container actually saw.

@@ -21,10 +21,42 @@ var errBindPathTraversal = errors.New(`bind source contains a ".." component, wh
 // Matches the kernel's own MAXSYMLINKS.
 const maxPinSymlinks = 40
 
-// openat2Unsupported latches once the kernel is known not to support openat2,
-// so the fallback does not pay for a failing syscall on every bind. Atomic
+// openat2Unsupported latches once the kernel is known not to have openat2, so
+// the fallback does not pay for a failing syscall on every bind. Atomic
 // because sibling container creates are served concurrently.
+//
+// The latch is process-global and permanent, which is why only errors that
+// genuinely mean "this kernel does not implement the syscall" set it — see
+// openat2Missing. Anything conditional (a seccomp filter, a transient EPERM)
+// falls back for that one call instead, so a single odd error cannot silently
+// convert the node's resolver for the rest of the daemon's uptime.
 var openat2Unsupported atomic.Bool
+
+// openat2FallbackNote carries the reason the resolver fell back, so it reaches
+// the operator's log instead of nothing at all. Set at most once per process;
+// delivered at most once, by the first bind that looks (see
+// openat2FallbackNotice), because pinBindSource has no logger of its own and
+// threading one through every call site would be a lot of churn for a
+// once-per-process event.
+var (
+	openat2Noted     atomic.Bool
+	openat2FallbackR atomic.Pointer[string]
+)
+
+func noteOpenat2Fallback(reason string) {
+	if openat2Noted.CompareAndSwap(false, true) {
+		openat2FallbackR.Store(&reason)
+	}
+}
+
+// openat2FallbackNotice returns the fallback reason exactly once, then "".
+// Callers with a logger (buildBindMounts) surface it.
+func openat2FallbackNotice() string {
+	if r := openat2FallbackR.Swap(nil); r != nil {
+		return *r
+	}
+	return ""
+}
 
 // closePinFd drops a pinned descriptor. Close errors on a descriptor being
 // discarded are not actionable.
@@ -159,8 +191,17 @@ func resolveBeneath(rootFd int, comps []string) (int, error) {
 	if err == nil {
 		return fd, nil
 	}
-	if isOpenat2Unavailable(err) {
+	if openat2Missing(err) {
 		openat2Unsupported.Store(true)
+		noteOpenat2Fallback(fmt.Sprintf("openat2(2) is not implemented on this kernel (%v); dind bind sources will be resolved by the equivalent O_PATH|O_NOFOLLOW walk for the rest of this process", err))
+		return resolveBeneathWalk(rootFd, comps)
+	}
+	if openat2Blocked(err) {
+		// Conditional, so it does not latch: a seccomp filter that rejects
+		// the syscall will reject it again next time and we will fall back
+		// again, at the cost of one failing syscall per bind. That is cheap,
+		// and it means a one-off EPERM cannot permanently downgrade the node.
+		noteOpenat2Fallback(fmt.Sprintf("openat2(2) was refused (%v), most likely by a seccomp filter; dind bind sources are being resolved by the equivalent O_PATH|O_NOFOLLOW walk instead", err))
 		return resolveBeneathWalk(rootFd, comps)
 	}
 	return -1, err
@@ -170,22 +211,34 @@ func resolveBeneath(rootFd int, comps []string) (int, error) {
 // real call; after that the answer is latched.
 func openat2Known() bool { return !openat2Unsupported.Load() }
 
-// isOpenat2Unavailable distinguishes "this kernel/sandbox has no openat2" from
-// a genuine resolution failure. ENOSYS is a pre-5.6 kernel; EPERM is a seccomp
-// filter that does not know the syscall; E2BIG is an OpenHow the kernel does
-// not understand.
-//
-// EACCES and EINVAL are deliberately NOT in this list even though the syscall
-// can return them for an unsupported flag set: both are also ordinary
-// resolution outcomes (EACCES on a directory we may not search, EINVAL from
-// RESOLVE_IN_ROOT rejecting an escape on some kernels), and treating a real
-// rejection as "kernel too old" would silently downgrade every subsequent bind
-// on the node to the fallback walk.
-func isOpenat2Unavailable(err error) bool {
-	return errors.Is(err, unix.ENOSYS) ||
-		errors.Is(err, unix.EPERM) ||
-		errors.Is(err, unix.E2BIG)
+// openat2Missing reports errors that can only mean the kernel does not
+// implement openat2 at all: ENOSYS on pre-5.6, and E2BIG for an OpenHow the
+// kernel cannot parse. These latch.
+func openat2Missing(err error) bool {
+	return errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.E2BIG)
 }
+
+// openat2Blocked reports errors that mean something is refusing the syscall
+// rather than lacking it. These fall back without latching.
+func openat2Blocked(err error) bool {
+	return errors.Is(err, unix.EPERM)
+}
+
+// EACCES and EINVAL are deliberately in NEITHER list.
+//
+// EACCES is an ordinary resolution outcome — one directory along the path we
+// may not search — and treating it as "no openat2" would downgrade the whole
+// node's resolver because of a single unreadable directory.
+//
+// EINVAL means a malformed OpenHow (bad flags, or a reserved field set). It is
+// unreachable for a correct call: RESOLVE_IN_ROOT shipped in the same release
+// as openat2 itself, so there is no kernel that has one without the other. If
+// it ever does happen, the bind fails closed with the real error rather than
+// quietly switching resolvers. (Note for anyone reading the git history: an
+// earlier version of this comment justified excluding EINVAL by claiming
+// RESOLVE_IN_ROOT returns it when a path escapes. It does not — it clamps the
+// escape instead. EXDEV is RESOLVE_BENEATH's escape error, and we do not use
+// RESOLVE_BENEATH. Right call, wrong reason.)
 
 // resolveBeneathWalk is the openat2-less fallback: a manual component-by-
 // component walk that reproduces RESOLVE_IN_ROOT semantics.
@@ -197,13 +250,37 @@ func isOpenat2Unavailable(err error) bool {
 // name, and an absolute target restarts the walk at rootFd instead of at the
 // node's real root.
 //
+// ".." is handled by holding every directory on the way down open and stepping
+// back to the one above — never by re-opening a parent by name, which would be
+// a second walk of the sort this whole mechanism exists to remove. At the root
+// it is a no-op, exactly as RESOLVE_IN_ROOT clamps it.
+//
+// An earlier version refused ".." outright, reasoning that a lexically cleaned
+// bind source cannot contain one. That is true of the source, but not of a
+// SYMLINK TARGET, which is spliced into the walk here — and relative "../"
+// targets are everywhere in real images (/etc/alternatives/*, Debian
+// multiarch, tool caches). It failed closed rather than unsafely, but it made
+// this path meaningfully stricter than openat2 while the comment claimed
+// equivalence, which would have surfaced as legitimate binds 400ing on any
+// node that ever fell back.
+//
 // This exists so a node on a pre-5.6 kernel degrades to "slower but equally
 // contained" rather than to "unprotected" or "dind is broken".
 func resolveBeneathWalk(rootFd int, comps []string) (int, error) {
-	cur, err := unix.Dup(rootFd)
+	root, err := unix.Dup(rootFd)
 	if err != nil {
 		return -1, fmt.Errorf("dup bind root: %w", err)
 	}
+	// stack[0] is always the bind root; the last element is the current
+	// directory. Everything in between is held open so ".." can step back
+	// without naming anything.
+	stack := []int{root}
+	closeStack := func() {
+		for _, fd := range stack {
+			closePinFd(fd)
+		}
+	}
+
 	remaining := append([]string(nil), comps...)
 	links := 0
 
@@ -214,56 +291,62 @@ func resolveBeneathWalk(rootFd int, comps []string) (int, error) {
 		case "", ".":
 			continue
 		case "..":
-			// RESOLVE_IN_ROOT makes ".." at the root a no-op; anywhere else
-			// it would need parent tracking. Refusing is stricter and, for
-			// a lexically cleaned bind source, unreachable except through a
-			// symlink target.
-			closePinFd(cur)
-			return -1, errBindPathTraversal
+			if len(stack) > 1 {
+				closePinFd(stack[len(stack)-1])
+				stack = stack[:len(stack)-1]
+			}
+			// At the root, ".." is a no-op: there is no "above" to reach.
+			continue
 		}
 
+		cur := stack[len(stack)-1]
 		next, err := unix.Openat(cur, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		if err != nil {
-			closePinFd(cur)
+			closeStack()
 			return -1, err
 		}
 		var st unix.Stat_t
 		if err := unix.Fstat(next, &st); err != nil {
 			closePinFd(next)
-			closePinFd(cur)
+			closeStack()
 			return -1, fmt.Errorf("stat %s during bind resolution: %w", name, err)
 		}
 		if st.Mode&unix.S_IFMT != unix.S_IFLNK {
-			closePinFd(cur)
-			cur = next
+			stack = append(stack, next)
 			continue
 		}
 
-		// Symlink: expand it in place rather than following it by name.
+		// Symlink: expand it in place rather than following it by name. The
+		// link itself is not descended into, so the stack does not grow.
 		links++
 		if links > maxPinSymlinks {
 			closePinFd(next)
-			closePinFd(cur)
+			closeStack()
 			return -1, unix.ELOOP
 		}
 		target, err := readlinkFd(next)
 		closePinFd(next)
 		if err != nil {
-			closePinFd(cur)
+			closeStack()
 			return -1, err
 		}
 		if strings.HasPrefix(target, "/") {
 			// Absolute target: re-anchor at the bind root, which is what
 			// RESOLVE_IN_ROOT does and what the path means from inside the
 			// runner's own namespace.
-			closePinFd(cur)
-			if cur, err = unix.Dup(rootFd); err != nil {
-				return -1, fmt.Errorf("dup bind root: %w", err)
+			for _, fd := range stack[1:] {
+				closePinFd(fd)
 			}
+			stack = stack[:1]
 		}
 		remaining = append(strings.Split(target, "/"), remaining...)
 	}
-	return cur, nil
+
+	result := stack[len(stack)-1]
+	for _, fd := range stack[:len(stack)-1] {
+		closePinFd(fd)
+	}
+	return result, nil
 }
 
 // readlinkFd reads the target of the symlink an O_PATH|O_NOFOLLOW descriptor

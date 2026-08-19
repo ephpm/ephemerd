@@ -46,8 +46,8 @@ const sharedNamespace = "ephemerd"
 // Server is a per-job fake Docker daemon.
 type Server struct {
 	jobID          string
-	jobNamespace   string // per-job containerd namespace for isolation
-	cacheNamespace string // per-(provider,repo) shared image cache namespace; empty disables caching
+	jobNamespace   string    // per-job containerd namespace for isolation
+	cacheNamespace string    // per-(provider,repo) shared image cache namespace; empty disables caching
 	transport      Transport // how the API is exposed to the job container; see listen.go
 	dockerDir      string    // <DataDir>/jobs/<JobID>/docker — per-job scratch, exists on every transport
 	sockPath       string    // host-side unix socket path; empty on the TCP transport
@@ -422,6 +422,34 @@ func (s *Server) Start() error {
 func (s *Server) Stop() {
 	s.log.Info("stopping fake docker daemon")
 
+	// STOP SERVING FIRST. Everything below tears down state that in-flight
+	// requests can still be creating, and the most dangerous of those is bind
+	// staging: handleContainerCreate publishes bind mounts under the job's
+	// staging directory, and the stager teardown further down removes that
+	// directory. os.RemoveAll walking into a bind mount that appeared after
+	// the teardown's mount check deletes the files visible THROUGH the mount
+	// — the runner's own rootfs — and only then reports EBUSY on the
+	// mountpoint. (Verified: RemoveAll over a live bind mount empties the
+	// source and returns "device or resource busy" afterwards.)
+	//
+	// The stager refuses to stage after teardown and holds its lock across
+	// the mount, so the race is closed on that side too; this ordering means
+	// there is nothing left to race with in the first place. It is also just
+	// correct on its own terms — a sibling that still holds DOCKER_HOST (the
+	// TCP transport) can keep issuing docker create calls right through
+	// teardown, because siblings are not in the runner's cgroup and outlive
+	// the runner task the runtime killed before calling Stop.
+	if s.server != nil {
+		if err := s.server.Shutdown(context.Background()); err != nil {
+			s.log.Debug("shutting down fake docker server", "error", err)
+		}
+	}
+	if s.listener != nil {
+		if err := s.listener.Close(); err != nil {
+			s.log.Debug("closing listener", "error", err)
+		}
+	}
+
 	// Destroy all exec processes and containers created through this socket.
 	s.destroyAllExecs()
 	s.destroyAllContainers()
@@ -458,16 +486,6 @@ func (s *Server) Stop() {
 		CleanupJobBuildRecords(context.Background(), s.client, s.buildkit.ContainerdNamespace(), s.jobID, s.log)
 	}
 
-	if s.server != nil {
-		if err := s.server.Shutdown(context.Background()); err != nil {
-			s.log.Debug("shutting down fake docker server", "error", err)
-		}
-	}
-	if s.listener != nil {
-		if err := s.listener.Close(); err != nil {
-			s.log.Debug("closing listener", "error", err)
-		}
-	}
 	// Remove the firewall allow opened for this job's TCP listener. The
 	// container address is half the rule, so it has to go back in for the
 	// delete to find the right one — and, crucially, only that one: a

@@ -18,6 +18,10 @@ var errBindPathTraversal = errors.New(`bind source contains a ".." component, wh
 // closePinFd is a no-op off Linux: nothing here holds a descriptor.
 func closePinFd(int) {}
 
+// openat2FallbackNotice has nothing to report off Linux — there is no openat2
+// and no fallback walk here. See bindpin_linux.go.
+func openat2FallbackNotice() string { return "" }
+
 // pinBindSource is the non-Linux implementation. It exists so the translation
 // logic and its tests build and run on a Windows or macOS dev host.
 //

@@ -1479,6 +1479,16 @@ func (s *Server) buildBindMounts(ctx context.Context, binds []string) ([]oci.Spe
 	runnerRootfs := s.runnerRootfsPath
 	s.mu.Unlock()
 
+	// The bind resolver has no logger of its own. If it has had to fall back
+	// from openat2 to the manual contained walk, this is where that becomes
+	// visible — once per process, on the first bind after it happened.
+	// Without it the switch is silent, and a node resolving binds by the
+	// fallback path looks identical to one that is not until something
+	// unexpected starts failing.
+	if note := openat2FallbackNotice(); note != "" {
+		s.log.Warn("dind bind source resolver fell back from openat2", "detail", note)
+	}
+
 	out := make([]oci.SpecOpts, 0, len(binds))
 	var pins []*bindPin
 	fail := func(format string, args ...any) ([]oci.SpecOpts, []*bindPin, error) {

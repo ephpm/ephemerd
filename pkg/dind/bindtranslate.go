@@ -110,6 +110,9 @@ func translateBindSource(src string, runnerBinds map[string]string, runnerRootfs
 		if err != nil {
 			return bindResolution{}, fmt.Errorf("bind source %q rejected: %w", src, err)
 		}
+		if err := rejectUnbindableType(src, pin); err != nil {
+			return bindResolution{}, err
+		}
 		return bindResolution{ResolvedPath: pin.Logical(), Pin: pin}, nil
 	}
 
@@ -128,10 +131,8 @@ func translateBindSource(src string, runnerBinds map[string]string, runnerRootfs
 			}
 			return bindResolution{}, fmt.Errorf("bind source %q rejected: %w", src, err)
 		}
-		mode := pin.Mode()
-		if !mode.IsDir() && !mode.IsRegular() {
-			_ = pin.Close()
-			return bindResolution{}, fmt.Errorf("bind source %q resolves to something that is not a regular file or directory (mode %s)", src, mode)
+		if err := rejectUnbindableType(src, pin); err != nil {
+			return bindResolution{}, err
 		}
 		return bindResolution{ResolvedPath: pin.Logical(), Pin: pin}, nil
 	}
@@ -152,6 +153,29 @@ func translateBindSource(src string, runnerBinds map[string]string, runnerRootfs
 	}
 
 	return bindResolution{}, fmt.Errorf("bind source %q is not visible to ephemerd dind (not in runner rootfs or known bind table)", src)
+}
+
+// rejectUnbindableType refuses a pinned source that is neither a directory nor
+// a regular file, closing the pin on the way out.
+//
+// Applied to every pinned branch, not just the rootfs one. The runner
+// directory reachable through the bind table is job-writable, so a job can put
+// a FIFO or a unix socket under it and ask for it by name; the mountpoint the
+// stager would create for it is a plain file, and binding a FIFO onto one is
+// at best confusing and at worst a container that blocks forever on open.
+// There is no escalation either way — this is about the two pinned branches
+// answering the same question the same way.
+//
+// The exact-match bind-table entries are deliberately not subject to this:
+// /var/run/docker.sock IS a socket, it is ephemerd's own, and it is passed
+// through unpinned.
+func rejectUnbindableType(src string, pin *bindPin) error {
+	mode := pin.Mode()
+	if mode.IsDir() || mode.IsRegular() {
+		return nil
+	}
+	_ = pin.Close()
+	return fmt.Errorf("bind source %q resolves to something that is not a regular file or directory (mode %s)", src, mode)
 }
 
 // matchBindPrefix returns the host source for the longest runnerBinds key
