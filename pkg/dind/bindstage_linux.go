@@ -4,6 +4,7 @@ package dind
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -93,11 +94,10 @@ func (m *mountStager) stage(p *bindPin) (string, error) {
 	src := "/proc/self/fd/" + strconv.Itoa(p.fd)
 	if err := unix.Mount(src, target, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
 		_ = os.Remove(target)
-		return "", fmt.Errorf("staging bind source %s at %s: %w "+
-			"(ephemerd binds every job-supplied -v source into %s before handing it to the container runtime, "+
-			"so the source cannot be swapped between validation and mount; "+
-			"this requires ephemerd to run as root with CAP_SYS_ADMIN on a writable data directory)",
-			p.logical, target, err, m.dir)
+		return "", fmt.Errorf("staging bind source %s at %s: %w. "+
+			"ephemerd binds every job-supplied -v source into %s before handing it to the container runtime, "+
+			"so a job cannot swap the source between validation and mount. %s",
+			p.logical, target, err, m.dir, stagingMountAdvice(err))
 	}
 
 	p.staged = target
@@ -109,6 +109,33 @@ func (m *mountStager) stage(p *bindPin) (string, error) {
 		return unmountAndRemove(target)
 	}
 	return target, nil
+}
+
+// stagingMountAdvice turns a mount(2) errno into the one sentence an operator
+// needs, because the two likely causes want completely different responses and
+// the raw errno does not distinguish them: "ephemerd is not privileged enough"
+// is a deployment problem, "your data directory is unusable" is a disk or
+// configuration problem, and telling someone to check both wastes their time.
+func stagingMountAdvice(err error) string {
+	switch {
+	case errors.Is(err, unix.EPERM):
+		return "This one is about PRIVILEGE, not the data directory: ephemerd cannot call mount(2) here, " +
+			"which needs CAP_SYS_ADMIN. ephemerd requires root on Linux regardless of this feature — the " +
+			"shipped systemd unit runs as root, the embedded containerd needs mount(2) for the overlayfs " +
+			"snapshotter, and networking manages iptables and a CNI bridge. Run `ephemerd doctor`, which " +
+			"checks this explicitly."
+	case errors.Is(err, unix.EROFS):
+		return "This one is about the DATA DIRECTORY: it is on a read-only filesystem, so the staging " +
+			"directory cannot be mounted into. Point --data-dir at writable storage."
+	case errors.Is(err, unix.ENOSPC):
+		return "This one is about the DATA DIRECTORY: the filesystem holding it is out of space or inodes."
+	case errors.Is(err, unix.EACCES):
+		return "This one is about the DATA DIRECTORY: a component of the staging path is not searchable by " +
+			"ephemerd. Check the ownership and mode of the --data-dir tree."
+	default:
+		return "Check that --data-dir points at a writable directory on a filesystem that supports bind " +
+			"mounts, and that ephemerd is running as root (`ephemerd doctor`)."
+	}
 }
 
 // ensureDirLocked creates the per-job staging directory on first use and

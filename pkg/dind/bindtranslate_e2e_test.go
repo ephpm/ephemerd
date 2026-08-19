@@ -51,6 +51,13 @@ func TestBindTranslation_RealContainerd(t *testing.T) {
 		// doc, deferred follow-ups.
 		t.Skipf("bind translation requires overlayfs snapshotter; goos=%s", goruntime.GOOS)
 	}
+	// Bind translation now publishes every job-supplied source as a bind mount
+	// under <data>/dind-binds before it reaches the OCI spec (issue #125), so
+	// this test needs mount(2) where it previously did not. It fails closed by
+	// design: staging must never degrade to putting a job-controlled path in
+	// the spec, because that is the vulnerability, and it would leave every
+	// test green while the escape was live. See requireBindStaging.
+	requireBindStaging(t)
 
 	ctrdClient := sharedTestContainerd(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -258,6 +265,13 @@ func TestBindTranslation_RealContainerd(t *testing.T) {
 // drops the bind and continues, leaving the test no way to notice. Against
 // the fix, `/etc/shadow` is not in the runner rootfs or bind table, so
 // buildBindMounts returns an error that the handler will surface as 400.
+//
+// Deliberately NOT gated on requireBindStaging, unlike the test above: the
+// rejection happens in translateBindSource, before anything is pinned, so this
+// never reaches the stager and needs no mount privilege. That is a property
+// worth stating rather than leaving to luck — it is the reason this test still
+// runs on the unprivileged CI runner, and if a future change moves the
+// rejection after staging it should be re-gated rather than quietly skipped.
 func TestBindTranslation_RejectsForeignSource(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping bind-translation e2e in short mode")
