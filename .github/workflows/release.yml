@@ -81,6 +81,12 @@ jobs:
 
   build-linux-arm64:
     name: Build (Linux arm64)
+    # TEMPORARY (v0.2.4 only): the arm64 host (sharks) is offline being rebuilt
+    # from Incus to Proxmox, so there is no self-hosted linux/arm64 runner. Skip
+    # the arm64 leg for this tag only and backfill the arm64 asset onto the
+    # release once arm64 capacity returns. This branch is NOT merged to main —
+    # main keeps building all four platforms for the next release.
+    if: false
     needs: validate
     runs-on: [self-hosted, linux, arm64]
     steps:
@@ -196,9 +202,9 @@ jobs:
 
   release:
     name: Publish GitHub Release
+    # build-linux-arm64 intentionally omitted for v0.2.4 (skipped above).
     needs:
       - build-linux-amd64
-      - build-linux-arm64
       - build-windows-amd64
       - build-darwin-arm64
     runs-on: [self-hosted, linux, x64]
