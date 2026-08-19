@@ -46,8 +46,8 @@ const sharedNamespace = "ephemerd"
 // Server is a per-job fake Docker daemon.
 type Server struct {
 	jobID          string
-	jobNamespace   string // per-job containerd namespace for isolation
-	cacheNamespace string // per-(provider,repo) shared image cache namespace; empty disables caching
+	jobNamespace   string    // per-job containerd namespace for isolation
+	cacheNamespace string    // per-(provider,repo) shared image cache namespace; empty disables caching
 	transport      Transport // how the API is exposed to the job container; see listen.go
 	dockerDir      string    // <DataDir>/jobs/<JobID>/docker — per-job scratch, exists on every transport
 	sockPath       string    // host-side unix socket path; empty on the TCP transport
@@ -70,6 +70,13 @@ type Server struct {
 	buildkit        *buildkit.Server // shared embedded BuildKit solver (nil → fall back to platform default)
 	runnerNetNS     string           // path to runner container's net namespace; used to install DNAT rules for port bindings
 	allowPrivileged bool             // gate for docker run --privileged / --cap-add; see config.DindConfig.AllowPrivileged
+
+	// stager publishes every job-supplied bind source at a path under
+	// <DataDir>/dind-binds/<JobID>/ that only root can reach, so the path
+	// the OCI spec carries has nothing in it the job can swap between
+	// validation and runc's mount. See bindStager and issue #125. Always
+	// set by New; a nil stager makes bind translation fail closed.
+	stager bindStager
 
 	// mirror routes this job's image pulls through a LAN pull-through
 	// cache. Nil means no mirror and every pull path below is unchanged.
@@ -231,6 +238,7 @@ func New(cfg Config) (*Server, error) {
 		buildkit:        cfg.BuildKit,
 		runnerNetNS:     cfg.RunnerNetNS,
 		allowPrivileged: cfg.AllowPrivileged,
+		stager:          newBindStager(cfg.DataDir, cfg.JobID, cfg.Log),
 		mirror:          cfg.RegistryMirror,
 		log:             cfg.Log.With("component", "dind", "job_id", cfg.JobID),
 		images:          make(map[string]*imageEntry),
@@ -415,9 +423,45 @@ func (s *Server) Start() error {
 func (s *Server) Stop() {
 	s.log.Info("stopping fake docker daemon")
 
+	// STOP SERVING FIRST. Everything below tears down state that in-flight
+	// requests can still be creating, and the most dangerous of those is bind
+	// staging: handleContainerCreate publishes bind mounts under the job's
+	// staging directory, and the stager teardown further down removes that
+	// directory. os.RemoveAll walking into a bind mount that appeared after
+	// the teardown's mount check deletes the files visible THROUGH the mount
+	// — the runner's own rootfs — and only then reports EBUSY on the
+	// mountpoint. (Verified: RemoveAll over a live bind mount empties the
+	// source and returns "device or resource busy" afterwards.)
+	//
+	// The stager refuses to stage after teardown and holds its lock across
+	// the mount, so the race is closed on that side too; this ordering means
+	// there is nothing left to race with in the first place. It is also just
+	// correct on its own terms — a sibling that still holds DOCKER_HOST (the
+	// TCP transport) can keep issuing docker create calls right through
+	// teardown, because siblings are not in the runner's cgroup and outlive
+	// the runner task the runtime killed before calling Stop.
+	if s.server != nil {
+		if err := s.server.Shutdown(context.Background()); err != nil {
+			s.log.Debug("shutting down fake docker server", "error", err)
+		}
+	}
+	if s.listener != nil {
+		if err := s.listener.Close(); err != nil {
+			s.log.Debug("closing listener", "error", err)
+		}
+	}
+
 	// Destroy all exec processes and containers created through this socket.
 	s.destroyAllExecs()
 	s.destroyAllContainers()
+
+	// Every container's cleanup released its own staged bind mounts; this is
+	// the backstop for anything that never made it onto a containerEntry
+	// (a create that failed between staging and registration). Leaving one
+	// behind pins the runner's rootfs mount and blocks snapshot deletion.
+	if s.stager != nil {
+		s.stager.teardown()
+	}
 
 	// Clean up the per-job containerd namespace. destroyAllContainers handles
 	// containers tracked in the in-memory map; this catches stragglers
@@ -443,16 +487,6 @@ func (s *Server) Stop() {
 		CleanupJobBuildRecords(context.Background(), s.client, s.buildkit.ContainerdNamespace(), s.jobID, s.log)
 	}
 
-	if s.server != nil {
-		if err := s.server.Shutdown(context.Background()); err != nil {
-			s.log.Debug("shutting down fake docker server", "error", err)
-		}
-	}
-	if s.listener != nil {
-		if err := s.listener.Close(); err != nil {
-			s.log.Debug("closing listener", "error", err)
-		}
-	}
 	// Remove the firewall allow opened for this job's TCP listener. The
 	// container address is half the rule, so it has to go back in for the
 	// delete to find the right one — and, crucially, only that one: a

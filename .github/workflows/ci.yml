@@ -42,6 +42,30 @@ jobs:
             -run TestImagePull_SharedNamespaceHitIsUsableFromJobNamespace \
             -v ./pkg/dind/
 
+      # Same rationale as the step above, for the #125 bind-staging tests. The
+      # security property they cover — that a job cannot swap a bind source
+      # between validation and runc's mount — is only observable when mount(2)
+      # is available, which it is not on this unprivileged runner. Printing
+      # the SKIP keeps that on the record instead of letting a green package
+      # imply coverage it does not have; the previous attempt at #125 passed
+      # review on exactly that misreading.
+      #
+      # TestBindTranslation_RealContainerd is in the list because it USED to
+      # run here and no longer does: bind translation now stages every
+      # job-supplied source as a real bind mount, so the test needs mount(2)
+      # where it previously did not. That is a genuine loss of CI coverage and
+      # it should be legible as a SKIP line, not inferred from a green package.
+      # It is not fixable by making staging degrade when unprivileged — that
+      # reinstates the escape and turns every one of these tests green while
+      # the vulnerability is live.
+      #
+      # Keep the -run pattern in sync with the test names; see requireBindStaging.
+      - name: Privileged-test coverage report (dind bind staging, #125)
+        run: |
+          go test -tags containers_image_openpgp -count=1 \
+            -run 'TestBindStaging|TestBindTranslation|TestSweepStagedBinds|TestEnsureTrustedAncestry|TestUnmountTreeAndRemove|TestResolveBeneathWalk' \
+            -v ./pkg/dind/
+
       - name: E2E — GitHub provider (fake server)
         run: mage e2egithub
 

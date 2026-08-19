@@ -142,7 +142,127 @@ overlay mount so every layer's content is visible.
 malicious `/home/runner/../../etc/shadow` resolves to `/etc/shadow` and
 either falls into A's rootfs (which means the sibling sees A's own
 `/etc/shadow` — exactly what A could already see) or fails to resolve at
-all. There is no source path that escapes the runner's rootfs envelope.
+all.
+
+Lexical cleaning is not sufficient on its own — see the next section.
+
+## Resolution and staging (issue #125)
+
+The original design resolved a source to a *path string* and put that string
+in B's OCI spec. runc then walked the string again, in its own process, at
+task start. The job owns every byte of A's rootfs, so it could swap a
+validated directory for a symlink in between and runc would mount the
+symlink's target. Reproduced against real runc 1.3.4: the container received
+the swapped target, exit status 0, nothing logged anywhere.
+
+Two things fix it, and both are necessary.
+
+**1. Contained resolution, once, to a descriptor**
+(`pkg/dind/bindpin_linux.go`). Every source with a job-supplied component is
+resolved with `openat2(2)` under `RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS`,
+anchored at the branch's root (A's rootfs, or the host source from A's bind
+table). The kernel enforces containment during the walk instead of a string
+comparison afterwards, and the result is held open as an `O_PATH` descriptor,
+so renaming or replacing a component afterwards cannot change what it points
+at. Pre-5.6 kernels fall back to an `O_PATH|O_NOFOLLOW`
+component-by-component walk that holds every directory on the way down open,
+so `..` steps back to a descriptor already held rather than re-opening a
+parent by name. `TestResolveBeneathWalk_MatchesOpenat2` asserts the two
+resolvers land on the same inode — including for `..` arriving from a symlink
+target, which is the case that made an earlier version of the walk stricter
+than `openat2` while claiming equivalence. The fleet is all 6.x, so the walk
+is reached only if the latch below trips.
+
+The "no openat2" latch is process-global and permanent, so only `ENOSYS` and
+`E2BIG` set it — errors that can only mean the kernel lacks the syscall. A
+refusal (`EPERM`, e.g. a seccomp filter) falls back for that one call without
+latching, and `EACCES`/`EINVAL` are ordinary failures that fail the bind
+closed. Whichever path it takes, the first bind afterwards logs a WARN naming
+the reason; a node silently resolving binds by the fallback used to be
+indistinguishable from one that was not.
+
+`RESOLVE_IN_ROOT` rather than Go's `os.Root`: an absolute symlink is
+*reinterpreted* relative to the root, which is what a container rootfs means
+and what merged-usr images (`/bin -> /usr/bin`) require. `os.Root` rejects
+absolute symlinks outright and would break every Ubuntu runner image. Note the
+consequence: a symlink inside A's rootfs whose target is the *host* path of
+that rootfs no longer resolves. That cannot occur in a container image —
+nothing inside a container can name the host path of its own rootfs — and
+following it would mean resolving against the host's root, which is the escape.
+
+**2. Staging, because a descriptor cannot go in the spec**
+(`pkg/dind/bindstage_linux.go`). The obvious handoff — putting
+`/proc/<ephemerd-pid>/fd/<n>` in `ocispec.Mount.Source` — does not work. runc
+does not re-resolve the string (its own error echoes it verbatim), but
+`mount(2)` rejects it:
+
+```
+error mounting "/proc/3543706/fd/3" to rootfs at "/marker":
+mount src=/proc/3543706/fd/3, dst=/marker, dstFd=/proc/thread-self/fd/11,
+flags=MS_BIND|MS_REC: invalid argument
+```
+
+A bind source must live in the *caller's* mount namespace, and runc always has
+its own. The rejection is unconditional — legitimate binds fail identically —
+so an fd handoff is a functional regression, not a fix. (This is recorded as
+an executable test, `TestBindStaging_RealRunc_ProcFdSourceIsRejected`, so the
+next person does not rediscover it from an outage.)
+
+Instead ephemerd performs the bind itself, in its own mount namespace where
+`/proc/self/fd/<n>` resolves fine, onto a path it owns:
+
+```
+openat2(RESOLVE_IN_ROOT|RESOLVE_NO_MAGICLINKS)          -> pinned fd
+mount("/proc/self/fd/N" -> <data>/dind-binds/<job>/<n>)  (same ns: works)
+spec.Source = <data>/dind-binds/<job>/<n>
+```
+
+runc re-walks the staging path, which is fine: nothing in the name is derived
+from the job's request (the leaf is a bare counter), and no component of it is
+swappable by anyone but root. `ensureTrustedAncestry` checks that precondition
+on first use and fails the bind rather than assuming it — every component must
+be a real directory (not a symlink) owned by root or by ephemerd's own euid,
+and not group- or other-writable unless it carries the sticky bit, which is
+what makes a data dir under `/tmp` acceptable while a plain group-writable one
+is not. The staging directories ephemerd creates itself are 0700.
+
+Sources with no job-supplied
+component — `/var/run/docker.sock`, `/etc/hosts`, `/etc/resolv.conf`, the
+runner-mount root itself — are still passed through unpinned and unstaged;
+their paths are entirely ephemerd's.
+
+**Staging directory location.** `<data>/dind-binds/<job-id>/`, deliberately
+*not* under `<data>/jobs/<job-id>/`, which the runtime's orphan sweep
+`os.RemoveAll`s. Recursively deleting a directory containing a live bind mount
+deletes the files visible *through* the mount — here, A's own rootfs.
+
+**Lifecycle.** Pins are held on the `containerEntry` for the container's whole
+life (not just until the task starts: `docker restart` makes runc re-read the
+spec) and released in `cleanupContainer`. `Server.Stop` tears down the job's
+whole staging directory as a backstop. A hard kill skips both, so
+`dind.SweepStagedBinds` runs at daemon startup, from `Runtime.CleanOrphans`,
+*before* the container and snapshot sweep — a leaked staging mount holds a
+reference to the rootfs it was bound from, which makes the snapshot
+undeletable.
+
+**Failure mode inverted, on purpose.** Before, a swapped source mounted
+silently. Now a source that cannot be staged fails the `docker create` with a
+400. That is the correct direction, but it is a new way for a job to break, so
+the error names the staging directory and the requirement (root with
+`CAP_SYS_ADMIN`, writable data dir).
+
+**Operator note.** `ensureTrustedAncestry` is the one new way an otherwise
+working deployment can start rejecting every bind: an ephemerd whose
+`--data-dir` sits under a group- or world-writable directory without the
+sticky bit now fails `docker create` instead of staging into a path someone
+else could swap. The default `/var/lib/ephemerd` is fine, and so is anything
+under `/tmp` (sticky). A custom data dir on a shared or relaxed-permission
+mount is not, and the error says which component and why.
+
+**Windows and macOS are unaffected.** Bind translation is not wired into
+either native container path; `bindpin_other.go` / `bindstage_other.go` exist
+only so the translation policy tests build and run on a dev host, and they
+carry no security property.
 
 ## Security envelope
 
@@ -250,21 +370,50 @@ the Windows-native runner code path. There are two scenarios:
   lands in lowerdir ro), unknown source surfaces a 400-shaped error,
   no-rootfs-registered rejects rather than silently allowing.
 
-All tests pass with `CGO_ENABLED=0 go test ./pkg/dind/` and don't
+All of the above pass with `CGO_ENABLED=0 go test ./pkg/dind/` and don't
 require a real containerd.
+
+`pkg/dind/bindstage_linux_test.go` (Linux, **root only** — `mount(2)` needs
+`CAP_SYS_ADMIN` and the project's Linux CI runner is unprivileged) covers the
+staging layer itself: the swap-after-validation escape, a control proving the
+pre-fix shape *does* follow the swap, the legitimate-bind regression set
+(directory, regular file, auto-mkdir, merged-usr symlink traversal, and the
+three passthrough binds), teardown, the startup sweep, and the trusted-ancestry
+precondition.
+
+`pkg/dind/bindstage_runc_linux_test.go` (Linux, root, and
+`EPHEMERD_TEST_RUNC=<path to runc>`) is the end-to-end proof, because nothing
+on the daemon side can observe what runc's `mount(2)` resolves:
+
+```
+sudo EPHEMERD_TEST_RUNC=$PWD/pkg/containerd/embed/runc \
+  go test ./pkg/dind/ -run TestBindStaging_RealRunc -v
+```
+
+Against runc 1.3.4 it reports the control leaking (`CONTAINER-SAW: SWAPPED`),
+the staged source holding (`CONTAINER-SAW: PINNED`), and the `/proc/<pid>/fd`
+source being rejected with `invalid argument`.
+
+**A green `go test ./pkg/dind/` on an unprivileged host proves none of this.**
+The tests that carry the security property skip there, loudly. The previous
+attempt at #125 shipped a spec runc rejects outright and the package was still
+`ok`.
 
 ## Deferred follow-ups
 
 - **Windows-native `container:`.** Different snapshotter and mount
   semantics; needs its own translation layer or a clean "not supported"
   rejection at request time.
-- **Symlink hardening.** `filepath.Clean` handles `..` but not symlinks
-  that resolve outside the runner rootfs. The current upperdir/lowerdir
-  walk only honors paths that exist as plain files/dirs within the
-  layers, so we don't currently *open* the door — but if a future
-  layer walk were to add `filepath.EvalSymlinks`, the call needs an
-  after-the-fact prefix check to confirm the resolved path stays inside
-  the snapshot directory.
+- ~~**Symlink hardening.**~~ Done, and then done again properly: the
+  after-the-fact prefix check this bullet proposed was implemented, and was
+  the bug — see "Resolution and staging (issue #125)" above. Containment is
+  now enforced by the kernel during a single resolution, and the result is a
+  descriptor rather than a name.
+- **`open_tree(OPEN_TREE_CLONE)` + `move_mount`.** A cleaner way to hand a
+  detached mount to the runtime than a staging path, and it would remove the
+  staging directory and its lifecycle entirely. It needs the runtime to accept
+  a mount fd, which the OCI spec does not express and containerd does not
+  plumb, so it is not reachable from here today.
 - **Resolved-path caching.** Each `buildBindMounts` call queries the
   snapshotter and `os.Stat`s every source. A given runner doesn't
   change its layers within a job, so the resolution can be cached

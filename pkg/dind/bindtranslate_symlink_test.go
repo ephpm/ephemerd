@@ -3,6 +3,7 @@ package dind
 import (
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
 )
@@ -73,22 +74,58 @@ func TestTranslateBindSource_SymlinkEscapeViaAncestor_Rejected(t *testing.T) {
 // TestTranslateBindSource_InternalSymlink_Allowed confirms the fix does not
 // over-reject: a symlink that stays inside the rootfs (a legitimate overlay
 // arrangement) resolves fine.
+//
+// Both realistic forms are covered, because they are what real runner images
+// contain: a relative link, and an ABSOLUTE link written from the container's
+// point of view — Ubuntu's merged-usr layout makes /bin, /lib and /sbin
+// absolute symlinks into /usr, so every bind that traverses them takes the
+// second path. Resolution therefore has to reinterpret an absolute symlink
+// relative to the rootfs (which openat2's RESOLVE_IN_ROOT does, and Go's
+// os.Root notably does not — it rejects absolute symlinks outright, which is
+// why os.Root is not used here).
+//
+// A link whose target is the rootfs's own HOST path is deliberately not
+// covered as an "allowed" case: it cannot occur in a container image (nothing
+// inside the container can name the host path of its own rootfs) and treating
+// it as in-bounds would mean resolving symlink targets against the host's root
+// rather than the container's, which is the escape this all exists to prevent.
+// See TestTranslateBindSource_SymlinkEscape_Rejected.
 func TestTranslateBindSource_InternalSymlink_Allowed(t *testing.T) {
-	rootfs := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(rootfs, "real", "dir"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(rootfs, "real", "dir", "file"), []byte("ok"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// `<rootfs>/link -> <rootfs>/real` — an in-rootfs symlink.
-	mkSymlinkOrSkip(t, filepath.Join(rootfs, "real"), filepath.Join(rootfs, "link"))
+	for _, tc := range []struct {
+		name      string
+		target    string // symlink target, as written inside the rootfs
+		linuxOnly bool
+	}{
+		{name: "relative", target: "real"},
+		// Reinterpreting an absolute target relative to the rootfs is
+		// RESOLVE_IN_ROOT, i.e. a kernel feature. The dev-host stub in
+		// bindpin_other.go has no equivalent (it resolves against the real
+		// filesystem root) and is not a production path — see the comment
+		// there. Running this case off Linux would only assert that the stub
+		// is a stub.
+		{name: "container_absolute_merged_usr_style", target: "/real", linuxOnly: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.linuxOnly && goruntime.GOOS != "linux" {
+				t.Skipf("absolute in-rootfs symlinks are reinterpreted by openat2's RESOLVE_IN_ROOT; goos=%s has no bind translation in production", goruntime.GOOS)
+			}
+			rootfs := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(rootfs, "real", "dir"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(rootfs, "real", "dir", "file"), []byte("ok"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			mkSymlinkOrSkip(t, tc.target, filepath.Join(rootfs, "link"))
 
-	got, err := translateBindSource("/link/dir/file", nil, rootfs, "", nil)
-	if err != nil {
-		t.Fatalf("in-rootfs symlink should be allowed, got: %v", err)
-	}
-	if got.HostPath == "" {
-		t.Fatal("expected a resolved host path")
+			got, err := translateBindSource("/link/dir/file", nil, rootfs, "", nil)
+			if err != nil {
+				t.Fatalf("in-rootfs symlink should be allowed, got: %v", err)
+			}
+			if got.ResolvedPath == "" {
+				t.Fatal("expected a resolved host path")
+			}
+			closeBindPins([]*bindPin{got.Pin})
+		})
 	}
 }

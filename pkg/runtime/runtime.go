@@ -310,6 +310,15 @@ func (r *Runtime) SetTaskHooks(onStarted, onDestroy func(*RunnerEnv)) {
 func (r *Runtime) CleanOrphans(ctx context.Context) error {
 	ctx = namespaces.WithNamespace(ctx, namespace)
 
+	// Unmount dind bind-staging mounts left by a previous process. This runs
+	// FIRST, before any container or snapshot deletion: each leaked staging
+	// mount holds a reference to the runner rootfs it was bound from, so
+	// while one is present containerd cannot delete that container's
+	// snapshot and the sweep below silently fails to reclaim the space.
+	// A hard kill (SIGKILL, panic, node reset) is the case that produces
+	// them — every graceful path unmounts as it goes.
+	dind.SweepStagedBinds(r.cfg.DataDir, r.cfg.Log)
+
 	// Clean orphan containers (and their associated snapshots)
 	containers, err := r.client.Containers(ctx)
 	if err != nil {
