@@ -23,6 +23,19 @@ ARG TARGETARCH
 
 USER root
 
+# C toolchain. Required by `go test -race`: the race detector is implemented in
+# a cgo runtime shim, so without a C compiler every -race invocation dies with
+# "-race requires cgo" / `C compiler "gcc" not found`. The base image
+# (mcr.microsoft.com/dotnet/runtime-deps:8.0-noble via actions-runner) ships
+# runtime libs only and has no compiler.
+#
+# gcc + libc6-dev is the minimal set that satisfies the race runtime. Deliberately
+# not build-essential: that adds g++, make, dpkg-dev and ~250MB of image for
+# nothing we build here. ephemerd itself is still compiled CGO_ENABLED=0.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc libc6-dev && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" | tar -C /usr/local -xz
 ENV PATH="/usr/local/go/bin:/usr/local/bin:${PATH}"
 
