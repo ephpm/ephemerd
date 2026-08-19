@@ -1,4 +1,4 @@
-//go:build linux
+﻿//go:build linux
 
 package dind
 
@@ -18,7 +18,7 @@ import (
 // requireMountPrivilege skips a test that needs mount(2). The project's Linux
 // CI runner is unprivileged; these tests are meant to be run on a Linux node
 // (or WSL) as root, and skipping loudly is better than a green run that proved
-// nothing — which is exactly how the previous attempt at #125 passed review.
+// nothing â€” which is exactly how the previous attempt at #125 passed review.
 func requireMountPrivilege(t *testing.T) {
 	t.Helper()
 	if os.Geteuid() != 0 {
@@ -33,8 +33,8 @@ func discardLog() *slog.Logger {
 // newTestStager builds a real mountStager rooted under dir and guarantees its
 // mounts are gone before the test's TempDir cleanup runs.
 //
-// The ordering is not incidental: t.Cleanup is LIFO, so this registration —
-// made after t.TempDir() created its own cleanup — runs first. If it did not,
+// The ordering is not incidental: t.Cleanup is LIFO, so this registration â€”
+// made after t.TempDir() created its own cleanup â€” runs first. If it did not,
 // os.RemoveAll would walk INTO a live bind mount and delete the files it
 // exposes, which in production would be the runner's own rootfs.
 func newTestStager(t *testing.T, dataDir, jobID string) *mountStager {
@@ -50,7 +50,7 @@ func newTestStager(t *testing.T, dataDir, jobID string) *mountStager {
 //	<dir>/evil/real/marker = SWAPPED  (what the attacker substitutes)
 //
 // It returns dir. The "job" later renames a/ away and drops a symlink to evil/
-// in its place — the deterministic version of the race.
+// in its place â€” the deterministic version of the race.
 func plantVictim(t *testing.T, dir string) {
 	t.Helper()
 	for _, p := range []string{"a/real", "evil/real"} {
@@ -101,8 +101,7 @@ func TestBindStaging_SwapAfterValidationDoesNotLeak(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pinning a contained bind source must succeed: %v", err)
 	}
-	defer pin.Close()
-
+	defer func() { _ = pin.Close() }()
 	staged, err := stager.stage(pin)
 	if err != nil {
 		t.Fatalf("staging: %v", err)
@@ -111,29 +110,29 @@ func TestBindStaging_SwapAfterValidationDoesNotLeak(t *testing.T) {
 	// USE: the job swaps the validated directory for a symlink to its own tree.
 	swapVictim(t, rootfs)
 
-	// The original path now reads the attacker's content — proving the swap
+	// The original path now reads the attacker's content â€” proving the swap
 	// worked and that this test would catch a regression.
 	orig, err := os.ReadFile(filepath.Join(rootfs, "a", "real", "marker"))
 	if err != nil {
 		t.Fatalf("reading the swapped path: %v", err)
 	}
 	if string(orig) != "SWAPPED" {
-		t.Fatalf("swap did not take effect: original path reads %q, want SWAPPED — the test is not exercising the attack", orig)
+		t.Fatalf("swap did not take effect: original path reads %q, want SWAPPED â€” the test is not exercising the attack", orig)
 	}
 
-	// The staged path — what the OCI spec carries — must still be the
+	// The staged path â€” what the OCI spec carries â€” must still be the
 	// validated inode.
 	got, err := os.ReadFile(filepath.Join(staged, "marker"))
 	if err != nil {
 		t.Fatalf("reading the staged path %s: %v", staged, err)
 	}
 	if string(got) != "PINNED" {
-		t.Fatalf("TOCTOU: staged bind source %s reads %q after the swap, want PINNED — the container would receive the attacker's target", staged, got)
+		t.Fatalf("TOCTOU: staged bind source %s reads %q after the swap, want PINNED â€” the container would receive the attacker's target", staged, got)
 	}
 }
 
 // TestBindStaging_UnstagedPathLeaks is the control. It asserts that the
-// pre-fix arrangement — a path string in the spec, re-walked later — really
+// pre-fix arrangement â€” a path string in the spec, re-walked later â€” really
 // does follow the swap. Without this, a passing SwapAfterValidation test
 // proves nothing: it could be green because the swap never worked.
 func TestBindStaging_UnstagedPathLeaks(t *testing.T) {
@@ -150,7 +149,7 @@ func TestBindStaging_UnstagedPathLeaks(t *testing.T) {
 		t.Fatalf("reading the re-walked path: %v", err)
 	}
 	if string(got) != "SWAPPED" {
-		t.Fatalf("re-walking the validated path returned %q, want SWAPPED — this control must reproduce the bug for the staging test above to mean anything", got)
+		t.Fatalf("re-walking the validated path returned %q, want SWAPPED â€” this control must reproduce the bug for the staging test above to mean anything", got)
 	}
 }
 
@@ -186,7 +185,7 @@ func TestBindStaging_LegitimateBindsStillWork(t *testing.T) {
 	}
 
 	// The ephemerd-owned, non-rootfs binds: a socket and two files. These are
-	// the passthrough category — no pin, no staging — and they must keep
+	// the passthrough category â€” no pin, no staging â€” and they must keep
 	// working exactly as before.
 	sock := filepath.Join(root, "docker", "d.sock")
 	if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
@@ -196,7 +195,7 @@ func TestBindStaging_LegitimateBindsStillWork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating a real unix socket for the docker.sock bind: %v", err)
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	hosts := filepath.Join(root, "hosts")
 	resolv := filepath.Join(root, "resolv.conf")
 	for _, p := range []string{hosts, resolv} {
@@ -266,7 +265,7 @@ func TestBindStaging_LegitimateBindsStillWork(t *testing.T) {
 	for _, dest := range []string{"/__w", "/__w/_temp", "/__w/_actions", "/step.sh", "/tool"} {
 		src := byDest[dest]
 		if !strings.HasPrefix(src, stagingPrefix) {
-			t.Errorf("%s source = %q, want a path under the staging dir %q — a job-supplied source must never reach the spec as its own path", dest, src, stagingPrefix)
+			t.Errorf("%s source = %q, want a path under the staging dir %q â€” a job-supplied source must never reach the spec as its own path", dest, src, stagingPrefix)
 			continue
 		}
 		if _, err := os.Stat(src); err != nil {
@@ -342,7 +341,7 @@ func TestBindStaging_RunnerBindSuffixIsStaged(t *testing.T) {
 	spec := applyOpts(t, opts)
 	staged := spec.Mounts[0].Source
 	if !strings.HasPrefix(staged, jobStagingDir(root, "job-suffix")+string(filepath.Separator)) {
-		t.Fatalf("runner-bind suffix source = %q, want a staging path — this branch is as job-controlled as the rootfs branch", staged)
+		t.Fatalf("runner-bind suffix source = %q, want a staging path â€” this branch is as job-controlled as the rootfs branch", staged)
 	}
 
 	// And it holds the validated inode across the swap, same as the rootfs
@@ -369,7 +368,7 @@ func TestBindStaging_RunnerBindSuffixIsStaged(t *testing.T) {
 // ordering safe rather than merely lucky: once torn down, staging must FAIL.
 // If it instead recreated the directory (which it did before, because
 // ensureDirLocked keys off `ready` and teardown cleared it), the mount would
-// be published into a directory the caller had already swept — leaking a mount
+// be published into a directory the caller had already swept â€” leaking a mount
 // that pins the runner's rootfs until the next daemon startup, and racing
 // teardown's own os.RemoveAll, which deletes THROUGH a live bind mount.
 func TestBindStaging_StageAfterTeardownIsRefused(t *testing.T) {
@@ -386,7 +385,7 @@ func TestBindStaging_StageAfterTeardownIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pin.Close()
+	defer func() { _ = pin.Close() }()
 	if _, err := stager.stage(pin); err != nil {
 		t.Fatalf("staging before teardown: %v", err)
 	}
@@ -397,7 +396,7 @@ func TestBindStaging_StageAfterTeardownIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer late.Close()
+	defer func() { _ = late.Close() }()
 	if _, err := stager.stage(late); err == nil {
 		t.Fatal("staging after teardown must fail; silently recreating the staging dir leaks a mount that pins the runner rootfs")
 	}
@@ -419,7 +418,7 @@ func TestBindStaging_StageAfterTeardownIsRefused(t *testing.T) {
 // The second subtest drives the guard itself. It has to inject the mount
 // enumeration: as root, MNT_DETACH does not fail, so there is no honest way to
 // leave a real mount behind. (Stacking more mounts at one point than
-// detachMount unwinds does not work either — mountinfo lists one entry per
+// detachMount unwinds does not work either â€” mountinfo lists one entry per
 // stacked mount, so the caller invokes detachMount once per entry and the
 // whole stack comes down.)
 func TestUnmountTreeAndRemove_RefusesWhileMounted(t *testing.T) {
@@ -451,7 +450,7 @@ func TestUnmountTreeAndRemove_RefusesWhileMounted(t *testing.T) {
 		if _, statErr := os.Stat(filepath.Join(source, "precious")); statErr == nil {
 			t.Fatalf("os.RemoveAll left the bind source intact (err was %v); if this ever becomes true the guard could be relaxed, but do not relax it on a hunch", err)
 		}
-		t.Logf("confirmed: os.RemoveAll reported %v AFTER emptying the bind source — this is what the guard prevents", err)
+		t.Logf("confirmed: os.RemoveAll reported %v AFTER emptying the bind source â€” this is what the guard prevents", err)
 	})
 
 	t.Run("guard_refuses_and_preserves_the_source", func(t *testing.T) {
@@ -484,7 +483,7 @@ func TestUnmountTreeAndRemove_RefusesWhileMounted(t *testing.T) {
 			t.Errorf("error %q should explain that mounts remain", err)
 		}
 		if _, statErr := os.Stat(filepath.Join(source, "precious")); statErr != nil {
-			t.Fatalf("the refusal did not protect the bind source — it was deleted: %v", statErr)
+			t.Fatalf("the refusal did not protect the bind source â€” it was deleted: %v", statErr)
 		}
 		if _, statErr := os.Stat(staging); statErr != nil {
 			t.Errorf("staging dir was removed despite the refusal: %v", statErr)
@@ -496,7 +495,7 @@ func TestUnmountTreeAndRemove_RefusesWhileMounted(t *testing.T) {
 // comment makes: that it is equivalent to openat2 with RESOLVE_IN_ROOT, not
 // merely "stricter, therefore safe".
 //
-// The case that broke it was ".." arriving from a SYMLINK TARGET — the walk
+// The case that broke it was ".." arriving from a SYMLINK TARGET â€” the walk
 // refused every "..", while RESOLVE_IN_ROOT resolves them clamped at the root.
 // Relative "../" targets are ordinary in real images (/etc/alternatives/*,
 // Debian multiarch), so the two resolvers disagreeing meant any node that fell
@@ -589,7 +588,7 @@ func TestBindStaging_TeardownUnmountsAndRemoves(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(mounts) == 0 {
-		t.Fatalf("no mount at %s after staging — staging did not actually bind anything", staged)
+		t.Fatalf("no mount at %s after staging â€” staging did not actually bind anything", staged)
 	}
 
 	stager.teardown()
@@ -703,7 +702,7 @@ func TestUnescapeMountPath(t *testing.T) {
 
 // TestBindStaging_MountpointTypeMatchesSource makes sure a file source gets a
 // file mountpoint. Binding a file onto a directory is ENOTDIR, which would
-// break /etc/hosts-shaped binds — a quiet way to regress the feature while all
+// break /etc/hosts-shaped binds â€” a quiet way to regress the feature while all
 // the directory tests stay green.
 func TestBindStaging_MountpointTypeMatchesSource(t *testing.T) {
 	requireMountPrivilege(t)
@@ -722,7 +721,7 @@ func TestBindStaging_MountpointTypeMatchesSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pin.Close()
+	defer func() { _ = pin.Close() }()
 	staged, err := stager.stage(pin)
 	if err != nil {
 		t.Fatalf("staging a regular file: %v", err)

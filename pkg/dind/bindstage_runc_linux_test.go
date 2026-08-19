@@ -1,4 +1,4 @@
-//go:build linux
+﻿//go:build linux
 
 package dind
 
@@ -190,7 +190,7 @@ func TestBindStaging_RealRunc_SwapDoesNotLeak(t *testing.T) {
 		if err != nil {
 			t.Fatalf("pinning a contained source: %v", err)
 		}
-		defer pin.Close()
+		defer func() { _ = pin.Close() }()
 		staged, err := stager.stage(pin)
 		if err != nil {
 			t.Fatalf("staging: %v", err)
@@ -205,7 +205,7 @@ func TestBindStaging_RealRunc_SwapDoesNotLeak(t *testing.T) {
 			t.Fatalf("ESCAPE: the container received the attacker's target through the staged source.\nrunc output: %s", out)
 		}
 		if !strings.Contains(out, "CONTAINER-SAW: PINNED") {
-			t.Fatalf("the container did not see the validated content — the bind failed instead of holding, which is the regression the previous fix shipped.\nrunc output: %s", out)
+			t.Fatalf("the container did not see the validated content â€” the bind failed instead of holding, which is the regression the previous fix shipped.\nrunc output: %s", out)
 		}
 		t.Logf("staged (fixed shape): %s", out)
 	})
@@ -215,7 +215,7 @@ func TestBindStaging_RealRunc_SwapDoesNotLeak(t *testing.T) {
 // simply carry /proc/<ephemerd-pid>/fd/<n>, which is the shape the earlier
 // fix/linux-isolation-hardening branch shipped.
 //
-// runc does not re-resolve the string — its own error echoes it verbatim — but
+// runc does not re-resolve the string â€” its own error echoes it verbatim â€” but
 // mount(2) refuses it, because a bind source must live in the CALLER's mount
 // namespace and runc always has its own. That is unconditional: legitimate
 // binds fail identically, which makes the fd handoff a functional regression
@@ -238,15 +238,14 @@ func TestBindStaging_RealRunc_ProcFdSourceIsRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pin.Close()
-
+	defer func() { _ = pin.Close() }()
 	bundle := filepath.Join(work, "bundle-procfd")
 	procSource := "/proc/" + strconv.Itoa(os.Getpid()) + "/fd/" + strconv.Itoa(pin.fd)
 	writeBundle(t, runcBin, bundle, initBin, procSource)
 
 	out := runBundle(t, runcBin, bundle, "eph-toctou-procfd")
 	if strings.Contains(out, "CONTAINER-SAW:") {
-		t.Fatalf("a /proc/<pid>/fd source unexpectedly mounted — if the kernel now allows this, the staging layer could be simplified.\nrunc output: %s", out)
+		t.Fatalf("a /proc/<pid>/fd source unexpectedly mounted â€” if the kernel now allows this, the staging layer could be simplified.\nrunc output: %s", out)
 	}
 	if !strings.Contains(out, "invalid argument") {
 		t.Logf("note: the fd source failed for a reason other than EINVAL; output: %s", out)

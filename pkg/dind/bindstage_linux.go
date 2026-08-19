@@ -302,7 +302,9 @@ func mountPointsUnder(dir string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading mount table: %w", err)
 	}
-	defer f.Close()
+	// Read-only, so a Close error carries no information a caller could act
+	// on — but errcheck is right that it must not be silently dropped.
+	defer func() { _ = f.Close() }()
 
 	prefix := strings.TrimSuffix(dir, "/") + "/"
 	var out []string
