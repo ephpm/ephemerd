@@ -68,6 +68,22 @@ type Config struct {
 	// default network providers already work.
 	Network *networking.Manager
 
+	// CNIConfigPath points the Linux BuildKit worker at ephemerd's CNI
+	// conflist so build `RUN` steps attach to the per-job CNI bridge — and
+	// are therefore subject to the egress firewall (which jumps on the
+	// container subnet) — instead of BuildKit's default fallback to the HOST
+	// network namespace, which bypasses the firewall entirely. When set, the
+	// worker uses network mode "cni" and fails init if the config is missing,
+	// rather than silently degrading to host networking. Empty preserves
+	// BuildKit's default ("auto") provider selection. Linux only; ignored on
+	// Windows (which uses the HCN NAT path via Network) and unused on macOS.
+	CNIConfigPath string
+
+	// CNIBinDir is the directory holding the CNI plugin binaries (bridge,
+	// host-local, portmap) the worker invokes for build-step networking.
+	// Paired with CNIConfigPath. Linux only.
+	CNIBinDir string
+
 	// GC bounds the on-disk build cache. The zero value produces NO prune
 	// rules, which is how BuildKit reads "never garbage-collect" — see
 	// GCConfig for what that cost us in production. Callers should pass a

@@ -70,6 +70,46 @@ func TestDockerBuildOptsToSolveOpt_AllOptions(t *testing.T) {
 	}
 }
 
+// TestDockerBuildOptsToSolveOpt_CacheMountNamespaced asserts that cache mounts
+// are scoped to the job so one job's RUN --mount=type=cache can't feed another.
+func TestDockerBuildOptsToSolveOpt_CacheMountNamespaced(t *testing.T) {
+	req := httptest.NewRequest("POST", "/build?t=alpine:local", nil)
+	opt, err := dockerBuildOptsToSolveOpt(req, "/ctx", "job-abc")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := opt.FrontendAttrs["build-arg:BUILDKIT_CACHE_MOUNT_NS"], "job-abc"; got != want {
+		t.Errorf("cache mount namespace = %q, want %q", got, want)
+	}
+}
+
+// TestDockerBuildOptsToSolveOpt_CacheNSNotOverridable asserts a workflow cannot
+// point its cache mounts at another job's namespace via --build-arg.
+func TestDockerBuildOptsToSolveOpt_CacheNSNotOverridable(t *testing.T) {
+	req := httptest.NewRequest("POST",
+		`/build?t=alpine:local&buildargs={"BUILDKIT_CACHE_MOUNT_NS":"victim-job"}`, nil)
+	opt, err := dockerBuildOptsToSolveOpt(req, "/ctx", "job-abc")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := opt.FrontendAttrs["build-arg:BUILDKIT_CACHE_MOUNT_NS"], "job-abc"; got != want {
+		t.Errorf("cache mount namespace = %q, want %q (workflow override must not win)", got, want)
+	}
+}
+
+// TestDockerBuildOptsToSolveOpt_NoJobIDNoCacheNS documents that a build with no
+// job scope (empty jobID) leaves cache mounts unscoped, matching scopedBuildRef.
+func TestDockerBuildOptsToSolveOpt_NoJobIDNoCacheNS(t *testing.T) {
+	req := httptest.NewRequest("POST", "/build?t=alpine:local", nil)
+	opt, err := dockerBuildOptsToSolveOpt(req, "/ctx", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := opt.FrontendAttrs["build-arg:BUILDKIT_CACHE_MOUNT_NS"]; ok {
+		t.Errorf("cache mount namespace should be unset when jobID is empty")
+	}
+}
+
 func TestDockerBuildOptsToSolveOpt_InvalidBuildargsJSON(t *testing.T) {
 	req := httptest.NewRequest("POST", "/build?buildargs=not-json", nil)
 	_, err := dockerBuildOptsToSolveOpt(req, "/ctx", "test-job")

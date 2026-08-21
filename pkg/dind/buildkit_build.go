@@ -323,6 +323,28 @@ func dockerBuildOptsToSolveOpt(r *http.Request, ctxDir, jobID string) (bkclient.
 		}
 	}
 
+	// Scope RUN --mount=type=cache mounts to this job.
+	//
+	// SECURITY. All jobs share ONE embedded BuildKit worker, and its cache
+	// mounts are keyed only by the ID the Dockerfile author picked (e.g. the
+	// default "/root/.cache/go-build"). Two jobs that use the same ID share the
+	// same on-disk cache mount: job A writes bytes that job B then reads and
+	// links into its own build — a cross-job channel that is especially acute
+	// here because two jobs on one host can be different PRs (including a PR
+	// from a fork) in different trust domains. BUILDKIT_CACHE_MOUNT_NS prefixes
+	// every cache-mount ID with the job scope, giving each job its own cache
+	// namespace. jobID is the same per-job identifier scopedBuildRef uses.
+	//
+	// Set AFTER the buildargs loop so a workflow cannot override the namespace
+	// (and reach another job's cache) via --build-arg BUILDKIT_CACHE_MOUNT_NS.
+	// The cost is that cache mounts no longer carry over between jobs; that is
+	// the intended trade for isolation, and matches the per-job scoping already
+	// applied to image tags. Empty jobID (non-job builds) leaves the mounts
+	// unscoped, consistent with scopedBuildRef.
+	if jobID != "" {
+		frontendAttrs["build-arg:BUILDKIT_CACHE_MOUNT_NS"] = jobID
+	}
+
 	// --label: same encoding as buildargs.
 	if raw := q.Get("labels"); raw != "" {
 		var labels map[string]string

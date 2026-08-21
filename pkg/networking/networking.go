@@ -6,10 +6,28 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
+	"path/filepath"
 )
 
 // DefaultSubnet is the preferred IP range for containers.
 const DefaultSubnet = "10.88.0.0/16"
+
+// cniConfListName is the filename of the CNI conflist the Linux networking
+// backend writes under <DataDir>/cni/conf. Kept here (not just in
+// network_linux.go) so callers on any platform can derive the path without a
+// build constraint.
+const cniConfListName = "10-ephemerd.conflist"
+
+// CNIConfListPath returns the path to the CNI conflist for the given data dir.
+//
+// Exposed so the embedded BuildKit worker can point its network provider at the
+// SAME bridge/subnet this package configures, ensuring build `RUN` steps land
+// on the firewalled container network instead of the host netns. The file is
+// only written on Linux (network_linux.go); on other platforms the path is
+// meaningful only as a lookup key and nothing consumes it.
+func CNIConfListPath(dataDir string) string {
+	return filepath.Join(dataDir, "cni", "conf", cniConfListName)
+}
 
 // Config for container networking.
 type Config struct {

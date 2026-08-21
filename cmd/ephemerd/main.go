@@ -322,8 +322,12 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 				ContainerdAddress:   containerd.SocketPath(configDir),
 				ContainerdNamespace: buildkitNamespace,
 				Network:             net,
-				GC:                  buildkitGCConfig(cfg),
-				Log:                 log.With("component", "buildkit"),
+				// Put build RUN steps on the firewalled CNI bridge instead of
+				// the host netns (see buildkit.Config.CNIConfigPath).
+				CNIConfigPath: networking.CNIConfListPath(configDir),
+				CNIBinDir:     cm.Dir(),
+				GC:            buildkitGCConfig(cfg),
+				Log:           log.With("component", "buildkit"),
 			}
 			bk, err = buildkit.NewServer(ctx, bkCfg)
 			if err != nil {
@@ -580,8 +584,13 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			ContainerdAddress:   containerd.SocketPath(configDir),
 			ContainerdNamespace: buildkitNamespace,
 			Network:             net,
-			GC:                  buildkitGCConfig(cfg),
-			Log:                 log.With("component", "buildkit"),
+			// Put build RUN steps on the firewalled CNI bridge instead of the
+			// host netns (see buildkit.Config.CNIConfigPath). Linux-only; the
+			// Windows worker ignores it and uses the HCN NAT path via Network.
+			CNIConfigPath: networking.CNIConfListPath(configDir),
+			CNIBinDir:     cm.Dir(),
+			GC:            buildkitGCConfig(cfg),
+			Log:           log.With("component", "buildkit"),
 		}
 		bk, err = buildkit.NewServer(ctx, bkCfg)
 		if err != nil {
