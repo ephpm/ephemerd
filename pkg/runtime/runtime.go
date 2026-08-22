@@ -1302,6 +1302,18 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			// /actions-runner/_work/...` resolves to the same bytes the runner
 			// sees. dind and the runner share this one upperdir, so a lazy dir
 			// dind creates for a bind source also appears live in the runner.
+			//
+			// One consequence to be precise about: a runner base-tree file that
+			// lives ONLY in the shared lowerdir and was never copied up is not
+			// present under this upperdir. A sibling `docker -v
+			// /actions-runner/<lower-only-file>` therefore does NOT fail to
+			// resolve — it hits translateBindSource's Docker-compatible
+			// auto-mkdir-on-missing-source path (pinBindSource autoCreate) and
+			// the sibling gets a freshly created EMPTY directory, not the base
+			// file's bytes. Real jobs only bind `_work/`, which lives in the
+			// upper, so this is a benign known limitation rather than a
+			// resolution error; a follow-up could add the lowerdir to the dind
+			// resolver's search path if a workflow ever needs it.
 			bindMappings[r.cfg.RunnerMount] = runnerWritableDir
 		}
 		dindServer.SetRunnerRootfs(snapshotName, runnerRootfsPath, bindMappings)

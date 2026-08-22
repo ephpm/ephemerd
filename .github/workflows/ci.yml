@@ -66,6 +66,24 @@ jobs:
             -run 'TestBindStaging|TestBindTranslation|TestSweepStagedBinds|TestEnsureTrustedAncestry|TestUnmountTreeAndRemove|TestResolveBeneathWalk' \
             -v ./pkg/dind/
 
+      # Same rationale as the two steps above, for the F1 overlay containment
+      # proof. TestRunnerOverlay_JobCannotPoisonSharedTree realizes the exact
+      # overlayfs mount prepareJobRunnerTree asks runc for, poisons run.sh from
+      # one job's view, and asserts the shared lowerdir and a second job are
+      # untouched — the property that lets anonymous fork-PR CI share one runner
+      # tree. It needs mount(2) (root + overlayfs), which `mage ci`'s buffered
+      # `go test ./...` neither guarantees nor makes visible: on an unprivileged
+      # runner it root-gates itself to a SKIP that a green package silently
+      # swallows, so a green PR would imply overlay containment it never
+      # exercised. Running it here verbosely puts either the PASS or the SKIP
+      # reason on the record. If this runner is privileged the test actually
+      # executes the on-metal proof; if not, the SKIP line is the honest signal.
+      - name: Privileged-test coverage report (F1 runner overlay containment)
+        run: |
+          go test -count=1 \
+            -run TestRunnerOverlay_JobCannotPoisonSharedTree \
+            -v ./pkg/runtime/
+
       - name: E2E — GitHub provider (fake server)
         run: mage e2egithub
 
