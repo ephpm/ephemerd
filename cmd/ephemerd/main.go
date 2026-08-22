@@ -311,10 +311,12 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		defer net.Cleanup()
 
 		// Initialize embedded BuildKit when --dind is on. Without this,
-		// dind.Server gets BuildKit=nil and POST /build falls through to the
-		// buildah path; built images then live in containers/storage instead
-		// of the "buildkit" containerd namespace, and POST /images/.../push
-		// can't find them. Mirrors the non-containerd-only branch below.
+		// dind.Server gets BuildKit=nil and POST /build is fail-closed: the
+		// router returns HTTP 501 ("there is no buildah fallback") rather than
+		// silently picking a different builder. Builds fail loudly on this node
+		// — they never run unfirewalled — so BuildKit init must succeed here for
+		// docker build to work at all. Mirrors the non-containerd-only branch
+		// below.
 		var bk *buildkit.Server
 		if cfg.Dind.Enabled {
 			bkCfg := buildkit.Config{
@@ -331,7 +333,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			}
 			bk, err = buildkit.NewServer(ctx, bkCfg)
 			if err != nil {
-				log.Warn("buildkit init failed in worker mode; docker build will fall back",
+				log.Warn("buildkit init failed in worker mode; docker build will fail closed with HTTP 501 on this node",
 					"error", err)
 				bk = nil
 			} else {

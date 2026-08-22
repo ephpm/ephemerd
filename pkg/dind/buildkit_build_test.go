@@ -97,16 +97,30 @@ func TestDockerBuildOptsToSolveOpt_CacheNSNotOverridable(t *testing.T) {
 	}
 }
 
-// TestDockerBuildOptsToSolveOpt_NoJobIDNoCacheNS documents that a build with no
-// job scope (empty jobID) leaves cache mounts unscoped, matching scopedBuildRef.
-func TestDockerBuildOptsToSolveOpt_NoJobIDNoCacheNS(t *testing.T) {
-	req := httptest.NewRequest("POST", "/build?t=alpine:local", nil)
-	opt, err := dockerBuildOptsToSolveOpt(req, "/ctx", "")
+// TestDockerBuildOptsToSolveOpt_NoJobIDUniqueCacheNS asserts that a build with
+// no job scope (empty jobID) still gets a cache mount namespace, and that the
+// namespace is unique per build rather than a single shared one. Leaving it
+// unset would collapse every unscoped build onto one shared cache mount — the
+// exact cross-job read/write channel BUILDKIT_CACHE_MOUNT_NS exists to close.
+func TestDockerBuildOptsToSolveOpt_NoJobIDUniqueCacheNS(t *testing.T) {
+	req1 := httptest.NewRequest("POST", "/build?t=alpine:local", nil)
+	opt1, err := dockerBuildOptsToSolveOpt(req1, "/ctx", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if _, ok := opt.FrontendAttrs["build-arg:BUILDKIT_CACHE_MOUNT_NS"]; ok {
-		t.Errorf("cache mount namespace should be unset when jobID is empty")
+	ns1, ok := opt1.FrontendAttrs["build-arg:BUILDKIT_CACHE_MOUNT_NS"]
+	if !ok || ns1 == "" {
+		t.Fatalf("cache mount namespace should be set even when jobID is empty")
+	}
+
+	req2 := httptest.NewRequest("POST", "/build?t=alpine:local", nil)
+	opt2, err := dockerBuildOptsToSolveOpt(req2, "/ctx", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	ns2 := opt2.FrontendAttrs["build-arg:BUILDKIT_CACHE_MOUNT_NS"]
+	if ns1 == ns2 {
+		t.Errorf("two empty-jobID builds share cache namespace %q; want unique per build", ns1)
 	}
 }
 

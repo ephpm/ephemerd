@@ -339,11 +339,17 @@ func dockerBuildOptsToSolveOpt(r *http.Request, ctxDir, jobID string) (bkclient.
 	// (and reach another job's cache) via --build-arg BUILDKIT_CACHE_MOUNT_NS.
 	// The cost is that cache mounts no longer carry over between jobs; that is
 	// the intended trade for isolation, and matches the per-job scoping already
-	// applied to image tags. Empty jobID (non-job builds) leaves the mounts
-	// unscoped, consistent with scopedBuildRef.
-	if jobID != "" {
-		frontendAttrs["build-arg:BUILDKIT_CACHE_MOUNT_NS"] = jobID
-	}
+	// applied to image tags.
+	//
+	// The namespace is set UNCONDITIONALLY. A real job uses its jobID; a
+	// non-job build (empty jobID: tests, tooling) gets a fresh unique scope
+	// instead of being left unset. Leaving it unset does NOT isolate — it
+	// collapses every unscoped build onto ONE shared cache mount, which is
+	// exactly the cross-job read/write channel this guards against. Unlike
+	// scopedBuildRef, where an empty jobID only risks a tag-name collision,
+	// an unscoped cache mount is a live data channel, so it is closed here
+	// even at the cost of no cache reuse for those out-of-band builds.
+	frontendAttrs["build-arg:BUILDKIT_CACHE_MOUNT_NS"] = cacheMountNS(jobID)
 
 	// --label: same encoding as buildargs.
 	if raw := q.Get("labels"); raw != "" {

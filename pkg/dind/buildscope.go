@@ -1,6 +1,32 @@
 package dind
 
-import "strings"
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"strings"
+	"time"
+)
+
+// cacheMountNS returns the BUILDKIT_CACHE_MOUNT_NS value used to isolate a
+// build's RUN --mount=type=cache mounts. A real job uses its per-job scope
+// (the same identifier scopedBuildRef uses). A non-job build (empty jobID)
+// gets a fresh unique value so it still never shares a cache mount with any
+// other build — leaving the namespace unset would instead collapse every
+// unscoped build onto one shared cache mount. Isolation is preferred over
+// cache reuse here; see the call site in dockerBuildOptsToSolveOpt.
+func cacheMountNS(jobID string) string {
+	if jobID != "" {
+		return jobID
+	}
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback — this should never fail. A timestamp is still unique
+		// enough to keep this build's cache off every other build's.
+		return fmt.Sprintf("ephemerd-build-%d", time.Now().UnixNano())
+	}
+	return "ephemerd-build-" + hex.EncodeToString(b)
+}
 
 // buildScopeRegistry is the synthetic registry hostname used to scope
 // job-built image tags inside the shared "buildkit" containerd namespace.
