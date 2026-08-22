@@ -311,10 +311,12 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		defer net.Cleanup()
 
 		// Initialize embedded BuildKit when --dind is on. Without this,
-		// dind.Server gets BuildKit=nil and POST /build falls through to the
-		// buildah path; built images then live in containers/storage instead
-		// of the "buildkit" containerd namespace, and POST /images/.../push
-		// can't find them. Mirrors the non-containerd-only branch below.
+		// dind.Server gets BuildKit=nil and POST /build is fail-closed: the
+		// router returns HTTP 501 ("there is no buildah fallback") rather than
+		// silently picking a different builder. Builds fail loudly on this node
+		// — they never run unfirewalled — so BuildKit init must succeed here for
+		// docker build to work at all. Mirrors the non-containerd-only branch
+		// below.
 		var bk *buildkit.Server
 		if cfg.Dind.Enabled {
 			bkCfg := buildkit.Config{
@@ -322,12 +324,16 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 				ContainerdAddress:   containerd.SocketPath(configDir),
 				ContainerdNamespace: buildkitNamespace,
 				Network:             net,
-				GC:                  buildkitGCConfig(cfg),
-				Log:                 log.With("component", "buildkit"),
+				// Put build RUN steps on the firewalled CNI bridge instead of
+				// the host netns (see buildkit.Config.CNIConfigPath).
+				CNIConfigPath: networking.CNIConfListPath(configDir),
+				CNIBinDir:     cm.Dir(),
+				GC:            buildkitGCConfig(cfg),
+				Log:           log.With("component", "buildkit"),
 			}
 			bk, err = buildkit.NewServer(ctx, bkCfg)
 			if err != nil {
-				log.Warn("buildkit init failed in worker mode; docker build will fall back",
+				log.Warn("buildkit init failed in worker mode; docker build will fail closed with HTTP 501 on this node",
 					"error", err)
 				bk = nil
 			} else {
@@ -580,8 +586,13 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			ContainerdAddress:   containerd.SocketPath(configDir),
 			ContainerdNamespace: buildkitNamespace,
 			Network:             net,
-			GC:                  buildkitGCConfig(cfg),
-			Log:                 log.With("component", "buildkit"),
+			// Put build RUN steps on the firewalled CNI bridge instead of the
+			// host netns (see buildkit.Config.CNIConfigPath). Linux-only; the
+			// Windows worker ignores it and uses the HCN NAT path via Network.
+			CNIConfigPath: networking.CNIConfListPath(configDir),
+			CNIBinDir:     cm.Dir(),
+			GC:            buildkitGCConfig(cfg),
+			Log:           log.With("component", "buildkit"),
 		}
 		bk, err = buildkit.NewServer(ctx, bkCfg)
 		if err != nil {
