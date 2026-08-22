@@ -72,6 +72,17 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	LogRetention    time.Duration // max age for job log files (default 7d)
 
+	// MacOSProvisionTimeout bounds the pre-registration provisioning phase of
+	// a macOS VM job — booting the VM and waiting for its runner to become
+	// reachable (handleMacOSJob → MacOSVM.WaitForRunner). If the wait has not
+	// returned by this deadline the VM is force-stopped so the reachability
+	// wait unblocks, the job is failed, and the single macOS concurrency slot
+	// is released. Guards against a hung guest SSH command wedging the wait
+	// indefinitely (the VM-internal loop caps itself at ~2 min, but its SSH
+	// session calls carry no deadline and ignore ctx). Zero applies
+	// defaultMacOSProvisionTimeout.
+	MacOSProvisionTimeout time.Duration
+
 	// Retry configures the claim/provision retry queue. When the initial
 	// attempt to claim a queued job fails with a retryable error
 	// (rate-limit exhausted, transient 5xx, network), the job is
@@ -163,6 +174,13 @@ type OrphanSweepConfig struct {
 // defaultOrphanGrace is applied when OrphanSweepConfig.Grace is zero.
 const defaultOrphanGrace = 10 * time.Minute
 
+// defaultMacOSProvisionTimeout bounds a macOS VM job's provisioning phase
+// (boot + wait-for-runner-reachable) when Config.MacOSProvisionTimeout is
+// zero. Generous relative to a healthy provision (~1 min) so it never trips a
+// slow-but-progressing boot, but small enough that a wedged VM frees the sole
+// macOS slot in minutes instead of hours.
+const defaultMacOSProvisionTimeout = 5 * time.Minute
+
 // jobKey uniquely identifies a job across providers. Different providers
 // can return the same int64 job ID, so we include the provider name.
 type jobKey struct {
@@ -214,28 +232,33 @@ func labelSetKey(labels []string) string {
 // When a job is queued, it provisions a runner environment.
 // When the job completes, it destroys the environment.
 type Scheduler struct {
-	cfg          Config
-	running      map[jobKey]*runningJob
-	seen         map[jobKey]time.Time      // recently handled jobs for dedup
-	started      map[jobKey]time.Time      // jobs OBSERVED going in_progress/completed (webhook mode); the event-driven "satisfied" signal
-	pending      map[jobKey]struct{}       // jobs dispatched to a handler but not yet holding sem
-	attempts     map[jobKey]int            // provisioning passes per job, for zombie detection
-	jobLabels    map[jobKey]string         // fungibility class (labelSetKey) of every accepted job; pruned with seen
-	runners      map[string]*runnerBinding // dispatched runners by name; tracks observed job assignment
-	webhookMode  bool                      // true when job events arrive via webhooks (in_progress observable)
-	runCtx       context.Context           // scheduler root context (set once at Run start); used for event-driven re-dispatch
-	jobsCtx      context.Context           // detached parent for job runtimes; survives runCtx (signal) cancellation
-	jobsCancel   context.CancelFunc        // cancels jobsCtx; called by drain() once the wait/force-kill phase ends
-	mu           sync.Mutex
-	sem          chan struct{} // local job concurrency limiter
-	linuxSem     chan struct{} // Linux dispatch (VM) concurrency limiter
-	macSem       chan struct{} // macOS VM concurrency limiter (Vz has a hard cap)
-	draining     bool          // true when shutting down, rejects new jobs
-	startTime    time.Time
+	cfg         Config
+	running     map[jobKey]*runningJob
+	seen        map[jobKey]time.Time      // recently handled jobs for dedup
+	started     map[jobKey]time.Time      // jobs OBSERVED going in_progress/completed (webhook mode); the event-driven "satisfied" signal
+	pending     map[jobKey]struct{}       // jobs dispatched to a handler but not yet holding sem
+	attempts    map[jobKey]int            // provisioning passes per job, for zombie detection
+	jobLabels   map[jobKey]string         // fungibility class (labelSetKey) of every accepted job; pruned with seen
+	runners     map[string]*runnerBinding // dispatched runners by name; tracks observed job assignment
+	webhookMode bool                      // true when job events arrive via webhooks (in_progress observable)
+	runCtx      context.Context           // scheduler root context (set once at Run start); used for event-driven re-dispatch
+	jobsCtx     context.Context           // detached parent for job runtimes; survives runCtx (signal) cancellation
+	jobsCancel  context.CancelFunc        // cancels jobsCtx; called by drain() once the wait/force-kill phase ends
+	mu          sync.Mutex
+	sem         chan struct{} // local job concurrency limiter
+	linuxSem    chan struct{} // Linux dispatch (VM) concurrency limiter
+	macSem      chan struct{} // macOS VM concurrency limiter (Vz has a hard cap)
+	draining    bool          // true when shutting down, rejects new jobs
+	startTime   time.Time
 
 	// retry holds pending re-attempts for jobs whose initial claim
 	// failed with a retryable error. Nil when Config.Retry.Enabled=false.
 	retry *retryQueue
+
+	// newMacOSVM constructs a per-job macOS VM. Defaults to vm.NewMacOSVM;
+	// overridable in tests to inject a fake that exercises the provisioning
+	// watchdog without a real Virtualization.framework VM.
+	newMacOSVM func(cfg vm.MacOSVMConfig, jobID string) (vm.MacOSVM, error)
 }
 
 const seenTTL = 10 * time.Minute
@@ -298,8 +321,8 @@ type runningJob struct {
 	repo         string
 	image        string
 	cancel       context.CancelFunc
-	artifactsDir string              // non-empty if OCI artifacts were extracted for this job
-	dispatched   string              // non-empty if dispatched to Linux VM worker (stores container name)
+	artifactsDir string     // non-empty if OCI artifacts were extracted for this job
+	dispatched   string     // non-empty if dispatched to Linux VM worker (stores container name)
 	macosVM      vm.MacOSVM // non-nil if running as a macOS VM job
 	startedAt    time.Time
 }
@@ -403,18 +426,19 @@ func New(cfg Config) *Scheduler {
 	}
 
 	s := &Scheduler{
-		cfg:          cfg,
-		running:      make(map[jobKey]*runningJob),
-		seen:         make(map[jobKey]time.Time),
-		started:      make(map[jobKey]time.Time),
-		pending:      make(map[jobKey]struct{}),
-		attempts:     make(map[jobKey]int),
-		jobLabels:    make(map[jobKey]string),
-		runners:      make(map[string]*runnerBinding),
-		sem:          make(chan struct{}, cfg.MaxConcurrent),
-		linuxSem:     make(chan struct{}, cfg.MaxConcurrent),
-		macSem:       make(chan struct{}, macVMs),
-		startTime:    time.Now(),
+		cfg:        cfg,
+		running:    make(map[jobKey]*runningJob),
+		seen:       make(map[jobKey]time.Time),
+		started:    make(map[jobKey]time.Time),
+		pending:    make(map[jobKey]struct{}),
+		attempts:   make(map[jobKey]int),
+		jobLabels:  make(map[jobKey]string),
+		runners:    make(map[string]*runnerBinding),
+		sem:        make(chan struct{}, cfg.MaxConcurrent),
+		linuxSem:   make(chan struct{}, cfg.MaxConcurrent),
+		macSem:     make(chan struct{}, macVMs),
+		startTime:  time.Now(),
+		newMacOSVM: vm.NewMacOSVM,
 	}
 	// Only construct the retry queue when the caller explicitly enabled
 	// it. A disabled queue is safe to leave nil; enqueueRetryIfEligible
@@ -783,7 +807,9 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		// (queued jobs stay queued until a human re-delivers webhooks).
 		// Wire the drain before firing the poll.
 		if useWebhook {
-			if ep, ok := p.(interface{ Events() <-chan providers.JobEvent }); ok {
+			if ep, ok := p.(interface {
+				Events() <-chan providers.JobEvent
+			}); ok {
 				go func(ch <-chan providers.JobEvent) {
 					for ev := range ch {
 						events <- ev
@@ -1303,7 +1329,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 	}
 
 	// Create the macOS VM
-	macVM, err := vm.NewMacOSVM(*s.cfg.MacOSVMConfig, fmt.Sprintf("%d", jobID))
+	macVM, err := s.newMacOSVM(*s.cfg.MacOSVMConfig, fmt.Sprintf("%d", jobID))
 	if err != nil {
 		log.Error("failed to create macOS VM", "error", err)
 		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
@@ -1352,8 +1378,12 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		return
 	}
 
-	// Wait for the runner inside the VM to become reachable
-	ip, err := macVM.WaitForRunner(jobCtx)
+	// Wait for the runner inside the VM to become reachable, bounded by a
+	// hard provisioning deadline. Without this bound a hung guest SSH command
+	// can wedge WaitForRunner indefinitely: the job never gets tracked (so it
+	// is invisible to `ephemerd jobs` and the orphan sweep) yet still holds
+	// the sole macOS slot, stalling all macOS CI until a human intervenes.
+	ip, err := s.waitForMacRunnerBounded(jobCtx, macVM, log)
 	if err != nil {
 		log.Error("macOS VM runner not reachable", "error", err)
 		macVM.Stop()
@@ -1423,6 +1453,58 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		// Self-heal: re-provision if this VM's dispatched job never ran.
 		s.reprovisionIfStranded(ctx, event)
 	}()
+}
+
+// waitForMacRunnerBounded runs macVM.WaitForRunner under a hard provisioning
+// deadline and guarantees it returns.
+//
+// The VM-internal wait already caps its own polling loop at ~2 minutes, but
+// once the guest's SSH port opens it shells in to start the runner, and those
+// golang.org/x/crypto/ssh session calls carry no deadline and do not observe
+// ctx — a guest command that never returns wedges the wait forever. When that
+// happens the job is stuck BEFORE trackRunning: it is absent from `s.running`
+// (invisible to `ephemerd jobs`) and from `s.runners` (invisible to the orphan
+// sweep), yet still holds the single macOS concurrency slot, so every later
+// macOS job silently starves.
+//
+// The only reliable way to interrupt a blocked SSH session call is to drop the
+// connection: force-stopping the VM tears down the guest, the SSH read errors
+// out, and WaitForRunner unwinds. On timeout we do exactly that, then wait for
+// the wait goroutine to return so there is no leak, and report a failure. The
+// caller's normal error path then releases the slot and deregisters the runner
+// — cleanup runs even though the wait had been stuck.
+func (s *Scheduler) waitForMacRunnerBounded(ctx context.Context, macVM vm.MacOSVM, log *slog.Logger) (string, error) {
+	timeout := s.cfg.MacOSProvisionTimeout
+	if timeout <= 0 {
+		timeout = defaultMacOSProvisionTimeout
+	}
+
+	type result struct {
+		ip  string
+		err error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		ip, err := macVM.WaitForRunner(ctx)
+		resCh <- result{ip: ip, err: err}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case r := <-resCh:
+		return r.ip, r.err
+	case <-timer.C:
+		log.Error("macOS VM stuck in provisioning past deadline; force-stopping VM to reclaim the slot", "timeout", timeout)
+		macVM.Stop() // drops the guest connection so WaitForRunner unblocks
+		<-resCh      // wait goroutine unwinds now that the VM is gone
+		return "", fmt.Errorf("timed out after %s waiting for macOS VM runner to become reachable", timeout)
+	case <-ctx.Done():
+		macVM.Stop()
+		<-resCh
+		return "", ctx.Err()
+	}
 }
 
 // handleLocalJob provisions a runner using the local containerd Runtime.
