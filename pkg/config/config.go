@@ -1171,6 +1171,23 @@ type MacOSVMToml struct {
 	CPUs          uint   `toml:"cpus"`           // CPUs per VM (default: 4)
 	MemoryMB      uint64 `toml:"memory_mb"`      // memory per VM in MB (default: 8192)
 	MaxConcurrent int    `toml:"max_concurrent"` // max simultaneous macOS VMs (default: auto-detected from host CPUs)
+
+	// ProvisionTimeout bounds the pre-registration provisioning phase of a
+	// macOS VM job (boot + wait for the runner to become reachable). If a VM
+	// has not registered its runner within this window it is force-stopped and
+	// its concurrency slot released, so a wedged VM cannot hold the (often
+	// single) macOS slot indefinitely. Empty applies a 5m default.
+	ProvisionTimeout string `toml:"provision_timeout"`
+}
+
+// ParsedProvisionTimeout returns the macOS VM provisioning timeout as a
+// time.Duration, defaulting to 5m when unset or unparseable.
+func (m *MacOSVMToml) ParsedProvisionTimeout() time.Duration {
+	d, err := time.ParseDuration(m.ProvisionTimeout)
+	if err != nil {
+		return 5 * time.Minute
+	}
+	return d
 }
 
 type GitHubConfig struct {
