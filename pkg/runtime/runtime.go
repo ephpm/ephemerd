@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
@@ -969,6 +968,11 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	// On Windows, always mount because there's no Windows GHA runner image.
 	needsRunnerMount := (customImage || goruntime.GOOS == "windows") && r.cfg.RunnerDir != "" && r.cfg.RunnerMount != ""
 	var jobRunnerDir string
+	// runnerWritableDir is the host path holding this job's WRITABLE copy of
+	// the runner tree (the overlay upperdir on Linux, the byte copy on
+	// Windows). dind resolves sibling `docker -v` sources under the runner
+	// mount against it. Empty when no runner mount is installed.
+	var runnerWritableDir string
 	// Per-job runner dir cleanup on error. On success, Destroy() removes it
 	// via env.RunnerDir; on failure, the function returns before building
 	// the RunnerEnv so we must clean up here or the ~200MB copy orphans on
@@ -983,18 +987,20 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	}()
 	if needsRunnerMount {
 		jobRunnerDir = filepath.Join(filepath.Dir(r.cfg.RunnerDir), "job-"+id)
-		if err := copyDirForJob(r.cfg.RunnerDir, jobRunnerDir); err != nil {
-			return nil, fmt.Errorf("copying runner dir for %s: %w", id, err)
+		writableDir, runnerOpt, err := prepareJobRunnerTree(r.cfg.RunnerDir, jobRunnerDir, r.cfg.RunnerMount)
+		if err != nil {
+			return nil, fmt.Errorf("preparing runner dir for %s: %w", id, err)
 		}
+		runnerWritableDir = writableDir
 		// Hyper-V isolated containers on Windows mount this host directory
 		// into the utility VM via a VSMB share. The parent runners dir has
 		// already been granted traverse at startup; we grant Modify scoped
 		// to this specific job directory so each job's utility VM sees
-		// only its own files.
+		// only its own files. No-op on Linux.
 		if err := grantHyperVModify(jobRunnerDir); err != nil {
 			return nil, fmt.Errorf("granting Hyper-V access to %s: %w", jobRunnerDir, err)
 		}
-		opts = append(opts, withRunnerMount(jobRunnerDir, r.cfg.RunnerMount))
+		opts = append(opts, runnerOpt)
 	}
 
 	// Mount host DNS config so containers can resolve names.
@@ -1288,8 +1294,27 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		hostDataDir := filepath.Dir(r.cfg.LogDir)
 		bindMappings["/etc/hosts"] = filepath.Join(hostDataDir, "hosts", id+".hosts")
 		bindMappings["/etc/resolv.conf"] = filepath.Join(hostDataDir, "dns", id+".conf")
-		if jobRunnerDir != "" && r.cfg.RunnerMount != "" {
-			bindMappings[r.cfg.RunnerMount] = jobRunnerDir
+		if runnerWritableDir != "" && r.cfg.RunnerMount != "" {
+			// Map the runner mount to the job's WRITABLE layer, not the shared
+			// tree. On Linux that is the overlay upperdir: the runner creates
+			// _work/ (job checkouts, _temp, _actions) under the mount, all of
+			// which is copied up there, so a sibling `docker -v
+			// /actions-runner/_work/...` resolves to the same bytes the runner
+			// sees. dind and the runner share this one upperdir, so a lazy dir
+			// dind creates for a bind source also appears live in the runner.
+			//
+			// One consequence to be precise about: a runner base-tree file that
+			// lives ONLY in the shared lowerdir and was never copied up is not
+			// present under this upperdir. A sibling `docker -v
+			// /actions-runner/<lower-only-file>` therefore does NOT fail to
+			// resolve — it hits translateBindSource's Docker-compatible
+			// auto-mkdir-on-missing-source path (pinBindSource autoCreate) and
+			// the sibling gets a freshly created EMPTY directory, not the base
+			// file's bytes. Real jobs only bind `_work/`, which lives in the
+			// upper, so this is a benign known limitation rather than a
+			// resolution error; a follow-up could add the lowerdir to the dind
+			// resolver's search path if a workflow ever needs it.
+			bindMappings[r.cfg.RunnerMount] = runnerWritableDir
 		}
 		dindServer.SetRunnerRootfs(snapshotName, runnerRootfsPath, bindMappings)
 	}
@@ -1541,9 +1566,16 @@ func withDockerSocket(hostSocketPath string) oci.SpecOpts {
 	}
 }
 
-// withRunnerMount bind-mounts a per-job copy of the runner directory into the container.
-// The runner needs write access (e.g. run-helper.sh at startup) so we can't use
-// the shared extracted dir directly. The caller provides a job-specific copy.
+// withRunnerMount bind-mounts a per-job copy of the runner directory into the
+// container rw. The runner needs write access (e.g. run-helper.sh at startup)
+// so it cannot use the shared extracted dir directly; the caller provides a
+// job-specific copy.
+//
+// This is the Windows path (see prepareJobRunnerTree): the copy is a full byte
+// copy with independent inodes, so a job's writes cannot reach the shared tree
+// or another job. On Linux the runner tree is instead an overlayfs with the
+// shared tree as a read-only lowerdir (withRunnerOverlay) — an rw bind of a
+// hardlinked copy there was the F1 cross-job poisoning vector.
 func withRunnerMount(hostDir, containerDir string) oci.SpecOpts {
 	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
 		if s.Mounts == nil {
@@ -1564,6 +1596,49 @@ func withRunnerMount(hostDir, containerDir string) oci.SpecOpts {
 				Options:     []string{"rbind", "rw"},
 			})
 		}
+		return nil
+	}
+}
+
+// withRunnerOverlay mounts the shared runner tree into the container as an
+// overlayfs: the shared, persistent runner binaries are the READ-ONLY
+// lowerdir, and each job gets its own private upperdir+workdir on top. Every
+// write a job makes under the runner mount — including an in-place mutation
+// like `echo x >> /actions-runner/run.sh`, or the runner's own regeneration
+// of run-helper.sh at startup — is copied up into that job's upperdir and can
+// never touch the shared lower inodes. This is the F1 fix: the previous
+// `cp -al` hardlink copy shared inodes with the persistent tree, so a job
+// running as container-root (== host root, no userns) could poison the
+// runner tree for every concurrent and future job.
+//
+// lowerdir is the shared extracted runner directory (RunnerDir). upperdir and
+// workdir are per-job directories the caller created on the same filesystem
+// as the upperdir (overlayfs requires upper and work to share a filesystem).
+// The host already runs the overlayfs containerd snapshotter, so overlay
+// support on the data filesystem is guaranteed.
+//
+// Linux only. Windows containers cannot mount overlayfs; that path keeps the
+// per-job byte copy (copyDirNative), which already gives each job independent
+// inodes — see prepareJobRunnerTree.
+func withRunnerOverlay(lowerdir, upperdir, workdir, containerDir string) oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
+		if s.Mounts == nil {
+			s.Mounts = []ocispec.Mount{}
+		}
+		s.Mounts = append(s.Mounts, ocispec.Mount{
+			Destination: containerDir,
+			Type:        "overlay",
+			Source:      "overlay",
+			Options: []string{
+				// index=off keeps things simple and avoids the copy-up index
+				// that can conflict when the same lowerdir is reused across
+				// many concurrent per-job overlays (one per job, same lower).
+				"index=off",
+				"lowerdir=" + lowerdir,
+				"upperdir=" + upperdir,
+				"workdir=" + workdir,
+			},
+		})
 		return nil
 	}
 }
@@ -1606,20 +1681,68 @@ func withCacheProxyMounts(mounts []proxies.Mount) oci.SpecOpts {
 	}
 }
 
-// copyDirForJob creates a writable copy of src at dst for a single job.
-// On Linux, uses hardlinks (cp -al) for instant, space-efficient copies.
-// On Windows, uses a native Go walk+copy — xcopy returned exit 4 (init
-// error) intermittently when invoked under the SYSTEM service account,
-// even though manual runs from the same user worked. Going native avoids
-// the external-command dependency and surfaces real I/O errors.
+// prepareJobRunnerTree materializes the per-job runner directory rooted at
+// jobRunnerDir and returns (1) the SpecOpt that mounts the shared runner tree
+// at containerDir for this job and (2) the host path holding the job's
+// WRITABLE copy of the tree — what dind must resolve sibling `docker -v`
+// sources against.
+//
+// Linux (and other Unix): an overlayfs. The shared, persistent runnerDir is
+// the READ-ONLY lowerdir; each job gets a private upperdir+workdir. A job
+// running as container-root can freely write under the mount, but every write
+// (including in-place mutations of shared files, and the runner regenerating
+// run-helper.sh at startup) is copied up into that job's upperdir and can
+// never mutate the shared lower inodes. This is the F1 containment fix: the
+// previous `cp -al` copy shared inodes with the persistent tree, so one job
+// could poison the runner binaries for every concurrent and future job. The
+// writable host path is the upperdir — everything the runner creates under
+// the mount (notably _work/) lands there, which is exactly where a sibling
+// `docker -v /actions-runner/_work/...` must resolve on the host.
+//
+// Windows: a per-job byte copy (copyDirNative). Windows containers cannot
+// mount overlayfs, but the byte copy already gives each job independent
+// inodes, so an in-place write cannot reach the shared tree or another job.
+// The writable host path is the copy itself.
+func prepareJobRunnerTree(runnerDir, jobRunnerDir, containerDir string) (writableHostDir string, opt oci.SpecOpts, err error) {
+	if goruntime.GOOS == "windows" {
+		if cerr := copyDirForJob(runnerDir, jobRunnerDir); cerr != nil {
+			return "", nil, cerr
+		}
+		return jobRunnerDir, withRunnerMount(jobRunnerDir, containerDir), nil
+	}
+	// Remove any stale directory from a crashed job that reused this id so a
+	// leftover upper can't seed the new job's writable layer.
+	if rerr := os.RemoveAll(jobRunnerDir); rerr != nil {
+		return "", nil, rerr
+	}
+	upper := filepath.Join(jobRunnerDir, "upper")
+	work := filepath.Join(jobRunnerDir, "work")
+	if merr := os.MkdirAll(upper, 0o755); merr != nil {
+		return "", nil, merr
+	}
+	if merr := os.MkdirAll(work, 0o755); merr != nil {
+		return "", nil, merr
+	}
+	return upper, withRunnerOverlay(runnerDir, upper, work, containerDir), nil
+}
+
+// copyDirForJob creates a writable byte copy of src at dst for a single job.
+// Used on Windows, where overlayfs is unavailable; each job therefore gets an
+// independent copy with its own inodes (no shared-inode mutation across jobs).
+// It uses a native Go walk+copy — xcopy returned exit 4 (init error)
+// intermittently when invoked under the SYSTEM service account, even though
+// manual runs from the same user worked. Going native avoids the
+// external-command dependency and surfaces real I/O errors.
+//
+// Linux no longer copies the runner tree at all: prepareJobRunnerTree mounts
+// it as an overlay with the shared tree as a read-only lowerdir. The earlier
+// Linux implementation here used `cp -al` (hardlinks), which shared inodes
+// with the persistent tree and was the F1 cross-job poisoning vector.
 func copyDirForJob(src, dst string) error {
 	if err := os.RemoveAll(dst); err != nil {
 		return err
 	}
-	if goruntime.GOOS == "windows" {
-		return copyDirNative(src, dst)
-	}
-	return exec.Command("cp", "-al", src, dst).Run()
+	return copyDirNative(src, dst)
 }
 
 // copyDirNative recursively copies src to dst using only the standard

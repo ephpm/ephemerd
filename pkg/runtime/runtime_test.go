@@ -54,8 +54,8 @@ func TestIsRoutableDNS(t *testing.T) {
 		{"2001:db8::1", true}, // public, passes through
 
 		// Edge cases
-		{"", true},     // empty, let it through
-		{"abc", true},  // non-IP, let it through
+		{"", true},    // empty, let it through
+		{"abc", true}, // non-IP, let it through
 	}
 
 	for _, tt := range tests {
@@ -439,5 +439,170 @@ func TestCopyDirForJob(t *testing.T) {
 	}
 	if string(data) != "hello" {
 		t.Errorf("copied file = %q, want %q", string(data), "hello")
+	}
+}
+
+// --- F1: per-job runner tree containment ---
+//
+// F1 was the CRITICAL cross-job isolation hole: the per-job runner directory
+// was a `cp -al` hardlink farm over the shared, persistent runner tree,
+// bind-mounted rw, with container-root == host-root. A job that wrote in place
+// (e.g. `echo x >> /actions-runner/run.sh`) mutated the SHARED inode and
+// poisoned every concurrent and future job. The fix mounts the shared tree as
+// an overlayfs read-only lowerdir with a per-job upperdir, so writes copy up
+// into the job's own layer and never touch the shared inodes.
+
+// TestWithRunnerOverlay asserts the overlay SpecOpt exposes the shared runner
+// tree ONLY as a read-only lowerdir and never as a writable mount.
+func TestWithRunnerOverlay(t *testing.T) {
+	const (
+		lower  = "/data/runners/2.333.1-linux"
+		upper  = "/data/runners/job-abc/upper"
+		work   = "/data/runners/job-abc/work"
+		target = "/actions-runner"
+	)
+	s := &ocispec.Spec{}
+	if err := withRunnerOverlay(lower, upper, work, target)(nil, nil, nil, s); err != nil {
+		t.Fatalf("withRunnerOverlay error: %v", err)
+	}
+	if len(s.Mounts) != 1 {
+		t.Fatalf("expected 1 mount, got %d", len(s.Mounts))
+	}
+	m := s.Mounts[0]
+	if m.Type != "overlay" {
+		t.Errorf("Type = %q, want overlay", m.Type)
+	}
+	if m.Destination != target {
+		t.Errorf("Destination = %q, want %q", m.Destination, target)
+	}
+	joined := strings.Join(m.Options, ",")
+	if !strings.Contains(joined, "lowerdir="+lower) {
+		t.Errorf("options %q missing lowerdir=%s", joined, lower)
+	}
+	if !strings.Contains(joined, "upperdir="+upper) {
+		t.Errorf("options %q missing upperdir=%s", joined, upper)
+	}
+	if !strings.Contains(joined, "workdir="+work) {
+		t.Errorf("options %q missing workdir=%s", joined, work)
+	}
+	// The shared tree must never be handed to the job writable. In an overlay
+	// the lowerdir is read-only by construction, but guard against a
+	// regression that adds the shared path as an rw bind alongside.
+	for _, opt := range m.Options {
+		if opt == "upperdir="+lower || opt == "workdir="+lower {
+			t.Errorf("shared tree %s used as writable overlay layer", lower)
+		}
+	}
+	if m.Type == "bind" {
+		t.Error("runner tree must not be a writable bind of the shared tree")
+	}
+}
+
+// sharesAnyInode reports whether any regular file reachable under probe is the
+// SAME on-disk object (same inode / file id) as its counterpart under base.
+// This is the exact property the F1 hardlink farm violated: `cp -al` made the
+// per-job files hardlinks to the shared inodes, so os.SameFile returned true
+// and an in-place write hit both.
+func sharesAnyInode(t *testing.T, base, probe string) bool {
+	t.Helper()
+	shared := false
+	err := filepath.Walk(probe, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+		rel, err := filepath.Rel(probe, p)
+		if err != nil {
+			return err
+		}
+		bi, err := os.Stat(filepath.Join(base, rel))
+		if err != nil {
+			return nil //nolint:nilerr // no counterpart in base → cannot share
+		}
+		pi, err := os.Stat(p)
+		if err != nil {
+			return err
+		}
+		if os.SameFile(bi, pi) {
+			shared = true
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking %s: %v", probe, err)
+	}
+	return shared
+}
+
+// makeSharedRunnerTree builds a minimal stand-in for the extracted runner
+// tree: the run.sh a job would target plus a couple of "binary" files.
+func makeSharedRunnerTree(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "run.sh"), []byte("#!/bin/sh\n# ORIGINAL\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bin", "Runner.Listener"), []byte("ELF"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// TestPrepareJobRunnerTree_WritableLayerDoesNotShareSharedInodes is the F1
+// regression test. It proves two things on the current platform:
+//
+//  1. Teeth: the pre-fix mechanism — a `cp -al`-style hardlink farm — DOES
+//     share inodes with the shared tree, and the assertion detects it. This is
+//     what current `main` produces on Linux, so this test fails against main's
+//     behavior.
+//  2. Fix: the writable layer prepareJobRunnerTree hands the job (the overlay
+//     upperdir on Linux, an independent byte copy on Windows) shares NO inodes
+//     with the shared tree, so an in-place write cannot reach it.
+func TestPrepareJobRunnerTree_WritableLayerDoesNotShareSharedInodes(t *testing.T) {
+	shared := makeSharedRunnerTree(t)
+	parent := t.TempDir()
+
+	// (1) Teeth: reproduce main's per-job mechanism (hardlink farm) and prove
+	// the assertion catches the shared inodes it creates.
+	farm := filepath.Join(parent, "hardlink-farm")
+	if err := os.MkdirAll(filepath.Join(farm, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkOrSkip := func(oldp, newp string) {
+		if err := os.Link(oldp, newp); err != nil {
+			t.Skipf("hardlinks unsupported on this filesystem, cannot exercise the teeth check: %v", err)
+		}
+	}
+	linkOrSkip(filepath.Join(shared, "run.sh"), filepath.Join(farm, "run.sh"))
+	linkOrSkip(filepath.Join(shared, "bin", "Runner.Listener"), filepath.Join(farm, "bin", "Runner.Listener"))
+	if !sharesAnyInode(t, shared, farm) {
+		t.Fatal("assertion has no teeth: a hardlink farm was not detected as sharing shared-tree inodes")
+	}
+
+	// (2) Fix: the writable layer from the production helper shares nothing.
+	jobDir := filepath.Join(parent, "job-A")
+	writable, opt, err := prepareJobRunnerTree(shared, jobDir, "/actions-runner")
+	if err != nil {
+		t.Fatalf("prepareJobRunnerTree error: %v", err)
+	}
+	if opt == nil {
+		t.Fatal("prepareJobRunnerTree returned nil SpecOpt")
+	}
+	if writable == "" {
+		t.Fatal("prepareJobRunnerTree returned empty writable dir")
+	}
+	if sharesAnyInode(t, shared, writable) {
+		t.Errorf("writable layer %s shares an inode with the shared tree %s — a job could poison it (F1)", writable, shared)
+	}
+
+	// The shared tree itself must be untouched by preparing a job.
+	orig, err := os.ReadFile(filepath.Join(shared, "run.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(orig), "ORIGINAL") {
+		t.Errorf("shared run.sh was modified while preparing a job: %q", string(orig))
 	}
 }
