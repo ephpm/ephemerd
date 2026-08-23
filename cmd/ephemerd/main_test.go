@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -8,6 +9,36 @@ import (
 
 	"github.com/ephpm/ephemerd/pkg/config"
 )
+
+// TestEnforceFirewallInstall_LinuxFailClosed verifies the containment guarantee:
+// on Linux a firewall-install failure is fatal so serve() refuses to dispatch
+// jobs, while the happy path (successful install) and non-Linux hosts are
+// unaffected.
+func TestEnforceFirewallInstall_LinuxFailClosed(t *testing.T) {
+	installErr := errors.New("iptables missing")
+	fail := func() error { return installErr }
+	ok := func() error { return nil }
+
+	// Linux + install fails => error returned (dispatch refused).
+	if err := enforceFirewallInstall("linux", fail, quietLog()); err == nil {
+		t.Fatal("linux + install failure: want error (fail closed), got nil")
+	} else if !errors.Is(err, installErr) {
+		t.Errorf("linux + install failure: err = %v, want wrapping %v", err, installErr)
+	}
+
+	// Linux + install succeeds => no error (happy path preserved).
+	if err := enforceFirewallInstall("linux", ok, quietLog()); err != nil {
+		t.Errorf("linux + install success: want nil, got %v", err)
+	}
+
+	// Non-Linux hosts warn and continue even when install fails — the Linux
+	// RFC1918/EPHEMERD-INPUT chains don't exist there.
+	for _, goos := range []string{"windows", "darwin"} {
+		if err := enforceFirewallInstall(goos, fail, quietLog()); err != nil {
+			t.Errorf("%s + install failure: want nil (warn+continue), got %v", goos, err)
+		}
+	}
+}
 
 func quietLog() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))

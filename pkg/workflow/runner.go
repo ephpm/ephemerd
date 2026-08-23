@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
@@ -115,7 +116,16 @@ func (r *Runner) RunJob(ctx context.Context, jobName string, job Job, repoDir st
 	}
 	defer net.Cleanup()
 
+	// Fail closed on Linux: the RFC1918 egress fence and the EPHEMERD-INPUT
+	// host-protection chain are the container's only containment, so if they
+	// did not install, refuse to run the job rather than execute it with an
+	// open path to the host's LAN and control plane. On non-Linux hosts these
+	// chains do not exist (see enforceFirewallInstall in cmd/ephemerd), so the
+	// prior warn-and-continue behavior is preserved there.
 	if err := net.InstallFirewallRules(); err != nil {
+		if runtime.GOOS == "linux" {
+			return fmt.Errorf("installing container firewall rules: %w — refusing to run job without container egress/host containment (fail closed)", err)
+		}
 		r.Log.Warn("failed to install firewall rules", "error", err)
 	}
 

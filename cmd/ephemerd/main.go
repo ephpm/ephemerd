@@ -305,8 +305,8 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		if err != nil {
 			return fmt.Errorf("initializing networking: %w", err)
 		}
-		if err := net.InstallFirewallRules(); err != nil {
-			log.Warn("failed to install firewall rules", "error", err)
+		if err := enforceFirewallInstall(runtime_.GOOS, net.InstallFirewallRules, log); err != nil {
+			return err
 		}
 		defer net.Cleanup()
 
@@ -494,9 +494,12 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		return fmt.Errorf("initializing networking: %w", err)
 	}
 
-	// Install firewall rules to block container access to private networks
-	if err := net.InstallFirewallRules(); err != nil {
-		log.Warn("failed to install firewall rules (containers may access LAN)", "error", err)
+	// Install firewall rules to block container access to private networks.
+	// Fail closed on Linux: without the RFC1918 egress fence and the
+	// EPHEMERD-INPUT host-protection chain there is no container containment,
+	// so refuse to start rather than dispatch untrusted jobs unprotected.
+	if err := enforceFirewallInstall(runtime_.GOOS, net.InstallFirewallRules, log); err != nil {
+		return err
 	}
 	defer net.Cleanup()
 
@@ -1230,6 +1233,40 @@ func crictlCmd() *cli.Command {
 			return containerd.ExecCrictl(socketPath, cmd.Args().Slice())
 		},
 	}
+}
+
+// enforceFirewallInstall installs the container firewall and decides whether a
+// failure is fatal.
+//
+// On Linux the EPHEMERD-FORWARD RFC1918 egress fence and the EPHEMERD-INPUT
+// host-protection chain are the ONLY thing containing an untrusted job
+// container from the host's LAN and control plane. If they fail to install,
+// dispatching jobs anyway is a silent, total loss of containment — a public
+// fork PR would run with no egress fence and no host-input protection at all.
+// So on Linux we fail closed: return the error so serve() refuses to start
+// dispatching and exits non-zero, which systemd surfaces (Restart=on-failure
+// then retries, leaving the node cordoned rather than running jobs bare). This
+// mirrors checkKataPrereqs, which likewise refuses to start when an isolation
+// guarantee cannot be met — a silent downgrade is strictly worse than not
+// starting.
+//
+// Non-Linux hosts keep the prior warn-and-continue behavior. The Linux
+// RFC1918/EPHEMERD-INPUT chains do not exist on Windows/macOS: there the Linux
+// job firewall is installed by the in-VM worker (itself Linux, and made fail
+// closed by this same helper), while this call installs the host platform's own
+// rules (Windows netsh/L2Bridge; a darwin no-op) whose failure modes are out of
+// scope for this Linux-specific containment guarantee.
+//
+// goos is passed in (rather than read from runtime.GOOS) purely so the
+// fail-closed decision is unit-testable without a platform build tag.
+func enforceFirewallInstall(goos string, install func() error, log *slog.Logger) error {
+	if err := install(); err != nil {
+		if goos == "linux" {
+			return fmt.Errorf("installing container firewall rules: %w — refusing to run jobs without container egress/host containment (fail closed)", err)
+		}
+		log.Warn("failed to install firewall rules (containers may access LAN)", "error", err)
+	}
+	return nil
 }
 
 // needsHostAccess reports whether ephemerd runs anything that job containers
