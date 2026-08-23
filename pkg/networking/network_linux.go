@@ -29,12 +29,12 @@ func newPlatformNetworking() platformNetworking {
 func (l *linuxNetworking) init(cfg Config) error {
 	l.cfg = cfg
 
-	confDir := filepath.Join(cfg.DataDir, "cni", "conf")
+	confPath := CNIConfListPath(cfg.DataDir)
+	confDir := filepath.Dir(confPath)
 	if err := os.MkdirAll(confDir, 0o755); err != nil {
 		return fmt.Errorf("creating CNI conf dir: %w", err)
 	}
 
-	confPath := filepath.Join(confDir, "10-ephemerd.conflist")
 	if err := l.writeConfig(confPath); err != nil {
 		return fmt.Errorf("writing CNI config: %w", err)
 	}

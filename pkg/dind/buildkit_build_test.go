@@ -70,6 +70,60 @@ func TestDockerBuildOptsToSolveOpt_AllOptions(t *testing.T) {
 	}
 }
 
+// TestDockerBuildOptsToSolveOpt_CacheMountNamespaced asserts that cache mounts
+// are scoped to the job so one job's RUN --mount=type=cache can't feed another.
+func TestDockerBuildOptsToSolveOpt_CacheMountNamespaced(t *testing.T) {
+	req := httptest.NewRequest("POST", "/build?t=alpine:local", nil)
+	opt, err := dockerBuildOptsToSolveOpt(req, "/ctx", "job-abc")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := opt.FrontendAttrs["build-arg:BUILDKIT_CACHE_MOUNT_NS"], "job-abc"; got != want {
+		t.Errorf("cache mount namespace = %q, want %q", got, want)
+	}
+}
+
+// TestDockerBuildOptsToSolveOpt_CacheNSNotOverridable asserts a workflow cannot
+// point its cache mounts at another job's namespace via --build-arg.
+func TestDockerBuildOptsToSolveOpt_CacheNSNotOverridable(t *testing.T) {
+	req := httptest.NewRequest("POST",
+		`/build?t=alpine:local&buildargs={"BUILDKIT_CACHE_MOUNT_NS":"victim-job"}`, nil)
+	opt, err := dockerBuildOptsToSolveOpt(req, "/ctx", "job-abc")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := opt.FrontendAttrs["build-arg:BUILDKIT_CACHE_MOUNT_NS"], "job-abc"; got != want {
+		t.Errorf("cache mount namespace = %q, want %q (workflow override must not win)", got, want)
+	}
+}
+
+// TestDockerBuildOptsToSolveOpt_NoJobIDUniqueCacheNS asserts that a build with
+// no job scope (empty jobID) still gets a cache mount namespace, and that the
+// namespace is unique per build rather than a single shared one. Leaving it
+// unset would collapse every unscoped build onto one shared cache mount — the
+// exact cross-job read/write channel BUILDKIT_CACHE_MOUNT_NS exists to close.
+func TestDockerBuildOptsToSolveOpt_NoJobIDUniqueCacheNS(t *testing.T) {
+	req1 := httptest.NewRequest("POST", "/build?t=alpine:local", nil)
+	opt1, err := dockerBuildOptsToSolveOpt(req1, "/ctx", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	ns1, ok := opt1.FrontendAttrs["build-arg:BUILDKIT_CACHE_MOUNT_NS"]
+	if !ok || ns1 == "" {
+		t.Fatalf("cache mount namespace should be set even when jobID is empty")
+	}
+
+	req2 := httptest.NewRequest("POST", "/build?t=alpine:local", nil)
+	opt2, err := dockerBuildOptsToSolveOpt(req2, "/ctx", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	ns2 := opt2.FrontendAttrs["build-arg:BUILDKIT_CACHE_MOUNT_NS"]
+	if ns1 == ns2 {
+		t.Errorf("two empty-jobID builds share cache namespace %q; want unique per build", ns1)
+	}
+}
+
 func TestDockerBuildOptsToSolveOpt_InvalidBuildargsJSON(t *testing.T) {
 	req := httptest.NewRequest("POST", "/build?buildargs=not-json", nil)
 	_, err := dockerBuildOptsToSolveOpt(req, "/ctx", "test-job")

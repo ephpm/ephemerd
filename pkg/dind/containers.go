@@ -506,6 +506,23 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	// selectively in handleContainerStart for containers that need a
 	// real PTY (e.g. kindest/node, where systemd needs /dev/console).
 
+	// Confine non-privileged siblings to the same sandbox the runner container
+	// runs under: default seccomp, AppArmor, and CAP_NET_RAW (plus the other
+	// caps the runner drops) removed. Without this a non-privileged sibling
+	// inherits containerd's default spec, which ships CAP_NET_RAW and NO
+	// seccomp/AppArmor — enough to ARP-spoof the plaintext package-cache
+	// proxies on the bridge gateway and pivot into another job's build. This is
+	// applied to the base spec, BEFORE the HostConfig block below, so that:
+	//   - the privileged path (checkPrivilegedGate-gated) keeps its intentional
+	//     unconfined posture — the block below applies WithPrivileged /
+	//     WithSeccompUnconfined after and wins; and
+	//   - on a host with the gate OPEN, an explicit --cap-add still re-grants a
+	//     capability, because CapAdd is applied after this.
+	privileged := req.HostConfig != nil && req.HostConfig.Privileged
+	if !privileged {
+		opts = append(opts, nonPrivilegedHardeningOpts(s.log)...)
+	}
+
 	if req.HostConfig != nil {
 		// Privileged mode: all capabilities, all devices, disable seccomp/apparmor,
 		// writable /proc and /sys. Safe because dind containers run inside an
