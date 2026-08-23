@@ -322,6 +322,18 @@ shutdown_timeout = "5m"
 # cpus = 2
 # memory_mb = 2048
 
+# Per-job macOS VMs (Apple Virtualization.framework; darwin hosts only).
+# Each macOS job boots a clone-on-write VM and waits for its runner to
+# register. provision_timeout bounds that pre-registration wait: if a VM has
+# not become reachable within the window it is force-stopped and its slot
+# released, so a wedged VM can't hold the (often single) macOS slot and stall
+# macOS CI fleet-wide. Default 5m.
+# [vm.macos]
+# max_concurrent    = 1
+# cpus              = 4
+# memory_mb         = 8192
+# provision_timeout = "5m"
+
 # BuildKit build cache bounds.
 #
 # BuildKit only garbage-collects when its worker is given a GC policy.

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Code-Hex/vz/v3"
@@ -31,6 +32,8 @@ type darwinMacOSVM struct {
 	macAddr   string // VM's MAC address for ARP-based IP discovery
 	cancel    context.CancelFunc
 	done      chan struct{}
+	stopOnce  sync.Once // Stop is idempotent: the provisioning watchdog and the
+	// normal teardown path can both call it.
 }
 
 // NewMacOSVM creates a new per-job macOS VM. Call Start() to boot it.
@@ -624,6 +627,49 @@ dscl . -passwd /Users/admin admin "$RAND_PASS" 2>/dev/null || true
 echo "runner started (pid=$RUNNER_PID)"
 `
 
+// sshCommandTimeout bounds a single remote command executed over SSH.
+// ssh.ClientConfig.Timeout only covers connection establishment, NOT command
+// execution: session.CombinedOutput/Run block until the guest command returns.
+// A guest command that never returns (the root cause of a ~10h stuck macOS
+// provision) would otherwise wedge the reachability wait forever. Closing the
+// session on deadline unblocks the pending call.
+const sshCommandTimeout = 90 * time.Second
+
+// runSSHCommand runs cmd on client with a hard deadline, returning its combined
+// output. On timeout or ctx cancellation it closes the session — which unblocks
+// the underlying CombinedOutput — and returns an error. The result channel is
+// buffered so the command goroutine never leaks even after we stop waiting.
+func runSSHCommand(ctx context.Context, client *ssh.Client, cmd string, timeout time.Duration) ([]byte, error) {
+	session, err := client.NewSession()
+	if err != nil {
+		return nil, err
+	}
+	type res struct {
+		out []byte
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		out, cmdErr := session.CombinedOutput(cmd)
+		ch <- res{out: out, err: cmdErr}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case r := <-ch:
+		_ = session.Close()
+		return r.out, r.err
+	case <-timer.C:
+		_ = session.Close() // interrupts the blocked CombinedOutput
+		return nil, fmt.Errorf("ssh command timed out after %s", timeout)
+	case <-ctx.Done():
+		_ = session.Close()
+		return nil, ctx.Err()
+	}
+}
+
 // setupRunnerViaSSH connects to the VM using the Tart default credentials
 // (admin/admin) and starts the GitHub Actions runner. This is more reliable
 // than LaunchDaemons which may be blocked by SIP/SSV on modern macOS.
@@ -657,19 +703,13 @@ func (m *darwinMacOSVM) setupRunnerViaSSH(ctx context.Context, ip string) error 
 
 	// Fix ownership FIRST as a blocking command — SSH strict mode rejects
 	// key auth if /Users/admin or .ssh are owned by root (host injection).
-	fixSession, err := client.NewSession()
-	if err != nil {
-		return fmt.Errorf("SSH session for chown: %w", err)
-	}
 	// Fix ownership AND re-install the SSH key in case the host-side injection
 	// landed in the wrong place. This runs as a blocking command with password
-	// auth (before password is randomized).
+	// auth (before password is randomized). Bounded by sshCommandTimeout: a
+	// wedged guest command must not hang provisioning forever.
 	fixCmd := fmt.Sprintf(`sudo chown admin:staff /Users/admin && sudo chown -R admin:staff /Users/admin/.ssh /Users/admin/actions-runner 2>/dev/null; mkdir -p ~/.ssh && echo '%s' > ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys; echo ok`, strings.TrimSpace(m.cfg.SSHPubKey))
-	if out, err := fixSession.CombinedOutput(fixCmd); err != nil {
+	if out, err := runSSHCommand(ctx, client, fixCmd, sshCommandTimeout); err != nil {
 		m.cfg.Log.Warn("chown failed", "output", string(out), "error", err)
-	}
-	if err := fixSession.Close(); err != nil {
-		m.cfg.Log.Debug("closing fix session", "error", err)
 	}
 
 	// Read JIT config to pass inline via SSH
@@ -680,14 +720,7 @@ func (m *darwinMacOSVM) setupRunnerViaSSH(ctx context.Context, ip string) error 
 
 	// Check if the runner exists in the VM. If not (host-side injection
 	// failed due to APFS isolation), copy it via SSH tar pipe.
-	checkSession, err := client.NewSession()
-	if err != nil {
-		return fmt.Errorf("SSH session for check: %w", err)
-	}
-	out, checkErr := checkSession.CombinedOutput("test -f /Library/ephemerd/runner/run.sh && echo found || echo missing")
-	if closeErr := checkSession.Close(); closeErr != nil {
-		m.cfg.Log.Debug("closing check session", "error", closeErr)
-	}
+	out, checkErr := runSSHCommand(ctx, client, "test -f /Library/ephemerd/runner/run.sh && echo found || echo missing", sshCommandTimeout)
 
 	if checkErr != nil || strings.TrimSpace(string(out)) != "found" {
 		// Runner not in clone — copy via SSH (uncompressed tar for speed)
@@ -734,8 +767,24 @@ func (m *darwinMacOSVM) setupRunnerViaSSH(ctx context.Context, ip string) error 
 			m.cfg.Log.Debug("closing tar stdin", "error", err)
 		}
 
-		if err := <-errCh; err != nil {
-			return fmt.Errorf("untar on VM: %w", err)
+		// Bound the remote untar: session.Run has no deadline, so a hung
+		// guest tar must not wedge provisioning. Closing the session on
+		// timeout unblocks the Run in the goroutine above.
+		select {
+		case err := <-errCh:
+			if err != nil {
+				return fmt.Errorf("untar on VM: %w", err)
+			}
+		case <-time.After(sshCommandTimeout):
+			if closeErr := tarSession.Close(); closeErr != nil {
+				m.cfg.Log.Debug("closing tar session after timeout", "error", closeErr)
+			}
+			return fmt.Errorf("untar on VM timed out after %s", sshCommandTimeout)
+		case <-ctx.Done():
+			if closeErr := tarSession.Close(); closeErr != nil {
+				m.cfg.Log.Debug("closing tar session after cancel", "error", closeErr)
+			}
+			return ctx.Err()
 		}
 		m.cfg.Log.Info("runner copied to VM via SSH", "id", m.id)
 	}
@@ -773,6 +822,10 @@ func (m *darwinMacOSVM) setupRunnerViaSSH(ctx context.Context, ip string) error 
 }
 
 func (m *darwinMacOSVM) Stop() {
+	m.stopOnce.Do(m.stop)
+}
+
+func (m *darwinMacOSVM) stop() {
 	m.cfg.Log.Info("stopping macOS VM", "id", m.id)
 
 	if m.vm != nil {
