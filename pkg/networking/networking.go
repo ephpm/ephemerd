@@ -229,6 +229,21 @@ type platformNetworking interface {
 	// service opens — RDP/SMB/RPC stay blocked. No-op on macOS.
 	openHostPort(port int, containerIP string) error
 	closeHostPort(port int, containerIP string)
+
+	// joinJobNetwork / leaveJobNetwork implement per-job container-to-container
+	// isolation on the shared CNI bridge. joinJobNetwork records that the
+	// container attached under cniID belongs to jobID at containerIP and allows
+	// it to reach — and be reached by — the OTHER containers of the same job
+	// (the runner, its dind siblings, its `services:` containers), while the
+	// bridge's default posture denies it any other job's containers.
+	// leaveJobNetwork reverses that for the container attached under cniID.
+	//
+	// cniID is the SAME id passed to setup/teardown, so teardown needs only
+	// that id — not the job or the address. Linux enforces this with iptables;
+	// Windows already scopes per-endpoint egress ACLs and macOS has no bridge,
+	// so both are no-ops.
+	joinJobNetwork(cniID, jobID, containerIP string) error
+	leaveJobNetwork(cniID string)
 }
 
 // New creates and initializes the networking manager for the current platform.
@@ -331,6 +346,28 @@ func (m *Manager) OpenHostPort(port int, containerIP string) error {
 func (m *Manager) CloseHostPort(port int, containerIP string) {
 	if m.platform != nil {
 		m.platform.closeHostPort(port, containerIP)
+	}
+}
+
+// JoinJobNetwork registers the container attached under cniID as belonging to
+// jobID at containerIP and opens intra-job container-to-container reachability
+// for it, while the bridge's default posture keeps it from reaching any other
+// job's containers. Call it after Setup has returned the container's IP and
+// before the container starts doing work. Pair with LeaveJobNetwork, passing
+// the same cniID. No-op when no platform is initialized.
+func (m *Manager) JoinJobNetwork(cniID, jobID, containerIP string) error {
+	if m.platform == nil {
+		return nil
+	}
+	return m.platform.joinJobNetwork(cniID, jobID, containerIP)
+}
+
+// LeaveJobNetwork reverses JoinJobNetwork for the container attached under
+// cniID, removing the intra-job allows it held. Best-effort and safe to call
+// for an id that never joined. Call it on teardown, alongside Teardown.
+func (m *Manager) LeaveJobNetwork(cniID string) {
+	if m.platform != nil {
+		m.platform.leaveJobNetwork(cniID)
 	}
 }
 

@@ -52,6 +52,41 @@ const inputChainName = "EPHEMERD-INPUT"
 // host or kernel configuration where bridged traffic does reach FORWARD.
 const dindChainName = "EPHEMERD-DIND"
 
+// c2cChainName holds the per-job container-to-container policy. All jobs share
+// one flat CNI bridge (10.88.0.0/16), so without this chain the "allow
+// container-to-container" rule was a subnet-wide ACCEPT: a container in one
+// job could open a TCP connection to a *different* concurrent job's containers
+// — e.g. a fork-PR job reaching a maintainer job's `services:` postgres. That
+// is a cross-job data-reach that must be closed before untrusted fork PRs run
+// on the same node (finding: pen-test 2026-08-23, confirmed on v0.2.5).
+//
+// The chain is NOT "drop all 10.88↔10.88": a single job legitimately runs
+// several containers that MUST talk to each other — the runner container, its
+// per-job dind sibling containers, and its `services:` containers (the runner
+// reaching its own postgres). So the policy is "a job's containers may reach
+// each OTHER, but not ANOTHER job's containers":
+//
+//   - one ACCEPT pair (both directions) per intra-job container pair, scoped to
+//     the two /32s, inserted at the top of the chain as containers join, and
+//   - a single terminal `-s subnet -d subnet -j DROP` for everything else
+//     inside the subnet — i.e. cross-job pairs, which match no ACCEPT.
+//
+// Traffic whose destination is NOT in the container subnet (egress to the
+// internet, the RFC1918 REJECTs, DNS/gateway ports) never matches the terminal
+// DROP and RETURNs from this chain to the rest of EPHEMERD-FORWARD unchanged,
+// so the egress fence and the DNS/registry/proxy allow-list are untouched.
+//
+// The jump into this chain is placed AFTER the DNS/gateway-port ACCEPTs and
+// BEFORE the RFC1918 REJECTs in EPHEMERD-FORWARD: after DNS so gateway traffic
+// is never at risk, before the REJECTs because the container subnet sits inside
+// 10.0.0.0/8 and an intra-job ACCEPT must win over that private-range REJECT.
+//
+// For any of this to bind, container-to-container frames must traverse
+// iptables at all. On the shared bridge that requires net.bridge
+// .bridge-nf-call-iptables=1 (ensureBridgeNetfilter); without it same-bridge
+// traffic is L2-switched and bypasses every rule here.
+const c2cChainName = "EPHEMERD-C2C"
+
 var deniedRanges = []string{
 	"10.0.0.0/8",
 	"172.16.0.0/12",
@@ -319,7 +354,188 @@ func (l *linuxNetworking) closeHostPort(port int, containerIP string) {
 	}
 }
 
+// c2cPairRules returns the ordered, bidirectional ACCEPT pair that lets two
+// containers in the SAME job reach each other. Both directions are needed
+// because a container may be either end of a connection (the runner dialing its
+// postgres service, or a service pushing to the runner), and each /32→/32 rule
+// only matches one direction.
+//
+// The rules carry no chain name (the caller supplies -A/-I <chain>) and no
+// state match: intra-job traffic is allowed unconditionally, NEW included,
+// because the whole point is to permit the connection the runner opens to its
+// own service. Exposed as a pure function so tests can assert the exact rules
+// without invoking iptables.
+func c2cPairRules(ipA, ipB string) [][]string {
+	return [][]string{
+		{"-s", ipA + "/32", "-d", ipB + "/32", "-j", "ACCEPT"},
+		{"-s", ipB + "/32", "-d", ipA + "/32", "-j", "ACCEPT"},
+	}
+}
+
+// c2cCrossJobDropRule is the terminal rule of EPHEMERD-C2C: drop every
+// remaining container-to-container packet. Intra-job pairs are ACCEPTed above
+// it, so what reaches it is exactly cross-job traffic. It is scoped to
+// subnet→subnet so that anything whose destination is outside the container
+// subnet (internet egress, RFC1918 REJECTs, DNS/gateway) does NOT match and
+// instead RETURNs to the rest of EPHEMERD-FORWARD — the egress fence and DNS
+// allow-list are left intact.
+//
+// Pure (no side effects) so the emitted rule is unit-testable. Returns nil for
+// an empty subnet, which would otherwise produce a match-everything DROP.
+func c2cCrossJobDropRule(subnet string) []string {
+	if subnet == "" {
+		return nil
+	}
+	return []string{"-s", subnet, "-d", subnet, "-j", "DROP"}
+}
+
+// ensureC2CChain creates EPHEMERD-C2C if absent and makes sure the terminal
+// cross-job DROP is present as its last rule. Idempotent and side-effect-safe
+// to call from both installFirewallRules and joinJobNetwork. It does NOT touch
+// the EPHEMERD-FORWARD→EPHEMERD-C2C jump: the jump's position (after the DNS/
+// gateway ACCEPTs, before the RFC1918 REJECTs) is load-bearing and is placed
+// exactly once, by installFirewallRules.
+func (l *linuxNetworking) ensureC2CChain() error {
+	_ = iptables("-N", c2cChainName)
+
+	drop := c2cCrossJobDropRule(l.cfg.subnet())
+	if drop == nil {
+		return nil
+	}
+	if err := iptables(append([]string{"-C", c2cChainName}, drop...)...); err != nil {
+		if err := iptables(append([]string{"-A", c2cChainName}, drop...)...); err != nil {
+			return fmt.Errorf("adding %s cross-job drop: %w", c2cChainName, err)
+		}
+	}
+	return nil
+}
+
+// ensureBridgeNetfilter makes same-bridge container-to-container frames visible
+// to iptables by enabling net.bridge.bridge-nf-call-iptables. Without it, two
+// containers on the shared bridge talk at L2 and bypass EPHEMERD-C2C entirely,
+// so the cross-job DROP would match nothing and the isolation would be a no-op.
+//
+// Best-effort: br_netfilter may be built in (no module to load) and the sysctl
+// path can vary, so a failure is logged loudly rather than made fatal — the
+// firewall's routed rules (egress fence, control-plane drops) do not depend on
+// it. Where it cannot be enabled, cross-job L2 reach is NOT closed; that is
+// called out in the deploy notes.
+func (l *linuxNetworking) ensureBridgeNetfilter() {
+	// Load the module if it is not built in. Ignore failure: on kernels where
+	// it is built in, modprobe reports an error but the sysctl below still works.
+	if out, err := exec.Command("modprobe", "br_netfilter").CombinedOutput(); err != nil {
+		l.cfg.Log.Debug("modprobe br_netfilter (may be built in)", "output", strings.TrimSpace(string(out)))
+	}
+	if out, err := exec.Command("sysctl", "-w", "net.bridge.bridge-nf-call-iptables=1").CombinedOutput(); err != nil {
+		l.cfg.Log.Warn("could not enable bridge-nf-call-iptables; same-bridge cross-job traffic may bypass the container-to-container filter",
+			"error", err, "output", strings.TrimSpace(string(out)))
+		return
+	}
+	l.cfg.Log.Info("bridge netfilter enabled", "sysctl", "net.bridge.bridge-nf-call-iptables=1")
+}
+
+// joinJobNetwork records that the container attached under cniID belongs to
+// jobID at containerIP, and installs the intra-job ACCEPT pairs that let it
+// reach — and be reached by — the containers already attached for the same job
+// (the runner, its dind siblings, its `services:` containers).
+//
+// It adds nothing that would let containerIP reach a DIFFERENT job: only pairs
+// against the joining container's own job are written, and the terminal
+// cross-job DROP in EPHEMERD-C2C blocks the rest. Pairs are inserted at the top
+// of the chain so they precede that DROP.
+//
+// Idempotent per cniID; a second join with the same id is ignored. An empty or
+// unparseable IP is skipped (a container with no address has no reachability to
+// scope), and an empty jobID is rejected so containers cannot be lumped into a
+// single shared group.
+func (l *linuxNetworking) joinJobNetwork(cniID, jobID, containerIP string) error {
+	if jobID == "" {
+		return fmt.Errorf("joinJobNetwork: empty jobID for %q", cniID)
+	}
+	ip := net.ParseIP(strings.TrimSpace(containerIP))
+	if ip == nil || ip.To4() == nil {
+		l.cfg.Log.Debug("skipping c2c join: unusable container IP", "cni_id", cniID, "job_id", jobID, "ip", containerIP)
+		return nil
+	}
+	if err := l.ensureC2CChain(); err != nil {
+		return err
+	}
+
+	ipStr := ip.String()
+
+	l.c2cMu.Lock()
+	defer l.c2cMu.Unlock()
+	if l.c2cMember == nil {
+		l.c2cMember = make(map[string]c2cMember)
+		l.c2cJob = make(map[string]map[string]bool)
+	}
+	if _, ok := l.c2cMember[cniID]; ok {
+		return nil // already joined
+	}
+
+	peers := l.c2cJob[jobID]
+	for peer := range peers {
+		if peer == ipStr {
+			continue
+		}
+		for _, rule := range c2cPairRules(ipStr, peer) {
+			// Insert at the top so intra-job ACCEPTs always precede the terminal
+			// cross-job DROP, regardless of how many pairs already exist.
+			if err := iptables(append([]string{"-I", c2cChainName, "1"}, rule...)...); err != nil {
+				return fmt.Errorf("adding c2c allow %s: %w", strings.Join(rule, " "), err)
+			}
+		}
+	}
+
+	if peers == nil {
+		peers = make(map[string]bool)
+		l.c2cJob[jobID] = peers
+	}
+	peers[ipStr] = true
+	l.c2cMember[cniID] = c2cMember{jobID: jobID, ip: ipStr}
+	l.cfg.Log.Info("container joined job network", "cni_id", cniID, "job_id", jobID, "ip", ipStr, "job_size", len(peers))
+	return nil
+}
+
+// leaveJobNetwork removes the container attached under cniID from its job and
+// deletes the intra-job ACCEPT pairs it shared with every remaining member.
+// Best-effort on the iptables side: a rule that fails to delete is logged and
+// leaks only an allow between two addresses of the SAME job (never a cross-job
+// hole), and is flushed wholesale on the next daemon restart.
+func (l *linuxNetworking) leaveJobNetwork(cniID string) {
+	l.c2cMu.Lock()
+	defer l.c2cMu.Unlock()
+
+	m, ok := l.c2cMember[cniID]
+	if !ok {
+		return
+	}
+	delete(l.c2cMember, cniID)
+
+	peers := l.c2cJob[m.jobID]
+	delete(peers, m.ip)
+	for peer := range peers {
+		if peer == m.ip {
+			continue
+		}
+		for _, rule := range c2cPairRules(m.ip, peer) {
+			if err := iptables(append([]string{"-D", c2cChainName}, rule...)...); err != nil {
+				l.cfg.Log.Debug("failed to remove c2c allow", "rule", strings.Join(rule, " "), "error", err)
+			}
+		}
+	}
+	if len(peers) == 0 {
+		delete(l.c2cJob, m.jobID)
+	}
+	l.cfg.Log.Debug("container left job network", "cni_id", cniID, "job_id", m.jobID, "ip", m.ip)
+}
+
 func (l *linuxNetworking) installFirewallRules() error {
+	// Make same-bridge container-to-container frames traverse iptables so the
+	// EPHEMERD-C2C cross-job filter below can actually see them. Best-effort;
+	// see ensureBridgeNetfilter for why a failure is not fatal.
+	l.ensureBridgeNetfilter()
+
 	// Create our own chain to avoid interference from CNI/Netavark
 	_ = iptables("-N", chainName)
 
@@ -343,11 +559,10 @@ func (l *linuxNetworking) installFirewallRules() error {
 
 	// Rules inside our chain (evaluated in order, top to bottom):
 
-	// 0. Per-job dind Docker API rules. Must be first: rule 2 below allows
-	//    container-to-container traffic across the whole subnet, and the
-	//    gateway address sits inside that subnet, so anything appended after
-	//    it could never deny a container reaching a dind port. The chain is
-	//    empty until a job opens a port; see ensureDindChain.
+	// 0. Per-job dind Docker API rules. Must be first: the gateway address
+	//    sits inside the container subnet, so any dind allow/deny has to be
+	//    evaluated before the container-to-container jump below could match it.
+	//    The chain is empty until a job opens a port; see ensureDindChain.
 	if err := l.ensureDindChain(); err != nil {
 		return err
 	}
@@ -359,19 +574,33 @@ func (l *linuxNetworking) installFirewallRules() error {
 		l.cfg.Log.Debug("failed to flush dind chain", "error", err)
 	}
 
+	// Prepare the per-job container-to-container chain and clear any stale
+	// per-job pairs a previous daemon left behind. Startup runs before any job
+	// exists, so nothing live is revoked; the terminal cross-job DROP is
+	// re-established by ensureC2CChain. The subnet-wide ACCEPT that used to sit
+	// at this position (rule "2. Allow container-to-container") is deliberately
+	// gone — it let one job reach another job's containers. See c2cChainName.
+	if err := iptables("-F", c2cChainName); err != nil {
+		l.cfg.Log.Debug("failed to flush c2c chain (may not exist yet)", "error", err)
+	}
+	// Keep in-memory membership consistent with the just-flushed chain: a
+	// re-install that wiped the pairs must not leave the maps claiming they
+	// still exist.
+	l.c2cMu.Lock()
+	l.c2cMember = nil
+	l.c2cJob = nil
+	l.c2cMu.Unlock()
+	if err := l.ensureC2CChain(); err != nil {
+		return err
+	}
+
 	// 1. Allow return traffic
 	l.cfg.Log.Info("adding firewall rule", "rule", "allow return traffic")
 	if err := iptables("-A", chainName, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"); err != nil {
 		return fmt.Errorf("adding return traffic rule: %w", err)
 	}
 
-	// 2. Allow container-to-container
-	l.cfg.Log.Info("adding firewall rule", "rule", "allow container-to-container")
-	if err := iptables("-A", chainName, "-s", l.cfg.subnet(), "-d", l.cfg.subnet(), "-j", "ACCEPT"); err != nil {
-		return fmt.Errorf("adding container-to-container rule: %w", err)
-	}
-
-	// 3. Allow DNS only to the bridge gateway (prevents DNS tunneling to private networks)
+	// 2. Allow DNS only to the bridge gateway (prevents DNS tunneling to private networks)
 	gateway := deriveGateway(l.cfg.subnet())
 	for _, proto := range []string{"udp", "tcp"} {
 		l.cfg.Log.Info("adding firewall rule", "rule", "allow DNS "+proto+" to gateway")
@@ -380,7 +609,7 @@ func (l *linuxNetworking) installFirewallRules() error {
 		}
 	}
 
-	// 3b. Allow extra gateway ports (e.g., Go module proxy).
+	// 2b. Allow extra gateway ports (e.g., Go module proxy).
 	//     Note this is NOT where the gateway-port policy is enforced —
 	//     gateway-addressed traffic is delivered locally and never traverses
 	//     FORWARD. See EPHEMERD-INPUT below for the rules that actually
@@ -391,6 +620,21 @@ func (l *linuxNetworking) installFirewallRules() error {
 		l.cfg.Log.Info("adding firewall rule", "rule", fmt.Sprintf("allow tcp/%d to gateway", port))
 		if err := iptables("-A", chainName, "-p", "tcp", "-d", gateway, "--dport", fmt.Sprintf("%d", port), "-j", "ACCEPT"); err != nil {
 			return fmt.Errorf("adding gateway port rule (tcp/%d): %w", port, err)
+		}
+	}
+
+	// 3. Per-job container-to-container policy. Placed AFTER the DNS/gateway
+	//    ACCEPTs (so gateway traffic is never at risk of the cross-job DROP)
+	//    and BEFORE the RFC1918 REJECTs (so an intra-job ACCEPT wins over the
+	//    10.0.0.0/8 REJECT — the container subnet is inside it). Inside the
+	//    chain: intra-job /32↔/32 ACCEPT pairs (added as containers join) then
+	//    a terminal subnet→subnet DROP for cross-job traffic. Traffic bound
+	//    outside the subnet matches nothing here and RETURNs to the denies/
+	//    outbound rules below.
+	l.cfg.Log.Info("adding firewall rule", "rule", "per-job container-to-container")
+	if err := iptables("-C", chainName, "-s", l.cfg.subnet(), "-d", l.cfg.subnet(), "-j", c2cChainName); err != nil {
+		if err := iptables("-A", chainName, "-s", l.cfg.subnet(), "-d", l.cfg.subnet(), "-j", c2cChainName); err != nil {
+			return fmt.Errorf("adding container-to-container jump: %w", err)
 		}
 	}
 
@@ -609,6 +853,21 @@ func (l *linuxNetworking) removeFirewallRules() {
 	if err := iptables("-X", dindChainName); err != nil {
 		l.cfg.Log.Debug("failed to delete dind chain", "error", err)
 	}
+
+	// Remove the per-job container-to-container chain. Its only reference is
+	// the jump inside EPHEMERD-FORWARD, already flushed above, so -F then -X is
+	// safe. Reset in-memory membership so a restart in the same process starts
+	// from a clean slate.
+	if err := iptables("-F", c2cChainName); err != nil {
+		l.cfg.Log.Debug("failed to flush c2c chain", "error", err)
+	}
+	if err := iptables("-X", c2cChainName); err != nil {
+		l.cfg.Log.Debug("failed to delete c2c chain", "error", err)
+	}
+	l.c2cMu.Lock()
+	l.c2cMember = nil
+	l.c2cJob = nil
+	l.c2cMu.Unlock()
 
 	// Remove the container→host INPUT policy chain and its jump.
 	l.removeContainerInputChain()

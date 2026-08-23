@@ -80,6 +80,50 @@ func TestWriteConfig_ProducesValidJSON(t *testing.T) {
 	}
 }
 
+// TestWriteConfig_BridgeHasGatewayDNS pins the fix for the rootless-build DNS
+// regression: the bridge plugin must carry a dns.nameservers pointing at the
+// bridge gateway, where ephemerd's resolver listens. Without it, `docker build`
+// RUN steps — which run on this CNI bridge — get an empty resolv.conf from the
+// CNI result and cannot resolve anything.
+func TestWriteConfig_BridgeHasGatewayDNS(t *testing.T) {
+	dir := t.TempDir()
+	confPath := filepath.Join(dir, "conflist.json")
+
+	l := &linuxNetworking{
+		cfg: Config{
+			Subnet: "10.88.0.0/16",
+			MTU:    1500,
+			Log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		},
+	}
+	if err := l.writeConfig(confPath); err != nil {
+		t.Fatalf("writeConfig: %v", err)
+	}
+
+	data, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("config is not valid JSON: %v", err)
+	}
+	plugins := parsed["plugins"].([]any)
+	bridge := plugins[0].(map[string]any)
+
+	dns, ok := bridge["dns"].(map[string]any)
+	if !ok {
+		t.Fatalf("bridge plugin has no dns section; build RUN steps would get no resolver: %s", data)
+	}
+	ns, ok := dns["nameservers"].([]any)
+	if !ok || len(ns) == 0 {
+		t.Fatalf("dns.nameservers is empty: %v", dns)
+	}
+	if ns[0] != "10.88.0.1" {
+		t.Errorf("dns nameserver = %v, want the bridge gateway 10.88.0.1", ns[0])
+	}
+}
+
 func TestWriteConfig_GatewayMatchesSubnet(t *testing.T) {
 	dir := t.TempDir()
 	confPath := filepath.Join(dir, "conflist.json")

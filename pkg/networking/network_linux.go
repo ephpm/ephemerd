@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 
 	cni "github.com/containerd/go-cni"
 )
@@ -20,6 +21,28 @@ const defaultBridgeName = "ephemerd0"
 type linuxNetworking struct {
 	cfg Config
 	cni cni.CNI
+
+	// c2cMu guards the container-to-container membership maps and their
+	// EPHEMERD-C2C rules. Both callers of joinJobNetwork/leaveJobNetwork run
+	// concurrently (the runner attaches one container while a dind server
+	// attaches its siblings), so mutation of the shared iptables chain has to
+	// serialize.
+	c2cMu sync.Mutex
+	// c2cMember maps a CNI attachment id (the key Setup/Teardown use) to the
+	// job it belongs to and the container IP it was given. Keyed by the SAME id
+	// passed to Setup, so leaveJobNetwork needs only that id — the caller does
+	// not have to remember the job or the address at teardown.
+	c2cMember map[string]c2cMember
+	// c2cJob maps a jobID to the set of container IPs currently attached for it.
+	// Used to enumerate a joining container's intra-job peers.
+	c2cJob map[string]map[string]bool
+}
+
+// c2cMember records which job a CNI-attached container belongs to and the IP it
+// was assigned, so its intra-job allow rules can be removed on teardown.
+type c2cMember struct {
+	jobID string
+	ip    string
 }
 
 func newPlatformNetworking() platformNetworking {
@@ -174,6 +197,22 @@ func (l *linuxNetworking) writeConfig(path string) error {
 						"subnet":  subnet,
 						"gateway": gateway,
 					}}},
+				},
+				// Hand containers a resolv.conf pointing at the bridge gateway,
+				// where ephemerd's own DNS listens (EPHEMERD-INPUT already
+				// allows udp/tcp :53 to it). The bridge plugin copies this into
+				// the CNI result, and BuildKit's CNI network provider writes it
+				// into each build sandbox's /etc/resolv.conf.
+				//
+				// Without it, containers that rely on the CNI result for DNS —
+				// specifically `docker build` RUN steps, which since #177 run on
+				// this bridge instead of the host netns — get an empty resolver
+				// and cannot resolve anything (e.g. github.com), breaking source
+				// fetches mid-build. The runner container itself gets DNS by a
+				// separate bind-mount (withDNSMount) and was unaffected; this
+				// closes the gap for the build path.
+				"dns": map[string]any{
+					"nameservers": []string{gateway},
 				},
 			},
 			{

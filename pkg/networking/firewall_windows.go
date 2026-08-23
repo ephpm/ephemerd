@@ -460,6 +460,14 @@ func (w *windowsNetworking) closeHostPort(port int, containerIP string) {
 	}
 }
 
+// joinJobNetwork/leaveJobNetwork: the Linux cross-job container-to-container
+// filter has no Windows analogue here. Windows containers are isolated per
+// HCN endpoint (each carries its own egress ACLs applied at Setup), not sharing
+// a flat routed bridge the way the Linux CNI path does, so there is nothing to
+// scope per job at this layer. No-op.
+func (w *windowsNetworking) joinJobNetwork(_, _, _ string) error { return nil }
+func (w *windowsNetworking) leaveJobNetwork(_ string)            {}
+
 // hostPortRulePrefix is the DisplayName prefix of every per-job host-port allow
 // (see hostPortAllowRule). Swept by prefix on shutdown so a hard kill — which
 // skips dind's per-job CloseHostPort — cannot leak stale inbound allows.

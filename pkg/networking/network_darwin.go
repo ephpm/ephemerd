@@ -59,3 +59,9 @@ func (d *darwinNetworking) hostAddr() string { return "" }
 // delegates networking to the in-VM Linux stack.
 func (d *darwinNetworking) openHostPort(int, string) error { return nil }
 func (d *darwinNetworking) closeHostPort(int, string)      {}
+
+// joinJobNetwork/leaveJobNetwork: container-to-container isolation is enforced
+// by the in-VM Linux firewall (firewall_linux.go), not here — the macOS host
+// has no container bridge of its own.
+func (d *darwinNetworking) joinJobNetwork(_, _, _ string) error { return nil }
+func (d *darwinNetworking) leaveJobNetwork(_ string)            {}

@@ -207,10 +207,20 @@ func (r *Runner) RunJob(ctx context.Context, jobName string, job Job, repoDir st
 	// Attach networking
 	pid := task.Pid()
 	netns := fmt.Sprintf("/proc/%d/ns/net", pid)
-	if _, err := net.Setup(ctx, containerID, netns); err != nil {
+	setupResult, err := net.Setup(ctx, containerID, netns)
+	if err != nil {
 		return fmt.Errorf("setting up network: %w", err)
 	}
+	// Register the container as its own single-member job so the shared bridge
+	// denies it — and denies other jobs — cross-job container-to-container
+	// reach. containerID is unique per run, so it is both the cniID and jobID.
+	if setupResult != nil {
+		if jErr := net.JoinJobNetwork(containerID, containerID, setupResult.IP); jErr != nil {
+			r.Log.Warn("failed to register container in job network", "id", containerID, "error", jErr)
+		}
+	}
 	defer func() {
+		net.LeaveJobNetwork(containerID)
 		_ = net.Teardown(ctx, containerID, netns)
 	}()
 

@@ -818,6 +818,15 @@ func (s *Server) handleContainerStart(w http.ResponseWriter, r *http.Request, id
 				br.Containers[id] = result.IP
 			}
 			s.mu.Unlock()
+
+			// Register this sibling as a member of the job so the runner and the
+			// job's other `services:`/sibling containers can reach it, while the
+			// bridge keeps other jobs out. Keyed by the same container id used
+			// for Setup/Teardown. Best-effort: a failure only limits within-job
+			// reach and never opens a cross-job path.
+			if jErr := s.network.JoinJobNetwork(id, s.jobID, result.IP); jErr != nil {
+				s.log.Warn("failed to register dind container in job network (intra-job reach may be limited)", "id", id, "error", jErr)
+			}
 		}
 	}
 
@@ -837,6 +846,7 @@ func (s *Server) handleContainerStart(w http.ResponseWriter, r *http.Request, id
 			s.log.Debug("task cleanup after failed start", "error", delErr)
 		}
 		if s.network != nil && entry.NetNS != "" {
+			s.network.LeaveJobNetwork(id)
 			if tearErr := s.network.Teardown(ctx, id, entry.NetNS); tearErr != nil {
 				s.log.Debug("network cleanup after failed start", "error", tearErr)
 			}
@@ -1451,6 +1461,7 @@ func (s *Server) cleanupContainer(ctx context.Context, id string, entry *contain
 	}
 
 	if s.network != nil && entry.NetNS != "" {
+		s.network.LeaveJobNetwork(id)
 		if err := s.network.Teardown(ctx, id, entry.NetNS); err != nil {
 			s.log.Debug("network teardown during cleanup", "id", id, "error", err)
 		}
