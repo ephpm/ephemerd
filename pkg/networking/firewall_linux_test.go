@@ -396,6 +396,141 @@ func TestDindPortRules_ConcurrentJobsCannotCrossOver(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// EPHEMERD-C2C — per-job container-to-container isolation
+// ---------------------------------------------------------------------------
+
+// TestC2CPairRules_BidirectionalAcceptScopedToBothHosts pins the shape of an
+// intra-job allow: exactly two ACCEPTs, one per direction, each scoped to the
+// two /32s. Both directions are load-bearing — a /32→/32 rule matches only one
+// way, and a job's runner both dials its service (runner→service) and receives
+// from it (service→runner).
+func TestC2CPairRules_BidirectionalAcceptScopedToBothHosts(t *testing.T) {
+	rules := c2cPairRules("10.88.0.7", "10.88.0.9")
+	if len(rules) != 2 {
+		t.Fatalf("c2cPairRules returned %d rules, want 2 (one ACCEPT per direction)", len(rules))
+	}
+
+	fwd := joinRule(rules[0])
+	for _, want := range []string{"-s 10.88.0.7/32", "-d 10.88.0.9/32", "-j ACCEPT"} {
+		if !strings.Contains(fwd, want) {
+			t.Errorf("forward rule %q missing %q", fwd, want)
+		}
+	}
+	rev := joinRule(rules[1])
+	for _, want := range []string{"-s 10.88.0.9/32", "-d 10.88.0.7/32", "-j ACCEPT"} {
+		if !strings.Contains(rev, want) {
+			t.Errorf("reverse rule %q missing %q", rev, want)
+		}
+	}
+
+	// An intra-job allow must never carry a port or protocol scope: the two
+	// containers of one job may talk on any port (a service can listen anywhere).
+	for _, r := range rules {
+		s := joinRule(r)
+		if strings.Contains(s, "--dport") || strings.Contains(s, "-p ") {
+			t.Errorf("intra-job allow %q is port/proto-scoped; within-job traffic must not be narrowed", s)
+		}
+	}
+}
+
+// TestC2CCrossJobDropRule_SubnetScopedDrop pins the terminal deny: it drops
+// container→container traffic (subnet→subnet) and nothing else, so egress and
+// gateway/DNS traffic — whose destination is outside the subnet — RETURNs from
+// the chain untouched. A DROP that were not destination-scoped would blackhole
+// the internet.
+func TestC2CCrossJobDropRule_SubnetScopedDrop(t *testing.T) {
+	rule := c2cCrossJobDropRule(testSubnet)
+	s := joinRule(rule)
+	for _, want := range []string{"-s " + testSubnet, "-d " + testSubnet, "-j DROP"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("cross-job drop %q missing %q", s, want)
+		}
+	}
+	if c2cCrossJobDropRule("") != nil {
+		t.Error("empty subnet must yield no drop rule; a match-everything DROP would blackhole all forwarding")
+	}
+}
+
+// TestC2C_IntraJobAllowedInterJobDenied is the core property: enumerating the
+// ACCEPT pairs a job installs (one per intra-job container pair, as
+// joinJobNetwork does) covers every within-job pair and NO cross-job pair, so
+// two concurrent jobs sharing the flat bridge cannot reach each other while a
+// job's own containers stay mutually reachable.
+func TestC2C_IntraJobAllowedInterJobDenied(t *testing.T) {
+	// Job A: a runner plus a postgres service. Job B: a runner plus redis.
+	jobA := []string{"10.88.0.10", "10.88.0.11"}
+	jobB := []string{"10.88.0.20", "10.88.0.21"}
+
+	// Build the allow set exactly the way joinJobNetwork does: an ACCEPT pair
+	// for every unordered pair WITHIN a job.
+	allowed := map[string]bool{}
+	addJob := func(ips []string) {
+		for i := 0; i < len(ips); i++ {
+			for j := i + 1; j < len(ips); j++ {
+				for _, r := range c2cPairRules(ips[i], ips[j]) {
+					allowed[joinRule(r)] = true
+				}
+			}
+		}
+	}
+	addJob(jobA)
+	addJob(jobB)
+
+	// Helper: is there an ACCEPT that permits src→dst?
+	permits := func(src, dst string) bool {
+		return allowed[joinRule([]string{"-s", src + "/32", "-d", dst + "/32", "-j", "ACCEPT"})]
+	}
+
+	// Within-job pairs are allowed, both directions.
+	if !permits(jobA[0], jobA[1]) || !permits(jobA[1], jobA[0]) {
+		t.Error("job A runner<->postgres not mutually allowed; within-job services would break")
+	}
+	if !permits(jobB[0], jobB[1]) || !permits(jobB[1], jobB[0]) {
+		t.Error("job B runner<->redis not mutually allowed")
+	}
+
+	// Every cross-job pair is denied (no ACCEPT exists for it), so it falls to
+	// the terminal cross-job DROP.
+	for _, a := range jobA {
+		for _, b := range jobB {
+			if permits(a, b) || permits(b, a) {
+				t.Errorf("cross-job reach allowed between %s and %s; jobs must be isolated", a, b)
+			}
+		}
+	}
+}
+
+// TestJoinJobNetwork_RejectsEmptyJobID guards the grouping key: an empty jobID
+// would lump unrelated containers into one shared group and defeat the whole
+// isolation. It is rejected before any iptables call, so this is safe to assert
+// without a live firewall.
+func TestJoinJobNetwork_RejectsEmptyJobID(t *testing.T) {
+	l := &linuxNetworking{cfg: Config{Subnet: "10.88.0.0/16", Log: testLogger()}}
+	if err := l.joinJobNetwork("cni-1", "", "10.88.0.7"); err == nil {
+		t.Error("joinJobNetwork with empty jobID returned nil; it must reject an ungrouped container")
+	}
+}
+
+// TestJoinJobNetwork_SkipsUnusableIP proves a container with no usable IPv4
+// address is skipped (returns nil, installs nothing) rather than erroring the
+// job — it has no reachability to scope. The unusable-IP branch returns before
+// touching iptables, so this needs no live firewall. leaveJobNetwork for an id
+// that never joined must also be a no-op.
+func TestJoinJobNetwork_SkipsUnusableIP(t *testing.T) {
+	l := &linuxNetworking{cfg: Config{Subnet: "10.88.0.0/16", Log: testLogger()}}
+	for _, ip := range []string{"", "   ", "not-an-ip", "fd00::1"} {
+		if err := l.joinJobNetwork("cni-1", "job-1", ip); err != nil {
+			t.Errorf("joinJobNetwork(%q) returned %v; an unusable IP should be skipped, not error", ip, err)
+		}
+	}
+	if _, ok := l.c2cMember["cni-1"]; ok {
+		t.Error("a skipped join must not record membership")
+	}
+	// Leaving an unknown id must not panic and must be a no-op.
+	l.leaveJobNetwork("never-joined")
+}
+
 // The port is the whole scope on the deny side, so a caller passing an
 // address the CNI result did not produce must fail rather than open
 // something wider or something wrong.

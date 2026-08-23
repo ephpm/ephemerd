@@ -1215,6 +1215,19 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			return nil, fmt.Errorf("setting up network for %s: %w", id, err)
 		}
 
+		// Register the runner container as a member of its own job so it can
+		// reach — and be reached by — this job's dind sibling and `services:`
+		// containers, while the bridge denies it any OTHER job's containers.
+		// cniID == jobID == id for the runner; siblings join later under the
+		// same jobID from the dind server. Best-effort: a failure here only
+		// costs within-job container-to-container reach, never opens a cross-job
+		// path, so it must not abort the job.
+		if setupResult != nil {
+			if jErr := r.cfg.Network.JoinJobNetwork(id, id, setupResult.IP); jErr != nil {
+				r.cfg.Log.Warn("failed to register runner in job network (intra-job container reach may be limited)", "id", id, "error", jErr)
+			}
+		}
+
 		// The container's address exists only now — CNI is what allocates it
 		// — so this is the first moment the dind TCP port can be scoped to
 		// the one container entitled to use it. It has to be scoped: the dind
@@ -1230,6 +1243,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		if dindServer != nil && setupResult != nil {
 			if err := dindServer.SetRunnerIP(setupResult.IP); err != nil {
 				stopDind()
+				r.cfg.Network.LeaveJobNetwork(id)
 				if tearErr := r.cfg.Network.Teardown(ctx, id, netns); tearErr != nil {
 					r.cfg.Log.Debug("network teardown after failed dind port scope", "error", tearErr)
 				}
@@ -1251,6 +1265,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			teardownNetNS = windowsNetNS
 		}
 		if r.cfg.Network != nil && (netns != "" || windowsEndpointID != "") {
+			r.cfg.Network.LeaveJobNetwork(id)
 			if tearErr := r.cfg.Network.Teardown(ctx, id, teardownNetNS); tearErr != nil {
 				r.cfg.Log.Debug("network teardown after failed start", "error", tearErr)
 			}
@@ -1373,6 +1388,9 @@ func (r *Runtime) Destroy(ctx context.Context, env *RunnerEnv) error {
 
 	// Teardown networking (CNI on Linux, HCN endpoint on Windows)
 	if r.cfg.Network != nil {
+		// Drop the runner's intra-job container-to-container allows first, so a
+		// port number the kernel later reuses cannot inherit a stale reach.
+		r.cfg.Network.LeaveJobNetwork(env.ID)
 		if env.Netns != "" || goruntime.GOOS == "windows" {
 			if err := r.cfg.Network.Teardown(ctx, env.ID, env.Netns); err != nil {
 				r.cfg.Log.Warn("failed to teardown network", "id", env.ID, "error", err)
