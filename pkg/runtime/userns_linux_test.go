@@ -3,8 +3,10 @@
 package runtime
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 
@@ -77,6 +79,43 @@ func TestUsernsSpecOpts_EnabledWithoutBaseUsesResolvedDefaults(t *testing.T) {
 	}
 	if m.HostID != 1000000000 || m.Size != 65536 {
 		t.Errorf("resolved default mapping = %+v, want host 1000000000 size 65536", m)
+	}
+}
+
+// The snapshot remapper labels must (a) be absent when disabled and (b)
+// encode the SAME base+size as the spec maps when enabled — a transposed
+// or half-applied remap (spec says mapped, snapshot doesn't, or uid/gid
+// swapped) would leave the rootfs and runc disagreeing on ownership.
+func TestUsernsSnapshotOpts_LabelsMatchSpecAndDisabledEmpty(t *testing.T) {
+	if opts := usernsSnapshotOpts(config.RuntimeUserns{Enabled: false}); opts != nil {
+		t.Fatalf("disabled returned %d snapshot opts, want none", len(opts))
+	}
+	opts := usernsSnapshotOpts(config.RuntimeUserns{Enabled: true}) // resolved defaults
+	if len(opts) != 1 {
+		t.Fatalf("enabled returned %d snapshot opts, want 1", len(opts))
+	}
+	info := &snapshots.Info{}
+	for _, o := range opts {
+		if err := o(info); err != nil {
+			t.Fatalf("apply snapshot opt: %v", err)
+		}
+	}
+	uid := info.Labels[snapshots.LabelSnapshotUIDMapping]
+	gid := info.Labels[snapshots.LabelSnapshotGIDMapping]
+	if uid == "" || gid == "" {
+		t.Fatalf("remapper labels not set: uid=%q gid=%q", uid, gid)
+	}
+	// uid and gid use the same base+size, so their labels are identical here;
+	// divergence means the remap was built asymmetrically.
+	if uid != gid {
+		t.Errorf("uid mapping label %q != gid mapping label %q", uid, gid)
+	}
+	// Must encode the resolved default base, never host root.
+	if !strings.Contains(uid, "1000000000") {
+		t.Errorf("mapping label %q does not carry the resolved base 1000000000", uid)
+	}
+	if strings.HasPrefix(uid, "0:0:") {
+		t.Errorf("mapping label %q maps container root to host uid 0 — no remap", uid)
 	}
 }
 

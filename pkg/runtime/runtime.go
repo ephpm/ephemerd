@@ -1155,8 +1155,9 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	// (usernsSpecOpts) applied above. Fail-closed on a snapshotter that can't
 	// remap — see usernsSnapshotOpts.
 	if r.cfg.Userns.Enabled && goruntime.GOOS == "linux" {
+		ru := r.cfg.Userns.Resolved()
 		r.cfg.Log.Info("creating runner container in a remapped user namespace",
-			"job", id, "base_uid", r.cfg.Userns.Resolved().BaseUID, "size", r.cfg.Userns.Resolved().Size)
+			"job", id, "base_uid", ru.BaseUID, "size", ru.Size)
 	}
 	container, err := r.client.NewContainer(ctx, id,
 		client.WithImage(img),
