@@ -363,6 +363,23 @@ type RuntimeConfig struct {
 	// an explicit `allow_new_privileges = false`. See
 	// ResolvedAllowNewPrivileges for the default policy.
 	AllowNewPrivileges *bool `toml:"allow_new_privileges"`
+
+	// Userns runs each runner container in a REMAPPED user namespace, so
+	// container uid 0 maps to a high, unprivileged host uid instead of real
+	// host root. This is the structural layer beneath the
+	// capability/seccomp/AppArmor containment (see runtime.containerCapabilities
+	// and RuntimeConfig.AllowNewPrivileges): with it on, a successful
+	// container escape lands as an unprivileged host uid owning nothing,
+	// rather than as root on the VM.
+	//
+	// DEFAULT OFF, and deliberately so. The remap needs a host overlay
+	// snapshotter with idmapped-mount support and reworks the ownership of
+	// the per-job runner overlay and dind bind sources; enabling it changes
+	// behavior unit tests can't fully cover, so it must be validated on one
+	// pool before any fleet-wide rollout. Where the host can't support the
+	// remap the runtime fails the job closed rather than silently running
+	// unmapped. See issue #126 and RuntimeUserns.
+	Userns RuntimeUserns `toml:"userns"`
 }
 
 // ResolvedAllowNewPrivileges returns whether the runner container may
@@ -412,6 +429,48 @@ func (r RuntimeRlimits) Resolved() RuntimeRlimits {
 		r.Nproc = 1024
 	}
 	return r
+}
+
+// RuntimeUserns configures the user-namespace remap for runner containers.
+// The whole feature is off unless Enabled is set; the other fields only
+// matter then. See RuntimeConfig.Userns and issue #126.
+type RuntimeUserns struct {
+	// Enabled turns on the remap. Default false — the container shares the
+	// host user namespace and container root is real host root, which is
+	// the behavior ephemerd has always had. Plain bool (not a pointer):
+	// default-off is the zero value, so a missing key needs no distinction
+	// from an explicit `enabled = false`.
+	Enabled bool `toml:"enabled"`
+
+	// BaseUID / BaseGID are the host uid/gid that container uid/gid 0 map
+	// to; container id N maps to host base+N across the range. Default
+	// 1000000000 — far above any real host account (system + login uids
+	// live below 65536, and the range base+Size stays well under uint32's
+	// ceiling), so a mapped container can never collide with a real host
+	// identity.
+	BaseUID uint32 `toml:"base_uid"`
+	BaseGID uint32 `toml:"base_gid"`
+
+	// Size is the length of the contiguous uid/gid range mapped into the
+	// container. Default 65536 — covers the full 16-bit id space a
+	// container image can reference, including 65534/nobody.
+	Size uint32 `toml:"size"`
+}
+
+// Resolved returns the userns config with defaults filled in for any unset
+// field. Only meaningful when Enabled; callers should gate on Enabled
+// first and then read the resolved base/size.
+func (u RuntimeUserns) Resolved() RuntimeUserns {
+	if u.BaseUID == 0 {
+		u.BaseUID = 1000000000
+	}
+	if u.BaseGID == 0 {
+		u.BaseGID = 1000000000
+	}
+	if u.Size == 0 {
+		u.Size = 65536
+	}
+	return u
 }
 
 // DindConfig configures the fake Docker daemon mounted into job containers.

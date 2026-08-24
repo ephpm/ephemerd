@@ -120,6 +120,14 @@ type Config struct {
 	// construction site that forgets this field breaks `sudo` rather
 	// than silently loosening the sandbox.
 	AllowNewPrivileges bool
+	// Userns, when Enabled, runs each runner container in a remapped user
+	// namespace (container uid 0 -> host Userns.BaseUID) so a container
+	// escape lands as an unprivileged host uid, not root on the VM. Resolved
+	// value — callers pass cfg.Runtime.Userns.Resolved(); the zero value is
+	// disabled, so a construction site that forgets this field keeps today's
+	// shared-userns behavior. Linux only (Windows/HCS has no equivalent and
+	// ignores it). See config.RuntimeUserns and issue #126.
+	Userns config.RuntimeUserns
 	// LinuxRuntime is the containerd runtime handler for Linux job
 	// containers — "io.containerd.runc.v2" (default) or
 	// "io.containerd.kata.v2" for VM-isolated jobs. Empty means runc, so
@@ -930,6 +938,12 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	// apt-get install` works. See config.RuntimeConfig.AllowNewPrivileges.
 	opts = append(opts, newPrivilegesOpts(r.cfg.AllowNewPrivileges)...)
 	opts = append(opts, rlimitsOpts(r.cfg.Rlimits)...)
+	// User-namespace remap (default off; Linux only). Placed with the other
+	// spec-hardening opts. MUST be paired with the matching snapshot remapper
+	// labels applied to WithNewSnapshot below, or runc and the snapshotter
+	// disagree on rootfs ownership. See usernsSpecOpts / usernsSnapshotOpts
+	// and issue #126.
+	opts = append(opts, usernsSpecOpts(r.cfg.Userns)...)
 	switch {
 	case len(cfg.Entrypoint) > 0:
 		// Forge mode: custom entrypoint (e.g. act_runner register + daemon).
@@ -1135,10 +1149,19 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	}
 
 	runtimeName := resolveRuntimeName(r.cfg.LinuxRuntime, goruntime.GOOS)
+	// Snapshot remapper labels for the userns remap (default off / empty).
+	// When enabled these make the rootfs snapshot present mapped ownership to
+	// the remapped container; they MUST match the uid/gid maps in the spec
+	// (usernsSpecOpts) applied above. Fail-closed on a snapshotter that can't
+	// remap — see usernsSnapshotOpts.
+	if r.cfg.Userns.Enabled && goruntime.GOOS == "linux" {
+		r.cfg.Log.Info("creating runner container in a remapped user namespace",
+			"job", id, "base_uid", r.cfg.Userns.Resolved().BaseUID, "size", r.cfg.Userns.Resolved().Size)
+	}
 	container, err := r.client.NewContainer(ctx, id,
 		client.WithImage(img),
 		client.WithSnapshotter(snapshotterName),
-		client.WithNewSnapshot(snapshotName, img),
+		client.WithNewSnapshot(snapshotName, img, usernsSnapshotOpts(r.cfg.Userns)...),
 		client.WithNewSpec(opts...),
 		client.WithRuntime(runtimeName, nil),
 	)

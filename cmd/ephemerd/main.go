@@ -360,6 +360,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			DindAllowPrivileged: cfg.Dind.ResolvedAllowPrivileged(),
 			Rlimits:             cfg.Runtime.Rlimits.Resolved(),
 			AllowNewPrivileges:  cfg.Runtime.ResolvedAllowNewPrivileges(),
+			Userns:              cfg.Runtime.Userns.Resolved(),
 			LinuxRuntime:        cfg.Runner.Linux.ContainerdRuntime(),
 			Network:             net,
 			WindowsMemoryBytes:  cfg.Runner.Windows.MemoryBytes(),
