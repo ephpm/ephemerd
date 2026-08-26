@@ -60,11 +60,11 @@ func TestBuildkitDNSOpt_EmptyIsNilNonEmptySet(t *testing.T) {
 	if got := buildkitDNSOpt([]string{}); got != nil {
 		t.Errorf("buildkitDNSOpt([]) = %+v, want nil", got)
 	}
-	got := buildkitDNSOpt([]string{"10.88.0.1"})
+	got := buildkitDNSOpt([]string{"1.1.1.1", "8.8.8.8"})
 	if got == nil {
-		t.Fatal("buildkitDNSOpt([gateway]) = nil — build containers would fall back to the unreachable host resolver")
+		t.Fatal("buildkitDNSOpt(public) = nil — build containers would fall back to the unreachable host resolver")
 	}
-	if len(got.Nameservers) != 1 || got.Nameservers[0] != "10.88.0.1" {
-		t.Errorf("Nameservers = %v, want [10.88.0.1]", got.Nameservers)
+	if len(got.Nameservers) != 2 || got.Nameservers[0] != "1.1.1.1" || got.Nameservers[1] != "8.8.8.8" {
+		t.Errorf("Nameservers = %v, want [1.1.1.1 8.8.8.8]", got.Nameservers)
 	}
 }

@@ -82,11 +82,11 @@ func newWorkerController(ctx context.Context, cfg Config, _ *session.Manager) (*
 		NetworkOpt:      netOpt,
 		Labels:          map[string]string{"org.ephpm.ephemerd": "true"},
 	}
-	// Point build-container /etc/resolv.conf at ephemerd's bridge-gateway
-	// resolver. Without this the executor inherits the HOST resolv.conf, which
-	// a build step on the isolated CNI bridge cannot reach — every `RUN` that
-	// resolves a name fails. Must be paired with CNIConfigPath (which moves
-	// builds off the host netns in the first place). See Config.DNSNameservers.
+	// Give build containers a working /etc/resolv.conf (public resolvers over
+	// NAT egress — see Config.DNSNameservers). Without this the executor
+	// inherits the HOST resolv.conf, which a build step on the isolated CNI
+	// bridge cannot reach — every `RUN` that resolves a name fails. Must be
+	// paired with CNIConfigPath (which moves builds off the host netns).
 	opts.DNS = buildkitDNSOpt(cfg.DNSNameservers)
 
 	workerOpt, err := containerd.NewWorkerOpt(opts)

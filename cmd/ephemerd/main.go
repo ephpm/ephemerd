@@ -328,7 +328,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 				// the host netns (see buildkit.Config.CNIConfigPath).
 				CNIConfigPath:  networking.CNIConfListPath(configDir),
 				CNIBinDir:      cm.Dir(),
-				DNSNameservers: []string{net.GatewayIP()}, // build-container resolver = bridge gateway (#180 covered job containers only)
+				DNSNameservers: networking.DefaultPublicDNS, // build containers resolve via public DNS over NAT egress — same as job containers; NO resolver runs on the bridge gateway (#180's wrong target)
 				GC:             buildkitGCConfig(cfg),
 				Log:            log.With("component", "buildkit"),
 			}
@@ -595,9 +595,9 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			// Windows worker ignores it and uses the HCN NAT path via Network.
 			CNIConfigPath:  networking.CNIConfListPath(configDir),
 			CNIBinDir:      cm.Dir(),
-			DNSNameservers: []string{net.GatewayIP()}, // build-container resolver = bridge gateway (#180 covered job containers only)
+			DNSNameservers: networking.DefaultPublicDNS, // build containers resolve via public DNS over NAT egress — same as job containers; NO resolver runs on the bridge gateway (#180's wrong target)
 			GC:             buildkitGCConfig(cfg),
-			Log:           log.With("component", "buildkit"),
+			Log:            log.With("component", "buildkit"),
 		}
 		bk, err = buildkit.NewServer(ctx, bkCfg)
 		if err != nil {
