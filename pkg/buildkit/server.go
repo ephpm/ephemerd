@@ -84,6 +84,26 @@ type Config struct {
 	// Paired with CNIConfigPath. Linux only.
 	CNIBinDir string
 
+	// DNSNameservers is the resolver(s) written into each build container's
+	// /etc/resolv.conf. Set this to networking.DefaultPublicDNS (public
+	// resolvers reached over NAT egress) — the SAME set job containers get.
+	// Do NOT use the bridge gateway: ephemerd runs no resolver there, so
+	// pointing at it fails every lookup (the mistake #180 made and this once
+	// repeated).
+	//
+	// REQUIRED for `RUN` steps to resolve names once CNIConfigPath moves
+	// builds off the host netns. BuildKit's CNI provider attaches build steps
+	// to the container subnet but does NOT apply the CNI conflist's DNS to
+	// resolv.conf — that is the executor's job, and with no DNS set here the
+	// executor falls back to the HOST's /etc/resolv.conf (systemd-resolved on
+	// loopback), which the container's isolated netns cannot reach. Every
+	// `RUN` that resolves a name (apt-get, apk, pip, ...) then fails with
+	// "Temporary failure resolving". Job containers get their resolv.conf by a
+	// separate bind-mount (withDNSMount); this field is the equivalent for
+	// BuildKit build containers. Linux only; empty preserves BuildKit's
+	// default (host resolv.conf) behaviour.
+	DNSNameservers []string
+
 	// GC bounds the on-disk build cache. The zero value produces NO prune
 	// rules, which is how BuildKit reads "never garbage-collect" — see
 	// GCConfig for what that cost us in production. Callers should pass a
@@ -254,9 +274,9 @@ func newCore(ctx context.Context, cfg Config) (*serverCore, error) {
 		LeaseManager: defaultWorker.LeaseManager(),
 		ContentStore: defaultWorker.ContentStore(),
 		// HistoryConfig nil → no history retention beyond Controller defaults
-		HistoryConfig: &config.HistoryConfig{},
+		HistoryConfig:  &config.HistoryConfig{},
 		GarbageCollect: defaultWorker.GarbageCollect,
-		GracefulStop:  stop,
+		GracefulStop:   stop,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("buildkit: controller: %w", err)

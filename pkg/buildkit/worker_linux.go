@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/moby/buildkit/executor/oci"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/util/network/cniprovider"
 	"github.com/moby/buildkit/util/network/netproviders"
@@ -55,6 +56,19 @@ func buildkitNetProviderOpt(cfg Config) netproviders.Opt {
 	}
 }
 
+// buildkitDNSOpt maps the configured build-container nameservers onto the
+// executor's DNS config. Nil (empty input) leaves BuildKit's default — the
+// host /etc/resolv.conf — which is only correct when builds run in the host
+// netns; once CNIConfigPath moves them onto the isolated bridge the host
+// resolver is unreachable and this MUST be set. Split out so the mapping is
+// unit-testable without a running containerd. See Config.DNSNameservers.
+func buildkitDNSOpt(nameservers []string) *oci.DNSConfig {
+	if len(nameservers) == 0 {
+		return nil
+	}
+	return &oci.DNSConfig{Nameservers: nameservers}
+}
+
 // newWorkerController constructs a single containerd-backed worker.
 // Linux uses overlayfs + runc as the executor.
 func newWorkerController(ctx context.Context, cfg Config, _ *session.Manager) (*worker.Controller, error) {
@@ -68,6 +82,12 @@ func newWorkerController(ctx context.Context, cfg Config, _ *session.Manager) (*
 		NetworkOpt:      netOpt,
 		Labels:          map[string]string{"org.ephpm.ephemerd": "true"},
 	}
+	// Give build containers a working /etc/resolv.conf (public resolvers over
+	// NAT egress — see Config.DNSNameservers). Without this the executor
+	// inherits the HOST resolv.conf, which a build step on the isolated CNI
+	// bridge cannot reach — every `RUN` that resolves a name fails. Must be
+	// paired with CNIConfigPath (which moves builds off the host netns).
+	opts.DNS = buildkitDNSOpt(cfg.DNSNameservers)
 
 	workerOpt, err := containerd.NewWorkerOpt(opts)
 	if err != nil {
