@@ -46,3 +46,25 @@ func TestBuildkitNetProviderOpt_CNIWhenConfigured(t *testing.T) {
 		t.Errorf("CNI.Root = %q, want %q", opt.CNI.Root, want)
 	}
 }
+
+// TestBuildkitDNSOpt_EmptyIsNilNonEmptySet pins the pairing that goes with
+// CNI mode: once builds move off the host netns (above), they can only resolve
+// names if the executor writes an explicit resolv.conf. Empty must stay nil
+// (BuildKit's host-resolv.conf default, correct only for host-netns builds);
+// a configured gateway must produce a DNSConfig carrying it — the regression
+// where every `RUN apt-get` fails with "Temporary failure resolving".
+func TestBuildkitDNSOpt_EmptyIsNilNonEmptySet(t *testing.T) {
+	if got := buildkitDNSOpt(nil); got != nil {
+		t.Errorf("buildkitDNSOpt(nil) = %+v, want nil (host resolv.conf default)", got)
+	}
+	if got := buildkitDNSOpt([]string{}); got != nil {
+		t.Errorf("buildkitDNSOpt([]) = %+v, want nil", got)
+	}
+	got := buildkitDNSOpt([]string{"10.88.0.1"})
+	if got == nil {
+		t.Fatal("buildkitDNSOpt([gateway]) = nil — build containers would fall back to the unreachable host resolver")
+	}
+	if len(got.Nameservers) != 1 || got.Nameservers[0] != "10.88.0.1" {
+		t.Errorf("Nameservers = %v, want [10.88.0.1]", got.Nameservers)
+	}
+}
