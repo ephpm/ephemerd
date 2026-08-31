@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	RunnerVersion       = "2.335.1"
+	RunnerVersion       = "2.337.0"
 	CNIVersion          = "1.6.2"
 	ContainerdVersion   = "2.2.2"
 	RuncVersion         = "1.3.4"
@@ -68,12 +68,12 @@ const (
 // upstream checksum source in the SAME change — a stale hash fails the build
 // loudly (which is the point), but it must be fixed, never removed.
 var pinnedSHA256 = map[string]string{
-	// GitHub Actions runner (actions/runner v2.335.1)
-	"actions-runner-linux-x64-2.335.1.tar.gz":   "4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf",
-	"actions-runner-linux-arm64-2.335.1.tar.gz": "6d1e85bfd1a506a8b17c1f1b9b57dba458ffed90898799aaa9f599520b0d9207",
-	"actions-runner-win-x64-2.335.1.zip":        "eb65c95277af42bcf3778a799c41359d224ba2a67b4de26b7cea1729b09c803d",
-	"actions-runner-osx-x64-2.335.1.tar.gz":     "b2fe57b2ae5b0bc1605f9fc0723c07eedf06167321d3478ce0440f15e5b0a010",
-	"actions-runner-osx-arm64-2.335.1.tar.gz":   "e1a9bc7a3661e06fa0b129d15c2064fe65dc81a431001d8958a9db1409b73769",
+	// GitHub Actions runner (actions/runner v2.337.0)
+	"actions-runner-linux-x64-2.337.0.tar.gz":   "70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613",
+	"actions-runner-linux-arm64-2.337.0.tar.gz": "9b1dc70626422526e3c94767cf024896beb15da5342a3f4819bf2feac13e0393",
+	"actions-runner-win-x64-2.337.0.zip":        "1150692afa94e71f872017e254ea55b6eece1eece3fe7e3a6d4c93d0a1b85cfc",
+	"actions-runner-osx-x64-2.337.0.tar.gz":     "d383f505d7ed041b1873ab68c35dd766fc093f2252330f95bb427be8f2c6dcfc",
+	"actions-runner-osx-arm64-2.337.0.tar.gz":   "5a2cd92908a93d7276a194e1de6008099f3e7946f3f8e14aa7a1a7b4a31fdec2",
 
 	// CNI plugins (containernetworking/plugins v1.6.2)
 	"cni-plugins-linux-amd64-v1.6.2.tgz": "b8e811578fb66023f90d2e238d80cec3bdfca4b44049af74c374d4fae0f9c090",
