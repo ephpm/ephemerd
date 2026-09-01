@@ -186,13 +186,21 @@ RUN $checks = [ordered]@{ `
 # --profile minimal matches the workflows (rustc, cargo, rust-std — no docs,
 # no clippy: CI lint runs on Linux). rustup-init's URL is the same
 # https://win.rustup.rs/x86_64 the workflows fetch.
+#
+# No double quotes anywhere in this step (Join-Path + single quotes only):
+# a shell-form RUN's string reaches PowerShell through Windows
+# command-line argument parsing, which eats embedded double quotes — on
+# the first build the `"$env:USERPROFILE\.cargo\bin"` here arrived at the
+# parser as `$env:USERPROFILE\.cargo\bin` (unquoted) and died with
+# "Unexpected token '\.cargo\bin'". Every other RUN in this file is
+# single-quote-only for the same reason; keep it that way.
 RUN Write-Host ('Installing rustup with Rust ' + $env:RUST_VERSION + '...'); `
     Invoke-WebRequest -Uri 'https://win.rustup.rs/x86_64' -OutFile C:\rustup-init.exe; `
     & C:\rustup-init.exe -y --default-toolchain $env:RUST_VERSION --profile minimal; `
     if ($LASTEXITCODE -ne 0) { Write-Error ('rustup-init failed with exit code ' + $LASTEXITCODE); exit 1 }; `
     Remove-Item C:\rustup-init.exe; `
-    $cargoBin = "$env:USERPROFILE\.cargo\bin"; `
-    & "$cargoBin\rustup.exe" show; `
-    & "$cargoBin\rustc.exe" --version; `
-    & "$cargoBin\cargo.exe" --version; `
+    $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'; `
+    & (Join-Path $cargoBin 'rustup.exe') show; `
+    & (Join-Path $cargoBin 'rustc.exe') --version; `
+    & (Join-Path $cargoBin 'cargo.exe') --version; `
     if ($LASTEXITCODE -ne 0) { Write-Error 'baked Rust toolchain failed to run'; exit 1 }
