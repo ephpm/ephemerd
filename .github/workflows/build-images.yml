@@ -173,3 +173,58 @@ jobs:
           docker build -t $tagLatest -t $tagDated images/runner-ci-windows
           docker push $tagLatest
           docker push $tagDated
+
+  windows-msvc:
+    name: Build Windows CI Runner (MSVC)
+    # Chained build: the Dockerfile is FROM :runner-ci-windows, so it must
+    # run after that tag is pushed — `needs:` gives the ordering, `--pull`
+    # below guarantees the fresh remote tag is used even when the node has
+    # a stale local copy (the legacy builder prefers local images).
+    needs: windows
+    runs-on: [self-hosted, windows, x64]
+    # The VS Build Tools payload is several GB from Microsoft's CDN and the
+    # installer wants >= 2 GB of memory (Microsoft's documented floor for
+    # container installs) — generous timeout, and this is exactly the
+    # long-flaky operation the image exists to stop running per-job, so a
+    # retry of this workflow is the expected recovery path when the CDN
+    # flakes, not something downstream jobs ever see.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set date tag
+        shell: powershell
+        run: echo "DATE_TAG=$(Get-Date -Format 'yyyyMMdd')" >> $env:GITHUB_ENV
+
+      # Same legacy-builder rationale as the `windows` job above.
+      - name: Ensure docker CLI is available
+        shell: powershell
+        run: |
+          if (Get-Command docker -ErrorAction SilentlyContinue) {
+            Write-Host "docker CLI already on PATH"
+            return
+          }
+          $v = "27.3.1"
+          Write-Host "docker CLI not found - downloading v$v..."
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri "https://download.docker.com/win/static/stable/x86_64/docker-$v.zip" -OutFile docker.zip
+          Expand-Archive docker.zip -DestinationPath C:\temp-docker
+          Copy-Item C:\temp-docker\docker\docker.exe C:\go\bin\docker.exe
+          Remove-Item -Recurse docker.zip, C:\temp-docker
+          Write-Host "Installed docker CLI to C:\go\bin\docker.exe"
+
+      - name: Login to Docker Hub
+        shell: powershell
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: $env:DOCKER_PASSWORD | docker login -u $env:DOCKER_USERNAME --password-stdin
+
+      - name: Build and push
+        shell: powershell
+        run: |
+          $tagLatest = "${{ env.IMAGE_REPO }}:runner-ci-windows-msvc"
+          $tagDated  = "${{ env.IMAGE_REPO }}:runner-ci-windows-msvc-$env:DATE_TAG"
+          docker build --pull -t $tagLatest -t $tagDated images/runner-ci-windows-msvc
+          docker push $tagLatest
+          docker push $tagDated

@@ -492,6 +492,7 @@ ephemerd's own CI uses custom runner images that pre-cache all build dependencie
 |-------|------|----------------|
 | `runner-ci-linux` | `ghcr.io/actions/actions-runner:latest` | Go, Mage, runner archive, CNI plugins, containerd shim, runc, golangci-lint |
 | `runner-ci-windows` | `mcr.microsoft.com/windows/servercore:ltsc2025` | Go (in the tool cache, so `actions/setup-go` hits it), Mage, Docker CLI, runner archive (Windows + Linux), golangci-lint |
+| `runner-ci-windows-msvc` | `ephpm/ephemerd:runner-ci-windows` | Everything above, plus VS Build Tools 2022 (MSVC, clang-cl, Windows SDK) at `C:\BuildTools` and rustup with a pinned stable toolchain |
 | `runner-ci-macos` | `scratch` | Runner archive (macOS), Mage, golangci-lint (cross-compiled for darwin) |
 
 Note the three different bases. Each is chosen for what it *caches*, not to
@@ -501,3 +502,58 @@ starts from bare Server Core, and the macOS artifact image starts from
 `scratch`. All three work.
 
 The Linux image supports multi-arch (amd64 + arm64) via `docker buildx`. Each image includes an entrypoint script that copies the cached dependencies into the workspace so `mage ci` runs without downloading anything. The Go module cache is also enabled -- after the first CI job runs, the module cache is warm and all subsequent jobs skip the `go mod download` entirely. The first job downloads and builds everything; every job after that just copies in the cached assets and runs `mage ci`.
+
+### `runner-ci-windows-msvc`: the MSVC-baked Windows image
+
+`ephpm/ephemerd:runner-ci-windows-msvc` exists for repos that compile native
+code with MSVC on the fleet — concretely, `ephpm/ephpm` (Rust + embedded PHP,
+`release.yml` / `nightly.yml` / `windows-php-check.yml`) and `ephpm/php-sdk`
+(`build.yml`). Those workflows each installed VS Build Tools per-job via the
+official bootstrapper: 14+ minutes per job from Microsoft's CDN, failing
+roughly half the time around the 16.5-minute mark — the dominant Windows-leg
+flake class and release blocker. This image bakes what those steps install:
+
+- **VS Build Tools 2022** at `C:\BuildTools` — the `VCTools` workload with
+  recommended components (MSBuild, `cl.exe`, the Windows SDK) plus
+  `VC.Llvm.Clang` (`clang-cl.exe`, `libclang.dll` for bindgen).
+- **rustup** with a pinned stable toolchain (host target
+  `x86_64-pc-windows-msvc`) under `C:\Users\ContainerAdministrator`.
+
+**No workflow changes are needed to adopt it.** Every install step it
+replaces already guards itself — `Test-Path
+C:\BuildTools\MSBuild\Current\Bin\MSBuild.exe` for VS,
+`Test-Path $env:USERPROFILE\.cargo\bin\rustup.exe` for Rust — so on this
+image those steps log "already present" and finish in seconds; on any other
+image they keep installing exactly as before. Rollout is config-only, via
+the [per-repo override](#per-repo-image-overrides) (the key is the bare repo
+name, as delivered by the provider):
+
+```toml
+[runner.images.ephpm]
+windows = "ephpm/ephemerd:runner-ci-windows-msvc"
+
+[runner.images.php-sdk]
+windows = "ephpm/ephemerd:runner-ci-windows-msvc"
+```
+
+**The size tradeoff is deliberate.** VS Build Tools with the Windows SDK is
+roughly 7-9 GB on disk on top of the ~2 GB `runner-ci-windows` base it
+chains from (so nodes that already run the base image only pull the VS/Rust
+layers). That cost is paid once per node at pull time; the per-job install
+it eliminates cost 14+ minutes on *every* Windows job in those repos, plus
+the failed 16-minute jobs. Once configured, the image is included in
+`PinnedRunnerImages`, so disk-pressure image GC never evicts it. Do not
+point Go-only repos (like ephemerd itself) at it — they gain nothing and
+every node that schedules them would pull the VS layers.
+
+Build notes: `build-images.yml` builds it in the `windows-msvc` job, which
+`needs:` the base `windows` job and builds with `--pull` so it always chains
+from the freshly pushed base tag. Like all Windows images it must be built
+on a Windows host. The image does **not** bake php-sdk's
+`C:\Program Files\Microsoft Visual Studio\2022\Community` junction (spc's
+`findVisualStudio()` probe) — php-sdk's workflow creates that per-job in
+under a second, and reparse points in image layers are a portability risk —
+nor Git for Windows: php-sdk installs PortableGit per-job behind its own
+fast-path, and baking `git.exe` would silently switch `actions/checkout`
+from its API-tarball fallback to real git clones for every consumer of the
+image, a behavior change this image deliberately avoids.
