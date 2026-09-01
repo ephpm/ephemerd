@@ -2185,6 +2185,75 @@ owner = "testorg"
 	}
 }
 
+// --- RuntimeConfig.Userns (issue #126) ---
+
+func TestLoad_RuntimeUserns(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_test123")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[github]
+owner = "testorg"
+
+[runtime.userns]
+enabled = true
+base_uid = 1500000000
+base_gid = 1500000000
+size = 100000
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	u := cfg.Runtime.Userns
+	if !u.Enabled {
+		t.Error("Userns.Enabled = false, want true")
+	}
+	if u.BaseUID != 1500000000 || u.BaseGID != 1500000000 || u.Size != 100000 {
+		t.Errorf("Userns = %+v, want base 1500000000 size 100000", u)
+	}
+}
+
+func TestLoad_RuntimeUserns_OmittedIsOff(t *testing.T) {
+	// No [runtime.userns] block: the feature must be OFF (container shares the
+	// host user namespace, as ephemerd has always done). This is the
+	// load-bearing default — an accidental default-on would remap every job on
+	// upgrade and could break a whole fleet.
+	t.Setenv("GITHUB_TOKEN", "ghp_test123")
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[github]
+owner = "testorg"
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Runtime.Userns.Enabled {
+		t.Fatal("Userns.Enabled = true with no [runtime.userns] block — default must be OFF")
+	}
+}
+
+func TestRuntimeUserns_ResolvedDefaults(t *testing.T) {
+	// Enabled but nothing else set: Resolved() must supply a real,
+	// non-root base and a full-range size, never leaving BaseUID at 0
+	// (which would map container root back onto host root — no remap).
+	got := RuntimeUserns{Enabled: true}.Resolved()
+	if got.BaseUID != 1000000000 || got.BaseGID != 1000000000 || got.Size != 65536 {
+		t.Errorf("Resolved() = %+v, want base 1000000000 size 65536", got)
+	}
+	// Explicit values are preserved.
+	custom := RuntimeUserns{Enabled: true, BaseUID: 42, BaseGID: 43, Size: 7}.Resolved()
+	if custom.BaseUID != 42 || custom.BaseGID != 43 || custom.Size != 7 {
+		t.Errorf("Resolved() overrode explicit values: %+v", custom)
+	}
+}
+
 // --- LinuxVMToml.ResolvedEnabled ---
 
 func TestLinuxVMResolvedEnabled_DefaultIsPlatformBehavior(t *testing.T) {
