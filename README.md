@@ -17,7 +17,7 @@ Ephemeral GitHub Actions runner daemon. One binary, every platform. Secure by de
 
 ephemerd manages self-hosted GitHub Actions runners that are isolated, disposable, and automatic. Every job gets a fresh environment. When it's done, everything is destroyed. No leftover state, no security risk from untrusted PRs.
 
-Designed by [@luthermonson](https://github.com/luthermonson) in Arizona 🌵 Assembled in [Claude Opus 4.6](https://claude.ai).
+Designed by [@luthermonson](https://github.com/luthermonson) in Arizona 🌵 Assembled in [Claude](https://claude.ai).
 
 ## Why
 
@@ -609,6 +609,12 @@ Linux jobs are unaffected on every host, including Windows hosts: those run insi
 
 See [docs/architecture/overview.md](docs/architecture/overview.md) for the full design document covering isolation backends, embedded containerd, VM lifecycle, and the GitHub integration model.
 
-## License
+## Licensing
 
-MIT
+ephemerd's own source code is [MIT licensed](LICENSE).
+
+The release binaries additionally embed third-party components — including a
+Linux kernel (GPL-2.0), BusyBox (GPL-2.0), an Alpine Linux base userland, runc,
+containerd, CNI plugins, and the GitHub Actions runner — each under its own
+license. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the component
+list, licenses, and how to obtain their source code.

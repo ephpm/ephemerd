@@ -12,6 +12,15 @@ import (
 // DefaultSubnet is the preferred IP range for containers.
 const DefaultSubnet = "10.88.0.0/16"
 
+// DefaultPublicDNS is the resolver set handed to containers that resolve
+// names over NAT egress. There is NO resolver running on the bridge gateway
+// (the gateway IP is just the bridge address); containers reach these public
+// resolvers through the firewall's egress path. This matches what job
+// containers get via withDNSMount (pkg/runtime) and what dind provisions for
+// sibling containers (pkg/dind) — build containers must use the same, or
+// they point at a resolver that does not exist. See issue #180.
+var DefaultPublicDNS = []string{"1.1.1.1", "8.8.8.8"}
+
 // cniConfListName is the filename of the CNI conflist the Linux networking
 // backend writes under <DataDir>/cni/conf. Kept here (not just in
 // network_linux.go) so callers on any platform can derive the path without a
