@@ -387,6 +387,18 @@ type RuntimeConfig struct {
 	// duration strings ("10m", "1h"). Default 10m. See
 	// ResolvedOrphanContainerGrace.
 	OrphanContainerGrace time.Duration `toml:"orphan_container_grace"`
+
+	// DestroyTimeout bounds a single runner-environment teardown end to
+	// end. A healthy teardown takes ~15s; the bound exists for the
+	// unhealthy case — a dead containerd shim never delivers the killed
+	// task's exit event, and an unbounded Destroy then blocks forever,
+	// pinning the job's concurrency slot and wedging drains (observed in
+	// production: one dead shim held a slot for over an hour and stalled
+	// two consecutive upgrade drains). On expiry Destroy returns and the
+	// remaining teardown is abandoned to the orphan reapers (startup
+	// CleanOrphans + periodic ReapDeadContainers). Accepts Go duration
+	// strings ("5m", "90s"). Default 5m. See ResolvedDestroyTimeout.
+	DestroyTimeout time.Duration `toml:"destroy_timeout"`
 }
 
 // ResolvedOrphanContainerReap returns whether the periodic dead-container
@@ -411,6 +423,25 @@ func (r RuntimeConfig) ResolvedOrphanContainerGrace() time.Duration {
 		return 10 * time.Minute
 	}
 	return r.OrphanContainerGrace
+}
+
+// ResolvedDestroyTimeout returns the runner teardown bound with the
+// default (5m) applied when unset (or non-positive). The default is far
+// above what a healthy teardown needs (~15s), so it only ever fires when
+// a teardown step is genuinely wedged — there is deliberately no way to
+// configure an unbounded destroy.
+func (r RuntimeConfig) ResolvedDestroyTimeout() time.Duration {
+	// The floor guards a TOML footgun, not an operator preference: BurntSushi
+	// decodes a bare integer `destroy_timeout = 300` as 300 NANOSECONDS with
+	// no error (a duration string like "300s" is what the operator meant).
+	// A sub-second bound would make every teardown "time out" instantly and
+	// abandon its cleanup, piling up containers, snapshots, and endpoints —
+	// the opposite of what any configured value could intend. Anything below
+	// one second is therefore treated as a misparse, not a choice.
+	if r.DestroyTimeout < time.Second {
+		return 5 * time.Minute
+	}
+	return r.DestroyTimeout
 }
 
 // ResolvedAllowNewPrivileges returns whether the runner container may
