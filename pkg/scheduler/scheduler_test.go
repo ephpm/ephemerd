@@ -1068,7 +1068,7 @@ func TestRegisterExternalWebhooks_BuildsURLAndSecret(t *testing.T) {
 		Log:           testLogger(),
 		Providers:     []providers.Provider{whp},
 		WebhookSecret: "s3cr3t",
-		ExternalURL:   "https://mac.tricorder.cc",
+		ExternalURL:   "https://mac.example.com",
 	})
 
 	s.registerExternalWebhooks(context.Background(), []providers.Webhook{whp})
@@ -1080,7 +1080,7 @@ func TestRegisterExternalWebhooks_BuildsURLAndSecret(t *testing.T) {
 	gotURL, gotSecret := whp.lastURL, whp.lastSecret
 	whp.regMu.Unlock()
 
-	wantURL := "https://mac.tricorder.cc/webhook/test-webhook"
+	wantURL := "https://mac.example.com/webhook/test-webhook"
 	if gotURL != wantURL {
 		t.Errorf("registered URL = %q, want %q", gotURL, wantURL)
 	}
@@ -1108,7 +1108,7 @@ func TestRegisterExternalWebhooks_ContinuesOnError(t *testing.T) {
 		Log:           testLogger(),
 		Providers:     []providers.Provider{failing, ok},
 		WebhookSecret: "s3cr3t",
-		ExternalURL:   "https://mac.tricorder.cc",
+		ExternalURL:   "https://mac.example.com",
 	})
 
 	// Should not panic or return; both providers are attempted.

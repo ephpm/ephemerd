@@ -239,13 +239,13 @@ func TestValidate_ExternalURL_TrimsTrailingSlash(t *testing.T) {
 		Webhook: WebhookConfig{
 			Tunnel:      "external",
 			Secret:      "s3cr3t",
-			ExternalURL: "https://mac.tricorder.cc/",
+			ExternalURL: "https://mac.example.com/",
 		},
 	}
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got, want := cfg.Webhook.ExternalURL, "https://mac.tricorder.cc"; got != want {
+	if got, want := cfg.Webhook.ExternalURL, "https://mac.example.com"; got != want {
 		t.Errorf("ExternalURL = %q, want trailing slash trimmed to %q", got, want)
 	}
 }
@@ -259,7 +259,7 @@ func TestValidate_ExternalURL_RequiresSecret(t *testing.T) {
 		GitHub: GitHubConfig{Owner: "org"},
 		Webhook: WebhookConfig{
 			Tunnel:      "external",
-			ExternalURL: "https://mac.tricorder.cc",
+			ExternalURL: "https://mac.example.com",
 		},
 	}
 	if err := cfg.validate(); err == nil {
@@ -274,7 +274,7 @@ func TestValidate_ExternalURL_RejectedForPolling(t *testing.T) {
 		GitHub: GitHubConfig{Owner: "org"},
 		Webhook: WebhookConfig{
 			Tunnel:      "none",
-			ExternalURL: "https://mac.tricorder.cc",
+			ExternalURL: "https://mac.example.com",
 		},
 	}
 	if err := cfg.validate(); err == nil {
@@ -289,7 +289,7 @@ func TestValidate_ExternalURL_RejectedForManagedTunnel(t *testing.T) {
 		GitHub: GitHubConfig{Owner: "org"},
 		Webhook: WebhookConfig{
 			Tunnel:      "ngrok",
-			ExternalURL: "https://mac.tricorder.cc",
+			ExternalURL: "https://mac.example.com",
 		},
 	}
 	if err := cfg.validate(); err == nil {
