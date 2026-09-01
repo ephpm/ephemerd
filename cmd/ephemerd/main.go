@@ -368,7 +368,10 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			BuildKit:            bk,
 			ImageGC:             imageGC,
 			RegistryMirror:      registryMirror,
-			Log:                 log,
+
+			OrphanContainerReapEnabled: cfg.Runtime.ResolvedOrphanContainerReap(),
+			OrphanContainerGrace:       cfg.Runtime.ResolvedOrphanContainerGrace(),
+			Log:                        log,
 		})
 		if err != nil {
 			return fmt.Errorf("creating runtime: %w", err)
@@ -647,7 +650,10 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		BuildKit:            bk,
 		ImageGC:             imageGC,
 		RegistryMirror:      registryMirror,
-		Log:                 log,
+
+		OrphanContainerReapEnabled: cfg.Runtime.ResolvedOrphanContainerReap(),
+		OrphanContainerGrace:       cfg.Runtime.ResolvedOrphanContainerGrace(),
+		Log:                        log,
 	})
 	if err != nil {
 		return fmt.Errorf("creating runtime: %w", err)
@@ -1102,6 +1108,14 @@ func runNodeDiskSweeper(ctx context.Context, gc *imagegc.Collector, rt *runtime.
 			if rt != nil {
 				if err := rt.SweepOrphans(passCtx); err != nil {
 					log.Warn("orphan sweep failed", "error", err)
+				}
+				// Reap leftover job containers whose task is dead: their
+				// pinned writable snapshot is invisible to SweepOrphans
+				// (the container still exists, so its id stays "live") and
+				// to image GC (it counts as a running container). See
+				// runtime.ReapDeadContainers.
+				if err := rt.ReapDeadContainers(passCtx); err != nil {
+					log.Warn("dead-container reap failed", "error", err)
 				}
 			}
 			sweepDeadBuildRecords(passCtx, c, log)

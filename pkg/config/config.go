@@ -363,6 +363,54 @@ type RuntimeConfig struct {
 	// an explicit `allow_new_privileges = false`. See
 	// ResolvedAllowNewPrivileges for the default policy.
 	AllowNewPrivileges *bool `toml:"allow_new_privileges"`
+
+	// OrphanContainerReap toggles the periodic reaper that reclaims the
+	// writable snapshot pinned by a leftover job container — one whose job
+	// has ended (its containerd task is gone or Stopped) but whose
+	// container was never torn down. The startup CleanOrphans and the
+	// periodic SweepOrphans between them never covered this case:
+	// CleanOrphans only runs once at boot, and SweepOrphans deliberately
+	// never touches containers, so a dead job's container (and its tens of
+	// GB of overlay layers) accumulated for the entire uptime of a
+	// long-lived daemon. See runtime.ReapDeadContainers.
+	//
+	// Pointer form so a missing key is distinguishable from an explicit
+	// `orphan_container_reap = false`. Nil = default true; set false to
+	// disable. See ResolvedOrphanContainerReap.
+	OrphanContainerReap *bool `toml:"orphan_container_reap"`
+
+	// OrphanContainerGrace is how long a job container's task must have
+	// been dead before the periodic reaper deletes it. The window exists
+	// so the reaper cannot race the normal Destroy path, which removes a
+	// finished job's container within seconds — only a container whose task
+	// has been dead LONGER than this is treated as truly leaked. Accepts Go
+	// duration strings ("10m", "1h"). Default 10m. See
+	// ResolvedOrphanContainerGrace.
+	OrphanContainerGrace time.Duration `toml:"orphan_container_grace"`
+}
+
+// ResolvedOrphanContainerReap returns whether the periodic dead-container
+// reaper is enabled, applying the default (true) when the operator hasn't
+// set the key explicitly. Reaping only ever acts on provably dead job
+// containers past the grace window — see runtime.ReapDeadContainers — so
+// on-by-default is safe.
+func (r RuntimeConfig) ResolvedOrphanContainerReap() bool {
+	if r.OrphanContainerReap != nil {
+		return *r.OrphanContainerReap
+	}
+	return true
+}
+
+// ResolvedOrphanContainerGrace returns the dead-container reap grace with
+// the conservative default (10m) applied when unset (or non-positive). The
+// default is deliberately generous: it is far longer than the normal
+// Destroy path takes, so the reaper only ever sees containers a graceful
+// teardown genuinely failed to remove.
+func (r RuntimeConfig) ResolvedOrphanContainerGrace() time.Duration {
+	if r.OrphanContainerGrace <= 0 {
+		return 10 * time.Minute
+	}
+	return r.OrphanContainerGrace
 }
 
 // ResolvedAllowNewPrivileges returns whether the runner container may
