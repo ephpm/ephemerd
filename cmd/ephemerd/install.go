@@ -80,11 +80,19 @@ func installCmd() *cli.Command {
 				fmt.Printf("  images:  %s (from %s)\n", imagesTarget, imagesDir)
 			}
 
-			// 4. Install system service
+			// 4. Install system service. A failure here is a real error, not
+			// a warning: on Windows the recovery ladder (sc failure /
+			// failureflag) is what keeps a rebooted node from sitting
+			// silently dead, so an install that couldn't apply it must exit
+			// non-zero — otherwise mayfly (and any operator scripting) reads
+			// the node as fully installed while it's missing the exact
+			// resilience this step exists to provide. The binaries and
+			// config staged above are still on disk; re-running install
+			// after fixing the cause is idempotent.
 			if !noService {
 				binPath := filepath.Join(installDir, binaryName())
 				if err := installService(binPath, dataDir); err != nil {
-					fmt.Printf("  warning: could not install service: %v\n", err)
+					return fmt.Errorf("installing service (binaries and config are staged; re-run install after fixing this): %w", err)
 				}
 			}
 
