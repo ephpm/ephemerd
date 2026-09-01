@@ -48,3 +48,45 @@ func TestWaitTaskExit(t *testing.T) {
 		}
 	})
 }
+
+// TestDestroyWaitCompleted pins the caller-side wait: bounded, and when a
+// teardown finishes right at the deadline the completed result must win —
+// a completed teardown mis-logged as "abandoned" sends an operator hunting
+// for a leak that does not exist.
+func TestDestroyWaitCompleted(t *testing.T) {
+	t.Run("teardown finishes first", func(t *testing.T) {
+		done := make(chan struct{}, 1)
+		done <- struct{}{}
+		if !destroyWaitCompleted(context.Background(), done) {
+			t.Fatal("destroyWaitCompleted = false, want true when teardown already finished")
+		}
+	})
+
+	t.Run("deadline expires with teardown still wedged", func(t *testing.T) {
+		done := make(chan struct{}, 1) // never written — the wedged case
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		if destroyWaitCompleted(ctx, done) {
+			t.Fatal("destroyWaitCompleted = true, want false when teardown never finishes")
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Fatalf("destroyWaitCompleted took %v, want ~20ms", elapsed)
+		}
+	})
+
+	t.Run("both ready: done wins over the expired ctx", func(t *testing.T) {
+		done := make(chan struct{}, 1)
+		done <- struct{}{}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // ctx already expired AND done already delivered
+		// The select picks randomly between two ready cases, so run it
+		// enough times that a regression to coin-flip behavior cannot pass.
+		for i := 0; i < 100; i++ {
+			if !destroyWaitCompleted(ctx, done) {
+				t.Fatal("destroyWaitCompleted = false with done ready, want the completed teardown to win")
+			}
+			done <- struct{}{} // refill for the next iteration
+		}
+	})
+}

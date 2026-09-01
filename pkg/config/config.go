@@ -431,7 +431,14 @@ func (r RuntimeConfig) ResolvedOrphanContainerGrace() time.Duration {
 // a teardown step is genuinely wedged — there is deliberately no way to
 // configure an unbounded destroy.
 func (r RuntimeConfig) ResolvedDestroyTimeout() time.Duration {
-	if r.DestroyTimeout <= 0 {
+	// The floor guards a TOML footgun, not an operator preference: BurntSushi
+	// decodes a bare integer `destroy_timeout = 300` as 300 NANOSECONDS with
+	// no error (a duration string like "300s" is what the operator meant).
+	// A sub-second bound would make every teardown "time out" instantly and
+	// abandon its cleanup, piling up containers, snapshots, and endpoints —
+	// the opposite of what any configured value could intend. Anything below
+	// one second is therefore treated as a misparse, not a choice.
+	if r.DestroyTimeout < time.Second {
 		return 5 * time.Minute
 	}
 	return r.DestroyTimeout

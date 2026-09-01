@@ -2485,6 +2485,13 @@ func TestResolvedDestroyTimeout(t *testing.T) {
 		{0, 5 * time.Minute},                 // unset -> default
 		{-time.Minute, 5 * time.Minute},      // nonsense -> default, never unbounded
 		{90 * time.Second, 90 * time.Second}, // custom
+		// The TOML footgun: `destroy_timeout = 300` (bare integer, meaning
+		// seconds to the operator) decodes as 300 NANOSECONDS without error.
+		// Sub-second values are a misparse, never a choice — a near-zero
+		// bound would abandon every teardown instantly.
+		{300 * time.Nanosecond, 5 * time.Minute},
+		{999 * time.Millisecond, 5 * time.Minute},
+		{time.Second, time.Second}, // the floor itself is honored
 	}
 	for _, c := range cases {
 		r := RuntimeConfig{DestroyTimeout: c.in}

@@ -1589,57 +1589,102 @@ const destroyKillWait = 30 * time.Second
 // on metal: one dead shim pinned a scheduler slot for 1h+ and stalled two
 // upgrade drains in a row).
 //
-// Contract on timeout: Destroy returns an error and ABANDONS whatever
-// teardown remains — the worker goroutine may still be blocked inside an
-// uncancellable call (env.Dind.Stop and the HCS/HNS operations take no
-// ctx; rewriting those subsystems is out of scope). Everything an
-// abandoned teardown leaves behind is reclaimed asynchronously: the
-// periodic dead-container reaper (ReapDeadContainers) deletes the
-// container + snapshot once its task is provably dead past the grace
-// window, and the startup CleanOrphans / dind.CleanupStaleDindNamespaces
-// sweep the rest on the next boot. Leaking one parked goroutine per
-// wedged shim is the accepted cost of never wedging the scheduler.
+// Contract on timeout: Destroy returns an error and ABANDONS the wait —
+// the worker goroutine keeps running on its own detached context (budget
+// 2×DestroyTimeout) and will usually finish late, logging "runner
+// environment destroyed" when it does. It may instead stay blocked inside
+// an uncancellable call (env.Dind.Stop and the HCS/HNS operations take no
+// ctx; rewriting those subsystems is out of scope). What a teardown that
+// never finishes leaves behind, and who reclaims it:
+//   - container + snapshot: the periodic dead-container reaper
+//     (ReapDeadContainers), once the task is provably dead past the grace
+//     window; startup CleanOrphans otherwise.
+//   - per-job dind namespace: startup dind.CleanupStaleDindNamespaces.
+//   - the HNS endpoint + its pool IP (Windows): NOT reaped by anything —
+//     a restart merely re-adopts the endpoint and re-reserves its address
+//     (adoptExistingEndpoints), which is why the L2Bridge pool is sized
+//     with headroom. A repeatedly wedging node leaks one address per
+//     abandoned teardown; the per-step Warn logs are the observable.
+//     Known residual, accepted over holding the scheduler hostage.
+//   - one parked goroutine per wedged uncancellable call.
 func (r *Runtime) Destroy(ctx context.Context, env *RunnerEnv) error {
-	ctx = namespaces.WithNamespace(ctx, namespace)
-
 	timeout := r.cfg.DestroyTimeout
 	if timeout <= 0 {
 		timeout = defaultDestroyTimeout
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
 	r.cfg.Log.Info("destroying runner environment", "id", env.ID)
 
-	if r.cfg.OnTaskDestroy != nil {
-		r.cfg.OnTaskDestroy(env)
-	}
+	// The teardown goroutine gets its OWN context, detached from the
+	// caller's: derived from Background so the caller canceling (or this
+	// function returning and running its deferred cancel) cannot kill the
+	// in-flight background teardown — that was a review finding: sharing
+	// the caller-bounded ctx meant "continues in the background" was
+	// false, because the moment Destroy returned on timeout, cancel()
+	// fired and every remaining ctx-aware step (task delete, network
+	// teardown, container delete) failed instantly with context.Canceled.
+	// The steps budget is twice the caller's wait so that when a single
+	// wedged call finally clears, the rest of the teardown still has time
+	// to actually run.
+	stepsCtx, stepsCancel := context.WithTimeout(
+		namespaces.WithNamespace(context.Background(), namespace), 2*timeout)
 
-	// Run the teardown steps on their own goroutine so Destroy can return
-	// on ctx expiry even while a step that ignores ctx is still wedged.
+	// The OnTaskDestroy hook runs INSIDE the bounded goroutine, not
+	// before it: on Windows the hook closes an HCS handle
+	// (closers.closeAndRemove), and HCS calls are exactly the class that
+	// wedges on a dead shim — invoked synchronously here it would block
+	// Destroy before any of the timeout machinery existed.
+	//
 	// The channel is buffered: a late-finishing teardown sends its result
 	// and exits instead of leaking on a channel nobody reads.
 	done := make(chan struct{}, 1)
 	go func() {
-		r.destroySteps(ctx, env)
+		defer stepsCancel()
+		if r.cfg.OnTaskDestroy != nil {
+			r.cfg.OnTaskDestroy(env)
+		}
+		r.destroySteps(stepsCtx, env)
 		done <- struct{}{}
 	}()
 
+	waitCtx, waitCancel := context.WithTimeout(ctx, timeout)
+	defer waitCancel()
+	if destroyWaitCompleted(waitCtx, done) {
+		return nil
+	}
+	r.cfg.Log.Error("destroy timed out; abandoning teardown of runner environment to the orphan reaper",
+		"id", env.ID, "timeout", timeout)
+	return fmt.Errorf("destroying %s: %w", env.ID, waitCtx.Err())
+}
+
+// destroyWaitCompleted blocks until the teardown goroutine reports done or
+// ctx expires. When both are ready simultaneously (a teardown finishing
+// right at the deadline), done wins — otherwise a completed teardown gets
+// mis-logged as abandoned, which sends an operator hunting for a leak that
+// doesn't exist. Factored out so that preference is unit-testable.
+func destroyWaitCompleted(ctx context.Context, done <-chan struct{}) bool {
 	select {
 	case <-done:
-		return nil
+		return true
 	case <-ctx.Done():
-		r.cfg.Log.Error("destroy timed out; abandoning teardown of runner environment to the orphan reaper",
-			"id", env.ID, "timeout", timeout)
-		return fmt.Errorf("destroying %s: %w", env.ID, ctx.Err())
+		// The select above picks randomly when both cases are ready;
+		// re-check done so a just-finished teardown is reported as such.
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
 	}
 }
 
 // destroySteps is the teardown sequence proper. Every step is
 // best-effort (log and continue) so one wedged or failing step cannot
 // keep the later, independent steps from running. Steps that take a ctx
-// share Destroy's bounded ctx; steps that don't (Dind.Stop, HCS/HNS
-// internals) are bounded only by Destroy abandoning this goroutine.
+// receive the goroutine's own detached ctx (budget 2×DestroyTimeout,
+// survives Destroy returning); steps that don't (Dind.Stop, HCS/HNS
+// internals) are unbounded within this goroutine — Destroy's caller-side
+// wait is what stays bounded.
 func (r *Runtime) destroySteps(ctx context.Context, env *RunnerEnv) {
 	// Kill the task if still running. The exit-event wait is bounded: a
 	// dead shim never delivers it (this exact receive used to be a bare
@@ -1658,8 +1703,14 @@ func (r *Runtime) destroySteps(ctx context.Context, env *RunnerEnv) {
 		}
 	}
 
-	// Delete task
-	if _, err := env.Task.Delete(ctx); err != nil {
+	// Delete task. WithProcessKill matters after an abandoned kill-wait:
+	// without it a task whose process died but whose exit event was lost
+	// (dead shim) fails the delete with FailedPrecondition, the container
+	// delete below then fails too, and the periodic reaper can never
+	// converge — containerTaskLiveness fails safe on a task that still
+	// reads as Running, so the pinned snapshot would survive until the
+	// next daemon restart. Matches teardownContainer.
+	if _, err := env.Task.Delete(ctx, client.WithProcessKill); err != nil {
 		r.cfg.Log.Warn("failed to delete task", "id", env.ID, "error", err)
 	}
 
