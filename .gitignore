@@ -21,8 +21,9 @@ pkg/vm/embed/initrd
 # JetBrains
 .idea/
 
-# Claude Code personal overrides (per-engineer, per-project)
-.claude/settings.local.json
+# Local agent tooling and internal workbench notes (not part of the public repo)
+.claude/
+WORK.md
 
 # Per-host observability override (rendered from .env.example)
 examples/observability/.env
