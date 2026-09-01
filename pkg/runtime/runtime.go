@@ -12,6 +12,7 @@ import (
 	goruntime "runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
@@ -20,6 +21,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/errdefs"
 	"github.com/ephpm/ephemerd/pkg/buildkit"
 	"github.com/ephpm/ephemerd/pkg/config"
 	"github.com/ephpm/ephemerd/pkg/dind"
@@ -157,7 +159,21 @@ type Config struct {
 	// timer alone loses the race a single job can win by pulling a
 	// multi-gigabyte toolchain image between ticks.
 	ImageGC *imagegc.Collector
-	Log     *slog.Logger
+	// OrphanContainerReapEnabled turns on the periodic reaper that reclaims
+	// the snapshot pinned by a leftover job container whose task is dead
+	// (see ReapDeadContainers). The zero value is false — disabled — so a
+	// construction site that forgets this field fails SAFE (it never reaps)
+	// rather than silently deleting containers. Callers pass
+	// config.RuntimeConfig.ResolvedOrphanContainerReap(), whose default is
+	// true.
+	OrphanContainerReapEnabled bool
+	// OrphanContainerGrace is the minimum time a container's task must have
+	// been dead before ReapDeadContainers deletes it. Non-positive falls
+	// back to defaultOrphanContainerGrace, so a forgotten field cannot reap
+	// with a zero grace. Callers pass
+	// config.RuntimeConfig.ResolvedOrphanContainerGrace().
+	OrphanContainerGrace time.Duration
+	Log                  *slog.Logger
 }
 
 // resolveRuntimeName picks the containerd runtime handler for a job
@@ -329,37 +345,7 @@ func (r *Runtime) CleanOrphans(ctx context.Context) error {
 	}
 
 	for _, c := range containers {
-		id := c.ID()
-		log := r.cfg.Log.With("id", id)
-
-		// Try to kill and delete the task in any state
-		task, err := c.Task(ctx, nil)
-		if err == nil {
-			st, err := task.Status(ctx)
-			if err == nil {
-				log.Debug("orphan task state", "status", st.Status)
-				if st.Status == client.Running {
-					if err := task.Kill(ctx, 9); err != nil {
-						log.Debug("failed to kill orphan task", "error", err)
-					}
-					exitCh, err := task.Wait(ctx)
-					if err == nil {
-						<-exitCh
-					}
-				}
-			}
-			// WithProcessKill forces deletion even if task is in created state
-			if _, err := task.Delete(ctx, client.WithProcessKill); err != nil {
-				log.Debug("failed to delete orphan task", "error", err)
-			}
-		}
-
-		// Delete container and snapshot
-		if err := c.Delete(ctx, client.WithSnapshotCleanup); err != nil {
-			log.Warn("failed to delete orphan container", "error", err)
-		} else {
-			log.Info("orphan container removed")
-		}
+		r.teardownContainer(ctx, c, r.cfg.Log.With("id", c.ID()))
 	}
 
 	// On Windows only: grant the runners parent traverse-only access (no
@@ -470,6 +456,220 @@ func (r *Runtime) sweepOrphanState(ctx context.Context, live map[string]struct{}
 		}
 		return nil
 	})
+}
+
+// defaultOrphanContainerGrace is the fallback grace for ReapDeadContainers
+// when Config.OrphanContainerGrace is non-positive. Deliberately generous:
+// the normal Destroy path removes a finished job's container within
+// seconds, so anything still present this long after its task died is a
+// genuine leak, not a job the graceful path is about to clean up.
+const defaultOrphanContainerGrace = 10 * time.Minute
+
+// teardownContainer kills (if still running) and deletes a container's
+// task, then deletes the container with WithSnapshotCleanup so the writable
+// snapshot it pinned is reclaimed. Logs and continues on every error so one
+// stuck container cannot abort the caller's loop.
+//
+// Shared by two callers with different selection policies but identical
+// per-container teardown: startup CleanOrphans (which calls this for EVERY
+// container, on the assumption nothing legitimate runs yet) and the
+// periodic ReapDeadContainers (which calls it only for containers its
+// orphan predicate has proven dead). The Running branch is a no-op for the
+// reaper — it never passes a container with a Running task — so extracting
+// this does not change CleanOrphans' startup "kill everything" behavior.
+//
+// ctx must already carry the runtime namespace.
+func (r *Runtime) teardownContainer(ctx context.Context, c client.Container, log *slog.Logger) {
+	// Try to kill and delete the task in any state.
+	task, err := c.Task(ctx, nil)
+	if err == nil {
+		st, err := task.Status(ctx)
+		if err == nil {
+			log.Debug("orphan task state", "status", st.Status)
+			if st.Status == client.Running {
+				if err := task.Kill(ctx, 9); err != nil {
+					log.Debug("failed to kill orphan task", "error", err)
+				}
+				exitCh, err := task.Wait(ctx)
+				if err == nil {
+					<-exitCh
+				}
+			}
+		}
+		// WithProcessKill forces deletion even if task is in created state.
+		if _, err := task.Delete(ctx, client.WithProcessKill); err != nil {
+			log.Debug("failed to delete orphan task", "error", err)
+		}
+	}
+
+	// Delete container and snapshot.
+	if err := c.Delete(ctx, client.WithSnapshotCleanup); err != nil {
+		log.Warn("failed to delete orphan container", "error", err)
+	} else {
+		log.Info("orphan container removed")
+	}
+}
+
+// ReapDeadContainers reclaims the writable snapshot pinned by a leftover
+// job container whose job has ended but whose container was never torn
+// down. It is the container-level companion to SweepOrphans: SweepOrphans
+// reclaims per-job on-disk state and snapshots that no container owns, but
+// deliberately never touches containers, so a container that STILL EXISTS
+// with a dead job keeps its id in the live set and its (tens-of-GB) overlay
+// snapshot is skipped forever. Image GC cannot reclaim it either — the
+// container counts as a running container and pins the layers. Confirmed on
+// metal: a single leaked runner container pinned ~80 GB.
+//
+// Unlike the startup-only CleanOrphans, this is safe to run on the sweeper
+// tick while jobs are in flight because it reaps ONLY provably-dead
+// containers — see orphanContainerReapable for why the predicate cannot
+// select a live job.
+//
+// Errors on individual containers are logged and skipped; the sweep
+// continues so one wedged container cannot strand the rest.
+func (r *Runtime) ReapDeadContainers(ctx context.Context) error {
+	if !r.cfg.OrphanContainerReapEnabled {
+		return nil
+	}
+	ctx = namespaces.WithNamespace(ctx, namespace)
+
+	grace := r.cfg.OrphanContainerGrace
+	if grace <= 0 {
+		grace = defaultOrphanContainerGrace
+	}
+
+	containers, err := r.client.Containers(ctx)
+	if err != nil {
+		return fmt.Errorf("listing containers: %w", err)
+	}
+
+	now := time.Now()
+	// Release leaked dind bind-staging mounts lazily — only once, and only
+	// if we actually find something to reap. Each leaked staging mount pins
+	// the runner rootfs it was bound from, which makes WithSnapshotCleanup
+	// fail with "device or resource busy"; CleanOrphans sweeps them for the
+	// same reason. Skipped entirely on an idle node with nothing to reap.
+	stagedSwept := false
+	for _, c := range containers {
+		id := c.ID()
+		log := r.cfg.Log.With("id", id)
+
+		hasTask, status, exitTime, ok := r.containerTaskLiveness(ctx, c)
+		if !ok {
+			// Could not determine task state — fail safe, never reap on doubt.
+			continue
+		}
+
+		// createdAt is the fallback age source when the task carries no
+		// exit time (e.g. the task record is already gone). A read failure
+		// leaves it zero, which the predicate treats as "unknown age" and
+		// refuses to reap.
+		var createdAt time.Time
+		if info, ierr := c.Info(ctx); ierr == nil {
+			createdAt = info.CreatedAt
+		}
+
+		if !orphanContainerReapable(hasTask, status, exitTime, createdAt, now, grace, r.isProvisioning(id)) {
+			continue
+		}
+
+		if !stagedSwept {
+			dind.SweepStagedBinds(r.cfg.DataDir, r.cfg.Log)
+			stagedSwept = true
+		}
+
+		log.Info("reaping dead job container", "reason", "task dead past grace, snapshot pinned", "grace", grace)
+		r.teardownContainer(ctx, c, log)
+	}
+	return nil
+}
+
+// containerTaskLiveness reports the container's task state for the reap
+// predicate. hasTask is false when the container has no task at all;
+// status/exitTime describe the task when it has one. ok is false when the
+// state could not be determined reliably (an RPC error that is NOT a plain
+// "no such task"), which the caller treats as "do not reap".
+func (r *Runtime) containerTaskLiveness(ctx context.Context, c client.Container) (hasTask bool, status client.ProcessStatus, exitTime time.Time, ok bool) {
+	task, err := c.Task(ctx, nil)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			// Definitively no task — the job's process is gone.
+			return false, "", time.Time{}, true
+		}
+		// Ambiguous (timeout, transport error): fail safe.
+		return false, "", time.Time{}, false
+	}
+	st, serr := task.Status(ctx)
+	if serr != nil {
+		// The task exists but its state is unreadable: fail safe rather
+		// than guess it is dead.
+		return true, "", time.Time{}, false
+	}
+	return true, st.Status, st.ExitTime, true
+}
+
+// isProvisioning reports whether id is currently mid-provision (on-disk
+// state exists but its container is not yet fully registered). The reaper
+// unions this in as an extra guard even though a provisioning job has no
+// running container yet — a NewContainer that has just returned is briefly
+// both in containerd and in the provisioning set.
+func (r *Runtime) isProvisioning(id string) bool {
+	r.provMu.Lock()
+	defer r.provMu.Unlock()
+	_, ok := r.provisioning[id]
+	return ok
+}
+
+// orphanContainerReapable is the pure, testable orphan predicate for
+// ReapDeadContainers. It returns true ONLY for a container that is provably
+// a dead job's leftover, never for one that could still belong to a live
+// job. Kept as a free function taking primitive inputs so the safety logic
+// can be unit-tested without a containerd fake.
+//
+// SAFETY — why this cannot reap a live CI job (a false positive destroys a
+// running job, so this is a conservative AND of independent signals):
+//
+//  1. Task liveness. A live runner ALWAYS has a Running containerd task —
+//     the runner process is the task. We reap only when the task is gone
+//     entirely (hasTask=false) or has Stopped. Created, Paused, Pausing and
+//     Unknown are all treated as NOT reapable: Created/Paused/Pausing can be
+//     a container still being set up, and Unknown is a state we cannot
+//     interpret, so all fail safe.
+//  2. Not provisioning. A job whose container has just been created is
+//     briefly in the provisioning set; excluding it closes the window
+//     between NewContainer and the runner's task reaching Running.
+//  3. Grace window. Even a genuinely dead task is left alone until it has
+//     been dead longer than grace, because the normal Destroy path removes a
+//     finished job's container within seconds — reaping earlier would race
+//     that teardown. The age comes from the task's exit time when known,
+//     else the container's creation time; if NEITHER is known the container
+//     is skipped (an unknown age must never satisfy a "> grace" test).
+func orphanContainerReapable(hasTask bool, status client.ProcessStatus, exitTime, createdAt, now time.Time, grace time.Duration, provisioning bool) bool {
+	// (2) Never reap a job that is mid-provision.
+	if provisioning {
+		return false
+	}
+
+	// (1) Only a gone or Stopped task is dead. Anything else — Running,
+	// Created, Paused, Pausing, Unknown — is kept.
+	dead := !hasTask || status == client.Stopped
+	if !dead {
+		return false
+	}
+
+	// (3) Require the death to be older than the grace window.
+	ref := exitTime
+	if ref.IsZero() {
+		ref = createdAt
+	}
+	if ref.IsZero() {
+		// No reliable timestamp — fail safe.
+		return false
+	}
+	if grace <= 0 {
+		grace = defaultOrphanContainerGrace
+	}
+	return now.Sub(ref) > grace
 }
 
 // ImportImages loads pre-downloaded OCI image tarballs from the images directory.
