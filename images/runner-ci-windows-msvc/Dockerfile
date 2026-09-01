@@ -77,6 +77,29 @@ ARG RUST_VERSION=1.98.0
 # See https://github.com/PowerShell/PowerShell/issues/2138
 SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
 
+# Disable Delivery Optimization BEFORE any heavy step, in its own layer.
+#
+# DoSvc runs inside Server Core containers and writes sparse temp files
+# (C:\Windows\Temp\DO*.tmp) on its own schedule — whichever RUN happens to
+# be live when it does gets the file in its layer, and the Windows layer
+# archiver cannot serialize sparse backup streams, so the snapshot COMMIT
+# of that step dies with:
+#
+#   failed to reimport snapshot: Files/Windows/Temp/DO****.tmp:
+#   unknown stream ID 9        (9 = BACKUP_SPARSE_BLOCK)
+#
+# Observed killing this image's verification step (a read-only RUN!) on
+# 2026-09-01 — the failure is nondeterministic and can land on ANY step,
+# so it must be prevented at the source, not cleaned up after. Disabling
+# the service is registry state, so this single layer protects every
+# later step. Belt-and-braces: sweep any DO*.tmp it wrote before the
+# disable landed. -ErrorAction on the service ops because a future base
+# image may not ship DoSvc at all — absence is success here.
+RUN Stop-Service DoSvc -Force -ErrorAction SilentlyContinue; `
+    Set-Service DoSvc -StartupType Disabled -ErrorAction SilentlyContinue; `
+    Remove-Item -Path 'C:\Windows\Temp\DO*.tmp' -Force -ErrorAction SilentlyContinue; `
+    Write-Host 'Delivery Optimization disabled (sparse DO*.tmp files break Windows layer commits)'
+
 # Install VS Build Tools into C:\BuildTools.
 #
 # The argument list is byte-for-byte the one the workflows use, and must
