@@ -478,21 +478,38 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	// Language package caches (npm, pip, pub) — see pkgproxies.go.
 	gatewayPorts = append(gatewayPorts, pkgProxyPorts(cfg)...)
 
-	// Initialize container networking
-	net, err := networking.New(networking.Config{
-		DataDir:           configDir,
-		Subnet:            cfg.Network.Subnet,
-		MTU:               cfg.Network.MTU,
-		CNIBinDir:         cm.Dir(),
-		GatewayPorts:      gatewayPorts,
-		L2BridgeEgress:    cfg.Network.L2BridgeEgress,
-		HostNIC:           cfg.Network.HostNIC,
-		IPPool:            cfg.Network.IPPool,
-		Gateway:           cfg.Network.Gateway,
-		PublicDNS:         cfg.Network.PublicDNS,
-		ExtraAllowedCIDRs: cfg.Network.ExtraAllowedDestinations,
-		AllowHostAccess:   needsHostAccess(cfg),
-		Log:               log,
+	// Initialize container networking, retrying through the cold-boot window.
+	//
+	// This is the boot-fragile call on a Windows node: the service now
+	// declares depend= on hns/vmcompute (install_windows.go), but a running
+	// HNS does not mean the host NIC is usable yet — the L2Bridge path
+	// resolves the host NIC's address and default gateway and fails closed on
+	// an incomplete plan (pkg/networking initL2Bridge), and on a cold boot
+	// DHCP commonly lands seconds after the SCM starts us. Without the retry
+	// the daemon exits 1 and only the SCM restart ladder saves it, minutes
+	// later. All networking.New failures are retried, not just
+	// transient-looking ones: a genuine misconfig still fails after the
+	// window with its real last error, which is acceptable and
+	// self-documenting. The bounded-attempts style mirrors the containerd
+	// client connect loop in pkg/containerd/server.go. This shared call site
+	// also serves Linux/macOS hosts, where the extra tolerance is harmless,
+	// so it is not gated on GOOS.
+	net, err := retryInit(ctx, 30, 2*time.Second, log, "container networking", func() (*networking.Manager, error) {
+		return networking.New(networking.Config{
+			DataDir:           configDir,
+			Subnet:            cfg.Network.Subnet,
+			MTU:               cfg.Network.MTU,
+			CNIBinDir:         cm.Dir(),
+			GatewayPorts:      gatewayPorts,
+			L2BridgeEgress:    cfg.Network.L2BridgeEgress,
+			HostNIC:           cfg.Network.HostNIC,
+			IPPool:            cfg.Network.IPPool,
+			Gateway:           cfg.Network.Gateway,
+			PublicDNS:         cfg.Network.PublicDNS,
+			ExtraAllowedCIDRs: cfg.Network.ExtraAllowedDestinations,
+			AllowHostAccess:   needsHostAccess(cfg),
+			Log:               log,
+		})
 	})
 	if err != nil {
 		return fmt.Errorf("initializing networking: %w", err)
