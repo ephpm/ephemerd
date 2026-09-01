@@ -28,6 +28,16 @@ var (
 		Help: "Total number of jobs received (queued events).",
 	})
 
+	// OrphanReapDecisions counts what the orphan sweep did with each
+	// runner it nominated for teardown, by the busy verdict that decided
+	// it ("idle", "busy", "unknown") and the outcome ("reaped", "vetoed",
+	// "escaped"). A non-zero "escaped" rate means the busy check is
+	// failing to answer and runners are being destroyed on a timer again.
+	OrphanReapDecisions = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "ephemerd_orphan_reap_decisions_total",
+		Help: "Orphan-sweep teardown nominations by busy verdict and outcome.",
+	}, []string{"verdict", "outcome"})
+
 	// JobDuration tracks the full lifecycle duration of a job.
 	JobDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "ephemerd_job_duration_seconds",

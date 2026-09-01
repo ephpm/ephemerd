@@ -259,3 +259,117 @@ after the fact is strictly safe — it can waste a dispatch, never lose a job.
 
 A job over `maxProvisionAttempts` is not counted as class demand. We have given
 up on it, so it must not keep a spare runner alive indefinitely.
+
+## Third fix: never destroy a runner that is executing a job
+
+The two fixes above made the sweep's *rules* correct. They did not make its
+*evidence* correct, and that is what was killing live builds.
+
+Observed 2026-08-12 on the `linux-amd64` pool: three `dind-test` jobs with
+identical labels, dispatched concurrently, and a runner retired out from under
+an in-flight build.
+
+### Mechanism
+
+"Unbound" was inferred from webhooks and never verified. `runnerBinding.bound`
+flips only when `handleInProgress` processes an `in_progress` delivery naming
+that runner. Until then the runner looks idle in the ledger no matter what it
+is actually doing.
+
+That is not a rare, dropped-delivery failure — it is the normal shape of a
+same-label burst:
+
+1. Three same-label jobs A, B, C queue. ephemerd dispatches runners rA, rB, rC
+   (intent keys A, B, C). All three intent keys are now in `served`, so class
+   demand is **0**.
+2. GitHub permutes the assignments — say rA→B, rB→C, rC→A. Each runner starts
+   executing immediately.
+3. The three `in_progress` deliveries arrive over three separate HTTP requests
+   and are processed in whatever order they land. The **first** one processed
+   (job A, naming rC) sets `started[A]` and binds rC.
+4. `started[A]` is exactly the discharge signal for **rA**, whose intent key is
+   A. rA is now: unbound (its own `in_progress`, for job B, has not arrived),
+   discharged, and in a class with zero demand. That is rule 2, and rule 2
+   fires **immediately** — no grace window involved.
+5. Any sweep landing in that window retires rA. `handleCompleted` calls
+   `sweepOrphanRunners` on **every** completion, so it lands there routinely.
+
+rA was executing job B. The window is the inter-delivery skew between two
+`in_progress` webhooks of the same burst — hundreds of milliseconds is enough,
+and no delivery has to be dropped, delayed or reordered for it to open. Rule 1
+kills the same runner more slowly whenever a delivery genuinely *is* lost: the
+grace window expires and the runner still looks unbound.
+
+### Fix: the rules nominate, a busy check vetoes
+
+Both rules now produce **nominations**. Nothing is unhooked from the
+bookkeeping maps until a check taken *at the moment of teardown* — not derived
+from event history — confirms the runner is not executing a job. The hard
+invariant is: **never destroy a runner that is executing a job.**
+
+The check is layered (`pkg/scheduler/busy.go`, `pkg/runnerbusy`):
+
+1. **Local introspection (primary).** The actions-runner forks a
+   `Runner.Worker` child only while a job is executing — the listener process
+   is alive for the runner's whole life, so "a runner process exists" is not
+   the signal; the worker is. ephemerd owns the runtime, so it can look:
+   - **Linux (containerd):** `task.Pids()` → read `argv[0]` (falling back to
+     `comm`) from `/proc` on the host.
+   - **Windows (HCS / Hyper-V isolated):** the guest's processes are invisible
+     to the host process table, so HCS's own `ProcessList()` is used — the same
+     handle `pkg/metrics` already opens per container — matching `ImageName`.
+   - **macOS VM:** `pgrep -x Runner.Worker` over the existing per-job SSH
+     channel.
+   - **Dispatched into the Linux sidecar VM:** explicitly **unavailable** —
+     that containerd is behind the dispatch gRPC boundary and the host has no
+     view into the guest's PID namespace. It degrades to layer 2 rather than
+     silently answering "not busy".
+2. **The provider's busy flag (secondary).** GitHub reports `busy` per runner.
+   Consulted only when the local probe cannot answer, and only for a runner
+   already nominated — one GET per nomination, off every hot path.
+3. **Unknown.** Anything else. Unknown is *not* idle: it means possibly busy.
+
+The probes run with `s.mu` released (they do I/O), which opens a window for an
+`in_progress` delivery to bind a nominated runner. `reapRunnerLocked`
+re-validates the ledger entry — same binding, still unbound — before unhooking
+anything, so a runner bound during the probe survives its own nomination.
+
+### Escape hatches, and why both are time-based
+
+A veto that could never be overridden trades one leak for another: a wedged
+runner would squat a concurrency slot forever. Two bounds, both logged at warn
+level with an `ESCAPE:` prefix, and both counted in
+`ephemerd_orphan_reap_decisions_total{outcome="escaped"}`:
+
+- **Unknown → the grace window.** If the busy state cannot be determined for
+  the whole grace window, teardown proceeds. This is exactly the pre-veto
+  behaviour, so a platform with no usable probe is never *worse* than before —
+  and rule 1's nominations, which are already past the grace window, keep their
+  original timing on such a platform.
+- **Busy → the hard bound.** A positive busy verdict is overridden only past
+  `job_timeout + 30m` (or GitHub's 6h per-job ceiling + 30m when no job timeout
+  is configured). A job that exceeds `job_timeout` has already had its context
+  cancelled and its runner torn down by the normal path, so a runner still
+  claiming to be busy out there is wedged, not working.
+
+Both escapes are measured in **elapsed time**, not in consecutive failed
+probes. The sweep runs on every job completion as well as on a timer, so a
+probe-count escape would fire within milliseconds on a busy node — during
+exactly the same-label burst this change exists to survive — and effectively
+never on a quiet one. Wedged-ness is a property of duration, so duration is
+what bounds it.
+
+### Consequence: `orphan_grace` stops being load-bearing
+
+`orphan_grace` existed to paper over precisely this uncertainty. Too short
+killed live work; too long squatted a concurrency slot. With a verified-idle
+answer, reaping is immediate and safe, and with a verified-busy answer no
+window length can kill a build. The knob now only governs how long an
+*undeterminable* runner is held — the fallback path — so per-pool tuning
+(2m here, 15m there, 90m in the original incident) is no longer needed on any
+pool whose runners are locally probeable.
+
+The same veto answers the cross-daemon case: two pools both claiming arm64,
+GitHub binds one, and the loser's runner squats. "Is it actually busy?" is the
+right question there too, and the loser answers "no" immediately instead of
+waiting out a window.

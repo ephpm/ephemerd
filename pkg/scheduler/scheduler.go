@@ -259,6 +259,13 @@ type Scheduler struct {
 	// overridable in tests to inject a fake that exercises the provisioning
 	// watchdog without a real Virtualization.framework VM.
 	newMacOSVM func(cfg vm.MacOSVMConfig, jobID string) (vm.MacOSVM, error)
+
+	// busyProbe overrides the ground-truth "is this runner executing a
+	// job" check that vetoes orphan teardown. Nil (the default) uses
+	// probeRunnerBusy: local container/VM/process introspection, falling
+	// back to the provider's busy flag. Set only by tests, which have no
+	// real runtime to introspect.
+	busyProbe busyProber
 }
 
 const seenTTL = 10 * time.Minute
@@ -2009,12 +2016,62 @@ type orphanVictim struct {
 	key        jobKey
 	rj         *runningJob
 	discharged bool
+
+	// escaped records that teardown proceeded over a busy veto that never
+	// cleared. Logged loudly — this is the only remaining path by which
+	// the sweep can kill a live job.
+	escaped bool
+	// verdict / reason carry the busy check's answer into the log line.
+	verdict string
+	reason  string
+}
+
+// orphanNomination is a runner the sweep's rules have PROPOSED for
+// teardown. It is not yet a victim: the bookkeeping maps still hold it,
+// and the busy check gets a veto before anything is unhooked.
+//
+// Nominating and reaping are deliberately separate phases because the
+// busy check does I/O (a containerd query, an SSH round trip, a GitHub
+// GET) and must not run under s.mu — and because in the window while it
+// runs, an in_progress webhook may arrive and bind the runner, which the
+// reap phase re-checks.
+type orphanNomination struct {
+	name       string
+	rb         *runnerBinding
+	rj         *runningJob
+	discharged bool
+}
+
+// nominateRunnerLocked resolves a ledger entry to the job it belongs to
+// without unhooking anything. Caller holds s.mu. Returns ok=false when the
+// entry is stale or no longer names this runner.
+func (s *Scheduler) nominateRunnerLocked(name string, rb *runnerBinding) (orphanNomination, bool) {
+	rj, ok := s.running[rb.intentKey]
+	if !ok {
+		// Stale ledger entry — the wait-goroutine already cleaned up.
+		delete(s.runners, name)
+		return orphanNomination{}, false
+	}
+	if rj.runnerName() != name {
+		return orphanNomination{}, false
+	}
+	return orphanNomination{name: name, rb: rb, rj: rj}, true
 }
 
 // reapRunnerLocked unhooks a runner from the bookkeeping maps and returns it
 // for teardown. Caller holds s.mu. Returns ok=false when the ledger entry is
-// stale or no longer names this runner, in which case nothing is torn down.
+// stale, no longer names this runner, or has been bound to a job since it was
+// nominated — the last case is the race the nominate/veto split exists to
+// catch: an in_progress webhook landing while the busy check was in flight.
 func (s *Scheduler) reapRunnerLocked(name string, rb *runnerBinding) (orphanVictim, bool) {
+	if cur, ok := s.runners[name]; !ok || cur != rb {
+		// The ledger entry was replaced or removed while the busy check
+		// ran; whatever is there now was not what we nominated.
+		return orphanVictim{}, false
+	}
+	if rb.bound {
+		return orphanVictim{}, false
+	}
 	rj, ok := s.running[rb.intentKey]
 	if !ok {
 		// Stale ledger entry — the wait-goroutine already cleaned up.
@@ -2061,16 +2118,30 @@ func (s *Scheduler) reapRunnerLocked(name string, rb *runnerBinding) (orphanVict
 // that class's uncovered queued jobs first, so a spare that GitHub can still
 // legitimately hand a sibling job is kept (and no second runner is dispatched
 // for that job), while genuine surplus is retired immediately.
+//
+// # Both rules only NOMINATE
+//
+// Both rules decide from the same evidence — the scheduler's belief about
+// which runner is bound, assembled from in_progress webhooks — and that
+// belief is inference, not observation. A same-label burst permutes three
+// JIT runners across three jobs, and between the first in_progress
+// delivery and the last there is a window in which a runner that is
+// already executing a build still looks unbound; every completed event
+// triggers a sweep, so landing in that window is routine. Reaping on that
+// belief killed live builds.
+//
+// So the rules produce NOMINATIONS, and a busy check taken at the moment
+// of teardown — not derived from event history — either confirms or
+// vetoes each one. See busy.go for the check and its (time-bounded)
+// escape hatches.
 func (s *Scheduler) sweepOrphanRunners() {
 	if !s.cfg.OrphanSweep.Enabled {
 		return
 	}
-	grace := s.cfg.OrphanSweep.Grace
-	if grace <= 0 {
-		grace = defaultOrphanGrace
-	}
+	policy := s.reapPolicy()
+	grace := policy.Grace
 
-	var victims []orphanVictim
+	var nominations []orphanNomination
 
 	s.mu.Lock()
 	if !s.webhookMode {
@@ -2119,8 +2190,8 @@ func (s *Scheduler) sweepOrphanRunners() {
 			continue
 		}
 		if time.Since(rb.dispatchedAt) >= grace {
-			if v, ok := s.reapRunnerLocked(name, rb); ok {
-				victims = append(victims, v)
+			if n, ok := s.nominateRunnerLocked(name, rb); ok {
+				nominations = append(nominations, n)
 			}
 			continue
 		}
@@ -2143,23 +2214,36 @@ func (s *Scheduler) sweepOrphanRunners() {
 			demand[rb.labelSet]--
 			continue
 		}
-		if v, ok := s.reapRunnerLocked(name, rb); ok {
-			v.discharged = true
-			victims = append(victims, v)
+		if n, ok := s.nominateRunnerLocked(name, rb); ok {
+			n.discharged = true
+			nominations = append(nominations, n)
 		}
 	}
 	s.mu.Unlock()
 
+	victims := s.vetoBusyNominations(nominations, policy)
+
 	for _, v := range victims {
-		if v.discharged {
+		switch {
+		case v.escaped:
+			s.cfg.Log.Warn("ESCAPE: destroying a runner the busy check never cleared — it is wedged, or the busy check is broken",
+				"runner", v.name,
+				"dispatched_for_job", v.key.JobID,
+				"busy_verdict", v.verdict,
+				"reason", v.reason,
+				"grace", grace,
+				"hard_bound", policy.HardBound)
+		case v.discharged:
 			s.cfg.Log.Info("retiring discharged runner: its job ran on a same-label sibling and no queued job in that label set needs it",
 				"runner", v.name,
 				"dispatched_for_job", v.key.JobID,
+				"busy_verdict", v.verdict,
 				"detail", "same-label JIT runners are fungible; reconciled on the label set instead of waiting out the grace window")
-		} else {
+		default:
 			s.cfg.Log.Warn("destroying orphaned runner: dispatched but never assigned a job within the grace window",
 				"runner", v.name,
 				"dispatched_for_job", v.key.JobID,
+				"busy_verdict", v.verdict,
 				"grace", grace)
 		}
 		metrics.JobsActive.Dec()
