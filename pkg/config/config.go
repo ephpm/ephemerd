@@ -160,7 +160,7 @@ type WebhookConfig struct {
 	TLSKey  string `toml:"tls_key"`  // TLS private key path
 	Tunnel  string `toml:"tunnel"`   // "none" (default, polling), "external" (unmanaged ingress), "localtunnel", "ngrok", or "cloudflared"
 	// ExternalURL is the public base URL of the externally-managed tunnel
-	// (e.g. https://mac.tricorder.cc). When set with tunnel="external",
+	// (e.g. https://mac.example.com). When set with tunnel="external",
 	// ephemerd registers each tracked repo's webhook to
 	// <external_url>/webhook/<provider> using the secret. Ignored for managed
 	// tunnels (they use the tunnel's own URL) and for polling.

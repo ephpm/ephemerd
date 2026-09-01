@@ -63,7 +63,7 @@ owner = "your-org"
 # receiver and disables polling but does not create a tunnel:
 # tunnel = "external"
 # secret = "your_webhook_secret"        # required; must match the hook's secret
-# external_url = "https://mac.tricorder.cc"   # optional: public base URL of the
+# external_url = "https://mac.example.com"   # optional: public base URL of the
 #     # external tunnel. When set, ephemerd auto-registers each tracked repo's
 #     # webhook to <external_url>/webhook/<provider> on startup (idempotently) so
 #     # you don't have to hand-add a hook per repo. External hooks are NOT

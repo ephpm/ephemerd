@@ -39,7 +39,7 @@ layout: hextra-home
   >}}
   {{< hextra/feature-card
     title="Secure by Default"
-    subtitle="Every job runs in full isolation. Ephemeral environments destroyed after each run. Network firewall blocks LAN access."
+    subtitle="Every job runs in full isolation. Ephemeral environments destroyed after each run. LAN egress firewalled on Linux and macOS — on Windows, enable L2Bridge to enforce it."
     style="background: radial-gradient(ellipse at 50% 80%,rgba(221,74,57,0.15),hsla(0,0%,100%,0));"
   >}}
   {{< hextra/feature-card
