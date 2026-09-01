@@ -1205,13 +1205,18 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 	jobCtx, cancel := s.jobContext()
 
 	if err := s.cfg.LinuxDispatcher.Create(jobCtx, claim.RunnerName, image, claim.RunnerConfig, event.Provider.Name(), event.Repo); err != nil {
-		log.Error("dispatch create failed", "error", err)
+		log.Error("dispatch create failed", "error", err, "error_class", classifyErr(err))
 		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
 			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)
 		}
 		unsee()
 		cancel()
 		<-s.linuxSem
+		// Mirror the claim-failure branch above (and the local create
+		// path): a failed dispatch create used to drop the job forever —
+		// webhooks are never re-delivered. Slot released first; no-op for
+		// non-retryable errors or while draining.
+		s.enqueueRetryIfEligible(ctx, event, err)
 		return
 	}
 
@@ -1230,7 +1235,17 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 
 	// Wait for the job to finish in the background
 	go func() {
-		defer func() { <-s.linuxSem }()
+		// Same slot-release ordering as the local wait-goroutine: release
+		// once the job is untracked, never behind the destroy. The
+		// deferred call is only the panic/early-return backstop.
+		released := false
+		release := func() {
+			if !released {
+				released = true
+				<-s.linuxSem
+			}
+		}
+		defer release()
 
 		exitCode, err := s.cfg.LinuxDispatcher.Wait(jobCtx, claim.RunnerName)
 		if err != nil {
@@ -1256,6 +1271,11 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		if exists {
 			metrics.JobsActive.Dec()
 		}
+
+		// Release BEFORE the destroy RPC, mirroring the local path: the
+		// dispatched env is keyed by its unique claim.RunnerName, so a
+		// newly admitted job cannot collide with this teardown.
+		release()
 
 		if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), claim.RunnerName); err != nil {
 			log.Warn("dispatch destroy failed", "error", err)
@@ -1613,16 +1633,30 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 	// Create the runner environment with job timeout.
 	// Derived from jobsCtx, not ctx: the job keeps running across SIGTERM
 	// until it finishes or drain() gives up (see bindContexts).
+	//
+	// Create is retried IN PLACE for transient failures (a dead shim's
+	// "ttrpc: closed", a containerd restart, ...): the slot is held and
+	// the JIT claim already minted, so a couple of short-backoff attempts
+	// here are far cheaper than release-and-requeue. The retry queue
+	// below is the real safety net when these run out.
 	jobCtx, cancel := s.jobContext()
-	env, err := s.cfg.Runtime.Create(jobCtx, runtime.CreateConfig{
-		ID:         claim.RunnerName,
-		Image:      image,
-		JITConfig:  claim.RunnerConfig,
-		Env:        claim.Env,
-		Entrypoint: claim.Entrypoint,
-	})
+	var env *runtime.RunnerEnv
+	err = retryEnvCreate(jobCtx, log, createEnvBackoffs,
+		func(err error) bool { return classifyErr(err) != errNonRetryable },
+		s.isDraining,
+		func() error {
+			var cerr error
+			env, cerr = s.cfg.Runtime.Create(jobCtx, runtime.CreateConfig{
+				ID:         claim.RunnerName,
+				Image:      image,
+				JITConfig:  claim.RunnerConfig,
+				Env:        claim.Env,
+				Entrypoint: claim.Entrypoint,
+			})
+			return cerr
+		})
 	if err != nil {
-		log.Error("failed to create runner environment", "error", err)
+		log.Error("failed to create runner environment", "error", err, "error_class", classifyErr(err))
 		// Remove the ghost runner since the container won't start
 		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
 			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)
@@ -1633,6 +1667,13 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 		unsee()
 		cancel()
 		<-s.sem
+		// Mirror the claim-failure branch above: without this a job whose
+		// env create failed was dropped forever (GitHub never re-delivers
+		// the webhook) — on metal that was 1h43m of a job sitting queued
+		// after a dead shim failed a single create. Slot released FIRST so
+		// the retry never fires while we still hold it; no-op when the
+		// error is non-retryable or the node is draining.
+		s.enqueueRetryIfEligible(ctx, event, err)
 		return
 	}
 
@@ -1652,9 +1693,20 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 
 	// Wait for the job to finish in the background
 	go func() {
-		defer func() {
-			<-s.sem // release concurrency slot
-		}()
+		// Slot release is decoupled from teardown. It used to hang off a
+		// bare defer, which meant the slot came back only after Destroy
+		// returned — so a wedged teardown (dead shim) pinned a
+		// MaxConcurrent slot for its whole hang. The slot is released as
+		// soon as the job is untracked below; the deferred call is only
+		// the panic/early-return backstop.
+		released := false
+		release := func() {
+			if !released {
+				released = true
+				<-s.sem
+			}
+		}
+		defer release()
 
 		exitCode, err := s.cfg.Runtime.Wait(jobCtx, env)
 		if err != nil {
@@ -1676,7 +1728,21 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 		rj, exists := s.running[key]
 		if exists {
 			s.untrackRunningLocked(key, rj)
-			s.mu.Unlock()
+		}
+		s.mu.Unlock()
+
+		// Release the concurrency slot BEFORE destroying: the job is
+		// untracked, so its demand is gone, and the teardown must not be
+		// able to delay the next job's admission (Destroy is bounded, but
+		// even a bounded 5m hang is 5m of a dead slot). This is safe
+		// against a new job racing this env's teardown: every env is
+		// keyed by its unique claim.RunnerName — container ID, per-job
+		// runner dir, netns/HCN endpoint, dind socket all derive from it —
+		// so a freshly admitted job cannot touch anything this teardown
+		// still owns.
+		release()
+
+		if exists {
 			metrics.JobsActive.Dec()
 			if err := s.cfg.Runtime.Destroy(context.Background(), env); err != nil {
 				log.Warn("failed to destroy runner environment", "error", err)
@@ -1689,8 +1755,6 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 					log.Debug("deregister runner after local cleanup", "error", err)
 				}
 			}
-		} else {
-			s.mu.Unlock()
 		}
 
 		// Self-heal: re-provision if this runner's dispatched job never ran.
@@ -2301,6 +2365,59 @@ func (s *Scheduler) enqueueRetryIfEligible(ctx context.Context, event providers.
 		return
 	}
 	s.retry.Add(event, s.retryHandler, err)
+}
+
+// isDraining reports whether the scheduler has stopped taking new work
+// (shutdown drain or operator cordon).
+func (s *Scheduler) isDraining() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.draining
+}
+
+// createEnvBackoffs is the short in-place backoff ladder for a failed
+// runner-environment create. Deliberately tiny: the caller holds a
+// concurrency slot and a minted JIT claim for the whole ladder, so this
+// only rides out blips (a shim crash mid-create, a containerd restart) —
+// anything longer-lived goes through release-and-requeue on the retry
+// queue instead.
+var createEnvBackoffs = []time.Duration{5 * time.Second, 15 * time.Second}
+
+// retryEnvCreate runs create, retrying in place up to len(backoffs)
+// extra times with the given backoff between attempts. It gives up early
+// — returning the last error — when:
+//   - retryable(err) is false (a permanent error won't heal in 15s), or
+//   - drained() is true (a draining node must not sit on a slot waiting
+//     to start NEW work; the caller releases and returns, as it always
+//     did), or
+//   - ctx is cancelled mid-backoff (shutdown, job timeout).
+//
+// Pure aside from the injected callbacks so the attempt/short-circuit
+// behavior is unit-testable without a Scheduler.
+func retryEnvCreate(ctx context.Context, log *slog.Logger, backoffs []time.Duration,
+	retryable func(error) bool, drained func() bool, create func() error) error {
+	err := create()
+	for i := 0; err != nil && i < len(backoffs); i++ {
+		if !retryable(err) || drained() {
+			return err
+		}
+		log.Warn("failed to create runner environment; retrying in place",
+			"error", err, "attempt", i+1, "backoff", backoffs[i])
+		timer := time.NewTimer(backoffs[i])
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return err
+		}
+		// Drain may have started during the backoff; re-check before
+		// spending another create against a node that stopped taking work.
+		if drained() {
+			return err
+		}
+		err = create()
+	}
+	return err
 }
 
 // retryHandler is the callback the retry queue invokes on each fire.

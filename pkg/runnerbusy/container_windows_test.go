@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/Microsoft/hcsshim"
 	"github.com/containerd/containerd/v2/client"
@@ -125,6 +126,39 @@ func TestContainerBusy_Windows(t *testing.T) {
 				t.Errorf("compute system closed = %v, want %v", fake.closed, tt.wantOpen)
 			}
 		})
+	}
+}
+
+// TestContainerBusy_WindowsCtxBoundsAWedgedProbe pins that the caller's
+// ctx (busyProbeTimeout upstream) is actually enforced: hcsshim takes no
+// context, and before the probe ran HCS on its own goroutine a dead
+// shim/GCS wedged the whole sweep behind an uncancellable OpenContainer.
+// The wedged probe must come back Unknown — the fail-safe veto — not hang.
+func TestContainerBusy_WindowsCtxBoundsAWedgedProbe(t *testing.T) {
+	prev := openCompute
+	wedged := make(chan struct{})
+	t.Cleanup(func() {
+		openCompute = prev
+		close(wedged) // let the abandoned goroutine exit
+	})
+	openCompute = func(string) (hcsProcessLister, error) {
+		<-wedged // simulate HCS never answering
+		return nil, errors.New("wedged")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	got, err := ContainerBusy(ctx, &fakeTask{id: "job-1"}, quiet())
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("ContainerBusy took %v; ctx did not bound the wedged probe", elapsed)
+	}
+	if got != Unknown {
+		t.Errorf("state = %v, want unknown for a wedged probe", got)
+	}
+	if err == nil {
+		t.Error("err = nil, want a ctx error for a wedged probe")
 	}
 }
 

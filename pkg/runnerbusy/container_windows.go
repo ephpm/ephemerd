@@ -43,8 +43,37 @@ var openCompute = func(id string) (hcsProcessLister, error) {
 // Same fail-safe rule as the Linux probe: anything we cannot read is
 // Unknown, and an empty listing (which HCS also returns for a compute
 // system that has gone away underneath us) is Unknown rather than Idle.
-func ContainerBusy(_ context.Context, t ContainerTask, log *slog.Logger) (State, error) {
+//
+// The hcsshim calls take no context, so the probe runs them on a
+// goroutine and selects on ctx: without this, the caller's
+// busyProbeTimeout was simply not enforced on Windows, and a dead
+// shim/GCS wedged the probe (and the sweep serialized behind it)
+// indefinitely. On ctx expiry the goroutine is abandoned — it parks
+// inside HCS until that call eventually errors — and the probe reports
+// Unknown, which is the fail-safe veto.
+func ContainerBusy(ctx context.Context, t ContainerTask, log *slog.Logger) (State, error) {
 	id := t.ID()
+
+	type result struct {
+		state State
+		err   error
+	}
+	ch := make(chan result, 1) // buffered: a late probe result must not leak the goroutine
+	go func() {
+		st, err := containerBusyHCS(id, log)
+		ch <- result{st, err}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.state, r.err
+	case <-ctx.Done():
+		return Unknown, fmt.Errorf("busy probe for compute system %q: %w", id, ctx.Err())
+	}
+}
+
+// containerBusyHCS is the uncancellable HCS half of ContainerBusy.
+func containerBusyHCS(id string, log *slog.Logger) (State, error) {
 	c, err := openCompute(id)
 	if err != nil {
 		return Unknown, fmt.Errorf("opening compute system %q: %w", id, err)

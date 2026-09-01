@@ -371,6 +371,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 
 			OrphanContainerReapEnabled: cfg.Runtime.ResolvedOrphanContainerReap(),
 			OrphanContainerGrace:       cfg.Runtime.ResolvedOrphanContainerGrace(),
+			DestroyTimeout:             cfg.Runtime.ResolvedDestroyTimeout(),
 			Log:                        log,
 		})
 		if err != nil {
@@ -653,6 +654,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 
 		OrphanContainerReapEnabled: cfg.Runtime.ResolvedOrphanContainerReap(),
 		OrphanContainerGrace:       cfg.Runtime.ResolvedOrphanContainerGrace(),
+		DestroyTimeout:             cfg.Runtime.ResolvedDestroyTimeout(),
 		Log:                        log,
 	})
 	if err != nil {

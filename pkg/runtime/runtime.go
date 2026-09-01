@@ -173,7 +173,13 @@ type Config struct {
 	// with a zero grace. Callers pass
 	// config.RuntimeConfig.ResolvedOrphanContainerGrace().
 	OrphanContainerGrace time.Duration
-	Log                  *slog.Logger
+	// DestroyTimeout bounds a single Destroy end to end. Non-positive
+	// falls back to defaultDestroyTimeout, so the zero-value Config fails
+	// SAFE: a construction site that forgets this field gets a finite
+	// bound, never an unbounded teardown. Callers pass
+	// config.RuntimeConfig.ResolvedDestroyTimeout().
+	DestroyTimeout time.Duration
+	Log            *slog.Logger
 }
 
 // resolveRuntimeName picks the containerd runtime handler for a job
@@ -1559,9 +1565,49 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	return env, nil
 }
 
+// defaultDestroyTimeout is the fallback bound for Destroy when
+// Config.DestroyTimeout is non-positive. A healthy teardown takes ~15s;
+// 5m is generous headroom for a slow disk or an HNS hiccup while still
+// guaranteeing the caller gets its thread (and concurrency slot) back.
+const defaultDestroyTimeout = 5 * time.Minute
+
+// destroyKillWait is how long Destroy waits for a killed task's exit
+// event before giving up on it and pressing on with the rest of the
+// teardown. Deliberately much shorter than the overall destroy bound: a
+// dead shim never delivers the exit event at all, and burning the whole
+// destroy budget on it would starve the steps that still CAN succeed
+// (network teardown, dind stop, directory removal).
+const destroyKillWait = 30 * time.Second
+
 // Destroy tears down a runner environment completely.
+//
+// Destroy is BOUNDED: it returns within Config.DestroyTimeout (default
+// defaultDestroyTimeout) even when a teardown step wedges. This is a
+// production requirement, not a nicety — a dead containerd shim makes the
+// killed task's exit event never arrive AND makes task/container RPCs
+// hang, and an unbounded Destroy then blocks its caller forever (observed
+// on metal: one dead shim pinned a scheduler slot for 1h+ and stalled two
+// upgrade drains in a row).
+//
+// Contract on timeout: Destroy returns an error and ABANDONS whatever
+// teardown remains — the worker goroutine may still be blocked inside an
+// uncancellable call (env.Dind.Stop and the HCS/HNS operations take no
+// ctx; rewriting those subsystems is out of scope). Everything an
+// abandoned teardown leaves behind is reclaimed asynchronously: the
+// periodic dead-container reaper (ReapDeadContainers) deletes the
+// container + snapshot once its task is provably dead past the grace
+// window, and the startup CleanOrphans / dind.CleanupStaleDindNamespaces
+// sweep the rest on the next boot. Leaking one parked goroutine per
+// wedged shim is the accepted cost of never wedging the scheduler.
 func (r *Runtime) Destroy(ctx context.Context, env *RunnerEnv) error {
 	ctx = namespaces.WithNamespace(ctx, namespace)
+
+	timeout := r.cfg.DestroyTimeout
+	if timeout <= 0 {
+		timeout = defaultDestroyTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	r.cfg.Log.Info("destroying runner environment", "id", env.ID)
 
@@ -1569,7 +1615,35 @@ func (r *Runtime) Destroy(ctx context.Context, env *RunnerEnv) error {
 		r.cfg.OnTaskDestroy(env)
 	}
 
-	// Kill the task if still running
+	// Run the teardown steps on their own goroutine so Destroy can return
+	// on ctx expiry even while a step that ignores ctx is still wedged.
+	// The channel is buffered: a late-finishing teardown sends its result
+	// and exits instead of leaking on a channel nobody reads.
+	done := make(chan struct{}, 1)
+	go func() {
+		r.destroySteps(ctx, env)
+		done <- struct{}{}
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		r.cfg.Log.Error("destroy timed out; abandoning teardown of runner environment to the orphan reaper",
+			"id", env.ID, "timeout", timeout)
+		return fmt.Errorf("destroying %s: %w", env.ID, ctx.Err())
+	}
+}
+
+// destroySteps is the teardown sequence proper. Every step is
+// best-effort (log and continue) so one wedged or failing step cannot
+// keep the later, independent steps from running. Steps that take a ctx
+// share Destroy's bounded ctx; steps that don't (Dind.Stop, HCS/HNS
+// internals) are bounded only by Destroy abandoning this goroutine.
+func (r *Runtime) destroySteps(ctx context.Context, env *RunnerEnv) {
+	// Kill the task if still running. The exit-event wait is bounded: a
+	// dead shim never delivers it (this exact receive used to be a bare
+	// <-exitCh and blocked forever in production).
 	status, err := env.Task.Status(ctx)
 	if err == nil && status.Status == client.Running {
 		if err := env.Task.Kill(ctx, 9); err != nil {
@@ -1577,7 +1651,10 @@ func (r *Runtime) Destroy(ctx context.Context, env *RunnerEnv) error {
 		}
 		exitCh, err := env.Task.Wait(ctx)
 		if err == nil {
-			<-exitCh
+			if !waitTaskExit(ctx, exitCh, destroyKillWait) {
+				r.cfg.Log.Warn("killed task never reported exit; proceeding with teardown",
+					"id", env.ID, "waited", destroyKillWait)
+			}
 		}
 	}
 
@@ -1623,8 +1700,27 @@ func (r *Runtime) Destroy(ctx context.Context, env *RunnerEnv) error {
 	// Windows sharing violation from the just-exited container's file handles.
 	removeJobWorkdir(r.cfg.DataDir, env.ID, r.cfg.Log)
 
+	// Logged here rather than in Destroy so a teardown that finishes late
+	// — after Destroy already timed out and returned — still leaves an
+	// operator-visible record that it eventually completed.
 	r.cfg.Log.Info("runner environment destroyed", "id", env.ID)
-	return nil
+}
+
+// waitTaskExit waits for a killed task's exit notification, but never
+// longer than killWait (or the caller's ctx). Factored out of
+// destroySteps so the bound is unit-testable without faking a full
+// containerd client.Task. Returns true when the exit event arrived.
+func waitTaskExit(ctx context.Context, exitCh <-chan client.ExitStatus, killWait time.Duration) bool {
+	timer := time.NewTimer(killWait)
+	defer timer.Stop()
+	select {
+	case <-exitCh:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
 }
 
 // Wait blocks until the runner environment's task exits.

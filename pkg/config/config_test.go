@@ -2471,3 +2471,25 @@ func TestResolvedReconcileInterval(t *testing.T) {
 		t.Errorf("nil ResolvedReconcileInterval() = %v, want 30m", got)
 	}
 }
+
+// TestResolvedDestroyTimeout pins the fail-safe contract: the teardown
+// bound must be finite no matter what the operator writes — there is no
+// configuration that yields an unbounded Destroy, because an unbounded
+// Destroy is exactly what let a dead shim pin a concurrency slot for an
+// hour in production.
+func TestResolvedDestroyTimeout(t *testing.T) {
+	cases := []struct {
+		in   time.Duration
+		want time.Duration
+	}{
+		{0, 5 * time.Minute},                 // unset -> default
+		{-time.Minute, 5 * time.Minute},      // nonsense -> default, never unbounded
+		{90 * time.Second, 90 * time.Second}, // custom
+	}
+	for _, c := range cases {
+		r := RuntimeConfig{DestroyTimeout: c.in}
+		if got := r.ResolvedDestroyTimeout(); got != c.want {
+			t.Errorf("ResolvedDestroyTimeout(%v) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
