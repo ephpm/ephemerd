@@ -233,7 +233,7 @@ func TestCanHandleJob(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := New(Config{Log: testLogger()})
 			if tt.dispatcher {
-				s.cfg.LinuxDispatcher = &DispatchClient{}
+				s.SetLinuxDispatcher(&DispatchClient{})
 			}
 			if got := s.canHandleJob(tt.labels); got != tt.want {
 				t.Errorf("canHandleJob(%v) = %v, want %v", tt.labels, got, tt.want)
@@ -247,7 +247,7 @@ func TestCanHandleJob(t *testing.T) {
 // double-claiming Linux jobs against the dedicated Linux box.
 func TestCanHandleJob_LinuxJobsDisabled(t *testing.T) {
 	s := New(Config{Log: testLogger(), LinuxJobsDisabled: true})
-	s.cfg.LinuxDispatcher = &DispatchClient{}
+	s.SetLinuxDispatcher(&DispatchClient{})
 
 	if s.canHandleJob([]string{"self-hosted", "linux"}) {
 		t.Error("linux job accepted despite LinuxJobsDisabled")

@@ -203,6 +203,45 @@ func PlanEviction(candidates []Candidate, protected map[string]struct{}, usage d
 	return p
 }
 
+// PlanForced selects EVERY unprotected candidate, least-recently-used
+// first, regardless of disk pressure. It is the operator override behind
+// `ephemerd cache clear containerd --all`. Pure.
+//
+// WHY THIS IS SEPARATE FROM PlanEviction. PlanEviction is watermark-driven
+// by design: on a node whose thresholds are not tripped it correctly returns
+// an empty plan, which is right for the timer and wrong for a human who has
+// just decided this node's image store must go. Before this existed the
+// `--all` flag was accepted, silently dropped for the containerd target, and
+// reported "0 records removed" — so the operator concluded the command was
+// broken rather than that the policy had declined (observed while chasing
+// disk on a Windows node).
+//
+// The protected set is still an ABSOLUTE veto here, exactly as in
+// PlanEviction: --all forces the POLICY open, never the safety. An image
+// backing a running container or listed as a pinned runner image is never
+// selected, because evicting one breaks a job in flight or costs every
+// subsequent job a re-pull — neither is something an operator asking to
+// reclaim cache is asking for.
+func PlanForced(candidates []Candidate, protected map[string]struct{}) Plan {
+	var p Plan
+	p.Over = true
+	p.Reasons = []string{ReasonForced}
+
+	eligible := filterProtected(candidates, protected, &p.Protected)
+	sortLRU(eligible)
+	p.Evict = eligible
+	for _, c := range eligible {
+		if c.SizeBytes > 0 {
+			p.PlannedBytes += uint64(c.SizeBytes)
+		}
+	}
+	return p
+}
+
+// ReasonForced is the Pressure reason PlanForced reports: the pass ran
+// because an operator asked for it, not because a watermark tripped.
+const ReasonForced = "forced"
+
 // PlanByAge selects every candidate last accessed before cutoff,
 // least-recently-used first, skipping the protected set. It is the optional
 // age backstop (`cache_max_age`), not the primary mechanism: age alone

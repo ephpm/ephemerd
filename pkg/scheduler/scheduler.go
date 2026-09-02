@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ephpm/ephemerd/pkg/artifacts"
@@ -251,6 +252,18 @@ type Scheduler struct {
 	draining    bool          // true when shutting down, rejects new jobs
 	startTime   time.Time
 
+	// linuxDispatch is the live Linux-VM dispatch client. It is an atomic
+	// pointer, not a plain read of cfg.LinuxDispatcher, because on Windows
+	// the Linux sidecar VM boots on a retry ladder that can take many
+	// minutes and the daemon must NOT wait for it: Windows jobs must be
+	// schedulable immediately, and Linux capacity attaches when the VM
+	// finally comes up (see SetLinuxDispatcher and cmd/ephemerd's startup).
+	// Seeded from cfg.LinuxDispatcher in New, so callers that already have a
+	// dispatcher keep working unchanged. Every read goes through
+	// linuxDispatcher(); reading cfg.LinuxDispatcher directly would be a
+	// data race against a late attach.
+	linuxDispatch atomic.Pointer[DispatchClient]
+
 	// retry holds pending re-attempts for jobs whose initial claim
 	// failed with a retryable error. Nil when Config.Retry.Enabled=false.
 	retry *retryQueue
@@ -447,6 +460,7 @@ func New(cfg Config) *Scheduler {
 		startTime:  time.Now(),
 		newMacOSVM: vm.NewMacOSVM,
 	}
+	s.linuxDispatch.Store(cfg.LinuxDispatcher)
 	// Only construct the retry queue when the caller explicitly enabled
 	// it. A disabled queue is safe to leave nil; enqueueRetryIfEligible
 	// nil-checks so the "log and drop" path is a no-op for opted-out
@@ -889,6 +903,28 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	}
 }
 
+// linuxDispatcher returns the live Linux-VM dispatch client, or nil when this
+// host has none (yet). Nil is not permanent on Windows: the sidecar VM may
+// still be booting.
+func (s *Scheduler) linuxDispatcher() *DispatchClient { return s.linuxDispatch.Load() }
+
+// SetLinuxDispatcher attaches a Linux-VM dispatch client to an already-running
+// scheduler.
+//
+// WHY THIS EXISTS. Starting the Linux sidecar is slow and, on a host whose
+// Hyper-V stack is still settling after a reboot, retried: a single failing
+// vm.StartLinuxVM attempt costs on the order of ten minutes before it even
+// returns an error. The daemon used to BLOCK on that before it built the
+// scheduler or the webhook tunnel, so a sick Linux sidecar took the node's
+// Windows capacity down with it. Now startup waits only briefly, builds the
+// scheduler without a dispatcher, and calls this when (if) the VM comes up.
+//
+// Safe to call at any time from any goroutine; the next scheduling decision
+// picks it up. Calling it does not retroactively admit Linux jobs the
+// scheduler already declined — the provider re-offers those on the next poll
+// or webhook.
+func (s *Scheduler) SetLinuxDispatcher(dc *DispatchClient) { s.linuxDispatch.Store(dc) }
+
 // canHandleJob returns false if the job's labels include an OS or
 // architecture that this scheduler cannot handle.
 func (s *Scheduler) canHandleJob(jobLabels []string) bool {
@@ -899,7 +935,7 @@ func (s *Scheduler) canHandleJob(jobLabels []string) bool {
 			// Linux jobs run natively on Linux, via VM dispatch on Windows/macOS,
 			// or inside the embedded Linux VM on macOS — unless the operator
 			// turned Linux serving off ([vm.linux] enabled = false).
-			osOK = (goruntime.GOOS == "linux" || goruntime.GOOS == "darwin" || s.cfg.LinuxDispatcher != nil) &&
+			osOK = (goruntime.GOOS == "linux" || goruntime.GOOS == "darwin" || s.linuxDispatcher() != nil) &&
 				!s.cfg.LinuxJobsDisabled
 		case "windows":
 			osOK = goruntime.GOOS == "windows"
@@ -1036,7 +1072,7 @@ func (s *Scheduler) handleQueued(ctx context.Context, event providers.JobEvent) 
 	s.mu.Unlock()
 
 	// Dispatch Linux jobs to the Linux VM worker if available
-	if s.cfg.LinuxDispatcher != nil && isLinuxJob(event.Labels) {
+	if s.linuxDispatcher() != nil && isLinuxJob(event.Labels) {
 		s.handleLinuxJob(ctx, event)
 		return
 	}
@@ -1163,6 +1199,18 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		s.mu.Unlock()
 	}
 
+	// Taken ONCE, up front: the dispatcher can now be attached late (see
+	// SetLinuxDispatcher), and create/wait/destroy for a single job must all
+	// go to the same client. The caller checked it is non-nil; re-check here
+	// so the derefs below can never be reached with a nil client after a
+	// future refactor.
+	dispatcher := s.linuxDispatcher()
+	if dispatcher == nil {
+		log.Warn("no Linux dispatch client available; leaving the job for the next pass")
+		unsee()
+		return
+	}
+
 	// Acquire Linux dispatch concurrency slot (separate from local/macOS)
 	select {
 	case s.linuxSem <- struct{}{}:
@@ -1204,7 +1252,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 	// until it finishes or drain() gives up (see bindContexts).
 	jobCtx, cancel := s.jobContext()
 
-	if err := s.cfg.LinuxDispatcher.Create(jobCtx, claim.RunnerName, image, claim.RunnerConfig, event.Provider.Name(), event.Repo); err != nil {
+	if err := dispatcher.Create(jobCtx, claim.RunnerName, image, claim.RunnerConfig, event.Provider.Name(), event.Repo); err != nil {
 		log.Error("dispatch create failed", "error", err, "error_class", classifyErr(err))
 		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
 			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)
@@ -1247,7 +1295,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		}
 		defer release()
 
-		exitCode, err := s.cfg.LinuxDispatcher.Wait(jobCtx, claim.RunnerName)
+		exitCode, err := dispatcher.Wait(jobCtx, claim.RunnerName)
 		if err != nil {
 			if jobCtx.Err() != nil {
 				log.Warn("dispatched runner killed (timeout or shutdown)", "error", err)
@@ -1277,7 +1325,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		// newly admitted job cannot collide with this teardown.
 		release()
 
-		if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), claim.RunnerName); err != nil {
+		if err := dispatcher.Destroy(context.Background(), claim.RunnerName); err != nil {
 			log.Warn("dispatch destroy failed", "error", err)
 		}
 
@@ -1912,8 +1960,8 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event providers.JobEven
 	job.cancel()
 	if job.macosVM != nil {
 		job.macosVM.Stop()
-	} else if job.dispatched != "" && s.cfg.LinuxDispatcher != nil {
-		if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), job.dispatched); err != nil {
+	} else if dc := s.linuxDispatcher(); job.dispatched != "" && dc != nil {
+		if err := dc.Destroy(context.Background(), job.dispatched); err != nil {
 			log.Warn("failed to destroy dispatched runner", "error", err)
 		}
 	} else if job.env != nil {
@@ -1996,8 +2044,8 @@ func (s *Scheduler) destroyAll() {
 		job.cancel()
 		if job.macosVM != nil {
 			job.macosVM.Stop()
-		} else if job.dispatched != "" && s.cfg.LinuxDispatcher != nil {
-			if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), job.dispatched); err != nil {
+		} else if dc := s.linuxDispatcher(); job.dispatched != "" && dc != nil {
+			if err := dc.Destroy(context.Background(), job.dispatched); err != nil {
 				s.cfg.Log.Warn("failed to destroy dispatched runner", "job_id", key.JobID, "error", err)
 			}
 		} else if job.env != nil {
@@ -2314,8 +2362,8 @@ func (s *Scheduler) sweepOrphanRunners() {
 		v.rj.cancel()
 		if v.rj.macosVM != nil {
 			v.rj.macosVM.Stop()
-		} else if v.rj.dispatched != "" && s.cfg.LinuxDispatcher != nil {
-			if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), v.rj.dispatched); err != nil {
+		} else if dc := s.linuxDispatcher(); v.rj.dispatched != "" && dc != nil {
+			if err := dc.Destroy(context.Background(), v.rj.dispatched); err != nil {
 				s.cfg.Log.Warn("failed to destroy orphaned dispatched runner", "runner", v.name, "error", err)
 			}
 		} else if v.rj.env != nil {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -349,7 +350,7 @@ func TestQuarantineDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("quarantineDir: %v", err)
 	}
-	want := filepath.Join("/var", "lib", "ephemerd", "_quarantine-buildkit-1786575749")
+	want := filepath.Join("/var", "lib", "ephemerd", "_quarantine-buildkit-1786575749-000000000")
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -364,6 +365,62 @@ func TestQuarantineDir(t *testing.T) {
 	for _, bad := range []string{"/", "."} {
 		if _, err := quarantineDir(bad, now); err == nil {
 			t.Errorf("quarantineDir(%q) returned no error", bad)
+		}
+	}
+}
+
+// TestQuarantineDir_NeverCollides pins the uniquifier.
+//
+// The name used to be `<prefix><unix-seconds>` — one-second granularity with
+// no collision handling. Two heal keys can escalate to Rebuild at the same
+// moment; s.mu serializes them but does not spread them out, so both land in
+// the same second and get the same path. The second Rebuild's
+// os.Rename(DataDir, quarantine) then fails onto the existing directory,
+// pushing a rebuild that had nothing wrong with it into
+// reinitAfterFailedRebuild.
+//
+// The clock here is FROZEN, which is the worst case (nanoseconds cannot help)
+// and the only way to test the fallback deterministically.
+func TestQuarantineDir_NeverCollides(t *testing.T) {
+	parent := t.TempDir()
+	dataDir := filepath.Join(parent, "buildkit")
+	frozen := time.Unix(1786575749, 123456789)
+
+	seen := map[string]bool{}
+	for i := 0; i < 5; i++ {
+		got, err := quarantineDir(dataDir, frozen)
+		if err != nil {
+			t.Fatalf("quarantineDir #%d: %v", i, err)
+		}
+		if seen[got] {
+			t.Fatalf("quarantineDir returned %q twice with a frozen clock; the second Rebuild's rename would fail onto the first quarantine", got)
+		}
+		seen[got] = true
+		// Simulate Rebuild actually moving the store there.
+		if err := os.MkdirAll(got, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Nanoseconds are in the name, so an unfrozen clock does not even need
+	// the suffix loop.
+	a, err := quarantineDir(dataDir, time.Unix(1786575749, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := quarantineDir(dataDir, time.Unix(1786575749, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b {
+		t.Errorf("two instants inside the same second produced the same name %q", a)
+	}
+
+	// Every name must still be recognisable to pruneOldQuarantines, or a
+	// node that trips this repeatedly fills its disk with evidence.
+	for name := range seen {
+		if !strings.HasPrefix(filepath.Base(name), quarantineDirPrefix) {
+			t.Errorf("%q does not carry the quarantine prefix; pruneOldQuarantines would never reclaim it", name)
 		}
 	}
 }

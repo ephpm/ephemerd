@@ -46,6 +46,30 @@ var (
 	configDir string
 )
 
+// linuxDispatchStartupWait is the ONLY time daemon startup will spend waiting
+// on the Linux sidecar VM. It is the whole worst-case contribution of the
+// Linux-VM path to time-to-schedulable.
+//
+// Short on purpose. The sidecar is optional capacity and its start ladder is
+// slow and retried (see runtime_windows.go); the daemon's job is to serve
+// Windows work immediately and pick up Linux work when it can. The only thing
+// this window buys is avoiding a pointless "starting without it" log on hosts
+// where the VM is already up, which is why seconds are enough.
+const linuxDispatchStartupWait = 5 * time.Second
+
+// startLinuxStatsConsumer subscribes to the in-VM container stats stream and
+// feeds batches into the host's metrics registry under the linux-vm runtime
+// label. Runs for the daemon's lifetime; reconnects on transient stream
+// errors. Factored out because the dispatcher can arrive either during
+// startup or later (see scheduler.SetLinuxDispatcher) and both paths need it.
+func startLinuxStatsConsumer(ctx context.Context, dc *scheduler.DispatchClient, interval time.Duration, log *slog.Logger) {
+	go func() {
+		if err := dc.ConsumeContainerStats(ctx, uint32(interval.Seconds()), metrics.RuntimeLinuxVM, log.With("component", "container-stats-consumer")); err != nil && ctx.Err() == nil {
+			log.Warn("container stats consumer exited", "error", err)
+		}
+	}()
+}
+
 func main() {
 	// BuildKit mounts our binary into Windows build containers and re-execs
 	// it with argv[0]="get-user-info" to resolve user SIDs. The handler is
@@ -737,10 +761,47 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	// VMs via virtio-fs).
 	artifactExtractor := artifacts.NewExtractor(ctrdClient, registryMirror, log)
 
-	// Wait for Linux dispatch client if the VM is booting in the background.
-	linuxDispatcher, _ := waitDispatch()
-	if linuxDispatcher != nil {
-		log.Info("Linux job dispatch enabled")
+	// Wait — BRIEFLY — for the Linux dispatch client if a sidecar VM is
+	// booting in the background.
+	//
+	// This used to be a bare `waitDispatch()`, i.e. an unbounded block,
+	// sitting between the runtime and BOTH the webhook tunnel and
+	// scheduler.New. On Windows the thing it waited for is a retry ladder
+	// whose per-attempt cost is ~10 minutes, so a host whose Hyper-V stack
+	// was unhappy spent up to the full linuxVMStartBudget as a daemon with
+	// no scheduler, no webhook receiver and no ability to run the WINDOWS
+	// jobs it was perfectly capable of running. A Linux sidecar is extra
+	// capacity; it must never gate the host's primary capacity.
+	//
+	// Now: worst case linuxDispatchStartupWait (5s) of blocked startup,
+	// full stop, on every platform. If the VM is already up — the macOS
+	// path, where startContainerRuntime boots it synchronously, and the
+	// common Windows warm-restart case — this returns immediately. If it is
+	// not, the scheduler starts without Linux capacity and the dispatcher is
+	// attached the moment it becomes available (see below); nothing is lost
+	// but the first few seconds of Linux job admission.
+	//
+	// Buffered, so the producer never blocks even if nobody is listening.
+	dispatchCh := make(chan *scheduler.DispatchClient, 1)
+	go func() {
+		dc, _ := waitDispatch()
+		dispatchCh <- dc
+	}()
+
+	var linuxDispatcher *scheduler.DispatchClient
+	linuxDispatchPending := false
+	select {
+	case dc := <-dispatchCh:
+		// Terminal either way: a nil dc here means the ladder gave up, and
+		// nothing will arrive later.
+		linuxDispatcher = dc
+		if linuxDispatcher != nil {
+			log.Info("Linux job dispatch enabled")
+		}
+	case <-time.After(linuxDispatchStartupWait):
+		linuxDispatchPending = true
+		log.Info("Linux sidecar VM still starting; continuing without it — the scheduler starts now and Linux capacity attaches when the VM is ready",
+			"waited", linuxDispatchStartupWait)
 	}
 	if cfg.Dind.Enabled {
 		log.Info("DinD enabled — containers will have /var/run/docker.sock")
@@ -879,13 +940,33 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		// the linux-vm runtime label. Runs for the daemon's lifetime;
 		// reconnects on transient stream errors.
 		if linuxDispatcher != nil {
-			interval := cfg.Metrics.ParsedContainerStatsInterval()
-			go func() {
-				if err := linuxDispatcher.ConsumeContainerStats(ctx, uint32(interval.Seconds()), metrics.RuntimeLinuxVM, log.With("component", "container-stats-consumer")); err != nil && ctx.Err() == nil {
-					log.Warn("container stats consumer exited", "error", err)
-				}
-			}()
+			startLinuxStatsConsumer(ctx, linuxDispatcher, cfg.Metrics.ParsedContainerStatsInterval(), log)
 		}
+	}
+
+	// The Linux sidecar was still booting when the scheduler was built.
+	// Attach its dispatcher when it arrives, off the startup path.
+	//
+	// The scheduler tolerates this by design: it reads the dispatcher
+	// through an atomic pointer (scheduler.SetLinuxDispatcher), so a late
+	// attach is visible to the next scheduling decision without a data race
+	// and without a restart. Linux jobs offered before this point were
+	// declined as "cannot handle"; the provider re-offers them on the next
+	// poll or webhook, so nothing is permanently lost — only delayed.
+	if linuxDispatchPending {
+		go func() {
+			dc := <-dispatchCh
+			if dc == nil {
+				// The ladder gave up. Already logged, loudly, by the
+				// start goroutine. Windows jobs are unaffected.
+				return
+			}
+			sched.SetLinuxDispatcher(dc)
+			log.Info("Linux job dispatch enabled (sidecar VM finished starting after the scheduler)")
+			if cfg.Metrics.Enabled {
+				startLinuxStatsConsumer(ctx, dc, cfg.Metrics.ParsedContainerStatsInterval(), log)
+			}
+		}()
 	}
 
 	// Pull the macOS base image (Tart OCI) in the background so the

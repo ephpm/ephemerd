@@ -61,7 +61,7 @@ type hypervLinuxVM struct {
 func StartLinuxVM(cfg LinuxVMConfig) (LinuxVM, error) {
 	cfg.SetDefaults()
 
-	vmName, err := generateDistroName("ephemerd-linux")
+	vmName, err := generateDistroName(linuxVMNamePrefix)
 	if err != nil {
 		return nil, fmt.Errorf("generating VM name: %w", err)
 	}
@@ -174,19 +174,68 @@ func (l *hypervLinuxVM) Stop() {
 }
 
 // cleanupStaleVMs terminates any leftover ephemerd-linux-* VMs from a
-// previous run or crash using the HCS enumerate API.
+// previous run or crash using the HCS enumerate API, and then removes the HCN
+// endpoints those VMs left behind.
 func (l *hypervLinuxVM) cleanupStaleVMs() {
 	systems, err := hcsEnumerate("")
 	if err != nil {
 		l.cfg.Log.Warn("enumerating HCS compute systems for cleanup", "error", err)
+	} else {
+		for _, sys := range systems {
+			if sys.Owner != "ephemerd" {
+				continue
+			}
+			l.cfg.Log.Info("cleaning up stale Hyper-V VM", "id", sys.ID, "owner", sys.Owner, "state", sys.State)
+			l.terminateStaleVM(sys.ID)
+		}
+	}
+	// Endpoints are NOT compute systems and are not covered by the sweep
+	// above; they must be reclaimed by name. Runs after the VMs are gone so
+	// no endpoint being deleted is still attached to a live adapter.
+	l.cleanupStaleEndpoints()
+}
+
+// linuxVMNamePrefix / linuxVMEndpointSuffix name the resources one daemon
+// creates for its Linux sidecar: the VM is "<prefix>-<8 hex>" and its HCN
+// endpoint is that name plus the suffix. cleanupStaleEndpoints matches on the
+// pair, so the two must stay together.
+const (
+	linuxVMNamePrefix     = "ephemerd-linux"
+	linuxVMEndpointSuffix = "-ep"
+)
+
+// cleanupStaleEndpoints deletes HCN endpoints left over from a previous
+// daemon's Linux sidecar.
+//
+// WHY THIS IS NEEDED AND WHY IT IS SAFE. hypervLinuxVM.Stop is the only thing
+// that deletes the endpoint, and it does so from l.endpointID — which lives in
+// a struct only the start goroutine owns. Daemon shutdown will ABANDON a start
+// ladder that has not finished within its grace (cmd/ephemerd's
+// linuxVMShutdownGrace): it cannot touch linuxVM without racing the goroutine,
+// so Stop never runs and the endpoint survives the process. So does a hard
+// crash or an SCM kill. Endpoints are persistent HNS objects; they accumulate
+// one per abandoned start, each pinning an IP on the Default Switch.
+//
+// Reclaiming by name is safe because the whole naming scheme belongs to this
+// daemon (one ephemerd per host, one sidecar per ephemerd) and this runs
+// BEFORE our own endpoint is created, so nothing matched here can be ours.
+// That is the same assumption cleanupStaleVMs already makes when it terminates
+// every compute system owned by "ephemerd".
+func (l *hypervLinuxVM) cleanupStaleEndpoints() {
+	endpoints, err := hcn.ListEndpoints()
+	if err != nil {
+		l.cfg.Log.Warn("listing HCN endpoints for cleanup", "error", err)
 		return
 	}
-	for _, sys := range systems {
-		if sys.Owner != "ephemerd" {
+	for i := range endpoints {
+		ep := endpoints[i]
+		if !strings.HasPrefix(ep.Name, linuxVMNamePrefix+"-") || !strings.HasSuffix(ep.Name, linuxVMEndpointSuffix) {
 			continue
 		}
-		l.cfg.Log.Info("cleaning up stale Hyper-V VM", "id", sys.ID, "owner", sys.Owner, "state", sys.State)
-		l.terminateStaleVM(sys.ID)
+		l.cfg.Log.Info("cleaning up stale HCN endpoint from a previous run", "name", ep.Name, "id", ep.Id)
+		if err := ep.Delete(); err != nil {
+			l.cfg.Log.Warn("deleting stale HCN endpoint", "name", ep.Name, "id", ep.Id, "error", err)
+		}
 	}
 }
 
@@ -747,7 +796,7 @@ func (l *hypervLinuxVM) createNetworkEndpoint() (string, error) {
 	}
 
 	endpoint := &hcn.HostComputeEndpoint{
-		Name:               l.vmName + "-ep",
+		Name:               l.vmName + linuxVMEndpointSuffix,
 		HostComputeNetwork: network.Id,
 		SchemaVersion: hcn.SchemaVersion{
 			Major: 2,

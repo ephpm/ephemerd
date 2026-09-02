@@ -5,6 +5,7 @@ package buildkit
 import (
 	"context"
 	"fmt"
+	"io"
 	"path/filepath"
 
 	ctd "github.com/containerd/containerd/v2/client"
@@ -14,7 +15,6 @@ import (
 	"github.com/moby/buildkit/util/network"
 	"github.com/moby/buildkit/util/network/netproviders"
 	"github.com/moby/buildkit/worker"
-	"github.com/moby/buildkit/worker/base"
 	"github.com/moby/buildkit/worker/containerd"
 )
 
@@ -62,6 +62,14 @@ func newWorkerController(ctx context.Context, cfg Config, _ *session.Manager) (*
 	// forever. See GCConfig.
 	workerOpt.GCPolicy = cfg.GC.PruneInfo()
 
+	// From here on workerOpt.MetadataStore is an OPEN bbolt file
+	// (<DataDir>/worker/metadata_v2.db) under an exclusive flock, and `extra`
+	// collects anything else this function opens. EVERY error return below
+	// must go through finishWorkerController or unwind by hand — see that
+	// function's ownership contract for why a leaked handle here is the
+	// precondition for an unrecoverable node.
+	var extra []io.Closer
+
 	if cfg.Network != nil {
 		hcnProvider := newHCNNetworkProvider(cfg.Network, cfg.Log)
 		np := map[pb.NetMode]network.Provider{
@@ -75,8 +83,12 @@ func newWorkerController(ctx context.Context, cfg Config, _ *session.Manager) (*
 		// same containerd is harmless (gRPC connections are independent).
 		client, err := ctd.New(opts.Address, ctd.WithDefaultNamespace(opts.Namespace))
 		if err != nil {
+			// The metadata store is already open; nothing downstream will
+			// ever close it if we return from here.
+			closeQuietly(cfg.Log, workerOpt.MetadataStore, "hcn executor client dial failed")
 			return nil, fmt.Errorf("buildkit hcn executor client: %w", err)
 		}
+		extra = append(extra, client)
 		executorOpts := containerdexecutor.ExecutorOptions{
 			Client:           client,
 			Root:             workerOpt.Root,
@@ -94,14 +106,5 @@ func newWorkerController(ctx context.Context, cfg Config, _ *session.Manager) (*
 		workerOpt.NetworkProviders = np
 	}
 
-	w, err := base.NewWorker(ctx, workerOpt)
-	if err != nil {
-		return nil, fmt.Errorf("new worker: %w", err)
-	}
-
-	wc := &worker.Controller{}
-	if err := wc.Add(w); err != nil {
-		return nil, fmt.Errorf("add worker: %w", err)
-	}
-	return wc, nil
+	return finishWorkerController(ctx, workerOpt, extra, cfg.Log)
 }
