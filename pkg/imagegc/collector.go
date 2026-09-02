@@ -121,6 +121,9 @@ type Result struct {
 	// Skipped reports that the pass did not run because the failsafe
 	// backoff was still in effect.
 	Skipped bool
+	// Forced reports that the pass ignored the watermarks because an
+	// operator asked for a full eviction.
+	Forced bool
 }
 
 // EnsureHeadroom runs a collection pass if — and only if — the disk is
@@ -170,6 +173,26 @@ func (c *Collector) EnsureHeadroom(ctx context.Context) {
 // further passes for ExhaustedBackoff so the daemon does not spin listing
 // and re-planning a store it cannot shrink.
 func (c *Collector) Collect(ctx context.Context) (Result, error) {
+	return c.collect(ctx, false)
+}
+
+// CollectAll runs one pass that evicts EVERY unprotected image record,
+// whether or not the disk is over a watermark. It is the operator override
+// behind `ephemerd cache clear containerd --all`.
+//
+// It forces the POLICY, not the safety: images backing running containers
+// and the node's pinned runner images are protected here exactly as they are
+// in the automatic pass (see PlanForced). It also ignores the exhausted
+// backoff — that failsafe exists to stop the daemon spinning on its own
+// timer, and a human typing --all is not the daemon's timer.
+//
+// Cost is a cold image store: the next job on this node re-pulls everything.
+// That is the operator's stated intent when they pass --all.
+func (c *Collector) CollectAll(ctx context.Context) (Result, error) {
+	return c.collect(ctx, true)
+}
+
+func (c *Collector) collect(ctx context.Context, force bool) (Result, error) {
 	if c == nil {
 		return Result{}, nil
 	}
@@ -178,6 +201,7 @@ func (c *Collector) Collect(ctx context.Context) (Result, error) {
 
 	log := c.cfg.Log
 	var res Result
+	res.Forced = force
 
 	before, err := diskspace.Check(c.cfg.Path)
 	if err != nil {
@@ -186,14 +210,15 @@ func (c *Collector) Collect(ctx context.Context) (Result, error) {
 	res.Before, res.After = before, before
 	res.Pressure = Evaluate(before, c.cfg.Thresholds)
 
-	if res.Pressure.Over && c.now().Before(c.exhaustedUntil) {
+	if !force && res.Pressure.Over && c.now().Before(c.exhaustedUntil) {
 		res.Skipped = true
 		log.Debug("image gc suppressed; previous pass exhausted every evictable image",
 			"until", c.exhaustedUntil)
 		return res, nil
 	}
 	// Nothing to do: not under pressure and no age backstop configured.
-	if !res.Pressure.Over && c.cfg.MaxAge <= 0 {
+	// A forced pass always has something to do.
+	if !force && !res.Pressure.Over && c.cfg.MaxAge <= 0 {
 		return res, nil
 	}
 
@@ -243,16 +268,22 @@ func (c *Collector) Collect(ctx context.Context) (Result, error) {
 		}
 	}
 
-	if !res.Pressure.Over {
+	if !force && !res.Pressure.Over {
 		res.After, _ = diskspace.Check(c.cfg.Path)
 		return res, nil
 	}
 
 	plan := PlanEviction(cands, protected, before, c.cfg.Thresholds)
+	// A forced pass takes everything unprotected instead of stopping at the
+	// low watermark — that is the whole point of the operator override.
+	if force {
+		plan = PlanForced(cands, protected)
+	}
 	res.Protected = plan.Protected
 
-	log.Info("image gc: disk over high watermark",
+	log.Info("image gc: evicting image records",
 		"path", c.cfg.Path,
+		"forced", force,
 		"used_percent", round1(before.UsedPercent()),
 		"free_gib", round1(diskspace.GiB(before.FreeBytes)),
 		"total_gib", round1(diskspace.GiB(before.TotalBytes)),
@@ -263,25 +294,44 @@ func (c *Collector) Collect(ctx context.Context) (Result, error) {
 		"protected", plan.Protected)
 
 	// Stop as soon as a real reading clears both watermarks; the planned
-	// sizes are only a budgeting hint.
+	// sizes are only a budgeting hint. A forced pass has no stopping point
+	// short of the whole plan, so it passes no stop function.
 	cleared := false
-	res.Evicted = Evict(ctx, c.cfg.Client, plan.Evict, true, log, func() bool {
-		u, err := diskspace.Check(c.cfg.Path)
-		if err != nil {
+	var stop func() bool
+	if !force {
+		stop = func() bool {
+			u, err := diskspace.Check(c.cfg.Path)
+			if err != nil {
+				return false
+			}
+			res.After = u
+			if !Evaluate(u, c.cfg.Thresholds).Over {
+				cleared = true
+				return true
+			}
 			return false
 		}
-		res.After = u
-		if !Evaluate(u, c.cfg.Thresholds).Over {
-			cleared = true
-			return true
-		}
-		return false
-	})
+	}
+	res.Evicted = Evict(ctx, c.cfg.Client, plan.Evict, true, log, stop)
 
 	after, err := diskspace.Check(c.cfg.Path)
 	if err == nil {
 		res.After = after
 		cleared = !Evaluate(after, c.cfg.Thresholds).Over
+	}
+
+	// A forced pass was never chasing a watermark, so it must not arm the
+	// exhausted-backoff failsafe: doing so would let one operator-run
+	// `cache clear --all` silence the AUTOMATIC collector for the next 30
+	// minutes on a node that is genuinely filling up.
+	if force {
+		log.Info("image gc: forced pass complete",
+			"evicted", res.Evicted,
+			"protected", res.Protected,
+			"used_percent", round1(res.After.UsedPercent()),
+			"free_gib", round1(diskspace.GiB(res.After.FreeBytes)),
+			"reclaimed_gib", round1(diskspace.GiB(saturatingSub(res.After.FreeBytes, before.FreeBytes))))
+		return res, nil
 	}
 
 	switch {

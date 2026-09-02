@@ -498,7 +498,20 @@ func (r *Runtime) teardownContainer(ctx context.Context, c client.Container, log
 				}
 				exitCh, err := task.Wait(ctx)
 				if err == nil {
-					<-exitCh
+					// Bounded, for the same reason destroySteps' wait is
+					// (#190): a dead containerd shim never delivers the
+					// exit event, and this used to be a bare <-exitCh.
+					// That is far worse here than in Destroy — the
+					// startup CleanOrphans caller runs BEFORE the
+					// scheduler accepts jobs, so one leftover container
+					// with a dead shim hung daemon startup indefinitely
+					// and the node never came back. The periodic reaper
+					// only ever passes provably-dead tasks, so this
+					// branch is a no-op for it either way.
+					if !waitTaskExit(ctx, exitCh, destroyKillWait) {
+						log.Warn("killed orphan task never reported exit; proceeding with teardown",
+							"waited", destroyKillWait)
+					}
 				}
 			}
 		}

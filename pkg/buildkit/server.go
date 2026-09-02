@@ -12,6 +12,7 @@ package buildkit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -127,15 +128,39 @@ type Server struct {
 	// heal.go.
 	healer Healer
 
-	// mu guards core. Readers (Build, Client, Prune) hold it only long
-	// enough to take the pointer, never for the duration of a solve: a
-	// Rebuild must not have to wait out a multi-hour build before it can
-	// replace a store it already knows is corrupt.
+	// mu guards core, closed and rebuildErr. Readers (Build, Client, Prune)
+	// hold it only long enough to take the pointer, never for the duration
+	// of a solve: a Rebuild must not have to wait out a multi-hour build
+	// before it can replace a store it already knows is corrupt.
 	mu   sync.RWMutex
 	core *serverCore
+	// closed records that Close ran. Distinguishes an intentionally shut
+	// down server from one left core-less by a failed Rebuild — the two
+	// need very different operator messages.
+	closed bool
+	// rebuildErr is why the last Rebuild could not produce a working core.
+	// Kept so every subsequent build can name the ORIGINAL cause instead of
+	// a generic "unavailable"; cleared by a Rebuild that succeeds.
+	rebuildErr error
 
 	once sync.Once
 }
+
+// ErrServerClosed is returned by build paths after Close.
+var ErrServerClosed = errors.New("buildkit: server is closed")
+
+// ErrStoreUnavailable is returned by build paths when Rebuild tore the old
+// solver down and could not stand a new one up.
+//
+// WHY THIS EXISTS. Rebuild MUST stop the old core before it can quarantine
+// the data dir (see Rebuild), so a newCore failure leaves the Server with no
+// solver at all. Before this error existed, s.core kept pointing at the
+// already-stopped core: every later build dialed a dead in-process gRPC
+// server and failed with an opaque transport error, forever, while the node
+// stayed "healthy" in every health check and kept accepting jobs — a
+// build-dead node that only a daemon restart cleared. Naming the state gives
+// the operator the one instruction that actually works.
+var ErrStoreUnavailable = errors.New("buildkit: shared build store is unavailable after a failed metadata-store rebuild; restart ephemerd on this node to recover")
 
 // serverCore is everything that is discarded and rebuilt when the BuildKit
 // metadata store has to be reconstructed. Grouping it means Rebuild swaps one
@@ -152,16 +177,26 @@ type serverCore struct {
 
 	// stop is closed on shutdown to signal graceful stop to the Controller.
 	stop chan struct{}
+
+	// closeOnce makes close idempotent. Rebuild closes the OLD core and
+	// Server.Close closes whatever core is current; a Rebuild that failed
+	// used to leave both pointing at the same core, and the second
+	// `close(c.stop)` panicked the daemon on shutdown ("close of closed
+	// channel"). The nil-ing in Rebuild removes that aliasing, but a
+	// teardown path must never be one refactor away from a panic.
+	closeOnce sync.Once
 }
 
 // close tears down one core. Safe to call on a core whose gRPC server has
-// already stopped.
+// already stopped, and safe to call more than once.
 func (c *serverCore) close() {
 	if c == nil {
 		return
 	}
-	close(c.stop)
-	c.grpcServ.GracefulStop()
+	c.closeOnce.Do(func() {
+		close(c.stop)
+		c.grpcServ.GracefulStop()
+	})
 }
 
 // NewServer constructs and initializes an embedded BuildKit server. The
@@ -365,39 +400,138 @@ func (s *Server) PruneAll(ctx context.Context) (int64, error) {
 //
 // In-flight solves against the old controller fail when its gRPC server stops.
 // They were failing anyway — that is why we are here.
+//
+// FAILURE-PATH CONTRACT. The old core cannot be kept as a fallback: it holds
+// open bbolt handles inside DataDir, and the quarantine rename cannot happen
+// (on Windows, cannot happen AT ALL) while they are open, so stopping it is
+// unavoidably the first step — and grpc.Server.GracefulStop is one-way, so a
+// stopped core can never be handed back out. Rebuild therefore drops s.core
+// to nil up front and only ever installs a core it has just verified. On a
+// newCore failure it restores the quarantined store and makes ONE attempt to
+// re-init against it (the common cause is a transient containerd blip, and
+// the restored store is exactly what was serving builds a moment ago); if
+// that also fails, s.core stays nil and every build path fails fast with
+// ErrStoreUnavailable instead of dialing a dead gRPC server forever.
 func (s *Server) Rebuild(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.closed {
+		return ErrServerClosed
+	}
+
 	old := s.core
+	// Nil FIRST, under the same lock that closes it: from here until a new
+	// core is installed there is no usable solver, and readers must be told
+	// that rather than handed a pointer to a server being torn down.
+	s.core = nil
 	if old != nil {
 		old.close()
 	}
 
 	quarantine, err := quarantineDir(s.cfg.DataDir, time.Now())
 	if err != nil {
+		s.rebuildErr = err
 		return err
 	}
 	if err := os.Rename(s.cfg.DataDir, quarantine); err != nil {
-		return fmt.Errorf("buildkit: quarantine metadata store %s: %w", s.cfg.DataDir, err)
+		err = fmt.Errorf("buildkit: quarantine metadata store %s: %w", s.cfg.DataDir, err)
+		// The store is untouched on disk (the rename never happened), so
+		// the old core's replacement can still come straight back up.
+		s.reinitAfterFailedRebuild(ctx, err)
+		return err
 	}
 	pruneOldQuarantines(filepath.Dir(s.cfg.DataDir), quarantine, s.cfg.Log)
 
 	core, err := newCore(ctx, s.cfg)
 	if err != nil {
+		// Clear the half-built store first. newCore MkdirAll's DataDir (and
+		// may get as far as creating an empty cache.db/history.db) before
+		// the step that failed, so the restore below would be a rename onto
+		// an existing directory — which fails outright on Windows and fails
+		// on Linux the moment the new dir is non-empty. Everything at this
+		// path was created by the newCore call that just failed; the real
+		// store is safely at `quarantine`.
+		if rerr := os.RemoveAll(s.cfg.DataDir); rerr != nil {
+			s.cfg.Log.Warn("buildkit: could not clear the half-built metadata store before restoring",
+				"data_dir", s.cfg.DataDir, "error", rerr)
+		}
 		// Put the old store back: a broken cache is still better than no
 		// solver at all, and the next build will retry the repair.
 		if rerr := os.Rename(quarantine, s.cfg.DataDir); rerr != nil {
 			s.cfg.Log.Error("buildkit: could not restore the quarantined metadata store",
 				"quarantine", quarantine, "data_dir", s.cfg.DataDir, "error", rerr)
+			s.rebuildErr = err
+			return fmt.Errorf("buildkit: rebuild solver: %w", err)
 		}
-		return fmt.Errorf("buildkit: rebuild solver: %w", err)
+		err = fmt.Errorf("buildkit: rebuild solver: %w", err)
+		s.reinitAfterFailedRebuild(ctx, err)
+		return err
 	}
 	s.core = core
+	s.rebuildErr = nil
 
 	s.cfg.Log.Warn("buildkit: metadata store rebuilt after a dangling-snapshot failure; the build cache is cold",
 		"data_dir", s.cfg.DataDir, "quarantined_to", quarantine)
 	return nil
+}
+
+// reinitAfterFailedRebuild makes one attempt to stand a core back up against
+// the store now on disk, so a Rebuild that failed for a transient reason
+// (containerd restarting under us is the observed one) does not cost the node
+// its solver until the next daemon restart. Caller holds s.mu.
+//
+// cause is the error Rebuild is already returning; it is recorded either way
+// so ErrStoreUnavailable can name the original failure rather than the
+// second-order one. On success the node is degraded (the cache was NOT
+// rebuilt, so the corruption that triggered this is still there and the heal
+// ladder will fire again) but it is not build-dead, which is the difference
+// that matters.
+func (s *Server) reinitAfterFailedRebuild(ctx context.Context, cause error) {
+	core, err := newCore(ctx, s.cfg)
+	if err != nil {
+		s.rebuildErr = cause
+		s.cfg.Log.Error("buildkit: rebuild failed and the solver could not be restarted against the restored store; builds on this node will fail until ephemerd restarts",
+			"data_dir", s.cfg.DataDir, "cause", cause, "reinit_error", err)
+		return
+	}
+	s.core = core
+	s.rebuildErr = nil
+	s.cfg.Log.Warn("buildkit: rebuild failed; the previous metadata store was restored and the solver restarted against it — the store is still suspect",
+		"data_dir", s.cfg.DataDir, "cause", cause)
+}
+
+// coreUnavailableErr maps the Server's core state to the error a build path
+// must return when there is no core to dial. Pure, so the state machine that
+// used to be "silently return a stopped core" is table-testable.
+//
+// hasCore true means callers should proceed; it returns nil only in that
+// case.
+func coreUnavailableErr(hasCore, closed bool, rebuildErr error) error {
+	if hasCore {
+		return nil
+	}
+	if closed {
+		return ErrServerClosed
+	}
+	if rebuildErr != nil {
+		return fmt.Errorf("%w (last rebuild error: %v)", ErrStoreUnavailable, rebuildErr)
+	}
+	return ErrStoreUnavailable
+}
+
+// currentOrErr returns the live core, or the reason there isn't one. Every
+// build path goes through this rather than nil-checking current(), so
+// "no solver" always reaches the operator as a diagnosis instead of as a
+// dial failure against a stopped server.
+func (s *Server) currentOrErr() (*serverCore, error) {
+	s.mu.RLock()
+	core, closed, rerr := s.core, s.closed, s.rebuildErr
+	s.mu.RUnlock()
+	if err := coreUnavailableErr(core != nil, closed, rerr); err != nil {
+		return nil, err
+	}
+	return core, nil
 }
 
 // Client returns a buildkit client.Client connected to the in-process
@@ -405,9 +539,9 @@ func (s *Server) Rebuild(ctx context.Context) error {
 // use across different callers — construct one per request/goroutine and
 // Close it when done.
 func (s *Server) Client(ctx context.Context) (*client.Client, error) {
-	core := s.current()
-	if core == nil {
-		return nil, fmt.Errorf("buildkit: server is closed")
+	core, err := s.currentOrErr()
+	if err != nil {
+		return nil, err
 	}
 	dialer := func(ctx context.Context, _ string) (net.Conn, error) {
 		return core.bufnet.DialContext(ctx)
@@ -502,13 +636,17 @@ type pruneOptionFunc func(*client.PruneInfo)
 func (f pruneOptionFunc) SetPruneOption(pi *client.PruneInfo) { f(pi) }
 
 // Close signals the Controller to shut down gracefully, stops the in-process
-// gRPC server, and releases worker resources. Safe to call multiple times.
+// gRPC server, and releases worker resources. Safe to call multiple times —
+// belt (s.once) and braces (serverCore.closeOnce), because a double
+// `close(core.stop)` is a daemon panic on the shutdown path, where there is
+// nothing left to catch it.
 func (s *Server) Close() error {
 	s.once.Do(func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.core.close()
 		s.core = nil
+		s.closed = true
 	})
 	return nil
 }

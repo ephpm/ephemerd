@@ -141,7 +141,7 @@ func (p *Pruner) Prune(ctx context.Context, targets []string, all bool) []Result
 		case TargetBuildKit:
 			results = append(results, p.pruneBuildKit(ctx, all))
 		case TargetContainerd:
-			results = append(results, p.pruneContainerd(ctx))
+			results = append(results, p.pruneContainerd(ctx, all))
 		}
 	}
 	return results
@@ -199,17 +199,56 @@ func (p *Pruner) pruneBuildKit(ctx context.Context, all bool) Result {
 	return res
 }
 
-// pruneContainerd runs one image-collector pass. Under no disk pressure
+// collectPass names which image-collector entry point a containerd prune
+// request maps to. Split out as a pure function so the routing is
+// table-testable without a live containerd — the bug it guards against is
+// exactly that the request's `all` flag never reached the collector at all.
+type collectPass string
+
+const (
+	// passWatermark is the ordinary policy pass: evict only what disk
+	// pressure justifies.
+	passWatermark collectPass = "watermark"
+	// passForced is the operator override: evict every unprotected record.
+	passForced collectPass = "forced"
+)
+
+func containerdPass(all bool) collectPass {
+	if all {
+		return passForced
+	}
+	return passWatermark
+}
+
+// pruneContainerd runs one image-collector pass.
+//
+// all=false runs the ordinary watermark-driven pass. Under no disk pressure
 // that is a no-op by design: the collector protects images referenced by
 // running containers and the node's pinned runner images, and evicting a
 // warm image store on demand would only cost a re-pull.
-func (p *Pruner) pruneContainerd(ctx context.Context) Result {
+//
+// all=true is the operator override. It used to be SILENTLY DROPPED — this
+// function took no all parameter at all, so `ephemerd cache clear containerd
+// --all` ran the same watermark pass, correctly evicted nothing on a node
+// whose thresholds were not tripped, and reported success with zero records
+// removed. An operator chasing disk on a Windows node had no way to force
+// eviction and no way to tell the flag was being ignored. It now forces the
+// policy open (CollectAll) while keeping the safety: live-container images
+// and pinned runner images are still an absolute veto.
+func (p *Pruner) pruneContainerd(ctx context.Context, all bool) Result {
 	res := Result{Name: TargetContainerd}
 	if p.ImageGC == nil {
 		res.Err = fmt.Errorf("image gc is disabled on this node")
 		return res
 	}
-	gcRes, err := p.ImageGC.Collect(ctx)
+	var gcRes imagegc.Result
+	var err error
+	switch containerdPass(all) {
+	case passForced:
+		gcRes, err = p.ImageGC.CollectAll(ctx)
+	default:
+		gcRes, err = p.ImageGC.Collect(ctx)
+	}
 	if err != nil {
 		res.Err = err
 		return res

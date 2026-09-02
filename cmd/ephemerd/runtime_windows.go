@@ -3,12 +3,37 @@
 package main
 
 import (
+	"context"
 	"log/slog"
+	"time"
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/ephpm/ephemerd/pkg/containerd"
 	"github.com/ephpm/ephemerd/pkg/scheduler"
 	"github.com/ephpm/ephemerd/pkg/vm"
+)
+
+// Linux-sidecar start retry ladder.
+//
+// WHY IT EXISTS. vm.StartLinuxVM used to be a single shot: one error and the
+// goroutine logged "Linux jobs will not be available on this host" and gave
+// up for the daemon's entire uptime. The failures that actually happen on
+// this fleet are transient cold-boot ones — vmcompute/HCS and the Hyper-V
+// services are still coming up when ephemerd's service start races them
+// after a host reboot — so a node that would have been fine 20 seconds later
+// silently lost all of its Linux capacity, kept reporting healthy, and kept
+// accepting Windows jobs. Nobody noticed until Linux jobs queued.
+//
+// PARAMS. 10 attempts × 6s ≈ 1 minute of tolerance, matching the shape of
+// the networking.New ladder (30 × 2s) that #189 added for the same class of
+// post-boot race but with a longer per-attempt delay: each StartLinuxVM
+// attempt is itself expensive (WSL import + binary copy) and does its own
+// blocking, so hammering it every 2s buys nothing. A minute comfortably
+// covers vmcompute settling; anything longer is a real misconfiguration that
+// retrying will not fix, and the give-up log is the signal for it.
+const (
+	linuxVMStartAttempts = 10
+	linuxVMStartDelay    = 6 * time.Second
 )
 
 // startContainerRuntime starts containerd in-process for Windows jobs.
@@ -44,24 +69,43 @@ func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool
 	var dispatchClient *scheduler.DispatchClient
 	linuxVMDone := make(chan struct{})
 
+	// The retry ladder needs a cancellable ctx and startContainerRuntime
+	// takes none (the signature is shared with the Linux/macOS builds), so
+	// own one here. cleanup cancels it before waiting on linuxVMDone —
+	// otherwise a shutdown that lands mid-ladder would block the whole
+	// daemon stop for the ladder's remaining budget.
+	vmCtx, cancelVMStart := context.WithCancel(context.Background())
+
 	go func() {
 		defer close(linuxVMDone)
 		log.Info("starting Linux VM in background (Hyper-V)")
 
-		lvm, err := vm.StartLinuxVM(vm.LinuxVMConfig{
-			DataDir:             dataDir,
-			CPUs:                linuxVMCPUs,
-			MemoryMB:            linuxVMMemoryMB,
-			DiskSizeGB:          linuxVMDiskSizeGB,
-			DindEnabled:         dindEnabled,
-			DindAllowPrivileged: dindAllowPrivileged,
-			// Share the host's data dir read-only so the in-VM ephemerd
-			// reads the same config.toml. See docs/arch/plan9-config-share.md.
-			HostDataDir: dataDir,
-			Log:         log,
+		// Retrying StartLinuxVM is safe: it opens with cleanupStaleVMs (which
+		// removes a previous attempt's distro) and every step after the boot
+		// calls l.Stop() on its own way out, so a failed attempt does not
+		// leave a half-built VM for the next one to trip over.
+		lvm, err := retryInit(vmCtx, linuxVMStartAttempts, linuxVMStartDelay, log, "Linux VM", func() (vm.LinuxVM, error) {
+			return vm.StartLinuxVM(vm.LinuxVMConfig{
+				DataDir:             dataDir,
+				CPUs:                linuxVMCPUs,
+				MemoryMB:            linuxVMMemoryMB,
+				DiskSizeGB:          linuxVMDiskSizeGB,
+				DindEnabled:         dindEnabled,
+				DindAllowPrivileged: dindAllowPrivileged,
+				// Share the host's data dir read-only so the in-VM ephemerd
+				// reads the same config.toml. See docs/arch/plan9-config-share.md.
+				HostDataDir: dataDir,
+				Log:         log,
+			})
 		})
 		if err != nil {
-			log.Warn("Linux VM not started — Linux jobs will not be available on this host", "error", err)
+			// Still fail-soft, deliberately: the Linux sidecar is extra
+			// capacity, not a dependency of the Windows runtime that is
+			// already up and serving. Exiting non-zero here would turn a
+			// missing sidecar into a Windows-CI outage, which is strictly
+			// worse than the queueing it replaces.
+			log.Error("Linux VM not started after retries — Linux jobs will not be available on this host; Windows jobs are unaffected",
+				"attempts", linuxVMStartAttempts, "error", err)
 			return
 		}
 
@@ -92,6 +136,8 @@ func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool
 	}
 
 	cleanup = func() {
+		// Abort an in-progress start ladder first; see vmCtx above.
+		cancelVMStart()
 		<-linuxVMDone
 		if dispatchClient != nil {
 			if err := dispatchClient.Close(); err != nil {

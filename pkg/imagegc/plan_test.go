@@ -418,3 +418,99 @@ func TestPressure_ReasonString(t *testing.T) {
 		t.Errorf("ReasonString() on empty = %q, want empty", got)
 	}
 }
+
+// TestPlanForced covers the operator override behind `cache clear containerd
+// --all`. Two properties matter, and they pull in opposite directions:
+// forcing must beat the watermark policy (the whole complaint was that
+// --all evicted nothing on a node under no pressure), and it must NOT beat
+// the protected set (evicting a running job's image or a pinned runner image
+// is a broken job or a re-pull on every subsequent one).
+func TestPlanForced(t *testing.T) {
+	tests := []struct {
+		name       string
+		candidates []Candidate
+		protected  map[string]struct{}
+		wantEvict  []string
+		wantProt   int
+	}{
+		{
+			name:       "no pressure is irrelevant: everything unprotected goes",
+			candidates: []Candidate{cand("a", 1, 5), cand("b", 9, 5), cand("c", 3, 5)},
+			protected:  set(),
+			// LRU first: oldest access leads.
+			wantEvict: []string{"b", "c", "a"},
+		},
+		{
+			name:       "a running job's image is still an absolute veto",
+			candidates: []Candidate{cand("busy", 30, 20), cand("cold", 1, 1)},
+			protected:  set("busy"),
+			wantEvict:  []string{"cold"},
+			wantProt:   1,
+		},
+		{
+			name:       "pinned runner images are still an absolute veto",
+			candidates: []Candidate{cand("runner:latest", 40, 8), cand("scratch", 2, 1)},
+			protected:  set("runner:latest"),
+			wantEvict:  []string{"scratch"},
+			wantProt:   1,
+		},
+		{
+			// The failure mode this must NOT have: --all wiping a node whose
+			// every image is live.
+			name:       "everything protected evicts nothing",
+			candidates: []Candidate{cand("a", 5, 1), cand("b", 6, 1)},
+			protected:  set("a", "b"),
+			wantEvict:  nil,
+			wantProt:   2,
+		},
+		{
+			name:       "empty store is a no-op, not an error",
+			candidates: nil,
+			protected:  set(),
+			wantEvict:  nil,
+		},
+		{
+			// Unknown size (non-positive) must stay eligible, matching
+			// PlanEviction — a record with no size is not invisible.
+			name: "unknown-size records are still evicted",
+			candidates: []Candidate{
+				{Namespace: "ephemerd", Name: "sizeless", LastAccessed: time.Time{}},
+			},
+			protected: set(),
+			wantEvict: []string{"sizeless"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := PlanForced(tc.candidates, tc.protected)
+			if !p.Over {
+				t.Error("Plan.Over = false; a forced pass is always 'over' so callers treat it as a real pass")
+			}
+			if p.ReasonString() != ReasonForced {
+				t.Errorf("reason = %q, want %q", p.ReasonString(), ReasonForced)
+			}
+			if got := names(p.Evict); !reflect.DeepEqual(got, tc.wantEvict) {
+				t.Errorf("evict = %v, want %v", got, tc.wantEvict)
+			}
+			if p.Protected != tc.wantProt {
+				t.Errorf("protected = %d, want %d", p.Protected, tc.wantProt)
+			}
+		})
+	}
+}
+
+// TestPlanForced_BeatsWatermarkPolicy is the regression proper: on a node
+// with plenty of free space PlanEviction correctly plans nothing, and that
+// emptiness is what an operator's --all used to inherit.
+func TestPlanForced_BeatsWatermarkPolicy(t *testing.T) {
+	cands := []Candidate{cand("a", 10, 5), cand("b", 2, 5)}
+	idle := usage(500, 400) // 20% used — nowhere near the 85% high mark
+
+	if plan := PlanEviction(cands, set(), idle, defaults); len(plan.Evict) != 0 {
+		t.Fatalf("PlanEviction planned %v under no pressure; test premise is wrong", names(plan.Evict))
+	}
+	if got := names(PlanForced(cands, set()).Evict); !reflect.DeepEqual(got, []string{"a", "b"}) {
+		t.Errorf("PlanForced = %v, want both records evicted regardless of pressure", got)
+	}
+}
