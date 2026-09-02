@@ -92,7 +92,8 @@ func TestContainerdPass(t *testing.T) {
 
 // TestPruneContainerd_DisabledIsUnchangedByAll: --all forces the eviction
 // POLICY open, it does not conjure a collector. A node without image GC must
-// report the same clear reason either way.
+// report the same clear reason either way (the requested pass is appended for
+// diagnosis; the reason itself does not change).
 func TestPruneContainerd_DisabledIsUnchangedByAll(t *testing.T) {
 	p := &Pruner{}
 	for _, all := range []bool{false, true} {
@@ -109,15 +110,47 @@ func TestPruneContainerd_DisabledIsUnchangedByAll(t *testing.T) {
 	}
 }
 
-// TestPrune_ContainerdTargetThreadsAll walks the public entry point to prove
-// the flag survives the Prune -> pruneContainerd hop (the hop where it used
-// to be dropped).
+// TestPrune_ContainerdTargetThreadsAll walks the PUBLIC entry point to prove
+// the flag survives the Prune -> pruneContainerd hop — the hop where it used
+// to be dropped silently, so `cache clear containerd --all` ran a watermark
+// pass, evicted nothing, and reported success.
+//
+// It asserts on the pass NAME carried in the disabled-collector error, which
+// is the only externally visible evidence of what the flag became. Asserting
+// only "one result came back" (what this test used to do) proves nothing: a
+// nil ImageGC returns at the disabled guard, so the previous version of this
+// test passed identically whether `all` was threaded or hard-coded to false.
 func TestPrune_ContainerdTargetThreadsAll(t *testing.T) {
 	p := &Pruner{}
-	for _, all := range []bool{false, true} {
-		results := p.Prune(context.Background(), []string{TargetContainerd}, all)
+	for _, tc := range []struct {
+		all  bool
+		want collectPass
+	}{
+		{false, passWatermark},
+		{true, passForced},
+	} {
+		results := p.Prune(context.Background(), []string{TargetContainerd}, tc.all)
 		if len(results) != 1 || results[0].Name != TargetContainerd {
-			t.Fatalf("all=%v: results = %+v, want one containerd result", all, results)
+			t.Fatalf("all=%v: results = %+v, want one containerd result", tc.all, results)
 		}
+		if results[0].Err == nil {
+			t.Fatalf("all=%v: expected the disabled-collector error", tc.all)
+		}
+		if got := results[0].Err.Error(); !strings.Contains(got, string(tc.want)) {
+			t.Errorf("all=%v: err = %q, want it to name pass %q — the flag did not survive Prune -> pruneContainerd", tc.all, got, tc.want)
+		}
+	}
+}
+
+// TestPrune_ContainerdTargetThreadsAll_DistinguishesThePasses guards the
+// assertion above against a degenerate pass naming (e.g. both constants
+// becoming the same string), which would make it pass vacuously.
+func TestPrune_ContainerdTargetThreadsAll_DistinguishesThePasses(t *testing.T) {
+	if passWatermark == passForced {
+		t.Fatal("passWatermark and passForced are identical; the threading assertions above cannot distinguish them")
+	}
+	if strings.Contains(string(passForced), string(passWatermark)) ||
+		strings.Contains(string(passWatermark), string(passForced)) {
+		t.Fatalf("pass names %q and %q are substrings of one another; a Contains-based assertion would be ambiguous", passWatermark, passForced)
 	}
 }

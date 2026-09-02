@@ -237,13 +237,20 @@ func containerdPass(all bool) collectPass {
 // and pinned runner images are still an absolute veto.
 func (p *Pruner) pruneContainerd(ctx context.Context, all bool) Result {
 	res := Result{Name: TargetContainerd}
+	pass := containerdPass(all)
 	if p.ImageGC == nil {
-		res.Err = fmt.Errorf("image gc is disabled on this node")
+		// Naming the pass we WOULD have run is not decoration: it is the
+		// only externally visible evidence that the request's `all` flag
+		// reached this function at all, which is exactly the hop where it
+		// used to be dropped silently. It also tells an operator whose
+		// `--all` did nothing that the flag was understood and the
+		// collector is simply not configured on this node.
+		res.Err = fmt.Errorf("image gc is disabled on this node (requested pass: %s)", pass)
 		return res
 	}
 	var gcRes imagegc.Result
 	var err error
-	switch containerdPass(all) {
+	switch pass {
 	case passForced:
 		gcRes, err = p.ImageGC.CollectAll(ctx)
 	default:
