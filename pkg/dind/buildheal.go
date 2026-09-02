@@ -120,13 +120,30 @@ func (s *Server) healDanglingLease(ctx context.Context, bk *buildkit.Server, l b
 // prune to a rebuild. Returns false when the store could not be repaired at
 // all — the caller must then fail the build rather than retry.
 func (s *Server) applyHealAction(ctx context.Context, bk *buildkit.Server, action buildkit.HealAction, log *slog.Logger, report *buildkit.HealReport) bool {
+	// A canceled ctx (runner disconnected mid-build) must never escalate:
+	// the prune "failure" it produces is context.Canceled, not evidence of
+	// store inconsistency, and a Rebuild attempted under a dead ctx is the
+	// worst-case path — Rebuild stops the shared gRPC core first, and if
+	// newCore then fails the node is left build-dead until restart. Fail
+	// the (already-abandoned) build instead; a genuine desync will fire
+	// the ladder again from a live build.
+	if ctx.Err() != nil {
+		log.Warn("skipping shared-store repair under a canceled context", "error", ctx.Err())
+		return false
+	}
 	switch action {
 	case buildkit.HealPrune:
 		released, err := bk.PruneAll(ctx)
 		if err != nil {
 			// A prune that cannot even enumerate the store is itself
 			// evidence the metadata is inconsistent. Escalate now rather
-			// than burning another build to learn the same thing.
+			// than burning another build to learn the same thing — but
+			// never off the back of a canceled ctx (see above), whose
+			// prune failure proves nothing about the store.
+			if ctx.Err() != nil {
+				log.Warn("build cache prune canceled; not escalating", "error", err)
+				return false
+			}
 			log.Warn("build cache prune failed; escalating to a metadata rebuild", "error", err)
 			if rerr := bk.Rebuild(ctx); rerr != nil {
 				log.Error("rebuilding the buildkit metadata store failed", "error", rerr)

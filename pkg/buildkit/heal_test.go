@@ -399,3 +399,36 @@ func dirExists(p string) bool {
 	st, err := os.Stat(p)
 	return err == nil && st.IsDir()
 }
+
+// TestMatchersRejectJobInfluencedText pins the tail anchoring and the
+// near-miss shapes: the repair ladder throws away shared build cache, so it
+// must be unreachable from any error string a job can influence, and from
+// lease shapes that are not cache-record leases. A future "loosen the regex"
+// edit must fail here, not in production.
+func TestMatchersRejectJobInfluencedText(t *testing.T) {
+	reject := []struct{ name, msg string }{
+		// Attacker-influenced text is never the tail of the wrap chain —
+		// buildkit appends its own wrapping after job output / registry
+		// reason phrases. The anchor is what rejects these.
+		{"registry reason phrase gets wrapped",
+			`failed to solve: failed to load cache key: unexpected status from HEAD request to https://evil.example/v2/x/manifests/latest: 404 lease "aaaaaaaaaaaaaaaaaaaaaaaaa": not found (server message)`},
+		{"RUN output echoed into a failure gets wrapped",
+			`process "/bin/sh -c echo snapshot deadbeef does not exist: not found; false" did not complete successfully: exit code: 1`},
+		// Lease shapes that are not cache-record leases.
+		{"temporary lease shape", `lease "1755846719000000000-aBcD": not found`},
+		{"history lease ref_ prefix", `lease "ref_4igb5uptxddpdjw9lwatd9psk": not found`},
+		{"26-char id", `lease "4igb5uptxddpdjw9lwatd9pskx": not found`},
+		{"24-char id", `lease "4igb5uptxddpdjw9lwatd9ps": not found`},
+		{"id-less lease error", `lease does not exist: not found`},
+	}
+	for _, c := range reject {
+		t.Run(c.name, func(t *testing.T) {
+			if _, ok := ParseDanglingLease(c.msg); ok {
+				t.Fatalf("ParseDanglingLease matched %q, must reject", c.msg)
+			}
+			if _, ok := ParseDanglingSnapshot(c.msg); ok {
+				t.Fatalf("ParseDanglingSnapshot matched %q, must reject", c.msg)
+			}
+		})
+	}
+}

@@ -62,7 +62,12 @@ import (
 //
 // The ID character class allows the ':' and digest hex of a chain ID as well
 // as BuildKit's base-36 record IDs.
-var danglingSnapshotRe = regexp.MustCompile(`(?:parent )?snapshot ([A-Za-z0-9][A-Za-z0-9._:+\-]*) does not exist`)
+// Tail-anchored for the same reason as danglingLeaseRe below: the genuine
+// containerd error is the wrap chain's suffix ("... does not exist: not
+// found" ends the string), while a RUN command that merely PRINTS a matching
+// phrase gets further wrapping appended ("did not complete successfully:
+// exit code ..."), so job-controlled text cannot reach the repair ladder.
+var danglingSnapshotRe = regexp.MustCompile(`(?:parent )?snapshot ([A-Za-z0-9][A-Za-z0-9._:+\-]*) does not exist(?:: not found)?$`)
 
 // SnapshotKind classifies a dangling snapshot key by who owns it, which
 // decides what repairing it involves.
@@ -159,7 +164,15 @@ func DanglingSnapshotFromError(err error) (DanglingSnapshot, bool) {
 // derivative — followed by containerd's exact "not found" qualifies.
 // BuildKit's temporary leases have a different shape ("<nanos>-<base64>") and
 // a missing one does not indicate a persistent desync, so they do not match.
-var danglingLeaseRe = regexp.MustCompile(`lease "([a-z0-9]{25}(?:-view|-variants)?)": not found`)
+//
+// Anchored to the END of the error string: a genuine containerd not-found is
+// always the tail of the wrap chain, while job-influenced text (a hostile
+// registry's HTTP reason phrase, a RUN command's own output echoed into a
+// failure) is followed by more wrapping ("did not complete successfully",
+// status codes, ...). Without the anchor, a fork PR could embed a fake
+// lease line in an error it controls and trigger a shared-cache prune —
+// repair must never be reachable from attacker-influenced text.
+var danglingLeaseRe = regexp.MustCompile(`lease "([a-z0-9]{25}(?:-view|-variants)?)": not found$`)
 
 // DanglingLease identifies a containerd lease BuildKit's metadata believes in
 // and containerd no longer has.
