@@ -137,6 +137,72 @@ func DanglingSnapshotFromError(err error) (DanglingSnapshot, bool) {
 	return ParseDanglingSnapshot(err.Error())
 }
 
+// danglingLeaseRe matches containerd's lease-not-found message as it surfaces
+// through a BuildKit solve (#193):
+//
+//	lease "4igb5uptxddpdjw9lwatd9psk": not found
+//
+// This is the LEASE half of the same "two databases describe one store"
+// corruption the dangling-snapshot signature covers: BuildKit's bbolt
+// metadata still holds a cache record while the containerd lease that record
+// owns is gone (an out-of-band `ctr leases rm`, a restored containerd data
+// dir, or a crash between a lease deletion and the matching metadata clear).
+// The record loads fine — nothing on the load path checks the lease — and
+// detonates only when a build cache-hits it and tries to attach a resource
+// to the missing lease (buildkit source/containerimage/pull.go on a cached
+// FROM, cache/blobs.go setBlob on export), failing the job with the raw
+// containerd error above.
+//
+// Deliberately narrow, for the same reason as danglingSnapshotRe: repair
+// throws away build cache. Only a quoted BuildKit cache-record lease ID — 25
+// base-36 characters (identity.NewID), optionally the -view / -variants
+// derivative — followed by containerd's exact "not found" qualifies.
+// BuildKit's temporary leases have a different shape ("<nanos>-<base64>") and
+// a missing one does not indicate a persistent desync, so they do not match.
+var danglingLeaseRe = regexp.MustCompile(`lease "([a-z0-9]{25}(?:-view|-variants)?)": not found`)
+
+// DanglingLease identifies a containerd lease BuildKit's metadata believes in
+// and containerd no longer has.
+type DanglingLease struct {
+	// ID is the missing lease's ID from the error message — a BuildKit
+	// cache record ID, since the record's lease shares its ID.
+	ID string
+}
+
+// ParseDanglingLease extracts the missing lease ID from an error message,
+// reporting false when the message is some other failure. Pure — the whole
+// detection rule, testable without standing up BuildKit.
+func ParseDanglingLease(msg string) (DanglingLease, bool) {
+	m := danglingLeaseRe.FindStringSubmatch(msg)
+	if m == nil {
+		return DanglingLease{}, false
+	}
+	return DanglingLease{ID: m[1]}, true
+}
+
+// DanglingLeaseFromError is ParseDanglingLease over an error value. Nil
+// errors report false.
+func DanglingLeaseFromError(err error) (DanglingLease, bool) {
+	if err == nil {
+		return DanglingLease{}, false
+	}
+	return ParseDanglingLease(err.Error())
+}
+
+// HealKeyFromError returns the escalation-ladder key for err's repairable
+// shared-store signature, if it has one. It is what a caller that only needs
+// the Healer bookkeeping key (e.g. to Forget after a successful retry) should
+// use, so it stays in sync with every signature healAndRetryBuild acts on.
+func HealKeyFromError(err error) (string, bool) {
+	if d, ok := DanglingSnapshotFromError(err); ok {
+		return d.ID, true
+	}
+	if l, ok := DanglingLeaseFromError(err); ok {
+		return l.ID, true
+	}
+	return "", false
+}
+
 // chainIDRe matches an OCI layer chain ID: an algorithm, a colon and a hex
 // digest. Anything else is BuildKit's own record ID.
 var chainIDRe = regexp.MustCompile(`^[a-z0-9]+(?:[.+_-][a-z0-9]+)*:[0-9a-fA-F]{32,}$`)
@@ -211,7 +277,20 @@ type Healer struct {
 // Next reports the action to take for d and records it, so a second sighting
 // of the same key escalates instead of repeating a repair that did not work.
 func (h *Healer) Next(d DanglingSnapshot) HealAction {
-	if d.ID == "" {
+	return h.nextID(d.ID)
+}
+
+// NextLease is Next for the missing-lease signature. Lease IDs and snapshot
+// keys share one ladder map: they cannot collide (a lease ID is a full
+// 25-char record ID, a repairable snapshot key is a chain ID or record ID
+// with different provenance), and even a collision would only escalate a
+// repair one rung early.
+func (h *Healer) NextLease(l DanglingLease) HealAction {
+	return h.nextID(l.ID)
+}
+
+func (h *Healer) nextID(id string) HealAction {
+	if id == "" {
 		return HealNone
 	}
 	h.mu.Lock()
@@ -220,13 +299,13 @@ func (h *Healer) Next(d DanglingSnapshot) HealAction {
 		h.seen = map[string]HealAction{}
 	}
 	next := HealPrune
-	switch h.seen[d.ID] {
+	switch h.seen[id] {
 	case HealPrune:
 		next = HealRebuild
 	case HealRebuild, HealGiveUp:
 		next = HealGiveUp
 	}
-	h.seen[d.ID] = next
+	h.seen[id] = next
 	return next
 }
 
@@ -242,8 +321,12 @@ func (h *Healer) Forget(id string) {
 // HealReport summarises one repair attempt, for logging and for the message
 // surfaced to the job when repair fails.
 type HealReport struct {
-	// Snapshot is the key that triggered the repair.
+	// Snapshot is the key that triggered the repair, when the trigger was
+	// the dangling-snapshot signature.
 	Snapshot DanglingSnapshot
+	// Lease is the key that triggered the repair, when the trigger was the
+	// missing-lease signature. Exactly one of Snapshot and Lease is set.
+	Lease DanglingLease
 	// Action is the rung of the ladder that was executed.
 	Action HealAction
 	// ImagesEvicted counts containerd image records dropped because their
@@ -258,6 +341,10 @@ type HealReport struct {
 
 // String renders the report for a log line or an error message.
 func (r HealReport) String() string {
+	if r.Lease.ID != "" {
+		return fmt.Sprintf("lease=%s action=%s bytes_released=%d rebuilt=%t",
+			r.Lease.ID, r.Action, r.BytesReleased, r.Rebuilt)
+	}
 	return fmt.Sprintf("snapshot=%s kind=%s action=%s images_evicted=%d bytes_released=%d rebuilt=%t",
 		r.Snapshot.ID, r.Snapshot.Kind, r.Action, r.ImagesEvicted, r.BytesReleased, r.Rebuilt)
 }

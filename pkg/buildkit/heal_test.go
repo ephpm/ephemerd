@@ -104,6 +104,141 @@ func TestDanglingSnapshotFromError(t *testing.T) {
 	}
 }
 
+func TestParseDanglingLease(t *testing.T) {
+	tests := []struct {
+		name   string
+		msg    string
+		wantID string
+		wantOK bool
+	}{
+		{
+			// The #193 incident string, verbatim: a cached FROM hit a
+			// cache record whose containerd lease was gone.
+			name:   "missing cache record lease",
+			msg:    `failed to solve: lease "4igb5uptxddpdjw9lwatd9psk": not found`,
+			wantID: "4igb5uptxddpdjw9lwatd9psk",
+			wantOK: true,
+		},
+		{
+			name:   "view lease derivative",
+			msg:    `failed to solve: lease "4igb5uptxddpdjw9lwatd9psk-view": not found`,
+			wantID: "4igb5uptxddpdjw9lwatd9psk-view",
+			wantOK: true,
+		},
+		{
+			name:   "compression variants lease derivative",
+			msg:    `lease "4igb5uptxddpdjw9lwatd9psk-variants": not found`,
+			wantID: "4igb5uptxddpdjw9lwatd9psk-variants",
+			wantOK: true,
+		},
+		{
+			// A wrong positive throws away the node's build cache, so the
+			// near misses matter as much as the hits. BuildKit's temporary
+			// leases ("<nanos>-<base64>") are not a persistent desync — a
+			// retry mints a fresh one — and must not trigger a repair.
+			name:   "temporary lease id is a different failure",
+			msg:    `lease "123456789-AbC_": not found`,
+			wantOK: false,
+		},
+		{
+			// containerd's other missing-lease shape carries no ID and
+			// comes from a leased-context write, not a stale record.
+			name:   "lease does not exist is a different failure",
+			msg:    "lease does not exist: not found",
+			wantOK: false,
+		},
+		{
+			// 24 chars: not an identity.NewID (always exactly 25).
+			name:   "id of the wrong length",
+			msg:    `lease "4igb5uptxddpdjw9lwatd9ps": not found`,
+			wantOK: false,
+		},
+		{
+			name:   "missing content is a different failure",
+			msg:    `failed to solve: content digest sha256:abc: not found`,
+			wantOK: false,
+		},
+		{
+			name:   "empty",
+			msg:    "",
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := ParseDanglingLease(tt.msg)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v (got %+v)", ok, tt.wantOK, got)
+			}
+			if tt.wantOK && got.ID != tt.wantID {
+				t.Errorf("ID = %q, want %q", got.ID, tt.wantID)
+			}
+		})
+	}
+}
+
+func TestDanglingLeaseFromError(t *testing.T) {
+	if _, ok := DanglingLeaseFromError(nil); ok {
+		t.Fatal("nil error reported a dangling lease")
+	}
+
+	// The signature must survive wrapping: it arrives from the solver
+	// through several layers of fmt.Errorf.
+	base := errors.New(`lease "4igb5uptxddpdjw9lwatd9psk": not found`)
+	wrapped := fmt.Errorf("build failed: %w", fmt.Errorf("failed to solve: %w", base))
+	got, ok := DanglingLeaseFromError(wrapped)
+	if !ok {
+		t.Fatal("wrapped error not recognised")
+	}
+	if got.ID != "4igb5uptxddpdjw9lwatd9psk" {
+		t.Errorf("ID = %q", got.ID)
+	}
+}
+
+func TestHealKeyFromError(t *testing.T) {
+	tests := []struct {
+		name    string
+		err     error
+		wantKey string
+		wantOK  bool
+	}{
+		{
+			name:    "dangling snapshot",
+			err:     errors.New("snapshot jfvdzwv6tyfkgcimx9uaifsfh does not exist: not found"),
+			wantKey: "jfvdzwv6tyfkgcimx9uaifsfh",
+			wantOK:  true,
+		},
+		{
+			name:    "dangling lease",
+			err:     errors.New(`failed to solve: lease "4igb5uptxddpdjw9lwatd9psk": not found`),
+			wantKey: "4igb5uptxddpdjw9lwatd9psk",
+			wantOK:  true,
+		},
+		{
+			name:   "unrelated failure",
+			err:    errors.New("no space left on device"),
+			wantOK: false,
+		},
+		{
+			name:   "nil",
+			err:    nil,
+			wantOK: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			key, ok := HealKeyFromError(tt.err)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if key != tt.wantKey {
+				t.Errorf("key = %q, want %q", key, tt.wantKey)
+			}
+		})
+	}
+}
+
 func TestClassifySnapshotKey(t *testing.T) {
 	tests := []struct {
 		id   string
@@ -159,6 +294,33 @@ func TestHealerIgnoresEmptyID(t *testing.T) {
 	var h Healer
 	if got := h.Next(DanglingSnapshot{}); got != HealNone {
 		t.Fatalf("empty ID = %v, want HealNone", got)
+	}
+	if got := h.NextLease(DanglingLease{}); got != HealNone {
+		t.Fatalf("empty lease ID = %v, want HealNone", got)
+	}
+}
+
+func TestHealerLeaseLadder(t *testing.T) {
+	// The missing-lease signature climbs the same prune → rebuild → give-up
+	// ladder as the snapshot one, keyed by the lease ID.
+	var h Healer
+	l := DanglingLease{ID: "4igb5uptxddpdjw9lwatd9psk"}
+
+	if got := h.NextLease(l); got != HealPrune {
+		t.Fatalf("first = %v, want HealPrune", got)
+	}
+	if got := h.NextLease(l); got != HealRebuild {
+		t.Fatalf("second = %v, want HealRebuild", got)
+	}
+	if got := h.NextLease(l); got != HealGiveUp {
+		t.Fatalf("third = %v, want HealGiveUp", got)
+	}
+
+	// Forget re-arms the ladder after a successful retry, via the same key
+	// HealKeyFromError hands the build handler.
+	h.Forget(l.ID)
+	if got := h.NextLease(l); got != HealPrune {
+		t.Fatalf("after Forget = %v, want HealPrune", got)
 	}
 }
 

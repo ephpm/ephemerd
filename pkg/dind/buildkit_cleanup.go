@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/images"
@@ -41,8 +42,34 @@ func buildRecordJobID(name string) (string, bool) {
 	return jobID, true
 }
 
-// DeadBuildRecords returns the job-scoped build result records in names
-// whose job is not in live, together with the job each belongs to.
+// DeadBuildRecordGrace is how recently a job-scoped record may have been
+// written and still be exempt from the dead-job sweep.
+//
+// The grace closes a TOCTOU in the sweep's liveness check: the live set is a
+// container listing captured BEFORE the record listing, so a job that starts
+// — and exports a build — between the two listings has records the stale
+// live set would judge dead, and the sweep would delete a live job's build
+// output mid-job (breaking its subsequent docker push, and any containerd GC
+// the synchronous delete triggers runs against the job's in-flight solve).
+// A record can only be at risk if it was written after the live set was
+// captured, i.e. within the last pass; anything younger than the grace is
+// therefore skipped and picked up by a later tick once its job is provably
+// gone. Same principle as runtime.ReapDeadContainers' grace window: never
+// collect a resource whose owning operation could still be live.
+const DeadBuildRecordGrace = 15 * time.Minute
+
+// BuildRecord is one image record in the buildkit namespace as the dead-job
+// sweep sees it: its name and when containerd last wrote it.
+type BuildRecord struct {
+	Name string
+	// UpdatedAt is the record's last containerd write (falling back to its
+	// creation time when it was never updated). Zero means the age is
+	// unknown.
+	UpdatedAt time.Time
+}
+
+// DeadBuildRecords returns the job-scoped build result records in records
+// whose job is not in live and whose last write is older than grace.
 //
 // This is the decision half of the buildkit-namespace leak fix, kept pure
 // so the "which records are garbage" rule is testable on its own.
@@ -58,22 +85,27 @@ func buildRecordJobID(name string) (string, bool) {
 //
 // live holds container IDs as ephemerd knows them; matching is done on the
 // lowercased form because scopedBuildRef lowercases the ID to satisfy
-// Docker's reference grammar.
-func DeadBuildRecords(names []string, live map[string]struct{}) []string {
+// Docker's reference grammar. Records younger than grace — or with no
+// usable timestamp, since an unknown age must never satisfy an "older than"
+// test — are never selected; see DeadBuildRecordGrace for why.
+func DeadBuildRecords(records []BuildRecord, live map[string]struct{}, now time.Time, grace time.Duration) []string {
 	lowerLive := make(map[string]struct{}, len(live))
 	for id := range live {
 		lowerLive[strings.ToLower(id)] = struct{}{}
 	}
 	var out []string
-	for _, name := range names {
-		jobID, ok := buildRecordJobID(name)
+	for _, rec := range records {
+		jobID, ok := buildRecordJobID(rec.Name)
 		if !ok {
 			continue
 		}
 		if _, alive := lowerLive[jobID]; alive {
 			continue
 		}
-		out = append(out, name)
+		if rec.UpdatedAt.IsZero() || now.Sub(rec.UpdatedAt) <= grace {
+			continue
+		}
+		out = append(out, rec.Name)
 	}
 	return out
 }
@@ -129,7 +161,9 @@ func CleanupJobBuildRecords(ctx context.Context, c *client.Client, buildkitNS, j
 // or a daemon that predates per-job cleanup entirely.
 //
 // Safe to run while jobs are in flight — records belonging to a live job
-// are skipped.
+// are skipped, and records written more recently than DeadBuildRecordGrace
+// are left for a later tick because their job may have started after live
+// was captured.
 func PruneDeadBuildRecords(ctx context.Context, c *client.Client, buildkitNS string, live map[string]struct{}, log *slog.Logger) (int, error) {
 	if c == nil || buildkitNS == "" {
 		return 0, nil
@@ -142,13 +176,17 @@ func PruneDeadBuildRecords(ctx context.Context, c *client.Client, buildkitNS str
 		}
 		return 0, err
 	}
-	names := make([]string, 0, len(imgs))
+	records := make([]BuildRecord, 0, len(imgs))
 	for _, img := range imgs {
-		names = append(names, img.Name)
+		rec := BuildRecord{Name: img.Name, UpdatedAt: img.UpdatedAt}
+		if rec.UpdatedAt.IsZero() {
+			rec.UpdatedAt = img.CreatedAt
+		}
+		records = append(records, rec)
 	}
 
 	deleted := 0
-	for _, name := range DeadBuildRecords(names, live) {
+	for _, name := range DeadBuildRecords(records, live, time.Now(), DeadBuildRecordGrace) {
 		if derr := deleteBuildRecord(nsCtx, c, name); derr != nil {
 			log.Warn("buildkit cleanup: image delete",
 				"namespace", buildkitNS, "image", name, "error", derr)

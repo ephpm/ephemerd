@@ -25,9 +25,10 @@ import (
 // reclaim, a restored data dir, a crash mid-delete — costs one build instead
 // of every build.
 
-// healAndRetryBuild inspects a failed solve. When the failure is the
-// dangling-snapshot signature it repairs the shared store and reports whether
-// the caller should retry the build once.
+// healAndRetryBuild inspects a failed solve. When the failure is one of the
+// repairable shared-store corruption signatures — a dangling snapshot, or a
+// cache record whose containerd lease is gone (#193) — it repairs the shared
+// store and reports whether the caller should retry the build once.
 //
 // Repairing before retrying rather than merely marking the store dirty for the
 // next job is deliberate: the job that paid for the discovery is the one that
@@ -35,11 +36,18 @@ import (
 // from a slightly slow build; a job that hits it and fails is a red release
 // pipeline someone has to triage.
 func (s *Server) healAndRetryBuild(ctx context.Context, bk *buildkit.Server, solveErr error) (retry bool) {
-	d, ok := buildkit.DanglingSnapshotFromError(solveErr)
-	if !ok {
-		return false
+	if d, ok := buildkit.DanglingSnapshotFromError(solveErr); ok {
+		return s.healDanglingSnapshot(ctx, bk, d)
 	}
+	if l, ok := buildkit.DanglingLeaseFromError(solveErr); ok {
+		return s.healDanglingLease(ctx, bk, l)
+	}
+	return false
+}
 
+// healDanglingSnapshot repairs the "metadata names a snapshot containerd no
+// longer has" half of the shared-store corruption. See heal.go.
+func (s *Server) healDanglingSnapshot(ctx context.Context, bk *buildkit.Server, d buildkit.DanglingSnapshot) bool {
 	action := bk.Healer().Next(d)
 	log := s.log.With("component", "build-heal", "snapshot", d.ID, "kind", d.Kind.String(), "action", action.String())
 
@@ -65,6 +73,53 @@ func (s *Server) healAndRetryBuild(ctx context.Context, bk *buildkit.Server, sol
 		report.ImagesEvicted = n
 	}
 
+	if !s.applyHealAction(ctx, bk, action, log, &report) {
+		return false
+	}
+
+	log.Warn("shared build store repaired; retrying the build once", "report", report.String())
+	return true
+}
+
+// healDanglingLease repairs the reverse half of the same corruption: a cache
+// record that SURVIVES in BuildKit's metadata while the containerd lease it
+// owns is gone (#193). Nothing on the record-load path checks the lease, so
+// the record keeps being served from cache and every build that hits it dies
+// attaching a resource to the missing lease.
+//
+// The repair ladder is the same as the snapshot signature's, and the cheap
+// rung genuinely fixes it: the failed solve released its refs, so PruneAll
+// selects the stale record, and BuildKit's record removal tolerates the
+// already-missing lease (cacheRecord.remove ignores NotFound) and clears the
+// metadata. The retried build then re-pulls a clean copy.
+//
+// Unlike the snapshot path there is no image-record eviction half: image
+// records reference snapshots via gc.ref labels, never leases, so no
+// containerd image record can be poisoned by a missing lease.
+func (s *Server) healDanglingLease(ctx context.Context, bk *buildkit.Server, l buildkit.DanglingLease) bool {
+	action := bk.Healer().NextLease(l)
+	log := s.log.With("component", "build-heal", "lease", l.ID, "action", action.String())
+
+	if action == buildkit.HealGiveUp {
+		log.Error("shared build store still references a lease containerd does not have, after both a prune and a metadata rebuild — not retrying; inspect the node")
+		return false
+	}
+
+	log.Warn("build failed on a lease the shared store references but containerd does not have; repairing the shared store")
+
+	report := buildkit.HealReport{Lease: l, Action: action}
+	if !s.applyHealAction(ctx, bk, action, log, &report) {
+		return false
+	}
+
+	log.Warn("shared build store repaired; retrying the build once", "report", report.String())
+	return true
+}
+
+// applyHealAction executes one rung of the repair ladder, escalating a failed
+// prune to a rebuild. Returns false when the store could not be repaired at
+// all — the caller must then fail the build rather than retry.
+func (s *Server) applyHealAction(ctx context.Context, bk *buildkit.Server, action buildkit.HealAction, log *slog.Logger, report *buildkit.HealReport) bool {
 	switch action {
 	case buildkit.HealPrune:
 		released, err := bk.PruneAll(ctx)
@@ -87,8 +142,6 @@ func (s *Server) healAndRetryBuild(ctx context.Context, bk *buildkit.Server, sol
 		}
 		report.Rebuilt = true
 	}
-
-	log.Warn("shared build store repaired; retrying the build once", "report", report.String())
 	return true
 }
 
