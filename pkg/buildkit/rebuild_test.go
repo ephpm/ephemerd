@@ -13,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/solver/bboltcachestorage"
 	"github.com/moby/buildkit/util/db/boltutil"
 	"google.golang.org/grpc"
 )
@@ -301,58 +303,99 @@ func TestServerCoreClose_SurvivesAControllerCloseError(t *testing.T) {
 // open, so the directory can be renamed away and its bbolt files reopened.
 //
 // This is the test the old fakeCore()-based failure-path test structurally
-// could not be. It uses a real bbolt file, opened through the exact call
-// newCore uses for history.db (boltutil.Open with nil options, i.e. flock
-// timeout 0 = retry forever), and owned by the core's controller the way the
-// real one is.
+// could not be. It uses real bbolt files, opened through the exact calls
+// newCore and the worker make, and owned by the core's controller the way the
+// real ones are.
+//
+// ALL THREE STORES, not just history.db. control.Controller.Close closes
+// HistoryDB (<DataDir>/history.db), the WorkerController (hence
+// <DataDir>/worker/metadata_v2.db) and the CacheStore (<DataDir>/cache.db) —
+// and a partial fix that releases only some of them leaves the node in
+// exactly the same unrecoverable state as no fix at all. A stub that opened
+// one file could not tell the two apart; the worker's metadata_v2.db in
+// particular is the handle the newWorkerController unwind bug leaked.
 //
 // Before the fix this test fails twice over: the rename fails outright on
 // Windows ("Access is denied"), and the reopen blocks forever on the flock —
-// which is exactly why the reopen is under a deadline rather than a bare
-// call.
+// which is exactly why the reopens are under a deadline rather than bare
+// calls.
 func TestServerCoreClose_ReleasesTheBoltHandles(t *testing.T) {
 	parent := t.TempDir()
 	dataDir := filepath.Join(parent, "buildkit")
-	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+	workerDir := filepath.Join(dataDir, "worker")
+	if err := os.MkdirAll(workerDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	dbPath := filepath.Join(dataDir, "history.db")
 
-	db, err := boltutil.Open(dbPath, 0o600, nil)
+	// The same three opens the real core performs, on the same three paths.
+	cacheDB, err := bboltcachestorage.NewStore(filepath.Join(dataDir, "cache.db"))
+	if err != nil {
+		t.Fatalf("open cache.db: %v", err)
+	}
+	historyDB, err := boltutil.Open(filepath.Join(dataDir, "history.db"), 0o600, nil)
 	if err != nil {
 		t.Fatalf("open history.db: %v", err)
 	}
+	workerDB, err := metadata.NewStore(filepath.Join(workerDir, "metadata_v2.db"))
+	if err != nil {
+		t.Fatalf("open worker/metadata_v2.db: %v", err)
+	}
 
 	c := fakeCore()
-	c.controller = closerFn(db.Close)
+	// Mirrors control.Controller.Close's order: HistoryDB, WorkerController
+	// (which closes the worker's metadata store), CacheStore.
+	c.controller = closerFn(func() error {
+		return errors.Join(historyDB.Close(), workerDB.Close(), cacheDB.Close())
+	})
 	withinDeadline(t, 10*time.Second, "serverCore.close", c.close)
 
 	// 1. The Windows property: Rebuild's very first action after stopping
 	//    the old core is os.Rename(DataDir, quarantine), and an open handle
-	//    anywhere inside makes that impossible.
+	//    anywhere inside — at any depth — makes that impossible.
 	quarantine := filepath.Join(parent, "quarantined")
 	if err := os.Rename(dataDir, quarantine); err != nil {
-		t.Fatalf("could not rename the data dir after close(): %v — a bbolt handle is still open, which is the deadlock's first domino", err)
+		t.Fatalf("could not rename the data dir after close(): %v — a bbolt handle is still open somewhere under it, which is the deadlock's first domino", err)
 	}
 
-	// 2. The flock property, on every platform: the file can be opened
-	//    again. Under a deadline because the failure mode is an infinite
-	//    50ms retry loop inside bolt.Open, not an error return.
-	reopened := make(chan error, 1)
-	go func() {
-		db2, err := boltutil.Open(filepath.Join(quarantine, "history.db"), 0o600, nil)
-		if err == nil {
-			err = db2.Close()
+	// 2. The flock property, on every platform: every one of the three can be
+	//    opened again. Under a deadline because the failure mode is an
+	//    infinite 50ms retry loop inside bolt.Open, not an error return.
+	for _, tc := range []struct {
+		name string
+		open func() error
+	}{
+		{"cache.db", func() error {
+			s, err := bboltcachestorage.NewStore(filepath.Join(quarantine, "cache.db"))
+			if err != nil {
+				return err
+			}
+			return s.Close()
+		}},
+		{"history.db", func() error {
+			db, err := boltutil.Open(filepath.Join(quarantine, "history.db"), 0o600, nil)
+			if err != nil {
+				return err
+			}
+			return db.Close()
+		}},
+		{"worker/metadata_v2.db", func() error {
+			md, err := metadata.NewStore(filepath.Join(quarantine, "worker", "metadata_v2.db"))
+			if err != nil {
+				return err
+			}
+			return md.Close()
+		}},
+	} {
+		reopened := make(chan error, 1)
+		go func() { reopened <- tc.open() }()
+		select {
+		case err := <-reopened:
+			if err != nil {
+				t.Fatalf("reopening %s after close(): %v", tc.name, err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("reopening %s blocked — its flock was never released, so newCore would spin forever holding s.mu", tc.name)
 		}
-		reopened <- err
-	}()
-	select {
-	case err := <-reopened:
-		if err != nil {
-			t.Fatalf("reopening history.db after close(): %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("reopening history.db blocked — the flock was never released, so newCore would spin forever holding s.mu")
 	}
 }
 

@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ephpm/ephemerd/pkg/networking"
@@ -144,6 +145,19 @@ type Server struct {
 	// a generic "unavailable"; cleared by a Rebuild that succeeds.
 	rebuildErr error
 
+	// dataGen counts the times Rebuild has moved or deleted the contents of
+	// DataDir. Guarded by mu.
+	//
+	// It exists for exactly one decision: whether a solver init that
+	// buildCore ABANDONED, and which finished afterwards, may still be
+	// installed. A core is only valid for the store it opened. If DataDir has
+	// been renamed to quarantine or cleared and restored in the meantime, the
+	// late core's bbolt files are (on Linux) unlinked or (on Windows) a
+	// different directory's — installing it would give the node a solver
+	// writing into a store nothing else reads. Comparing the generation the
+	// init started at with the current one is a cheap, exact test for that.
+	dataGen uint64
+
 	once sync.Once
 
 	// newCoreFn is newCore, overridable in tests. The liveness property
@@ -212,6 +226,28 @@ type serverCore struct {
 	// channel"). The nil-ing in Rebuild removes that aliasing, but a
 	// teardown path must never be one refactor away from a panic.
 	closeOnce sync.Once
+
+	// abandoned records that close() gave up on a gRPC server that would not
+	// stop, and therefore SKIPPED controller.Close(). The core's bbolt
+	// handles under DataDir are still open and always will be. Set exactly
+	// once, inside closeOnce, before close() returns; read by tests and by
+	// closeAbandoned().
+	abandoned atomic.Bool
+
+	// graceTimeout / hardStopTimeout override coreCloseGraceTimeout and
+	// coreCloseHardStopTimeout. Zero means "use the constant". Tests set
+	// them: the escalation path they need to exercise is only reachable by
+	// waiting the bound out, and a 20s+5s wait per assertion is not a test.
+	graceTimeout    time.Duration
+	hardStopTimeout time.Duration
+}
+
+// closeAbandoned reports that this core's teardown gave up with its gRPC
+// server still running, so its bbolt handles under DataDir were deliberately
+// leaked. Callers that are about to touch DataDir on disk can use it to
+// explain a failure instead of guessing.
+func (c *serverCore) closeAbandoned() bool {
+	return c != nil && c.abandoned.Load()
 }
 
 // coreCloseGraceTimeout bounds how long close() waits for in-flight RPCs to
@@ -227,6 +263,32 @@ type serverCore struct {
 // to fail. Dropping an in-flight build is the correct trade: we are here
 // because builds on this node are already failing.
 const coreCloseGraceTimeout = 20 * time.Second
+
+// coreCloseHardStopTimeout bounds how long close() waits AFTER grpc.Server.Stop
+// before it abandons the server entirely.
+//
+// WHY A SECOND BOUND IS NEEDED, i.e. why Stop() is not the escape hatch it
+// looks like. Both GracefulStop and Stop funnel into grpc.Server.stop, whose
+// last act is `s.handlersWG.Wait()` (grpc@v1.78.0 server.go:1962) — it waits
+// for every RPC HANDLER GOROUTINE to return. Stop closes the listeners and the
+// transports, which cancels each stream's context, but a handler that does not
+// observe its context never returns and the WaitGroup never drains. The
+// in-flight `GracefulStop()` therefore stays blocked even after `Stop()`, and
+// the old code's unconditional `<-stopped` after Stop() was an unbounded wait
+// wearing a bound's clothing. Reproduced directly: with a handler that ignores
+// its stream ctx, GracefulStop was still blocked ten seconds after Stop().
+//
+// This is not hypothetical for BuildKit. A Windows RUN step whose containerd
+// shim has died leaves containerdexecutor.runProcess parked in
+// `p.Wait(context.Background())` / its `defer io.Wait()` — neither takes the
+// stream ctx — so the Solve handler never returns and this core's gRPC server
+// can never be stopped by any means short of process exit.
+//
+// Sized as a short grace after Stop() because Stop() DOES unblock the common
+// case (handlers that respect cancellation return promptly once their
+// transport dies); it only fails for the wedged-handler case, and for that
+// case no amount of waiting helps.
+const coreCloseHardStopTimeout = 5 * time.Second
 
 // close tears down one core. Safe to call on a core whose gRPC server has
 // already stopped, and safe to call more than once.
@@ -253,6 +315,14 @@ const coreCloseGraceTimeout = 20 * time.Second
 // lifetime. On Windows that made Rebuild's os.Rename(DataDir, quarantine)
 // fail with "Access is denied" every single time, which fed the reinit path
 // described in Server.reinitAfterFailedRebuild.
+//
+// GUARANTEE: close() ALWAYS returns, in at most graceTimeout+hardStopTimeout.
+// It is called with s.mu held (Rebuild, Server.Close) and from inside
+// closeOnce, so a call that does not return takes the whole daemon with it —
+// no build, no prune, no shutdown. That is the same wedge class this branch
+// exists to remove, and the guarantee is worth more than step 3.
+//
+// WHAT WE GIVE UP TO GET IT: see the escalation branch below.
 func (c *serverCore) close() {
 	if c == nil {
 		return
@@ -260,20 +330,21 @@ func (c *serverCore) close() {
 	c.closeOnce.Do(func() {
 		close(c.stop)
 
-		if c.grpcServ != nil {
-			stopped := make(chan struct{})
-			go func() {
-				c.grpcServ.GracefulStop()
-				close(stopped)
-			}()
-			select {
-			case <-stopped:
-			case <-time.After(coreCloseGraceTimeout):
-				// Stop() is the documented way to unblock a
-				// GracefulStop that is waiting on a long-lived stream.
-				c.grpcServ.Stop()
-				<-stopped
+		if c.grpcServ != nil && !c.stopGRPC() {
+			// The gRPC server could not be stopped, so an RPC handler is
+			// still live and may still be reading and writing the very
+			// bbolt files controller.Close() would close underneath it.
+			// Closing them here is not "leaky but safe" — it is a
+			// use-after-close of a bbolt DB from a running goroutine,
+			// i.e. a panic or a corrupted store. So we do not.
+			c.abandoned.Store(true)
+			if c.log != nil {
+				c.log.Error("buildkit: a solver RPC handler will not stop; ABANDONING this core's teardown with its bbolt handles (cache.db, history.db, worker/metadata_v2.db) INTENTIONALLY LEFT OPEN",
+					"grace", c.grace(), "hard_stop_grace", c.hardStop(),
+					"consequence", "the daemon stays live and can keep serving jobs, but this core's handles under the buildkit data dir are held until the process exits; on Windows the next metadata-store Rebuild's quarantine rename will fail with 'Access is denied' and the node needs an ephemerd restart to build again",
+					"likely_cause", "a build step whose containerd shim died — containerdexecutor's process Wait does not take the stream context, so the Solve handler never returns")
 			}
+			return
 		}
 
 		if c.controller != nil {
@@ -287,6 +358,67 @@ func (c *serverCore) close() {
 			}
 		}
 	})
+}
+
+func (c *serverCore) grace() time.Duration {
+	if c.graceTimeout > 0 {
+		return c.graceTimeout
+	}
+	return coreCloseGraceTimeout
+}
+
+func (c *serverCore) hardStop() time.Duration {
+	if c.hardStopTimeout > 0 {
+		return c.hardStopTimeout
+	}
+	return coreCloseHardStopTimeout
+}
+
+// stopGRPC drains the in-process gRPC server, escalating GracefulStop → Stop,
+// and reports whether the server actually stopped. False means a handler
+// goroutine is wedged and the server will never stop; the caller must NOT
+// touch anything that handler can still reach.
+//
+// The GracefulStop goroutine is deliberately left running when we give up: it
+// is parked on handlersWG.Wait() and will exit if the handler ever returns.
+// Killing it is not possible and waiting for it is the bug.
+func (c *serverCore) stopGRPC() bool {
+	stopped := make(chan struct{})
+	go func() {
+		c.grpcServ.GracefulStop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+		return true
+	case <-time.After(c.grace()):
+	}
+
+	// Stop() closes the listeners and every transport, which cancels each
+	// in-flight stream's context. Handlers that respect cancellation return
+	// almost immediately and the GracefulStop above then completes.
+	//
+	// Stop() runs on its own goroutine and is NOT waited on, for two
+	// independent reasons:
+	//
+	//   - Stop() itself can block indefinitely. grpc.Server.stop takes s.mu
+	//     and the parked GracefulStop holds s.mu for the whole of its
+	//     handlersWG.Wait() once the connections have drained (server.go:1938
+	//     `defer s.mu.Unlock()` + :1961). If the client hung up while the
+	//     handler stayed wedged — exactly the shim-death shape — Stop()
+	//     deadlocks on that mutex.
+	//   - Even when Stop() returns, it does not make GracefulStop return:
+	//     stop(false) skips handlersWG.Wait, stop(true) does not. So `stopped`
+	//     closing is the only honest evidence that the server is down.
+	go c.grpcServ.Stop()
+
+	select {
+	case <-stopped:
+		return true
+	case <-time.After(c.hardStop()):
+		return false
+	}
 }
 
 // NewServer constructs and initializes an embedded BuildKit server. The
@@ -467,15 +599,6 @@ func newCore(ctx context.Context, cfg Config) (*serverCore, error) {
 	}, nil
 }
 
-// current returns the live core. Callers take the pointer under the read lock
-// and then use it unlocked, so a concurrent Rebuild is never blocked by an
-// in-flight solve.
-func (s *Server) current() *serverCore {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.core
-}
-
 // DefaultSnapshotter is the containerd snapshotter this platform's BuildKit
 // worker uses when Config.Snapshotter is empty. Exported because the node's
 // image ↔ snapshot repair pass needs the same name to build the
@@ -551,6 +674,16 @@ func (s *Server) Rebuild(ctx context.Context) error {
 	s.core = nil
 	if old != nil {
 		old.close()
+		if old.closeAbandoned() {
+			// The old core's gRPC server would not stop, so its bbolt
+			// handles under DataDir are open FOREVER (see serverCore.close).
+			// Everything below — the quarantine rename, the fresh newCore —
+			// is going to fail because of it, on Windows certainly. Say so
+			// up front, so the log reads as one diagnosis rather than three
+			// unexplained rename errors.
+			s.cfg.Log.Error("buildkit: the previous solver could not be stopped; its bbolt handles under the data dir are still open, so this rebuild will very likely fail — restart ephemerd on this node",
+				"data_dir", s.cfg.DataDir)
+		}
 	}
 
 	quarantine, err := quarantineDir(s.cfg.DataDir, time.Now())
@@ -564,6 +697,9 @@ func (s *Server) Rebuild(ctx context.Context) error {
 		s.reinitAfterFailedRebuild(ctx, err)
 		return err
 	}
+	// From here on DataDir's contents are no longer what any already-running
+	// solver init believes them to be. See dataGen.
+	s.dataGen++
 	if err := os.Rename(s.cfg.DataDir, quarantine); err != nil {
 		err = fmt.Errorf("buildkit: quarantine metadata store %s: %w", s.cfg.DataDir, err)
 		// The store is untouched on disk (the rename never happened), so
@@ -575,22 +711,19 @@ func (s *Server) Rebuild(ctx context.Context) error {
 
 	core, err := s.buildCore(ctx)
 	if err != nil {
-		// Clear the half-built store first. newCore MkdirAll's DataDir (and
-		// may get as far as creating an empty cache.db/history.db) before
-		// the step that failed, so the restore below would be a rename onto
-		// an existing directory — which fails outright on Windows and fails
-		// on Linux the moment the new dir is non-empty. Everything at this
-		// path was created by the newCore call that just failed; the real
-		// store is safely at `quarantine`.
-		if rerr := os.RemoveAll(s.cfg.DataDir); rerr != nil {
-			s.cfg.Log.Warn("buildkit: could not clear the half-built metadata store before restoring",
-				"data_dir", s.cfg.DataDir, "error", rerr)
-		}
-		// Put the old store back: a broken cache is still better than no
-		// solver at all, and the next build will retry the repair.
-		if rerr := os.Rename(quarantine, s.cfg.DataDir); rerr != nil {
-			s.cfg.Log.Error("buildkit: could not restore the quarantined metadata store",
-				"quarantine", quarantine, "data_dir", s.cfg.DataDir, "error", rerr)
+		// Restoring means clearing the half-built store first, then renaming
+		// the quarantine back over it. Both steps can fail, and the reason
+		// they fail is worth being precise about, because it decides what the
+		// operator has to do.
+		s.dataGen++
+		if rerr := s.restoreQuarantinedStore(quarantine); rerr != nil {
+			// THE STORE IS NOW ONLY IN QUARANTINE. s.core is nil, so the
+			// node is build-dead until a restart, and a restart alone will
+			// NOT bring the cache back — the directory has to be moved by
+			// hand. Name both paths.
+			s.cfg.Log.Error("buildkit: could not restore the quarantined metadata store — it is STRANDED in quarantine and this node cannot build until an operator moves it back",
+				"quarantine", quarantine, "data_dir", s.cfg.DataDir, "error", rerr, "cause", err,
+				"recovery", "stop ephemerd, move the quarantine directory back onto the data dir path, then start ephemerd")
 			s.rebuildErr = err
 			return fmt.Errorf("buildkit: rebuild solver: %w", err)
 		}
@@ -639,8 +772,12 @@ var ErrCoreInitTimeout = errors.New("buildkit: solver init did not complete with
 // the outcome we already accept when newCore returns an error. Wedging costs
 // the node everything.
 //
-// An abandoned init is reaped: if it ever does finish, its core is closed, so
-// a late success cannot leak the very bbolt handles that made us give up.
+// An abandoned init is reaped, and the reaper ADOPTS a late success when it
+// still can (see adoptLateCore). coreInitTimeout is an engineering guess, not
+// a measured number; discarding a working solver because the guess was 10%
+// short would turn a slow init into a build-dead node, which is the outcome
+// this whole file exists to prevent. Adopting removes the cost of the guess
+// being wrong.
 func (s *Server) buildCore(ctx context.Context) (*serverCore, error) {
 	build := s.newCoreFn
 	if build == nil {
@@ -650,15 +787,13 @@ func (s *Server) buildCore(ctx context.Context) (*serverCore, error) {
 	if timeout <= 0 {
 		timeout = coreInitTimeout
 	}
+	// Read under the caller's write lock; compared again in adoptLateCore.
+	gen := s.dataGen
 
-	type result struct {
-		core *serverCore
-		err  error
-	}
 	// Buffered: the worker must never block on a send after we have stopped
 	// listening, or abandoning it would park a goroutine on a channel
 	// forever instead of letting it finish and be reaped.
-	done := make(chan result, 1)
+	done := make(chan coreInitResult, 1)
 
 	// Cancelled only when we abandon — best effort, since the ctx-aware
 	// steps (the containerd dial in newWorkerController) bail out on it even
@@ -674,7 +809,7 @@ func (s *Server) buildCore(ctx context.Context) (*serverCore, error) {
 
 	go func() {
 		core, err := build(initCtx, s.cfg)
-		done <- result{core: core, err: err}
+		done <- coreInitResult{core: core, err: err}
 	}()
 
 	select {
@@ -685,11 +820,120 @@ func (s *Server) buildCore(ctx context.Context) (*serverCore, error) {
 		kept = true
 		return r.core, nil
 	case <-time.After(timeout):
-		go func() {
-			r := <-done
-			r.core.close()
-		}()
+		go s.adoptLateCore(done, gen, timeout)
 		return nil, fmt.Errorf("%w after %s (something is still holding a lock under %s)", ErrCoreInitTimeout, timeout, s.cfg.DataDir)
+	}
+}
+
+// coreInitResult is what an init goroutine reports back to buildCore. Named
+// (rather than declared inside buildCore) so the reaper can be a method with
+// its own doc comment instead of a closure nobody reads.
+type coreInitResult struct {
+	core *serverCore
+	err  error
+}
+
+// adoptLateCore reaps an init that buildCore gave up on.
+//
+// If the init eventually produced a working core AND the store it opened is
+// still the store on disk AND the Server has no core, the core is INSTALLED.
+// Otherwise it is closed, so a late success can never leak the bbolt handles
+// that made us give up in the first place.
+//
+// WHY INSTALL RATHER THAN ALWAYS DISCARD. The alternative — the previous
+// behaviour — is that a node whose init took coreInitTimeout+1s is build-dead
+// until someone restarts ephemerd, even though a perfectly good solver was
+// sitting in this goroutine's hands. The bound exists to protect the DAEMON's
+// liveness (nothing may block s.mu indefinitely), and it still does: by the
+// time this runs, the caller has long since returned. Nothing about the bound
+// requires throwing the result away.
+//
+// gen is Server.dataGen as it was when the init STARTED. A mismatch means
+// Rebuild has moved or cleared DataDir since, so the late core is bound to a
+// store that no longer exists at that path — see Server.dataGen.
+func (s *Server) adoptLateCore(done <-chan coreInitResult, gen uint64, timeout time.Duration) {
+	r := <-done
+	if r.err != nil || r.core == nil {
+		// Nothing was built, so there is nothing to close or install. The
+		// error was already reported to the caller as ErrCoreInitTimeout.
+		return
+	}
+
+	s.mu.Lock()
+	adopt := s.core == nil && !s.closed && s.dataGen == gen
+	if adopt {
+		s.core = r.core
+		s.rebuildErr = nil
+	}
+	closed, hadCore, curGen := s.closed, !adopt && s.core != nil, s.dataGen
+	s.mu.Unlock()
+
+	if adopt {
+		s.cfg.Log.Warn("buildkit: a solver init that had been abandoned as too slow finished successfully and was installed; this node can build again WITHOUT a restart",
+			"data_dir", s.cfg.DataDir, "abandoned_after", timeout)
+		return
+	}
+
+	// Not adoptable. Close it — this is the leak-prevention half of the
+	// reaper and it must happen on every non-adopting path.
+	r.core.close()
+	s.cfg.Log.Warn("buildkit: a solver init that had been abandoned as too slow finished, but its core could not be installed and was discarded",
+		"data_dir", s.cfg.DataDir,
+		"server_closed", closed,
+		"another_core_installed", hadCore,
+		"data_dir_changed_under_it", curGen != gen)
+}
+
+// restoreRetryBudget / restoreRetryInterval bound the retry Rebuild makes when
+// it cannot put a quarantined store back.
+//
+// The realistic reason for the failure is a Windows sharing violation from an
+// ABANDONED newCore that is still running and still holds a handle under
+// DataDir (see buildCore). That handle is released the moment the init
+// finishes and adoptLateCore closes its core — usually within a second or two
+// of giving up. A short retry converts "the store is stranded and the node
+// needs a hand-repair" into "the rebuild failed and the node carried on",
+// which is a much better outcome for a couple of seconds spent under s.mu on
+// a path that has already spent coreInitTimeout there.
+const (
+	restoreRetryBudget   = 5 * time.Second
+	restoreRetryInterval = 250 * time.Millisecond
+)
+
+// restoreQuarantinedStore moves the quarantined store back onto DataDir.
+// Caller holds s.mu.
+//
+// The RemoveAll is not optional: newCore MkdirAll's DataDir and may get as far
+// as creating an empty cache.db/history.db before the step that failed, and a
+// rename onto an existing directory fails outright on Windows and fails on
+// Linux the moment the target is non-empty.
+//
+// It is also not obviously safe, which is why it is documented here rather
+// than asserted in a comment as it used to be ("everything at this path was
+// created by the newCore call that just failed"). That claim is false when the
+// failure was ErrCoreInitTimeout: the abandoned init is STILL RUNNING and may
+// still be creating files under DataDir. RemoveAll can therefore race it and
+// the rename can lose to its open handles. Retrying is what makes that
+// recoverable; the caller logs loudly if it is not.
+func (s *Server) restoreQuarantinedStore(quarantine string) error {
+	deadline := time.Now().Add(restoreRetryBudget)
+	for attempt := 1; ; attempt++ {
+		err := os.RemoveAll(s.cfg.DataDir)
+		if err != nil {
+			err = fmt.Errorf("clear the half-built store at %s: %w", s.cfg.DataDir, err)
+		} else if rerr := os.Rename(quarantine, s.cfg.DataDir); rerr != nil {
+			err = fmt.Errorf("rename %s back to %s: %w", quarantine, s.cfg.DataDir, rerr)
+		} else {
+			if attempt > 1 {
+				s.cfg.Log.Warn("buildkit: restored the quarantined metadata store on a retry (something under the data dir was still open)",
+					"data_dir", s.cfg.DataDir, "attempts", attempt)
+			}
+			return nil
+		}
+		if !time.Now().Add(restoreRetryInterval).Before(deadline) {
+			return err
+		}
+		time.Sleep(restoreRetryInterval)
 	}
 }
 
@@ -769,15 +1013,6 @@ func (s *Server) Client(ctx context.Context) (*client.Client, error) {
 		client.WithContextDialer(dialer),
 		client.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
 	)
-}
-
-// SessionManager exposes the session manager so callers (pkg/dind) can
-// hijack incoming POST /session HTTP streams into session gRPC.
-func (s *Server) SessionManager() *session.Manager {
-	if core := s.current(); core != nil {
-		return core.session
-	}
-	return nil
 }
 
 // ContainerdNamespace reports the containerd namespace build results and
