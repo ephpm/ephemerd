@@ -193,10 +193,19 @@ func startContainerRuntime(dataDir string, log *slog.Logger, linuxVMEnabled bool
 		case <-time.After(linuxVMShutdownGrace):
 			// Deliberately do NOT touch dispatchClient/linuxVM here: the
 			// start goroutine still owns them and reading them without the
-			// linuxVMDone barrier would be a data race. A half-started VM
-			// is cleaned up by the next daemon start (StartLinuxVM opens
-			// with cleanupStaleVMs).
-			log.Warn("Linux VM start ladder did not stop in time; abandoning it so shutdown can finish",
+			// linuxVMDone barrier would be a data race — which means
+			// hypervLinuxVM.Stop never runs for this VM, and Stop is the
+			// only thing that deletes its HCN endpoint (it reads
+			// l.endpointID, a field only that goroutine may touch).
+			//
+			// Both halves of the abandoned VM are reclaimed by the NEXT
+			// daemon start, not by this one: StartLinuxVM opens with
+			// cleanupStaleVMs, which terminates every compute system owned
+			// by "ephemerd" AND (see vm.cleanupStaleEndpoints) deletes every
+			// leftover ephemerd-linux-*-ep endpoint. Before that endpoint
+			// sweep existed, each abandoned start leaked one endpoint
+			// permanently, pinning an IP on the Default Switch.
+			log.Warn("Linux VM start ladder did not stop in time; abandoning it so shutdown can finish (its VM and HCN endpoint are reclaimed by the next daemon start)",
 				"grace", linuxVMShutdownGrace)
 		}
 		ctrd.Stop()
