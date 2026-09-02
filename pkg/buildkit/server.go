@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -144,6 +145,14 @@ type Server struct {
 	rebuildErr error
 
 	once sync.Once
+
+	// newCoreFn is newCore, overridable in tests. The liveness property
+	// buildCore guarantees is only observable against an init that hangs,
+	// and the real one can only be made to hang by corrupting a bbolt lock.
+	newCoreFn func(context.Context, Config) (*serverCore, error)
+	// coreTimeoutOverride shortens buildCore's bound in tests. Zero uses
+	// coreInitTimeout.
+	coreTimeoutOverride time.Duration
 }
 
 // ErrServerClosed is returned by build paths after Close.
@@ -162,11 +171,24 @@ var ErrServerClosed = errors.New("buildkit: server is closed")
 // the operator the one instruction that actually works.
 var ErrStoreUnavailable = errors.New("buildkit: shared build store is unavailable after a failed metadata-store rebuild; restart ephemerd on this node to recover")
 
+// coreController is the slice of *control.Controller that serverCore's
+// teardown needs. Close is the ONLY thing that releases the bbolt files under
+// DataDir; see serverCore.close.
+type coreController interface {
+	Close() error
+}
+
 // serverCore is everything that is discarded and rebuilt when the BuildKit
 // metadata store has to be reconstructed. Grouping it means Rebuild swaps one
 // pointer rather than mutating half a dozen fields under a lock.
 type serverCore struct {
-	controller *control.Controller
+	// controller is the *control.Controller, held as an interface for the
+	// one method teardown depends on. The concrete type can only be
+	// constructed against a live containerd, and the close contract below
+	// (that the controller IS closed, after the gRPC server stops) is the
+	// single most important property in this file — it must be testable
+	// without one.
+	controller coreController
 	session    *session.Manager
 	workers    *worker.Controller
 
@@ -178,6 +200,11 @@ type serverCore struct {
 	// stop is closed on shutdown to signal graceful stop to the Controller.
 	stop chan struct{}
 
+	// log is the core's own logger, needed because close() reports teardown
+	// errors and runs on paths (Rebuild, daemon shutdown) that have no other
+	// way to surface them. May be nil in tests.
+	log *slog.Logger
+
 	// closeOnce makes close idempotent. Rebuild closes the OLD core and
 	// Server.Close closes whatever core is current; a Rebuild that failed
 	// used to leave both pointing at the same core, and the second
@@ -187,15 +214,78 @@ type serverCore struct {
 	closeOnce sync.Once
 }
 
+// coreCloseGraceTimeout bounds how long close() waits for in-flight RPCs to
+// drain before it stops the gRPC server the hard way.
+//
+// grpc.Server.GracefulStop blocks until every open stream ends, and a Solve
+// stream lives as long as the build it is running — potentially hours. Two
+// things make waiting that long unacceptable here. Rebuild calls close()
+// while holding s.mu, so an unbounded wait blocks Client/Build/Prune/Close
+// for the duration of a build the Rebuild exists to unbreak; and, worse, the
+// bbolt handles below cannot be released until the server has stopped, so
+// the quarantine rename that Rebuild is about to attempt would be guaranteed
+// to fail. Dropping an in-flight build is the correct trade: we are here
+// because builds on this node are already failing.
+const coreCloseGraceTimeout = 20 * time.Second
+
 // close tears down one core. Safe to call on a core whose gRPC server has
 // already stopped, and safe to call more than once.
+//
+// ORDER MATTERS, and it mirrors buildkitd's own shutdown
+// (buildkit@v0.25.1 cmd/buildkitd/main.go: `defer controller.Close()`
+// registered before `server.GracefulStop()`, so the controller is closed
+// after the server has stopped serving):
+//
+//  1. close(c.stop) — BuildKit's GracefulStop channel. The history queue
+//     watches it and closes its pubsub when no build is active. A hint, not
+//     a barrier.
+//  2. GracefulStop (bounded, then Stop) — no RPC may still be touching the
+//     stores when we close them.
+//  3. controller.Close() — THE STEP THAT RELEASES THE bbolt FILES.
+//
+// Step 3 was missing, and serverCore.controller was a write-only field.
+// control.Controller.Close (buildkit@v0.25.1 control/control.go:141) closes,
+// in order, opt.HistoryDB (<dataDir>/history.db), opt.WorkerController (each
+// worker's Close → MetadataStore.Close, i.e. <dataDir>/worker/metadata_v2.db),
+// opt.CacheStore (<dataDir>/cache.db) and the llbsolver. Nothing else in
+// ephemerd closed any of them, so every core we ever tore down left three
+// exclusively-flock'd bbolt files open under DataDir for the daemon's
+// lifetime. On Windows that made Rebuild's os.Rename(DataDir, quarantine)
+// fail with "Access is denied" every single time, which fed the reinit path
+// described in Server.reinitAfterFailedRebuild.
 func (c *serverCore) close() {
 	if c == nil {
 		return
 	}
 	c.closeOnce.Do(func() {
 		close(c.stop)
-		c.grpcServ.GracefulStop()
+
+		if c.grpcServ != nil {
+			stopped := make(chan struct{})
+			go func() {
+				c.grpcServ.GracefulStop()
+				close(stopped)
+			}()
+			select {
+			case <-stopped:
+			case <-time.After(coreCloseGraceTimeout):
+				// Stop() is the documented way to unblock a
+				// GracefulStop that is waiting on a long-lived stream.
+				c.grpcServ.Stop()
+				<-stopped
+			}
+		}
+
+		if c.controller != nil {
+			if err := c.controller.Close(); err != nil && c.log != nil {
+				// Logged, not returned: every caller is on a teardown
+				// path that has no better answer than to continue. What
+				// matters operationally is that the attempt happened —
+				// a failure here is the signal that a handle may still
+				// be held.
+				c.log.Warn("buildkit: closing the solver controller (bbolt handles may still be held)", "error", err)
+			}
+		}
 	})
 }
 
@@ -250,13 +340,37 @@ func newCore(ctx context.Context, cfg Config) (*serverCore, error) {
 		return nil, fmt.Errorf("buildkit: session manager: %w", err)
 	}
 
+	// Everything constructed below this point owns an OS resource, and three
+	// of them (the worker's metadata_v2.db, cache.db, history.db) are bbolt
+	// files under DataDir held with an EXCLUSIVE flock. Returning from a
+	// later step without closing an earlier one leaks that lock for the
+	// daemon's lifetime — and a leaked lock under DataDir is precisely what
+	// makes Rebuild's quarantine rename impossible on Windows and its
+	// re-open impossible everywhere. So every early return from here on
+	// unwinds what it has already built, newest first.
+	//
+	// This is live, not theoretical: a corrupt history.db is one of the
+	// conditions that sends the heal ladder to Rebuild, and before this the
+	// `history db` error path returned with cache.db and metadata_v2.db
+	// still open.
+	var built []io.Closer
+	unwind := func() {
+		for i := len(built) - 1; i >= 0; i-- {
+			if cerr := built[i].Close(); cerr != nil {
+				cfg.Log.Warn("buildkit: closing a partially built solver core", "error", cerr)
+			}
+		}
+	}
+
 	workerCtrl, err := newWorkerController(ctx, cfg, sessMgr)
 	if err != nil {
 		return nil, fmt.Errorf("buildkit: worker controller: %w", err)
 	}
+	built = append(built, workerCtrl)
 
 	defaultWorker, err := workerCtrl.GetDefault()
 	if err != nil {
+		unwind()
 		return nil, fmt.Errorf("buildkit: default worker: %w", err)
 	}
 
@@ -266,19 +380,24 @@ func newCore(ctx context.Context, cfg Config) (*serverCore, error) {
 
 	gwfe, err := gateway.NewGatewayFrontend(workerCtrl.Infos(), nil)
 	if err != nil {
+		unwind()
 		return nil, fmt.Errorf("buildkit: gateway frontend: %w", err)
 	}
 	frontends["gateway.v0"] = gwfe
 
 	cacheStore, err := bboltcachestorage.NewStore(filepath.Join(cfg.DataDir, "cache.db"))
 	if err != nil {
+		unwind()
 		return nil, fmt.Errorf("buildkit: cache store: %w", err)
 	}
+	built = append(built, cacheStore)
 
 	historyDB, err := boltutil.Open(filepath.Join(cfg.DataDir, "history.db"), 0o600, nil)
 	if err != nil {
+		unwind()
 		return nil, fmt.Errorf("buildkit: history db: %w", err)
 	}
+	built = append(built, historyDB)
 
 	// Registry resolver for cache import/export. Empty registries config
 	// falls back to default behavior (anonymous pulls, docker config auth).
@@ -314,6 +433,7 @@ func newCore(ctx context.Context, cfg Config) (*serverCore, error) {
 		GracefulStop:   stop,
 	})
 	if err != nil {
+		unwind()
 		return nil, fmt.Errorf("buildkit: controller: %w", err)
 	}
 
@@ -332,6 +452,9 @@ func newCore(ctx context.Context, cfg Config) (*serverCore, error) {
 		close(grpcErrCh)
 	}()
 
+	// From here the core owns `built`: serverCore.close() releases all of it
+	// through ctrl.Close(), which closes HistoryDB, the WorkerController and
+	// the CacheStore. Do NOT also close them here.
 	return &serverCore{
 		controller: ctrl,
 		session:    sessMgr,
@@ -340,6 +463,7 @@ func newCore(ctx context.Context, cfg Config) (*serverCore, error) {
 		grpcServ:   grpcServ,
 		grpcErrCh:  grpcErrCh,
 		stop:       stop,
+		log:        cfg.Log,
 	}, nil
 }
 
@@ -431,7 +555,13 @@ func (s *Server) Rebuild(ctx context.Context) error {
 
 	quarantine, err := quarantineDir(s.cfg.DataDir, time.Now())
 	if err != nil {
-		s.rebuildErr = err
+		err = fmt.Errorf("buildkit: choose a quarantine path for %s: %w", s.cfg.DataDir, err)
+		// The store has not been touched on disk — this failed before any
+		// rename was attempted — so this branch is STRICTLY SAFER than the
+		// rename-failure branch below, which does attempt a re-init. It
+		// used to strand the node build-dead anyway. Symmetry, so the
+		// safer failure is not the one with the worse outcome.
+		s.reinitAfterFailedRebuild(ctx, err)
 		return err
 	}
 	if err := os.Rename(s.cfg.DataDir, quarantine); err != nil {
@@ -443,7 +573,7 @@ func (s *Server) Rebuild(ctx context.Context) error {
 	}
 	pruneOldQuarantines(filepath.Dir(s.cfg.DataDir), quarantine, s.cfg.Log)
 
-	core, err := newCore(ctx, s.cfg)
+	core, err := s.buildCore(ctx)
 	if err != nil {
 		// Clear the half-built store first. newCore MkdirAll's DataDir (and
 		// may get as far as creating an empty cache.db/history.db) before
@@ -476,6 +606,93 @@ func (s *Server) Rebuild(ctx context.Context) error {
 	return nil
 }
 
+// coreInitTimeout bounds how long any s.mu-holding path will WAIT for a
+// solver core to come up. Generous enough that a healthy containerd
+// re-attach — the case these paths exist to rescue — comfortably fits.
+const coreInitTimeout = 45 * time.Second
+
+// ErrCoreInitTimeout is returned by buildCore when a solver init did not
+// finish inside coreInitTimeout and was abandoned.
+var ErrCoreInitTimeout = errors.New("buildkit: solver init did not complete within the bound and was abandoned")
+
+// buildCore constructs a solver core and GUARANTEES that the caller unblocks
+// within coreInitTimeout, whatever state the store is in.
+//
+// WHY THE BOUND IS MANDATORY, NOT TIDY. Both callers run with s.mu HELD —
+// Rebuild's write lock, which Client, Build, Prune and Close all need — and
+// the work is newCore, which bbolt-opens three files under DataDir. BuildKit
+// opens them with a nil *bolt.Options, so the flock timeout is 0, and bbolt
+// reads 0 as "retry forever, 50ms apart" rather than "fail fast"
+// (bbolt@v1.4.3 bolt_windows.go:flock — both the initial `if timeout != 0`
+// and the deadline check `timeout != 0 && time.Since(t) > timeout-...` skip
+// the give-up path when timeout is zero; cache/metadata/metadata.go:30 passes
+// nil). So if ANYTHING still holds a lock under DataDir, a straight-line call
+// never returns: the daemon can no longer build, prune, or even shut down. An
+// unkillable process is strictly worse than the build-dead node these paths
+// were added to prevent, and it is a REGRESSION against the pre-existing
+// behaviour of simply returning an error.
+//
+// serverCore.close() now genuinely releases those handles, so in practice the
+// lock is free. This bound is the second line of defence: liveness of the
+// daemon must not be load-bearing on the correctness of a teardown path.
+// Losing an init attempt costs the node its solver until a restart — exactly
+// the outcome we already accept when newCore returns an error. Wedging costs
+// the node everything.
+//
+// An abandoned init is reaped: if it ever does finish, its core is closed, so
+// a late success cannot leak the very bbolt handles that made us give up.
+func (s *Server) buildCore(ctx context.Context) (*serverCore, error) {
+	build := s.newCoreFn
+	if build == nil {
+		build = newCore
+	}
+	timeout := s.coreTimeoutOverride
+	if timeout <= 0 {
+		timeout = coreInitTimeout
+	}
+
+	type result struct {
+		core *serverCore
+		err  error
+	}
+	// Buffered: the worker must never block on a send after we have stopped
+	// listening, or abandoning it would park a goroutine on a channel
+	// forever instead of letting it finish and be reaped.
+	done := make(chan result, 1)
+
+	// Cancelled only when we abandon — best effort, since the ctx-aware
+	// steps (the containerd dial in newWorkerController) bail out on it even
+	// though the bbolt opens will not. On success the new core keeps the
+	// caller's ctx exactly as it did before.
+	initCtx, cancelInit := context.WithCancel(ctx)
+	kept := false
+	defer func() {
+		if !kept {
+			cancelInit()
+		}
+	}()
+
+	go func() {
+		core, err := build(initCtx, s.cfg)
+		done <- result{core: core, err: err}
+	}()
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			return nil, r.err
+		}
+		kept = true
+		return r.core, nil
+	case <-time.After(timeout):
+		go func() {
+			r := <-done
+			r.core.close()
+		}()
+		return nil, fmt.Errorf("%w after %s (something is still holding a lock under %s)", ErrCoreInitTimeout, timeout, s.cfg.DataDir)
+	}
+}
+
 // reinitAfterFailedRebuild makes one attempt to stand a core back up against
 // the store now on disk, so a Rebuild that failed for a transient reason
 // (containerd restarting under us is the observed one) does not cost the node
@@ -487,8 +704,10 @@ func (s *Server) Rebuild(ctx context.Context) error {
 // rebuilt, so the corruption that triggered this is still there and the heal
 // ladder will fire again) but it is not build-dead, which is the difference
 // that matters.
+//
+// GUARANTEE: always returns, in at most coreInitTimeout. See buildCore.
 func (s *Server) reinitAfterFailedRebuild(ctx context.Context, cause error) {
-	core, err := newCore(ctx, s.cfg)
+	core, err := s.buildCore(ctx)
 	if err != nil {
 		s.rebuildErr = cause
 		s.cfg.Log.Error("buildkit: rebuild failed and the solver could not be restarted against the restored store; builds on this node will fail until ephemerd restarts",
@@ -656,15 +875,42 @@ func (s *Server) Close() error {
 // store starts empty.
 const quarantineDirPrefix = "_quarantine-buildkit-"
 
-// quarantineDir picks the path to move a corrupt store to. Pure apart from
-// the caller-supplied clock, so the naming is testable.
+// quarantineDirCollisionLimit bounds the suffix search. Reaching it means the
+// clock is not advancing AND a hundred quarantines already exist, which is a
+// broken host, not a naming problem.
+const quarantineDirCollisionLimit = 100
+
+// quarantineDir picks the path to move a corrupt store to. The name is
+// derived from the caller-supplied clock, so it is testable; it also consults
+// the filesystem to guarantee the path does not already exist.
+//
+// WHY IT IS NOT JUST A UNIX TIMESTAMP. It was, and one-second granularity is
+// not enough. Two heal keys can both escalate to Rebuild at once; s.mu
+// serializes them but does nothing to spread them out in time, so both land
+// in the same second and get the same name. os.Rename onto the existing
+// directory then fails (always on Windows; on Linux as soon as the first
+// quarantine is non-empty, which it always is), and a Rebuild that had
+// nothing wrong with it is pushed into reinitAfterFailedRebuild. Nanoseconds
+// make that collision essentially impossible; the suffix loop makes it
+// actually impossible, including across a clock that jumps backwards.
 func quarantineDir(dataDir string, now time.Time) (string, error) {
 	base := filepath.Base(dataDir)
 	parent := filepath.Dir(dataDir)
 	if base == "." || base == string(filepath.Separator) || parent == dataDir {
 		return "", fmt.Errorf("buildkit: refusing to quarantine implausible data dir %q", dataDir)
 	}
-	return filepath.Join(parent, fmt.Sprintf("%s%d", quarantineDirPrefix, now.UTC().Unix())), nil
+	stamp := now.UTC()
+	name := fmt.Sprintf("%s%d-%09d", quarantineDirPrefix, stamp.Unix(), stamp.Nanosecond())
+	for i := 0; i < quarantineDirCollisionLimit; i++ {
+		candidate := filepath.Join(parent, name)
+		if i > 0 {
+			candidate = filepath.Join(parent, fmt.Sprintf("%s-%d", name, i))
+		}
+		if _, err := os.Lstat(candidate); errors.Is(err, os.ErrNotExist) {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("buildkit: no free quarantine path beside %s after %d attempts", dataDir, quarantineDirCollisionLimit)
 }
 
 // pruneOldQuarantines removes every quarantine directory in parent except
