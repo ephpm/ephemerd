@@ -12,7 +12,6 @@ import (
 	"github.com/moby/buildkit/util/network/cniprovider"
 	"github.com/moby/buildkit/util/network/netproviders"
 	"github.com/moby/buildkit/worker"
-	"github.com/moby/buildkit/worker/base"
 	"github.com/moby/buildkit/worker/containerd"
 )
 
@@ -98,14 +97,9 @@ func newWorkerController(ctx context.Context, cfg Config, _ *session.Manager) (*
 	// forever. See GCConfig.
 	workerOpt.GCPolicy = cfg.GC.PruneInfo()
 
-	w, err := base.NewWorker(ctx, workerOpt)
-	if err != nil {
-		return nil, fmt.Errorf("new worker: %w", err)
-	}
-
-	wc := &worker.Controller{}
-	if err := wc.Add(w); err != nil {
-		return nil, fmt.Errorf("add worker: %w", err)
-	}
-	return wc, nil
+	// From here on workerOpt.MetadataStore is an OPEN bbolt file
+	// (<DataDir>/worker/metadata_v2.db) under an exclusive flock.
+	// finishWorkerController owns it on every path — see its ownership
+	// contract. Linux opens nothing else here, so `extra` is empty.
+	return finishWorkerController(ctx, workerOpt, nil, cfg.Log)
 }
