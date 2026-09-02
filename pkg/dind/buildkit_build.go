@@ -105,15 +105,16 @@ func (s *Server) handleImageBuildBuildkit(bk *buildkit.Server) http.HandlerFunc 
 		w.WriteHeader(http.StatusOK)
 		flusher, _ := w.(http.Flusher)
 
-		// The solve runs at most twice. A first failure carrying the
-		// dangling-snapshot signature means the SHARED build store names a
-		// snapshot containerd no longer has — a state no job can repair
+		// The solve runs at most twice. A first failure carrying a
+		// repairable shared-store signature — a dangling snapshot, or a
+		// cache record whose containerd lease is gone — means the SHARED
+		// build store disagrees with containerd in a way no job can repair
 		// from inside its own namespace (see buildheal.go), so ephemerd
 		// repairs it host-side and gives this build the second chance. Any
 		// other failure, and any second failure, is final.
 		solveErr := s.runSolve(r.Context(), bk, opt, w, flusher)
 		if solveErr != nil {
-			healed, _ := buildkit.DanglingSnapshotFromError(solveErr)
+			healKey, _ := buildkit.HealKeyFromError(solveErr)
 			if s.healAndRetryBuild(r.Context(), bk, solveErr) {
 				if err := writeJSONLine(w, map[string]any{
 					"stream": "ephemerd: repaired a corrupt entry in the shared build store; retrying the build\n",
@@ -129,7 +130,7 @@ func (s *Server) handleImageBuildBuildkit(bk *buildkit.Server) http.HandlerFunc 
 					// The repair stuck. Drop the escalation state so a
 					// recurrence weeks from now starts from the cheap
 					// rung again instead of rebuilding the store.
-					bk.Healer().Forget(healed.ID)
+					bk.Healer().Forget(healKey)
 				}
 			}
 		}

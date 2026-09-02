@@ -3,6 +3,7 @@ package dind
 import (
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestBuildScopePrefix(t *testing.T) {
@@ -98,18 +99,24 @@ func TestDeadBuildRecords(t *testing.T) {
 	)
 	scoped := func(job, ref string) string { return BuildScopePrefix(job) + ref }
 
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	const grace = 15 * time.Minute
+	old := now.Add(-time.Hour)     // safely past the grace window
+	young := now.Add(-time.Minute) // inside the grace window
+	rec := func(name string, at time.Time) BuildRecord { return BuildRecord{Name: name, UpdatedAt: at} }
+
 	tests := []struct {
-		name  string
-		names []string
-		live  map[string]struct{}
-		want  []string
+		name    string
+		records []BuildRecord
+		live    map[string]struct{}
+		want    []string
 	}{
 		{
 			name: "selects records of dead jobs only",
-			names: []string{
-				scoped(liveJob, "ephpm:dev"),
-				scoped(dead1, "ephpm:dev"),
-				scoped(dead2, "ephpm:dev"),
+			records: []BuildRecord{
+				rec(scoped(liveJob, "ephpm:dev"), old),
+				rec(scoped(dead1, "ephpm:dev"), old),
+				rec(scoped(dead2, "ephpm:dev"), old),
 			},
 			live: map[string]struct{}{liveJob: {}},
 			want: []string{scoped(dead1, "ephpm:dev"), scoped(dead2, "ephpm:dev")},
@@ -119,37 +126,62 @@ func TestDeadBuildRecords(t *testing.T) {
 			// from containerd container IDs, which may not be. Matching
 			// must be case-insensitive or a live job's build output gets
 			// deleted mid-job.
-			name:  "live job matching is case-insensitive",
-			names: []string{scoped("Ephemerd-Mixed-Case", "img:v1")},
-			live:  map[string]struct{}{"Ephemerd-Mixed-Case": {}},
-			want:  nil,
+			name:    "live job matching is case-insensitive",
+			records: []BuildRecord{rec(scoped("Ephemerd-Mixed-Case", "img:v1"), old)},
+			live:    map[string]struct{}{"Ephemerd-Mixed-Case": {}},
+			want:    nil,
+		},
+		{
+			// The live set is captured BEFORE the record listing, so a
+			// record written moments ago may belong to a job that started
+			// in between — it must survive this pass even though its job
+			// is not in the (stale) live set. A later tick collects it
+			// once the job is provably gone.
+			name:    "never selects a record younger than the grace",
+			records: []BuildRecord{rec(scoped(dead1, "ephpm:dev"), young)},
+			live:    nil,
+			want:    nil,
+		},
+		{
+			// An unknown age can never satisfy "older than the grace" —
+			// fail safe, exactly like the dead-container reaper.
+			name:    "never selects a record with no timestamp",
+			records: []BuildRecord{rec(scoped(dead1, "ephpm:dev"), time.Time{})},
+			live:    nil,
+			want:    nil,
 		},
 		{
 			// BuildKit's own cache records live in the same namespace
 			// and are owned by its bbolt DB — deleting them behind its
 			// back leaves snapshots pinned and corrupts the index.
-			name:  "never selects records that are not job-scoped",
-			names: []string{"docker.io/library/alpine:3", "sha256:deadbeef"},
-			live:  nil,
-			want:  nil,
+			name: "never selects records that are not job-scoped",
+			records: []BuildRecord{
+				rec("docker.io/library/alpine:3", old),
+				rec("sha256:deadbeef", old),
+			},
+			live: nil,
+			want: nil,
 		},
 		{
-			name:  "no live jobs means every scoped record is dead",
-			names: []string{scoped(dead1, "a:1"), scoped(dead2, "b:2")},
-			live:  nil,
-			want:  []string{scoped(dead1, "a:1"), scoped(dead2, "b:2")},
+			name: "no live jobs means every old scoped record is dead",
+			records: []BuildRecord{
+				rec(scoped(dead1, "a:1"), old),
+				rec(scoped(dead2, "b:2"), old),
+			},
+			live: nil,
+			want: []string{scoped(dead1, "a:1"), scoped(dead2, "b:2")},
 		},
 		{
-			name:  "empty input",
-			names: nil,
-			live:  map[string]struct{}{liveJob: {}},
-			want:  nil,
+			name:    "empty input",
+			records: nil,
+			live:    map[string]struct{}{liveJob: {}},
+			want:    nil,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := DeadBuildRecords(tc.names, tc.live)
+			got := DeadBuildRecords(tc.records, tc.live, now, grace)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("DeadBuildRecords() = %v, want %v", got, tc.want)
 			}
