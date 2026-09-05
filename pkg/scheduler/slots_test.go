@@ -398,8 +398,12 @@ func TestSlotWaitSeverity(t *testing.T) {
 		wantLevel   slog.Level
 		wantSuspect bool
 	}{
-		{"busy node, short wait", time.Minute, 1, 1, slog.LevelWarn, false},
-		{"busy node, long wait", 2 * time.Hour, 1, 1, slog.LevelWarn, false},
+		{"this pool has a tracked job, short wait", time.Minute, 1, 1, slog.LevelWarn, false},
+		// The third column is jobs tracked IN THIS POOL, not on the node.
+		// It used to be s.ActiveJobs() (every pool), which meant a Linux job
+		// on the mac explained away a leaked macOS slot; see
+		// TestSlotLeakEscalationIsScopedToThePool.
+		{"this pool has a tracked job, long wait", 2 * time.Hour, 1, 1, slog.LevelWarn, false},
 		{"untracked holder, short wait", time.Minute, 1, 0, slog.LevelWarn, false},
 		{"untracked holder, long wait", slotLeakSuspectAfter, 1, 0, slog.LevelError, true},
 		{"nothing held, long wait", 2 * time.Hour, 0, 0, slog.LevelWarn, false},
@@ -596,3 +600,85 @@ func TestHealthzExposesHeldSlots(t *testing.T) {
 		t.Error("healthz slots did not break out the macos pool")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// MINOR 4: the leak escalation is per-pool, not per-node.
+// ---------------------------------------------------------------------------
+
+// TestTrackedInPool: jobs are counted against the pool whose slot they hold.
+func TestTrackedInPool(t *testing.T) {
+	s := New(Config{MaxConcurrent: 2, MaxMacOSVMs: 2, Log: quietLogger()})
+	s.mu.Lock()
+	s.running[jobKey{Provider: "p", JobID: 1}] = &runningJob{}                  // local
+	s.running[jobKey{Provider: "p", JobID: 2}] = &runningJob{dispatched: "r-2"} // linux
+	s.running[jobKey{Provider: "p", JobID: 3}] = &runningJob{
+		macosVM: &fastMacVM{stops: new(atomic.Int32)},
+	} // macos
+	s.mu.Unlock()
+
+	for pool, want := range map[string]int{"local": 1, "linux": 1, "macos": 1} {
+		if got := s.trackedInPool(pool); got != want {
+			t.Errorf("trackedInPool(%q) = %d, want %d", pool, got, want)
+		}
+	}
+	if got := s.ActiveJobs(); got != 3 {
+		t.Errorf("ActiveJobs() = %d, want 3 (the global count keeps its meaning)", got)
+	}
+}
+
+// TestSlotLeakEscalationIsScopedToThePool is the reason trackedInPool exists.
+//
+// The escalation compared a PER-POOL held count against s.ActiveJobs(), which
+// is len(s.running) across every pool. The #196 node is a mac: it serves Linux
+// jobs from its embedded VM continuously, so there was almost always a tracked
+// job somewhere — and one was enough to make a leaked macOS slot look
+// accounted for and hold the report at Warn forever. The one signal that would
+// have named the outage was suppressed by unrelated work.
+//
+// Without the fix this test FAILS: the log says "waiting for a free
+// concurrency slot" at Warn instead of naming the suspected leak.
+func TestSlotLeakEscalationIsScopedToThePool(t *testing.T) {
+	after, every, leak := slotWaitLogAfter, slotWaitLogEvery, slotLeakSuspectAfter
+	defer func() { slotWaitLogAfter, slotWaitLogEvery, slotLeakSuspectAfter = after, every, leak }()
+	slotWaitLogAfter = 10 * time.Millisecond
+	slotWaitLogEvery = 10 * time.Millisecond
+	slotLeakSuspectAfter = 10 * time.Millisecond
+
+	s := New(Config{MaxConcurrent: 1, MaxMacOSVMs: 1, Log: quietLogger()})
+
+	// A perfectly healthy LOCAL job, tracked, doing real work. It has nothing
+	// to do with the macOS pool.
+	s.mu.Lock()
+	s.running[jobKey{Provider: "github", JobID: 1}] = &runningJob{repo: "myrepo"}
+	s.mu.Unlock()
+
+	// The macOS slot is held by nothing tracked: the #196 state exactly.
+	s.macSem <- struct{}{}
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	got := make(chan *slotToken, 1)
+	go func() { got <- s.acquireSlot(context.Background(), s.macSem, "macos", log) }()
+
+	time.Sleep(60 * time.Millisecond)
+	<-s.macSem // let the waiter through so the goroutine (and the log) settle
+	select {
+	case tok := <-got:
+		tok.release()
+	case <-time.After(5 * time.Second):
+		t.Fatal("acquireSlot never returned after the slot was freed")
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "suspected slot leak") {
+		t.Errorf("a leaked macOS slot was not escalated because an unrelated LOCAL job was tracked; got:\n%s", out)
+	}
+	if !strings.Contains(out, "level=ERROR") {
+		t.Errorf("leak report was not logged at ERROR; got:\n%s", out)
+	}
+	if !strings.Contains(out, "pool_tracked_jobs=0") {
+		t.Errorf("wait log did not report the POOL's tracked-job count; got:\n%s", out)
+	}
+}
+

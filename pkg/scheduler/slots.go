@@ -95,8 +95,9 @@ func (t *slotToken) release() {
 // logged nothing at all while five macOS jobs piled up behind a slot that
 // would never come back.
 func (s *Scheduler) acquireSlot(ctx context.Context, sem chan struct{}, pool string, log *slog.Logger) *slotToken {
-	// Fast path: a free slot logs nothing, which is the overwhelmingly
-	// common case and must stay allocation- and timer-free.
+	// Fast path: a free slot logs nothing and arms no timer, which is the
+	// overwhelmingly common case. (It still allocates the token — one tiny
+	// struct per job, against a job that is about to boot a VM.)
 	select {
 	case sem <- struct{}{}:
 		return &slotToken{sem: sem}
@@ -118,13 +119,22 @@ func (s *Scheduler) acquireSlot(ctx context.Context, sem chan struct{}, pool str
 		case <-ctx.Done():
 			return nil
 		case <-timer.C:
-			held, tracked, waited := len(sem), s.ActiveJobs(), time.Since(start)
+			// PER-POOL, not global. The first version of this compared the
+			// pool's held count against s.ActiveJobs(), which is
+			// len(s.running) across EVERY pool — so a single tracked Linux
+			// job running on the mac was enough to make a genuinely leaked
+			// macOS slot look accounted for and keep the escalation at Warn.
+			// On the #196 node that is not a hypothetical: the mac serves
+			// Linux jobs in its embedded VM continuously, so the one signal
+			// that would have named the outage was suppressed by unrelated
+			// work.
+			held, tracked, waited := len(sem), s.trackedInPool(pool), time.Since(start)
 			level, msg := slotWaitSeverity(waited, held, tracked)
 			log.Log(ctx, level, msg,
 				"pool", pool,
 				"held", held,
 				"capacity", cap(sem),
-				"tracked_jobs", tracked,
+				"pool_tracked_jobs", tracked,
 				"waited", waited.Truncate(time.Second))
 			timer.Reset(slotWaitLogEvery)
 		}
@@ -139,18 +149,56 @@ func (s *Scheduler) acquireSlot(ctx context.Context, sem chan struct{}, pool str
 // costs nothing when the node is idle and cannot produce a false alarm on a
 // node that simply has no macOS work.
 //
-// held > 0 with trackedJobs == 0 means the slot is charged to a job the
+// held > 0 with poolTrackedJobs == 0 means the slot is charged to a job the
 // scheduler is not tracking. That is legitimate for the length of a
 // provision (bounded by MacOSProvisionTimeout, minutes) and illegitimate
 // forever after — it is the exact signature of the 28-hour macOS outage,
 // where `ephemerd status` reported active_jobs: 0 on a node whose only slot
 // had been held since the previous afternoon. Pure so the escalation rule is
 // testable without a real pool or a real wait.
-func slotWaitSeverity(waited time.Duration, held, trackedJobs int) (slog.Level, string) {
-	if held > 0 && trackedJobs == 0 && waited >= slotLeakSuspectAfter {
+//
+// poolTrackedJobs is scoped to THE POOL BEING WAITED ON (see trackedInPool),
+// never to the whole scheduler. held is a per-pool number, so comparing it to
+// a global job count mixes units: on a mac, which serves Linux jobs from its
+// embedded VM alongside macOS VMs, one tracked Linux job made a leaked macOS
+// slot look explained and downgraded this to Warn forever.
+func slotWaitSeverity(waited time.Duration, held, poolTrackedJobs int) (slog.Level, string) {
+	if held > 0 && poolTrackedJobs == 0 && waited >= slotLeakSuspectAfter {
 		return slog.LevelError, "blocked on a concurrency slot that no tracked job accounts for — suspected slot leak"
 	}
 	return slog.LevelWarn, "waiting for a free concurrency slot"
+}
+
+// poolOf reports which dispatch pool a tracked job's slot came from. It
+// mirrors the routing in handleQueued: macOS jobs hold macSem, Linux jobs
+// dispatched into the VM worker hold linuxSem, everything else holds sem.
+func poolOf(rj *runningJob) string {
+	switch {
+	case rj.macosVM != nil:
+		return "macos"
+	case rj.dispatched != "":
+		return "linux"
+	default:
+		return "local"
+	}
+}
+
+// trackedInPool counts tracked running jobs whose slot came from pool.
+//
+// This is the denominator the leak watchdog needs: "is anything the scheduler
+// knows about accounting for the slots THIS pool is holding". ActiveJobs() —
+// the global count — cannot answer that on a node that runs more than one
+// kind of job, and a mac runs three.
+func (s *Scheduler) trackedInPool(pool string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, rj := range s.running {
+		if poolOf(rj) == pool {
+			n++
+		}
+	}
+	return n
 }
 
 // SlotUsage reports concurrency-slot occupancy for every dispatch pool.
