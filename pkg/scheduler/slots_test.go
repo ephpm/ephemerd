@@ -1214,3 +1214,90 @@ func TestSlotLeakEscalationIsScopedToThePool(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// MINOR 6: the slot must be free WHILE teardown is still in flight.
+// ---------------------------------------------------------------------------
+
+// TestSlotIsFreeWhileTeardownIsStillInFlight pins the ORDERING, which nothing
+// else in the suite did.
+//
+// Every teardown bound in this package is compressed to milliseconds in tests
+// and mockProvider.ReleaseJob returns instantly, so deleting the explicit
+// slot.release() and leaning on the deferred backstop still passed everything
+// — even though in production the difference is a GitHub API call on
+// context.Background() with no deadline, plus a VM stop that may never return,
+// standing between the job ending and the next macOS job starting. This test
+// makes ReleaseJob slow on purpose and asserts the slot is already back.
+func TestSlotIsFreeWhileTeardownIsStillInFlight(t *testing.T) {
+	t.Run("provisioning failure path", func(t *testing.T) {
+		prov := newMockProvider("mac-order-fail")
+		defer func() { _ = prov.Stop(context.Background()) }()
+
+		s := newSlotTestScheduler(t, prov, newWedgedMacVM(t))
+
+		observed := make(chan int, 4)
+		proceed := make(chan struct{})
+		var once sync.Once
+		prov.releaseHook = func(*providers.Claim) {
+			once.Do(func() {
+				observed <- len(s.macSem)
+				<-proceed
+			})
+		}
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.handleMacOSJob(context.Background(), macEvent(prov, 11))
+		}()
+
+		select {
+		case held := <-observed:
+			if held != 0 {
+				t.Errorf("macSem held=%d while the ghost-runner deregistration was still in flight, want 0: "+
+					"the slot is being held across a GitHub API call that has no deadline", held)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("ReleaseJob was never reached on the provisioning failure path")
+		}
+		close(proceed)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("handleMacOSJob did not return")
+		}
+	})
+
+	t.Run("job wait-goroutine", func(t *testing.T) {
+		prov := newMockProvider("mac-order-wait")
+		defer func() { _ = prov.Stop(context.Background()) }()
+
+		var stops atomic.Int32
+		s := newSlotTestScheduler(t, prov, &fastMacVM{ip: "192.168.64.5", stops: &stops})
+
+		observed := make(chan int, 4)
+		proceed := make(chan struct{})
+		var once sync.Once
+		prov.releaseHook = func(*providers.Claim) {
+			once.Do(func() {
+				observed <- len(s.macSem)
+				<-proceed
+			})
+		}
+
+		runMacDispatch(t, s, macEvent(prov, 12), 5*time.Second)
+
+		select {
+		case held := <-observed:
+			if held != 0 {
+				t.Errorf("macSem held=%d while the finished job's runner was still being deregistered, want 0: "+
+					"the next macOS job is waiting on a teardown that cannot delay it", held)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the wait-goroutine never reached ReleaseJob")
+		}
+		close(proceed)
+		waitForSlotFree(t, s.macSem, 5*time.Second)
+		assertCapacityIntact(t, s.macSem)
+	})
+}
