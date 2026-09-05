@@ -69,10 +69,26 @@ func statusCmd() *cli.Command {
 				return fmt.Errorf("status: %w", err)
 			}
 
+			// held_slots is deliberately next to active_jobs: they differ
+			// exactly when a job is provisioning or a slot leaked, and a
+			// node whose slots are all held while active_jobs reads 0 is
+			// the shape of the 28-hour macOS stall in issue #196.
+			slots := make([]map[string]any, 0, len(resp.SlotPools))
+			for _, p := range resp.SlotPools {
+				slots = append(slots, map[string]any{
+					"pool":     p.Pool,
+					"held":     p.Held,
+					"capacity": p.Capacity,
+				})
+			}
+
 			data := map[string]any{
 				"status":         resp.Status,
 				"active_jobs":    resp.ActiveJobs,
 				"max_concurrent": resp.MaxConcurrent,
+				"held_slots":     resp.HeldSlots,
+				"slot_capacity":  resp.SlotCapacity,
+				"slots":          slots,
 				"draining":       resp.Draining,
 				"uptime":         resp.Uptime,
 				"version":        resp.Version,

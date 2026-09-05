@@ -76,6 +76,28 @@ message StatusResponse {
   // The upgrade flow polls this after a restart to confirm the new binary
   // came up on the target version.
   string version = 6;
+  // held_slots is how many concurrency slots are currently HELD across every
+  // dispatch pool, which is not the same thing as active_jobs.
+  //
+  // active_jobs counts jobs the scheduler is tracking. A slot is taken before
+  // the job is tracked and given back after it is untracked, so a job that is
+  // still provisioning — or one whose slot leaked — is charged here and not
+  // there. Issue #196: a mac held its only slot for 28 hours after a wedged
+  // provision and reported status ok with active_jobs 0 the whole time.
+  // held_slots == slot_capacity with active_jobs 0 is that failure, visible.
+  int32 held_slots = 7;
+  // slot_capacity is the total number of slots across all pools.
+  int32 slot_capacity = 8;
+  // slot_pools breaks the totals down per dispatch pool (local, linux,
+  // macos), so an operator can tell which pool is saturated.
+  repeated SlotPool slot_pools = 9;
+}
+
+// SlotPool is one dispatch pool's concurrency-slot occupancy.
+message SlotPool {
+  string pool = 1;
+  int32 held = 2;
+  int32 capacity = 3;
 }
 
 message ListJobsRequest {}

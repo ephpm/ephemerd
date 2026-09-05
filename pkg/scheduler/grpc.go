@@ -79,10 +79,26 @@ func (c *controlServer) Status(ctx context.Context, req *apiv1.StatusRequest) (*
 	draining := c.sched.draining
 	c.sched.mu.Unlock()
 
+	// Slot occupancy is reported alongside the tracked-job count, never in
+	// place of it. ActiveJobs is len(s.running) and a slot is held from
+	// before trackRunning to after untrackRunning, so a stuck provision — or
+	// a leaked slot — shows up here and nowhere else. See issue #196.
+	var pools []*apiv1.SlotPool
+	for _, p := range c.sched.SlotUsage() {
+		pools = append(pools, &apiv1.SlotPool{
+			Pool:     p.Pool,
+			Held:     int32(p.Held),
+			Capacity: int32(p.Capacity),
+		})
+	}
+
 	return &apiv1.StatusResponse{
 		Status:        "ok",
 		ActiveJobs:    int32(activeJobs),
 		MaxConcurrent: int32(c.sched.cfg.MaxConcurrent),
+		HeldSlots:     int32(c.sched.HeldSlots()),
+		SlotCapacity:  int32(c.sched.SlotCapacity()),
+		SlotPools:     pools,
 		Draining:      draining,
 		Uptime:        time.Since(c.sched.startTime).Truncate(time.Second).String(),
 		Version:       c.sched.cfg.Version,
