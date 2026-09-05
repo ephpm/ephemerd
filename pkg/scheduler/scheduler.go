@@ -283,6 +283,16 @@ type Scheduler struct {
 	macUnwindGrace time.Duration
 	macStopGrace   time.Duration
 
+	// macAbandoned counts macOS VMs whose teardown this daemon walked away
+	// from and has not seen die. Releasing the slot on a wedged teardown
+	// (#196) removed the semaphore's accidental cap on how many guests could
+	// be stranded; this is the explicit one. See slots.go.
+	macAbandoned abandonedMacVMs
+
+	// macAbandonedCap overrides defaultMacAbandonedVMCap. Zero uses the
+	// default; only tests set it.
+	macAbandonedCap int
+
 	// busyProbe overrides the ground-truth "is this runner executing a
 	// job" check that vetoes orphan teardown. Nil (the default) uses
 	// probeRunnerBusy: local container/VM/process introspection, falling
@@ -354,7 +364,14 @@ type runningJob struct {
 	artifactsDir string     // non-empty if OCI artifacts were extracted for this job
 	dispatched   string     // non-empty if dispatched to Linux VM worker (stores container name)
 	macosVM      vm.MacOSVM // non-nil if running as a macOS VM job
+	macVMID      string     // macOS VM instance id; names this job's on-disk paths
 	startedAt    time.Time
+}
+
+// macRef is the identity every macOS teardown site reports to the
+// abandoned-VM registry. Safe on a non-macOS job (returns a zero VMID).
+func (rj *runningJob) macRef(key jobKey) macVMRef {
+	return macVMRef{JobID: key.JobID, VMID: rj.macVMID}
 }
 
 // runnerName returns the name the runner was registered under with the
@@ -1339,6 +1356,34 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		s.mu.Unlock()
 	}
 
+	// refuseCordoned drops this dispatch because the macOS pool has given up
+	// on too many VMs to safely start another (see slots.go).
+	//
+	// It leaves the seen stamp and clears only pending, exactly like the #154
+	// cordon rejection: seen ages out via seenTTL, so the node retries in ~10
+	// minutes rather than re-logging this every poll, and the job stays queued
+	// on the platform so a healthy node can take it immediately.
+	refuseCordoned := func(n, limit int) {
+		s.mu.Lock()
+		delete(s.pending, key)
+		s.mu.Unlock()
+		log.Error("refusing to provision a macOS VM: this node has abandoned too many macOS VMs without confirming they died",
+			"abandoned_macos_vms", n,
+			"cap", limit,
+			"detail", "each one is a live guest holding its full configured RAM; starting more risks OOMing the host and Vz will refuse anyway. Restart ephemerd to reclaim them.")
+	}
+
+	// vmID names the VM instance. Still the bare job id at this point; the
+	// per-attempt discriminator lands in the follow-up commit.
+	vmID := fmt.Sprintf("%d", jobID)
+	ref := macVMRef{JobID: jobID, VMID: vmID}
+	log = log.With("vm", vmID)
+
+	if n, limit, cordoned := s.macPoolCordoned(); cordoned {
+		refuseCordoned(n, limit)
+		return
+	}
+
 	// Acquire macOS VM concurrency slot (separate from Linux/local sem).
 	slot := s.acquireSlot(ctx, s.macSem, "macos", log)
 	if slot == nil {
@@ -1364,13 +1409,24 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		return
 	}
 
+	// Re-check the abandoned-VM cordon now that the wait for the slot is over.
+	// Same reasoning as the #154 cordon re-check in admitDispatch: this
+	// dispatch may have been parked on the semaphore for the entire life of
+	// the job ahead of it, and that is exactly the window in which a wedged
+	// teardown gets abandoned.
+	if n, limit, cordoned := s.macPoolCordoned(); cordoned {
+		slot.release()
+		refuseCordoned(n, limit)
+		return
+	}
+
 	log.Info("provisioning macOS VM runner for job")
 
 	// Extract OCI artifacts if an image is specified
 	image := s.resolveImage(ctx, &event, "darwin")
 	var artifactsDir string
 	if image != "" && s.cfg.Artifacts != nil {
-		artifactsDir = artifacts.ArtifactsDir(s.cfg.DataDir, fmt.Sprintf("%d", jobID))
+		artifactsDir = artifacts.ArtifactsDir(s.cfg.DataDir, vmID)
 		log.Info("extracting OCI artifacts for macOS VM job", "image", image, "dest", artifactsDir)
 		if err := s.cfg.Artifacts.Extract(ctx, image, artifactsDir); err != nil {
 			log.Error("failed to extract OCI artifacts", "image", image, "error", err)
@@ -1395,7 +1451,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 	}
 
 	// Create the macOS VM
-	macVM, err := s.newMacOSVM(*s.cfg.MacOSVMConfig, fmt.Sprintf("%d", jobID))
+	macVM, err := s.newMacOSVM(*s.cfg.MacOSVMConfig, vmID)
 	if err != nil {
 		log.Error("failed to create macOS VM", "error", err)
 		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
@@ -1417,7 +1473,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		// the call that hangs (#196).
 		unsee()
 		slot.release()
-		stopVMBounded(macVM, s.teardownGrace(), log)
+		s.stopVMBounded(macVM, ref, log)
 		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
 			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)
 		}
@@ -1437,7 +1493,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		unsee()
 		cancel()
 		slot.release()
-		stopVMBounded(macVM, s.teardownGrace(), log)
+		s.stopVMBounded(macVM, ref, log)
 		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
 			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)
 		}
@@ -1452,7 +1508,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 	// can wedge WaitForRunner indefinitely: the job never gets tracked (so it
 	// is invisible to `ephemerd jobs` and the orphan sweep) yet still holds
 	// the sole macOS slot, stalling all macOS CI until a human intervenes.
-	ip, err := s.waitForMacRunnerBounded(jobCtx, macVM, log)
+	ip, alreadyStopped, err := s.waitForMacRunnerBounded(jobCtx, macVM, ref, log)
 	if err != nil {
 		log.Error("macOS VM runner not reachable", "error", err)
 		// THE 28-HOUR LINE (#196). The slot goes back here, first, before
@@ -1466,7 +1522,18 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		unsee()
 		cancel()
 		slot.release()
-		stopVMBounded(macVM, s.teardownGrace(), log)
+		// Do NOT stop it again when the deadline path already did. Stopping a
+		// second time is never a cheap no-op: darwinMacOSVM.Stop is a
+		// sync.Once, so a second caller BLOCKS until the first invocation
+		// returns. Against the wedged guest this whole PR is about, that is a
+		// full teardownGrace (30s) of dead time on a path that still has a
+		// ghost runner to deregister — and it spawns a third goroutine parked
+		// inside the Once behind the first two. Against a healthy VM it is a
+		// pointless goroutine. Either way the VM is already stopped-or-
+		// abandoned and accounted for, so skip it.
+		if !alreadyStopped {
+			s.stopVMBounded(macVM, ref, log)
+		}
 		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
 			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)
 		}
@@ -1485,6 +1552,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		cancel:       cancel,
 		artifactsDir: artifactsDir,
 		macosVM:      macVM,
+		macVMID:      vmID,
 		startedAt:    time.Now(),
 	}, event.Provider, labelSetKey(event.Labels))
 
@@ -1534,7 +1602,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		if exists {
 			metrics.JobsActive.Dec()
 			if rj.macosVM != nil {
-				stopVMBounded(rj.macosVM, s.teardownGrace(), log)
+				s.stopVMBounded(rj.macosVM, rj.macRef(key), log)
 			}
 			if rj.artifactsDir != "" {
 				artifacts.Cleanup(rj.artifactsDir, s.cfg.Log)
@@ -1585,7 +1653,13 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 // its send and exit if it ever comes back. What must NOT happen is turning
 // that leaked goroutine into a leaked concurrency slot: teardown gets a
 // bounded grace period to be tidy, and then we return regardless.
-func (s *Scheduler) waitForMacRunnerBounded(ctx context.Context, macVM vm.MacOSVM, log *slog.Logger) (string, error) {
+//
+// The second return value reports whether this function already STOPPED the
+// VM. The caller's error path must not stop it again: darwinMacOSVM.Stop is a
+// sync.Once, so a redundant second Stop blocks until the first returns —
+// against a wedged guest that is a full teardown grace of dead time and a
+// third goroutine parked in the Once. See handleMacOSJob.
+func (s *Scheduler) waitForMacRunnerBounded(ctx context.Context, macVM vm.MacOSVM, ref macVMRef, log *slog.Logger) (string, bool, error) {
 	timeout := s.cfg.MacOSProvisionTimeout
 	if timeout <= 0 {
 		timeout = defaultMacOSProvisionTimeout
@@ -1611,14 +1685,14 @@ func (s *Scheduler) waitForMacRunnerBounded(ctx context.Context, macVM vm.MacOSV
 
 	select {
 	case r := <-resCh:
-		return r.ip, r.err
+		return r.ip, false, r.err
 	case <-timer.C:
 		log.Error("macOS VM stuck in provisioning past deadline; force-stopping VM to reclaim the slot", "timeout", timeout)
-		s.abandonMacProvision(macVM, unwound, log)
-		return "", fmt.Errorf("timed out after %s waiting for macOS VM runner to become reachable", timeout)
+		s.abandonMacProvision(macVM, unwound, ref, log)
+		return "", true, fmt.Errorf("timed out after %s waiting for macOS VM runner to become reachable", timeout)
 	case <-ctx.Done():
-		s.abandonMacProvision(macVM, unwound, log)
-		return "", ctx.Err()
+		s.abandonMacProvision(macVM, unwound, ref, log)
+		return "", true, ctx.Err()
 	}
 }
 
@@ -1633,13 +1707,19 @@ func (s *Scheduler) waitForMacRunnerBounded(ctx context.Context, macVM vm.MacOSV
 // this teardown were still wedged in the Once, that "cleanup" call would hang
 // on a path that is holding a concurrency slot. Off-thread here plus
 // stopVMBounded there means neither can pin the slot.
-func (s *Scheduler) abandonMacProvision(macVM vm.MacOSVM, unwound <-chan struct{}, log *slog.Logger) {
+func (s *Scheduler) abandonMacProvision(macVM vm.MacOSVM, unwound <-chan struct{}, ref macVMRef, log *slog.Logger) {
 	// Dropping the guest is what unblocks a wedged SSH session call.
 	stopped := stopVMAsync(macVM)
 	if !awaitUnwind(stopped, unwound, s.provisionUnwindGrace()) {
 		log.Error("macOS VM teardown did not finish after the force-stop; abandoning it and reclaiming the concurrency slot anyway",
 			"grace", s.provisionUnwindGrace(),
 			"detail", "a wedged Vz stop or a wedged guest wait must never pin the macOS slot — see issue #196")
+		// Charge the guest we just walked away from. The slot comes back
+		// either way — that is the #196 fix and it is not negotiable — but the
+		// VM is still running and still holding its RAM, so it has to be
+		// counted against the cap that decides whether this node may start
+		// another one. See slots.go.
+		s.abandonVM(stopped, ref, "force-stop after the provisioning deadline did not return", log)
 	}
 }
 
@@ -1656,20 +1736,30 @@ func stopVMAsync(macVM vm.MacOSVM) <-chan struct{} {
 	return done
 }
 
-// stopVMBounded force-stops a VM without letting the teardown pin the caller.
-// Used by every macOS cleanup path that runs while a slot could still be held
-// or a job could still be waiting on this goroutine.
-func stopVMBounded(macVM vm.MacOSVM, grace time.Duration, log *slog.Logger) {
+// stopVMBounded force-stops a VM without letting the teardown pin the caller,
+// and charges the VM to the abandoned registry if the grace expires.
+//
+// Used by EVERY macOS cleanup path, not just the ones holding a slot. Three of
+// them used to call macosVM.Stop() directly — handleCompleted, destroyAll and
+// sweepOrphanRunners — and the sweep is called synchronously from the
+// cleanupTicker arm of Run's select, i.e. on the scheduler's only event loop.
+// A wedged Vz stop there does not cost one job's slot, it costs the whole
+// daemon: no queued, in_progress or completed handling for any platform, and
+// no drain on SIGTERM. That is strictly worse than the leak this PR fixes, so
+// there is no such thing as a macOS stop that may block its caller.
+func (s *Scheduler) stopVMBounded(macVM vm.MacOSVM, ref macVMRef, log *slog.Logger) {
+	grace := s.teardownGrace()
 	timer := time.NewTimer(grace)
 	defer timer.Stop()
+	done := stopVMAsync(macVM)
 	select {
-	case <-stopVMAsync(macVM):
+	case <-done:
 	case <-timer.C:
 		log.Warn("macOS VM stop did not return within the grace period; continuing without it",
 			"grace", grace)
+		s.abandonVM(done, ref, "teardown did not return within the stop grace", log)
 	}
 }
-
 // handleLocalJob provisions a runner using the local containerd Runtime.
 func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent) {
 	jobID := event.JobID
@@ -2049,7 +2139,11 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event providers.JobEven
 	resetBackoff(event.Repo)
 	job.cancel()
 	if job.macosVM != nil {
-		job.macosVM.Stop()
+		// Bounded (#196). This ran as a bare Stop(), so a wedged Vz teardown
+		// parked the completed-event handler forever — and with it the
+		// deferred sweepOrphanRunners above, which is how the node reconciles
+		// runners after every completion.
+		s.stopVMBounded(job.macosVM, job.macRef(ownerKey), log)
 	} else if job.dispatched != "" && s.cfg.LinuxDispatcher != nil {
 		if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), job.dispatched); err != nil {
 			log.Warn("failed to destroy dispatched runner", "error", err)
@@ -2133,7 +2227,13 @@ func (s *Scheduler) destroyAll() {
 		s.cfg.Log.Info("destroying runner on shutdown", "job_id", key.JobID, "provider", key.Provider)
 		job.cancel()
 		if job.macosVM != nil {
-			job.macosVM.Stop()
+			// Bounded (#196). destroyAll is the force-kill arm of drain(), so
+			// a bare Stop() here meant a wedged Vz teardown stopped the daemon
+			// from ever exiting: drain() never returns, Run() never returns,
+			// and SIGTERM has to be escalated to SIGKILL by hand. The
+			// shutdown timeout exists precisely so shutdown is bounded; a
+			// teardown that ignores it defeats it.
+			s.stopVMBounded(job.macosVM, job.macRef(key), s.cfg.Log.With("job_id", key.JobID))
 		} else if job.dispatched != "" && s.cfg.LinuxDispatcher != nil {
 			if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), job.dispatched); err != nil {
 				s.cfg.Log.Warn("failed to destroy dispatched runner", "job_id", key.JobID, "error", err)
@@ -2174,15 +2274,26 @@ func (s *Scheduler) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	// returned 200. held_slots is read straight off the semaphores and so
 	// counts the capacity that is actually spoken for. held == capacity with
 	// active_jobs 0, sustained, means a stuck provision or a leak.
+	//
+	// abandoned_macos_vms is the companion number: slots that were given BACK
+	// by walking away from a teardown. It is the cost side of the #196 trade —
+	// each one is a macOS guest still holding its RAM that only a daemon
+	// restart reclaims — and at the cap the macOS pool stops taking work, so
+	// an operator has to be able to see it without reading the log.
 	status := map[string]any{
-		"status":         "ok",
-		"active_jobs":    activeJobs,
-		"max_concurrent": s.cfg.MaxConcurrent,
-		"held_slots":     s.HeldSlots(),
-		"slot_capacity":  s.SlotCapacity(),
-		"slots":          s.SlotUsage(),
-		"draining":       draining,
-		"uptime":         time.Since(s.startTime).String(),
+		"status":                 "ok",
+		"active_jobs":            activeJobs,
+		"max_concurrent":         s.cfg.MaxConcurrent,
+		"held_slots":             s.HeldSlots(),
+		"slot_capacity":          s.SlotCapacity(),
+		"slots":                  s.SlotUsage(),
+		"abandoned_macos_vms":    s.AbandonedMacOSVMs(),
+		"abandoned_macos_vm_cap": s.abandonedMacVMCap(),
+		"draining":               draining,
+		"uptime":                 time.Since(s.startTime).String(),
+	}
+	if n := s.AbandonedMacOSVMDetails(); len(n) > 0 {
+		status["abandoned_macos_vm_details"] = n
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -2465,7 +2576,16 @@ func (s *Scheduler) sweepOrphanRunners() {
 		metrics.JobsActive.Dec()
 		v.rj.cancel()
 		if v.rj.macosVM != nil {
-			v.rj.macosVM.Stop()
+			// THE WORST ONE (#196). sweepOrphanRunners is called
+			// SYNCHRONOUSLY from the cleanupTicker arm of Run's select — the
+			// scheduler's only event loop. A tracked macOS job nominated as an
+			// orphan whose Vz stop wedges (the exact failure this PR exists
+			// for) used to block that loop forever: no queued, in_progress or
+			// completed handling for ANY platform, no drain on SIGTERM, the
+			// daemon alive and answering /healthz with 200 and doing nothing.
+			// That is strictly worse than the single leaked slot the rest of
+			// this PR is about, and it is one call away.
+			s.stopVMBounded(v.rj.macosVM, v.rj.macRef(v.key), s.cfg.Log.With("runner", v.name, "job_id", v.key.JobID))
 		} else if v.rj.dispatched != "" && s.cfg.LinuxDispatcher != nil {
 			if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), v.rj.dispatched); err != nil {
 				s.cfg.Log.Warn("failed to destroy orphaned dispatched runner", "runner", v.name, "error", err)

@@ -132,12 +132,15 @@ func TestWaitForMacRunnerBounded_ReturnsWhenWaitSucceeds(t *testing.T) {
 	var stops atomic.Int32
 	quick := &fastMacVM{ip: "192.168.64.5", stops: &stops}
 
-	ip, err := s.waitForMacRunnerBounded(context.Background(), quick, quietLogger())
+	ip, alreadyStopped, err := s.waitForMacRunnerBounded(context.Background(), quick, macVMRef{JobID: 1, VMID: "1-happy"}, quietLogger())
 	if err != nil {
 		t.Fatalf("unexpected error on healthy provision: %v", err)
 	}
 	if ip != "192.168.64.5" {
 		t.Errorf("ip = %q, want 192.168.64.5", ip)
+	}
+	if alreadyStopped {
+		t.Error("healthy provision reported the VM as already stopped; the caller would skip a teardown it still owes")
 	}
 	if stops.Load() != 0 {
 		t.Errorf("VM was stopped %d times on the happy path, want 0", stops.Load())

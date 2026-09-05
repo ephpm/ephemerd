@@ -99,9 +99,14 @@ func (c *controlServer) Status(ctx context.Context, req *apiv1.StatusRequest) (*
 		HeldSlots:     int32(c.sched.HeldSlots()),
 		SlotCapacity:  int32(c.sched.SlotCapacity()),
 		SlotPools:     pools,
-		Draining:      draining,
-		Uptime:        time.Since(c.sched.startTime).Truncate(time.Second).String(),
-		Version:       c.sched.cfg.Version,
+		// The other half of the slot story: slots that came back only because
+		// the daemon abandoned a teardown. A guest per count, still holding
+		// its RAM, reclaimable only by restart. See issue #196 and slots.go.
+		AbandonedMacosVms:   int32(c.sched.AbandonedMacOSVMs()),
+		AbandonedMacosVmCap: int32(c.sched.abandonedMacVMCap()),
+		Draining:            draining,
+		Uptime:              time.Since(c.sched.startTime).Truncate(time.Second).String(),
+		Version:             c.sched.cfg.Version,
 	}, nil
 }
 

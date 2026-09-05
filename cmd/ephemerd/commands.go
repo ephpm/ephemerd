@@ -89,9 +89,14 @@ func statusCmd() *cli.Command {
 				"held_slots":     resp.HeldSlots,
 				"slot_capacity":  resp.SlotCapacity,
 				"slots":          slots,
-				"draining":       resp.Draining,
-				"uptime":         resp.Uptime,
-				"version":        resp.Version,
+				// Non-zero means macOS guests are stranded on this node,
+				// holding RAM nothing but a restart reclaims; at the cap the
+				// macOS pool has stopped taking work. See issue #196.
+				"abandoned_macos_vms":    resp.AbandonedMacosVms,
+				"abandoned_macos_vm_cap": resp.AbandonedMacosVmCap,
+				"draining":               resp.Draining,
+				"uptime":                 resp.Uptime,
+				"version":                resp.Version,
 			}
 
 			pretty, _ := json.MarshalIndent(data, "", "  ")

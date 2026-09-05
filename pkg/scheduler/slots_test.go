@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -465,10 +466,12 @@ func TestAwaitUnwind(t *testing.T) {
 // capacity is not.
 func TestStopVMBoundedDoesNotHangOnAWedgedStop(t *testing.T) {
 	macVM := newWedgedMacVM(t)
+	s := New(Config{MaxMacOSVMs: 1, Log: quietLogger()})
+	s.macStopGrace = 20 * time.Millisecond
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		stopVMBounded(macVM, 20*time.Millisecond, quietLogger())
+		s.stopVMBounded(macVM, macVMRef{JobID: 1, VMID: "1-wedged"}, quietLogger())
 	}()
 	select {
 	case <-done:
@@ -477,6 +480,11 @@ func TestStopVMBoundedDoesNotHangOnAWedgedStop(t *testing.T) {
 	}
 	if macVM.stopCalls.Load() != 1 {
 		t.Errorf("Stop called %d times, want 1", macVM.stopCalls.Load())
+	}
+	// The VM it walked away from must be charged, or nothing bounds how many
+	// of them a node can strand.
+	if n := s.AbandonedMacOSVMs(); n != 1 {
+		t.Errorf("AbandonedMacOSVMs() = %d after walking away from a wedged stop, want 1", n)
 	}
 }
 
@@ -598,6 +606,319 @@ func TestHealthzExposesHeldSlots(t *testing.T) {
 	}
 	if !sawMac {
 		t.Error("healthz slots did not break out the macos pool")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// MAJOR 1: no macOS Stop() may block its caller — least of all the event loop.
+// ---------------------------------------------------------------------------
+
+// seedMacOSRunner files a tracked macOS job plus its runner-ledger entry, the
+// state the orphan sweep, handleCompleted and destroyAll all operate on.
+func seedMacOSRunner(s *Scheduler, prov providers.Provider, jobID int64, name string, dispatchedAt time.Time, macVM vm.MacOSVM) jobKey {
+	key := jobKey{Provider: prov.Name(), JobID: jobID}
+	_, cancel := context.WithCancel(context.Background())
+	s.mu.Lock()
+	s.running[key] = &runningJob{
+		provider:  prov,
+		claim:     &providers.Claim{RunnerID: jobID * 10, RunnerName: name, Repo: "myrepo"},
+		repo:      "myrepo",
+		cancel:    cancel,
+		macosVM:   macVM,
+		macVMID:   fmt.Sprintf("%d-seeded", jobID),
+		startedAt: dispatchedAt,
+	}
+	s.runners[name] = &runnerBinding{
+		intentKey:    key,
+		dispatchedAt: dispatchedAt,
+		observable:   true,
+		labelSet:     labelSetKey([]string{"self-hosted", "macos"}),
+	}
+	s.mu.Unlock()
+	return key
+}
+
+// newTeardownTestScheduler builds a scheduler whose macOS teardown bounds are
+// milliseconds, for the paths that tear a TRACKED macOS job down.
+func newTeardownTestScheduler(t *testing.T, prov providers.Provider, sweep bool) *Scheduler {
+	t.Helper()
+	s := New(Config{
+		Providers:       []providers.Provider{prov},
+		MacOSVMConfig:   &vm.MacOSVMConfig{},
+		MaxMacOSVMs:     1,
+		ShutdownTimeout: 50 * time.Millisecond,
+		OrphanSweep:     OrphanSweepConfig{Enabled: sweep, Grace: 10 * time.Minute},
+		Log:             quietLogger(),
+	})
+	s.webhookMode = true
+	s.busyProbe = idleProbe
+	s.macStopGrace = 50 * time.Millisecond
+	s.macUnwindGrace = 50 * time.Millisecond
+	return s
+}
+
+// mustReturnWithin fails (rather than hangs) if fn has not returned by d.
+func mustReturnWithin(t *testing.T, d time.Duration, what string, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatalf("%s did not return within %s: a macOS VM Stop() is blocking its caller", what, d)
+	}
+}
+
+// TestSweepOrphanRunners_WedgedMacOSVMCannotBlockTheEventLoop is the worst of
+// the three unbounded Stop() sites the #196 fix left behind.
+//
+// sweepOrphanRunners is called SYNCHRONOUSLY from the cleanupTicker arm of
+// Run's select — the scheduler's one and only event loop. A tracked macOS job
+// nominated as an orphan whose Vz stop wedges (exactly the failure that
+// produced the 28-hour outage) parked that loop forever: no queued,
+// in_progress or completed handling for any platform, and no drain on SIGTERM.
+// That is strictly worse than the leaked slot the rest of the PR fixes.
+//
+// Without the fix this test FAILS on mustReturnWithin: the sweep sits inside
+// wedgedMacVM.Stop() until the test binary's own timeout.
+func TestSweepOrphanRunners_WedgedMacOSVMCannotBlockTheEventLoop(t *testing.T) {
+	prov := &reportingProvider{claimCountingProvider: newClaimCountingProvider("mac-sweep")}
+	s := newTeardownTestScheduler(t, prov, true)
+
+	macVM := newWedgedMacVM(t)
+	key := seedMacOSRunner(s, prov, 4242, "mac-r-1", time.Now().Add(-30*time.Minute), macVM)
+
+	mustReturnWithin(t, 5*time.Second, "sweepOrphanRunners", s.sweepOrphanRunners)
+
+	if macVM.stopCalls.Load() == 0 {
+		t.Error("the orphaned macOS VM was never stopped; the sweep must still tear it down")
+	}
+	s.mu.Lock()
+	_, stillRunning := s.running[key]
+	s.mu.Unlock()
+	if stillRunning {
+		t.Error("orphaned macOS job is still tracked after the sweep")
+	}
+	// A stop it walked away from has to be counted, or nothing bounds them.
+	if n := s.AbandonedMacOSVMs(); n != 1 {
+		t.Errorf("AbandonedMacOSVMs() = %d after the sweep abandoned a wedged stop, want 1", n)
+	}
+}
+
+// TestHandleCompleted_WedgedMacOSVMCannotBlockTheHandler: the completed-event
+// handler also ran a bare Stop(). A wedge there parks the handler forever, and
+// with it the deferred sweepOrphanRunners that reconciles the ledger after
+// every completion.
+//
+// Without the fix this FAILS on mustReturnWithin.
+func TestHandleCompleted_WedgedMacOSVMCannotBlockTheHandler(t *testing.T) {
+	prov := &reportingProvider{claimCountingProvider: newClaimCountingProvider("mac-completed")}
+	s := newTeardownTestScheduler(t, prov, false)
+
+	macVM := newWedgedMacVM(t)
+	key := seedMacOSRunner(s, prov, 5150, "mac-r-2", time.Now(), macVM)
+
+	event := providers.JobEvent{
+		Provider:   prov,
+		Action:     "completed",
+		Repo:       "myrepo",
+		JobID:      5150,
+		RunnerName: "mac-r-2",
+		Conclusion: "success",
+	}
+	mustReturnWithin(t, 5*time.Second, "handleCompleted", func() {
+		s.handleCompleted(context.Background(), event)
+	})
+
+	if macVM.stopCalls.Load() == 0 {
+		t.Error("the completed job's macOS VM was never stopped")
+	}
+	s.mu.Lock()
+	_, stillRunning := s.running[key]
+	s.mu.Unlock()
+	if stillRunning {
+		t.Error("completed macOS job is still tracked")
+	}
+}
+
+// TestDrain_WedgedMacOSVMCannotBlockShutdown: destroyAll is the force-kill arm
+// of drain(), reached only after ShutdownTimeout has already expired. A bare
+// Stop() there meant a wedged guest kept the process alive indefinitely —
+// drain never returns, Run never returns, and SIGTERM has to be escalated to
+// SIGKILL by hand. The shutdown timeout exists to bound shutdown; a teardown
+// that ignores it defeats the entire mechanism.
+//
+// Without the fix this FAILS on mustReturnWithin.
+func TestDrain_WedgedMacOSVMCannotBlockShutdown(t *testing.T) {
+	prov := &reportingProvider{claimCountingProvider: newClaimCountingProvider("mac-drain")}
+	s := newTeardownTestScheduler(t, prov, false)
+
+	macVM := newWedgedMacVM(t)
+	seedMacOSRunner(s, prov, 6006, "mac-r-3", time.Now(), macVM)
+
+	mustReturnWithin(t, 10*time.Second, "drain", s.drain)
+
+	if macVM.stopCalls.Load() == 0 {
+		t.Error("the running macOS VM was never stopped on shutdown")
+	}
+	if n := s.ActiveJobs(); n != 0 {
+		t.Errorf("ActiveJobs() = %d after drain force-killed everything, want 0", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// MAJOR 3: the abandoned-VM trade is bounded and legible.
+// ---------------------------------------------------------------------------
+
+// TestMacOSPoolCordonsPastTheAbandonedVMCap.
+//
+// The semaphore used to be the accidental limiter on stranded guests: leak the
+// only slot and the node provisions zero more, so at most one guest could ever
+// be abandoned. Releasing the slot on the failure path is exactly what removed
+// that, and an abandoned VM is not tracked and no longer charged against
+// MaxMacOSVMs — so without an explicit cap a repeatably-wedging guest lets the
+// node keep provisioning until Virtualization.framework refuses (about two
+// concurrent macOS guests on Apple Silicon) or the host runs out of RAM.
+//
+// Without the cap this test FAILS: the second dispatch constructs and boots
+// another VM instead of being refused.
+func TestMacOSPoolCordonsPastTheAbandonedVMCap(t *testing.T) {
+	prov := newMockProvider("mac-cap")
+	defer func() { _ = prov.Stop(context.Background()) }()
+
+	// Constructed by hand rather than via newWedgedMacVM: this test needs to
+	// release the wedged Stop() mid-test to prove the cordon lifts.
+	first := &wedgedMacVM{stopReturns: make(chan struct{})}
+	s := newSlotTestScheduler(t, prov, first)
+	s.macAbandonedCap = 1
+
+	runMacDispatch(t, s, macEvent(prov, 1), 5*time.Second)
+	if n := s.AbandonedMacOSVMs(); n != 1 {
+		t.Fatalf("AbandonedMacOSVMs() = %d after one unkillable VM, want 1", n)
+	}
+
+	// Second job: must be refused before anything is constructed or booted.
+	var created atomic.Int32
+	s.newMacOSVM = func(vm.MacOSVMConfig, string) (vm.MacOSVM, error) {
+		created.Add(1)
+		return &wedgedMacVM{stopReturns: make(chan struct{})}, nil
+	}
+	runMacDispatch(t, s, macEvent(prov, 2), 5*time.Second)
+	if got := created.Load(); got != 0 {
+		t.Errorf("provisioned %d macOS VMs past the abandoned cap; the point of the cap is that it provisions none", got)
+	}
+	assertCapacityIntact(t, s.macSem)
+	if n := s.ActiveJobs(); n != 0 {
+		t.Errorf("ActiveJobs() = %d, want 0", n)
+	}
+
+	// The count is reportable, not just internal.
+	if n := s.AbandonedMacOSVMs(); n != 1 {
+		t.Errorf("AbandonedMacOSVMs() = %d, want 1", n)
+	}
+	if d := s.AbandonedMacOSVMDetails(); len(d) != 1 || d[0].JobID != 1 {
+		t.Errorf("AbandonedMacOSVMDetails() = %+v, want one entry for job 1", d)
+	}
+
+	// The cordon is not permanent: a merely-slow Vz stop that eventually
+	// returns discharges its entry and the pool takes work again. A node that
+	// recovers on its own must not need a restart.
+	close(first.stopReturns)
+	deadline := time.Now().Add(5 * time.Second)
+	for s.AbandonedMacOSVMs() != 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if n := s.AbandonedMacOSVMs(); n != 0 {
+		t.Fatalf("AbandonedMacOSVMs() = %d after the abandoned stop finally returned, want 0", n)
+	}
+
+	runMacDispatch(t, s, macEvent(prov, 3), 5*time.Second)
+	if created.Load() == 0 {
+		t.Error("the macOS pool stayed cordoned after its abandoned VMs were confirmed dead")
+	}
+}
+
+// TestStatusAndHealthzReportAbandonedMacOSVMs: held_slots showed the outage;
+// abandoned_macos_vms shows what the fix for it costs. An operator has to be
+// able to see stranded guests without reading the log.
+func TestStatusAndHealthzReportAbandonedMacOSVMs(t *testing.T) {
+	s := New(Config{MaxConcurrent: 2, MaxMacOSVMs: 1, Log: quietLogger()})
+	s.macAbandoned.charge(macVMRef{JobID: 77, VMID: "77-deadbeef"}, "test")
+
+	cs := &controlServer{sched: s, log: quietLogger()}
+	resp, err := cs.Status(context.Background(), &apiv1.StatusRequest{})
+	if err != nil {
+		t.Fatalf("Status() error: %v", err)
+	}
+	if resp.AbandonedMacosVms != 1 {
+		t.Errorf("Status.AbandonedMacosVms = %d, want 1", resp.AbandonedMacosVms)
+	}
+	if resp.AbandonedMacosVmCap != defaultMacAbandonedVMCap {
+		t.Errorf("Status.AbandonedMacosVmCap = %d, want %d", resp.AbandonedMacosVmCap, defaultMacAbandonedVMCap)
+	}
+	// The pre-existing contract is untouched.
+	if resp.Status != "ok" || resp.ActiveJobs != 0 || resp.MaxConcurrent != 2 {
+		t.Errorf("existing Status fields changed: %+v", resp)
+	}
+
+	rec := httptest.NewRecorder()
+	s.handleHealthz(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	var body struct {
+		ActiveJobs        int              `json:"active_jobs"`
+		HeldSlots         int              `json:"held_slots"`
+		AbandonedMacOSVMs int              `json:"abandoned_macos_vms"`
+		AbandonedCap      int              `json:"abandoned_macos_vm_cap"`
+		Details           []AbandonedMacVM `json:"abandoned_macos_vm_details"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decoding healthz body %q: %v", rec.Body.String(), err)
+	}
+	if body.AbandonedMacOSVMs != 1 {
+		t.Errorf("healthz abandoned_macos_vms = %d, want 1", body.AbandonedMacOSVMs)
+	}
+	if body.AbandonedCap != defaultMacAbandonedVMCap {
+		t.Errorf("healthz abandoned_macos_vm_cap = %d, want %d", body.AbandonedCap, defaultMacAbandonedVMCap)
+	}
+	if len(body.Details) != 1 || body.Details[0].VMID != "77-deadbeef" {
+		t.Errorf("healthz abandoned_macos_vm_details = %+v, want the stranded VM named", body.Details)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// MINOR 5: the deadline path already stopped the VM; do not stop it again.
+// ---------------------------------------------------------------------------
+
+// TestHandleMacOSJob_DeadlinePathStopsTheVMExactlyOnce.
+//
+// waitForMacRunnerBounded force-stops the VM when the deadline fires (#178,
+// unchanged). The caller's error path then called stopVMBounded on the very
+// same VM. Against darwinMacOSVM's stopOnce that is never a cheap no-op: the
+// second caller BLOCKS until the first invocation returns, so on the wedged
+// guest this whole PR is about it burned a full teardown grace and parked a
+// third goroutine inside the Once — while a ghost JIT runner still needed
+// deregistering.
+//
+// Without the fix this test FAILS: Stop is called twice and the second
+// abandonment is charged against the cap as well, so a single wedged VM
+// consumes the node's entire abandoned-VM budget.
+func TestHandleMacOSJob_DeadlinePathStopsTheVMExactlyOnce(t *testing.T) {
+	prov := newMockProvider("mac-double-stop")
+	defer func() { _ = prov.Stop(context.Background()) }()
+
+	macVM := newWedgedMacVM(t)
+	s := newSlotTestScheduler(t, prov, macVM)
+	s.macAbandonedCap = 99 // not the subject here
+
+	runMacDispatch(t, s, macEvent(prov, 999), 5*time.Second)
+
+	if got := macVM.stopCalls.Load(); got != 1 {
+		t.Errorf("Stop called %d times on the deadline path, want 1 — the second call re-enters a sync.Once that is still wedged", got)
+	}
+	if n := s.AbandonedMacOSVMs(); n != 1 {
+		t.Errorf("AbandonedMacOSVMs() = %d for ONE wedged VM, want 1 — a redundant stop must not double-charge the cap", n)
 	}
 }
 

@@ -91,6 +91,20 @@ message StatusResponse {
   // slot_pools breaks the totals down per dispatch pool (local, linux,
   // macos), so an operator can tell which pool is saturated.
   repeated SlotPool slot_pools = 9;
+  // abandoned_macos_vms counts macOS VMs whose teardown this daemon gave up
+  // on and has not seen finish.
+  //
+  // This is the COST of the #196 fix, made visible. When a Virtualization.
+  // framework stop wedges, the daemon walks away from it so the concurrency
+  // slot comes back — but the guest is still running and still holding its
+  // full configured RAM, and only a restart reclaims it. Non-zero means the
+  // node is losing memory it cannot get back; at abandoned_macos_vm_cap the
+  // macOS pool refuses further provisioning rather than growing without
+  // bound (Vz permits only a couple of concurrent macOS guests anyway).
+  int32 abandoned_macos_vms = 10;
+  // abandoned_macos_vm_cap is the value of abandoned_macos_vms at which the
+  // macOS pool stops taking work.
+  int32 abandoned_macos_vm_cap = 11;
 }
 
 // SlotPool is one dispatch pool's concurrency-slot occupancy.
