@@ -2,6 +2,8 @@ package scheduler
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -364,7 +366,7 @@ type runningJob struct {
 	artifactsDir string     // non-empty if OCI artifacts were extracted for this job
 	dispatched   string     // non-empty if dispatched to Linux VM worker (stores container name)
 	macosVM      vm.MacOSVM // non-nil if running as a macOS VM job
-	macVMID      string     // macOS VM instance id; names this job's on-disk paths
+	macVMID      string     // per-attempt macOS VM instance id (macVMInstanceID); owns this job's on-disk paths
 	startedAt    time.Time
 }
 
@@ -1373,9 +1375,25 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 			"detail", "each one is a live guest holding its full configured RAM; starting more risks OOMing the host and Vz will refuse anyway. Restart ephemerd to reclaim them.")
 	}
 
-	// vmID names the VM instance. Still the bare job id at this point; the
-	// per-attempt discriminator lands in the follow-up commit.
-	vmID := fmt.Sprintf("%d", jobID)
+	// PER-ATTEMPT VM IDENTITY. Every macOS resource used to be keyed by job id
+	// alone: the VM's shared directory (<data>/vm/macos/jobs/<id>), its disk
+	// and aux clones (<id>.img / <id>.aux) and its extracted OCI artifacts. On
+	// the failure paths below this function now releases the slot BEFORE
+	// teardown, which means the same job id can be re-dispatched (poll re-emits
+	// it, or the webhook catch-up poll does) while the previous attempt's VM is
+	// still alive with a stop wedged inside Virtualization.framework.
+	//
+	// With shared paths that is mutual destruction: attempt 2 apfsCopies over
+	// the .img/.aux files attempt 1's guest still has open and writes its JIT
+	// config into the same share, and then attempt 1's abandoned stop finally
+	// returns minutes later and runs os.Remove(clonePath) + os.RemoveAll(jobDir)
+	// — deleting attempt 2's disk and its .jit_config, so attempt 2's runner can
+	// never register and it times out too. Self-sustaining, and each round
+	// strands another guest.
+	//
+	// A per-attempt suffix makes the attempts disjoint by construction, so a
+	// late teardown can only ever delete its own files.
+	vmID := macVMInstanceID(jobID)
 	ref := macVMRef{JobID: jobID, VMID: vmID}
 	log = log.With("vm", vmID)
 
@@ -1426,6 +1444,10 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 	image := s.resolveImage(ctx, &event, "darwin")
 	var artifactsDir string
 	if image != "" && s.cfg.Artifacts != nil {
+		// Keyed by the VM instance, not the job: this directory is deleted by
+		// artifacts.Cleanup on every failure path below, all of which now run
+		// after the slot is released and therefore possibly concurrently with
+		// a fresh attempt at the same job id.
 		artifactsDir = artifacts.ArtifactsDir(s.cfg.DataDir, vmID)
 		log.Info("extracting OCI artifacts for macOS VM job", "image", image, "dest", artifactsDir)
 		if err := s.cfg.Artifacts.Extract(ctx, image, artifactsDir); err != nil {
@@ -1450,7 +1472,8 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		return
 	}
 
-	// Create the macOS VM
+	// Create the macOS VM. vmID (not the bare job id) is what every path this
+	// VM owns on disk is named after — see the per-attempt identity note above.
 	macVM, err := s.newMacOSVM(*s.cfg.MacOSVMConfig, vmID)
 	if err != nil {
 		log.Error("failed to create macOS VM", "error", err)
@@ -1593,10 +1616,20 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		// may delay the next macOS job. macVM.Stop() waits up to 15s for a
 		// graceful guest shutdown before forcing (and on the #196 node the
 		// force did not return either), and ReleaseJob is a GitHub API call
-		// on context.Background() with no deadline at all. This is safe
-		// against a newly admitted job: every VM, its clone, and its shared
-		// directory are keyed by job ID, so a fresh dispatch cannot touch
-		// anything this teardown still owns.
+		// on context.Background() with no deadline at all.
+		//
+		// WHAT MAKES THAT SAFE. Releasing here means the SAME job id can be
+		// dispatched again while this teardown is still running — unsee() has
+		// cleared seen/pending on the failure paths, the poll re-emits a still-
+		// queued job about every 30s, and admitDispatch will admit it. So the
+		// invariant is NOT "a fresh dispatch cannot collide because everything
+		// is keyed by job id" — everything being keyed by job id is precisely
+		// what WOULD collide. The invariant is that every path this teardown
+		// touches is keyed by the PER-ATTEMPT VM instance id (vmID: the VM's
+		// shared dir, its .img/.aux clones, its artifacts dir) or by the
+		// per-claim runner name (ReleaseJob), so a later attempt at the same
+		// job never shares a byte of state with this one and this teardown can
+		// only ever delete its own files.
 		slot.release()
 
 		if exists {
@@ -1760,6 +1793,34 @@ func (s *Scheduler) stopVMBounded(macVM vm.MacOSVM, ref macVMRef, log *slog.Logg
 		s.abandonVM(done, ref, "teardown did not return within the stop grace", log)
 	}
 }
+
+// macVMInstanceID names one PROVISIONING ATTEMPT, not one job.
+//
+// Everything a macOS VM owns on disk is named after this: its virtio-fs share
+// (<data>/vm/macos/jobs/<id>), its disk and aux clones (<id>.img, <id>.aux)
+// and its extracted OCI artifacts. Since the #196 fix releases the concurrency
+// slot before teardown, a second attempt at the same job can start while the
+// first attempt's VM is still alive with an unkillable stop pending — and that
+// first attempt's teardown ends in os.Remove(clonePath) and
+// os.RemoveAll(jobDir). Sharing those paths between attempts means attempt 1's
+// late cleanup deletes attempt 2's running disk and its .jit_config; attempt 2
+// then waits out its own deadline for a runner that can never register, and
+// strands another guest doing it.
+//
+// The job id stays in the name because it is what an operator greps for; the
+// random suffix is what makes the attempts disjoint. It is random rather than
+// a counter so that a daemon restart cannot re-issue an id whose files are
+// still on disk from before the restart.
+func macVMInstanceID(jobID int64) string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand does not fail in practice; if it ever does, a
+		// timestamp still discriminates attempts (they are minutes apart).
+		return fmt.Sprintf("%d-%d", jobID, time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%d-%s", jobID, hex.EncodeToString(b[:]))
+}
+
 // handleLocalJob provisions a runner using the local containerd Runtime.
 func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent) {
 	jobID := event.JobID

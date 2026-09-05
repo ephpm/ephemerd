@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -766,6 +768,215 @@ func TestDrain_WedgedMacOSVMCannotBlockShutdown(t *testing.T) {
 	}
 	if n := s.ActiveJobs(); n != 0 {
 		t.Errorf("ActiveJobs() = %d after drain force-killed everything, want 0", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// MAJOR 2: a re-dispatch of the same job must not share state with an
+// abandoned attempt at that job.
+// ---------------------------------------------------------------------------
+
+// pathedMacVM owns real files, named the way darwinMacOSVM names them:
+//
+//	<data>/vm/macos/jobs/<id>        the virtio-fs share (holds .jit_config)
+//	<data>/vm/macos/jobs/<id>.img    the APFS disk clone
+//
+// and its Stop() deletes both, exactly as darwinMacOSVM.stop does
+// (os.Remove(clonePath) + os.RemoveAll(jobDir)). The point of the fake is that
+// the paths come from the id string the SCHEDULER chooses, so the test can
+// observe whether two attempts at the same job collide on disk.
+type pathedMacVM struct {
+	id     string
+	jobDir string
+	clone  string
+
+	wedge bool          // WaitForRunner never returns (the #196 guest)
+	gate  chan struct{} // Stop blocks here before deleting; nil to not block
+	held  chan struct{} // closed once Stop has finished its deletions
+	done  chan struct{} // Wait blocks here; nil returns immediately
+
+	stops    atomic.Int32
+	stopOnce sync.Once
+}
+
+func newPathedMacVM(t *testing.T, dataDir, id string, wedge bool) *pathedMacVM {
+	t.Helper()
+	jobsDir := filepath.Join(dataDir, "vm", "macos", "jobs")
+	return &pathedMacVM{
+		id:     id,
+		jobDir: filepath.Join(jobsDir, id),
+		clone:  filepath.Join(jobsDir, id+".img"),
+		wedge:  wedge,
+		held:   make(chan struct{}),
+	}
+}
+
+func (m *pathedMacVM) jitPath() string { return filepath.Join(m.jobDir, ".jit_config") }
+
+func (m *pathedMacVM) WriteJITConfig(cfg string) error {
+	if err := os.MkdirAll(m.jobDir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(m.jitPath(), []byte(cfg), 0o600)
+}
+
+func (m *pathedMacVM) Start(context.Context) error {
+	if err := os.MkdirAll(filepath.Dir(m.clone), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(m.clone, []byte("disk-"+m.id), 0o600)
+}
+
+func (m *pathedMacVM) RunnerAddress() string { return "192.168.64.9" }
+
+func (m *pathedMacVM) WaitForRunner(context.Context) (string, error) {
+	if m.wedge {
+		select {} //nolint:staticcheck // models the wedged guest wait
+	}
+	return "192.168.64.9", nil
+}
+
+func (m *pathedMacVM) Wait(context.Context) (int, error) {
+	if m.done != nil {
+		<-m.done
+	}
+	return 0, nil
+}
+
+// Stop mirrors darwinMacOSVM.Stop: a sync.Once wrapping a teardown that ends
+// by deleting the VM's clone and its shared directory.
+func (m *pathedMacVM) Stop() {
+	m.stops.Add(1)
+	m.stopOnce.Do(func() {
+		if m.gate != nil {
+			<-m.gate
+		}
+		_ = os.RemoveAll(m.jobDir)
+		_ = os.Remove(m.clone)
+		close(m.held)
+	})
+}
+
+func assertFileExists(t *testing.T, path, what string) {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("%s is gone (%s): %v", what, path, err)
+	}
+}
+
+// TestHandleMacOSJob_RedispatchOfTheSameJobGetsDisjointResources is the race
+// that release-before-teardown opened.
+//
+// Every macOS resource used to be keyed by job ID alone and nothing else: the
+// VM's shared directory, its .img/.aux clones, its artifacts dir. The failure
+// paths now release the slot and clear seen/pending BEFORE teardown, so the
+// same job ID can be dispatched again — the poll re-emits a still-queued job
+// about every 30s, and maxProvisionAttempts allows several passes — while the
+// previous attempt's VM is still alive with a stop wedged inside
+// Virtualization.framework.
+//
+// Attempt 2 then writes its JIT config and clones its disk over attempt 1's
+// live files, attempt 1's abandoned stop returns minutes later and runs
+// os.Remove(clone) + os.RemoveAll(jobDir), and attempt 2 loses its disk and its
+// .jit_config to a teardown for a VM it has nothing to do with. Its runner can
+// never register, so it times out too, and strands another guest doing it —
+// self-sustaining.
+//
+// Without the per-attempt VM instance id this test FAILS: both attempts get
+// the same id, and attempt 2's files are gone after attempt 1's late teardown.
+func TestHandleMacOSJob_RedispatchOfTheSameJobGetsDisjointResources(t *testing.T) {
+	prov := newMockProvider("mac-redispatch")
+	defer func() { _ = prov.Stop(context.Background()) }()
+
+	dataDir := t.TempDir()
+	s := newSlotTestScheduler(t, prov, nil)
+	s.cfg.DataDir = dataDir
+	s.macAbandonedCap = 5 // the cap is tested elsewhere; don't trip it here
+
+	var mu sync.Mutex
+	var made []*pathedMacVM
+	s.newMacOSVM = func(_ vm.MacOSVMConfig, id string) (vm.MacOSVM, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		// The first attempt is the #196 guest: it never becomes reachable and
+		// its Stop() does not return until the test lets it.
+		first := len(made) == 0
+		m := newPathedMacVM(t, dataDir, id, first)
+		if first {
+			m.gate = make(chan struct{})
+		} else {
+			m.done = make(chan struct{}) // stays "running" until released
+		}
+		made = append(made, m)
+		return m, nil
+	}
+
+	// The same job id both times: this is a RE-dispatch, not a second job.
+	const jobID = int64(100817345293)
+	event := macEvent(prov, jobID)
+
+	// Attempt 1 hits the provisioning deadline and is abandoned with its Stop
+	// still pending.
+	runMacDispatch(t, s, event, 5*time.Second)
+
+	// Attempt 2 takes the freed slot.
+	runMacDispatch(t, s, event, 5*time.Second)
+
+	mu.Lock()
+	n := len(made)
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("expected 2 provisioning attempts, got %d", n)
+	}
+	mu.Lock()
+	one, two := made[0], made[1]
+	mu.Unlock()
+	t.Cleanup(func() {
+		if two.done != nil {
+			close(two.done)
+		}
+	})
+
+	if one.id == two.id {
+		t.Fatalf("both attempts at job %d were given the same VM instance id %q — "+
+			"their shared dir and disk clone are the same files, so attempt 1's "+
+			"late teardown will delete attempt 2's", jobID, one.id)
+	}
+
+	assertFileExists(t, two.jitPath(), "attempt 2's JIT config")
+	assertFileExists(t, two.clone, "attempt 2's disk clone")
+
+	// Attempt 1's abandoned teardown finally lands, minutes late in
+	// production. It must only ever delete its own files.
+	close(one.gate)
+	select {
+	case <-one.held:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the abandoned teardown never completed")
+	}
+
+	assertFileExists(t, two.jitPath(), "attempt 2's JIT config after attempt 1's late teardown")
+	assertFileExists(t, two.clone, "attempt 2's disk clone after attempt 1's late teardown")
+
+	if got := s.ActiveJobs(); got != 1 {
+		t.Errorf("ActiveJobs() = %d, want 1 (attempt 2 must still be running)", got)
+	}
+}
+
+// TestMacVMInstanceIDDiscriminatesAttempts: the id keeps the job number (it is
+// what an operator greps for) and adds a per-attempt suffix.
+func TestMacVMInstanceIDDiscriminatesAttempts(t *testing.T) {
+	const jobID = int64(100817345293)
+	seen := map[string]bool{}
+	for i := 0; i < 64; i++ {
+		id := macVMInstanceID(jobID)
+		if !strings.HasPrefix(id, "100817345293-") {
+			t.Fatalf("instance id %q does not lead with the job id", id)
+		}
+		if seen[id] {
+			t.Fatalf("macVMInstanceID repeated %q; two attempts would share a disk clone", id)
+		}
+		seen[id] = true
 	}
 }
 
