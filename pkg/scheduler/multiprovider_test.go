@@ -18,10 +18,21 @@ type mockProvider struct {
 	defaultImage string
 	events       chan providers.JobEvent
 
+	// releaseHook runs at the top of ReleaseJob, before the mutex is taken.
+	// Set once before the test starts and never mutated afterwards.
+	//
+	// It exists to model what ReleaseJob actually is in production — a GitHub
+	// API call, on context.Background(), with no deadline — so a test can
+	// assert that a concurrency slot is FREE while that call is still in
+	// flight. Without a slow ReleaseJob the release-before-teardown ordering
+	// this fix depends on is unobservable: the mock returns instantly, so
+	// moving the release after the teardown still passes.
+	releaseHook func(*providers.Claim)
+
 	mu       sync.Mutex
-	claims   []*providers.Claim  // jobs claimed via ClaimJob
-	releases []*providers.Claim  // jobs released via ReleaseJob
-	images   map[int64]string    // jobID → image for FetchJobImage
+	claims   []*providers.Claim // jobs claimed via ClaimJob
+	releases []*providers.Claim // jobs released via ReleaseJob
+	images   map[int64]string   // jobID → image for FetchJobImage
 }
 
 var _ providers.Poll = (*mockProvider)(nil)
@@ -62,6 +73,9 @@ func (m *mockProvider) ClaimJob(_ context.Context, event *providers.JobEvent, ru
 }
 
 func (m *mockProvider) ReleaseJob(_ context.Context, claim *providers.Claim) error {
+	if m.releaseHook != nil {
+		m.releaseHook(claim)
+	}
 	m.mu.Lock()
 	m.releases = append(m.releases, claim)
 	m.mu.Unlock()

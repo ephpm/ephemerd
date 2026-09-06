@@ -2,6 +2,8 @@ package scheduler
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -181,6 +183,22 @@ const defaultOrphanGrace = 10 * time.Minute
 // macOS slot in minutes instead of hours.
 const defaultMacOSProvisionTimeout = 5 * time.Minute
 
+// macProvisionUnwindGrace bounds how long the provisioning watchdog waits for
+// a force-stopped macOS VM to tear down and its reachability wait to unwind
+// before giving up on both and returning anyway.
+//
+// Comfortably more than darwinMacOSVM.stop's own 15s graceful-shutdown window
+// plus the force-stop that follows it, so a VM that CAN be killed is always
+// reaped tidily. Past that we stop caring: the whole point of the deadline was
+// to get the concurrency slot back, and waiting on an unkillable VM to say so
+// is what cost the fleet 28 hours of macOS CI (#196).
+const macProvisionUnwindGrace = 30 * time.Second
+
+// macTeardownGrace bounds a routine macOS VM Stop() on any path that is
+// holding a slot or a wait-goroutine. Same reasoning as
+// macProvisionUnwindGrace: teardown is best-effort, capacity is not.
+const macTeardownGrace = 30 * time.Second
+
 // jobKey uniquely identifies a job across providers. Different providers
 // can return the same int64 job ID, so we include the provider name.
 type jobKey struct {
@@ -260,6 +278,23 @@ type Scheduler struct {
 	// watchdog without a real Virtualization.framework VM.
 	newMacOSVM func(cfg vm.MacOSVMConfig, jobID string) (vm.MacOSVM, error)
 
+	// macUnwindGrace / macStopGrace bound macOS VM teardown on the paths that
+	// must not be delayed by it (see slots.go). Zero uses the package
+	// defaults; only tests set them, to compress a 30s grace into
+	// milliseconds.
+	macUnwindGrace time.Duration
+	macStopGrace   time.Duration
+
+	// macAbandoned counts macOS VMs whose teardown this daemon walked away
+	// from and has not seen die. Releasing the slot on a wedged teardown
+	// (#196) removed the semaphore's accidental cap on how many guests could
+	// be stranded; this is the explicit one. See slots.go.
+	macAbandoned abandonedMacVMs
+
+	// macAbandonedCap overrides defaultMacAbandonedVMCap. Zero uses the
+	// default; only tests set it.
+	macAbandonedCap int
+
 	// busyProbe overrides the ground-truth "is this runner executing a
 	// job" check that vetoes orphan teardown. Nil (the default) uses
 	// probeRunnerBusy: local container/VM/process introspection, falling
@@ -331,7 +366,14 @@ type runningJob struct {
 	artifactsDir string     // non-empty if OCI artifacts were extracted for this job
 	dispatched   string     // non-empty if dispatched to Linux VM worker (stores container name)
 	macosVM      vm.MacOSVM // non-nil if running as a macOS VM job
+	macVMID      string     // per-attempt macOS VM instance id (macVMInstanceID); owns this job's on-disk paths
 	startedAt    time.Time
+}
+
+// macRef is the identity every macOS teardown site reports to the
+// abandoned-VM registry. Safe on a non-macOS job (returns a zero VMID).
+func (rj *runningJob) macRef(key jobKey) macVMRef {
+	return macVMRef{JobID: key.JobID, VMID: rj.macVMID}
 }
 
 // runnerName returns the name the runner was registered under with the
@@ -1164,15 +1206,25 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 	}
 
 	// Acquire Linux dispatch concurrency slot (separate from local/macOS)
-	select {
-	case s.linuxSem <- struct{}{}:
-	case <-ctx.Done():
+	slot := s.acquireSlot(ctx, s.linuxSem, "linux", log)
+	if slot == nil {
 		unsee()
 		return
 	}
+	// Backstop until the wait-goroutine below takes ownership: every exit
+	// from this function returns the slot, including one a future edit
+	// forgets to release explicitly. See slots.go — a single missed release
+	// on the macOS path cost 28 hours of CI (#196).
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			slot.release()
+		}
+	}()
+
 	if v := s.admitDispatch(key); v != dispatchAdmit {
 		v.log(log)
-		<-s.linuxSem
+		slot.release()
 		return
 	}
 
@@ -1190,7 +1242,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 	if err != nil {
 		log.Error("failed to claim job", "error", err, "error_class", classifyErr(err))
 		unsee()
-		<-s.linuxSem
+		slot.release()
 		// Replaces the old blind time.Sleep(backoffDuration): the
 		// sem is released FIRST so we do not hold a slot idle across
 		// the wait, then a rate-aware jittered retry is enqueued
@@ -1211,7 +1263,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		}
 		unsee()
 		cancel()
-		<-s.linuxSem
+		slot.release()
 		// Mirror the claim-failure branch above (and the local create
 		// path): a failed dispatch create used to drop the job forever —
 		// webhooks are never re-delivered. Slot released first; no-op for
@@ -1234,18 +1286,12 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 	log.Info("Linux runner dispatched", "name", claim.RunnerName)
 
 	// Wait for the job to finish in the background
+	handedOff = true
 	go func() {
 		// Same slot-release ordering as the local wait-goroutine: release
 		// once the job is untracked, never behind the destroy. The
 		// deferred call is only the panic/early-return backstop.
-		released := false
-		release := func() {
-			if !released {
-				released = true
-				<-s.linuxSem
-			}
-		}
-		defer release()
+		defer slot.release()
 
 		exitCode, err := s.cfg.LinuxDispatcher.Wait(jobCtx, claim.RunnerName)
 		if err != nil {
@@ -1275,7 +1321,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		// Release BEFORE the destroy RPC, mirroring the local path: the
 		// dispatched env is keyed by its unique claim.RunnerName, so a
 		// newly admitted job cannot collide with this teardown.
-		release()
+		slot.release()
 
 		if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), claim.RunnerName); err != nil {
 			log.Warn("dispatch destroy failed", "error", err)
@@ -1312,16 +1358,83 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		s.mu.Unlock()
 	}
 
+	// refuseCordoned drops this dispatch because the macOS pool has given up
+	// on too many VMs to safely start another (see slots.go).
+	//
+	// It leaves the seen stamp and clears only pending, exactly like the #154
+	// cordon rejection: seen ages out via seenTTL, so the node retries in ~10
+	// minutes rather than re-logging this every poll, and the job stays queued
+	// on the platform so a healthy node can take it immediately.
+	refuseCordoned := func(n, limit int) {
+		s.mu.Lock()
+		delete(s.pending, key)
+		s.mu.Unlock()
+		log.Error("refusing to provision a macOS VM: this node has abandoned too many macOS VMs without confirming they died",
+			"abandoned_macos_vms", n,
+			"cap", limit,
+			"detail", "each one is a live guest holding its full configured RAM; starting more risks OOMing the host and Vz will refuse anyway. Restart ephemerd to reclaim them.")
+	}
+
+	// PER-ATTEMPT VM IDENTITY. Every macOS resource used to be keyed by job id
+	// alone: the VM's shared directory (<data>/vm/macos/jobs/<id>), its disk
+	// and aux clones (<id>.img / <id>.aux) and its extracted OCI artifacts. On
+	// the failure paths below this function now releases the slot BEFORE
+	// teardown, which means the same job id can be re-dispatched (poll re-emits
+	// it, or the webhook catch-up poll does) while the previous attempt's VM is
+	// still alive with a stop wedged inside Virtualization.framework.
+	//
+	// With shared paths that is mutual destruction: attempt 2 apfsCopies over
+	// the .img/.aux files attempt 1's guest still has open and writes its JIT
+	// config into the same share, and then attempt 1's abandoned stop finally
+	// returns minutes later and runs os.Remove(clonePath) + os.RemoveAll(jobDir)
+	// — deleting attempt 2's disk and its .jit_config, so attempt 2's runner can
+	// never register and it times out too. Self-sustaining, and each round
+	// strands another guest.
+	//
+	// A per-attempt suffix makes the attempts disjoint by construction, so a
+	// late teardown can only ever delete its own files.
+	vmID := macVMInstanceID(jobID)
+	ref := macVMRef{JobID: jobID, VMID: vmID}
+	log = log.With("vm", vmID)
+
+	if n, limit, cordoned := s.macPoolCordoned(); cordoned {
+		refuseCordoned(n, limit)
+		return
+	}
+
 	// Acquire macOS VM concurrency slot (separate from Linux/local sem).
-	select {
-	case s.macSem <- struct{}{}:
-	case <-ctx.Done():
+	slot := s.acquireSlot(ctx, s.macSem, "macos", log)
+	if slot == nil {
 		unsee()
 		return
 	}
+	// Backstop until the wait-goroutine below takes ownership. This function
+	// is issue #196's crime scene: it had six hand-written `<-s.macSem`
+	// returns and one of them was unreachable, because the provisioning
+	// watchdog it depended on could block forever before returning. The
+	// deferred release makes "did every path give the slot back?" a property
+	// of the function rather than of the reader's attention span.
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			slot.release()
+		}
+	}()
+
 	if v := s.admitDispatch(key); v != dispatchAdmit {
 		v.log(log)
-		<-s.macSem
+		slot.release()
+		return
+	}
+
+	// Re-check the abandoned-VM cordon now that the wait for the slot is over.
+	// Same reasoning as the #154 cordon re-check in admitDispatch: this
+	// dispatch may have been parked on the semaphore for the entire life of
+	// the job ahead of it, and that is exactly the window in which a wedged
+	// teardown gets abandoned.
+	if n, limit, cordoned := s.macPoolCordoned(); cordoned {
+		slot.release()
+		refuseCordoned(n, limit)
 		return
 	}
 
@@ -1331,7 +1444,11 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 	image := s.resolveImage(ctx, &event, "darwin")
 	var artifactsDir string
 	if image != "" && s.cfg.Artifacts != nil {
-		artifactsDir = artifacts.ArtifactsDir(s.cfg.DataDir, fmt.Sprintf("%d", jobID))
+		// Keyed by the VM instance, not the job: this directory is deleted by
+		// artifacts.Cleanup on every failure path below, all of which now run
+		// after the slot is released and therefore possibly concurrently with
+		// a fresh attempt at the same job id.
+		artifactsDir = artifacts.ArtifactsDir(s.cfg.DataDir, vmID)
 		log.Info("extracting OCI artifacts for macOS VM job", "image", image, "dest", artifactsDir)
 		if err := s.cfg.Artifacts.Extract(ctx, image, artifactsDir); err != nil {
 			log.Error("failed to extract OCI artifacts", "image", image, "error", err)
@@ -1350,13 +1467,14 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
 		unsee()
-		<-s.macSem
+		slot.release()
 		s.enqueueRetryIfEligible(ctx, event, err)
 		return
 	}
 
-	// Create the macOS VM
-	macVM, err := s.newMacOSVM(*s.cfg.MacOSVMConfig, fmt.Sprintf("%d", jobID))
+	// Create the macOS VM. vmID (not the bare job id) is what every path this
+	// VM owns on disk is named after — see the per-attempt identity note above.
+	macVM, err := s.newMacOSVM(*s.cfg.MacOSVMConfig, vmID)
 	if err != nil {
 		log.Error("failed to create macOS VM", "error", err)
 		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
@@ -1366,22 +1484,25 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
 		unsee()
-		<-s.macSem
+		slot.release()
 		return
 	}
 
 	// Write JIT config to the shared directory before booting
 	if err := macVM.WriteJITConfig(claim.RunnerConfig); err != nil {
 		log.Error("failed to write JIT config", "error", err)
-		macVM.Stop()
+		// Slot first, teardown second — for the rest of this function every
+		// failure path releases before it touches the VM, because Stop() is
+		// the call that hangs (#196).
+		unsee()
+		slot.release()
+		s.stopVMBounded(macVM, ref, log)
 		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
 			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)
 		}
 		if artifactsDir != "" {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
-		unsee()
-		<-s.macSem
 		return
 	}
 
@@ -1392,16 +1513,16 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 	// Boot the VM
 	if err := macVM.Start(jobCtx); err != nil {
 		log.Error("failed to start macOS VM", "error", err)
-		macVM.Stop()
+		unsee()
+		cancel()
+		slot.release()
+		s.stopVMBounded(macVM, ref, log)
 		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
 			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)
 		}
 		if artifactsDir != "" {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
-		unsee()
-		cancel()
-		<-s.macSem
 		return
 	}
 
@@ -1410,19 +1531,38 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 	// can wedge WaitForRunner indefinitely: the job never gets tracked (so it
 	// is invisible to `ephemerd jobs` and the orphan sweep) yet still holds
 	// the sole macOS slot, stalling all macOS CI until a human intervenes.
-	ip, err := s.waitForMacRunnerBounded(jobCtx, macVM, log)
+	ip, alreadyStopped, err := s.waitForMacRunnerBounded(jobCtx, macVM, ref, log)
 	if err != nil {
 		log.Error("macOS VM runner not reachable", "error", err)
-		macVM.Stop()
+		// THE 28-HOUR LINE (#196). The slot goes back here, first, before
+		// anything that talks to the VM or to GitHub. It used to go back
+		// last, after macVM.Stop() — and waitForMacRunnerBounded had already
+		// force-stopped this VM, so this Stop() re-entered a sync.Once whose
+		// first call was still wedged inside Virtualization.framework and
+		// blocked forever. The node logged "force-stopping VM to reclaim the
+		// slot", never reclaimed it, and starved every subsequent macOS job
+		// while reporting status: ok / active_jobs: 0.
+		unsee()
+		cancel()
+		slot.release()
+		// Do NOT stop it again when the deadline path already did. Stopping a
+		// second time is never a cheap no-op: darwinMacOSVM.Stop is a
+		// sync.Once, so a second caller BLOCKS until the first invocation
+		// returns. Against the wedged guest this whole PR is about, that is a
+		// full teardownGrace (30s) of dead time on a path that still has a
+		// ghost runner to deregister — and it spawns a third goroutine parked
+		// inside the Once behind the first two. Against a healthy VM it is a
+		// pointless goroutine. Either way the VM is already stopped-or-
+		// abandoned and accounted for, so skip it.
+		if !alreadyStopped {
+			s.stopVMBounded(macVM, ref, log)
+		}
 		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
 			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)
 		}
 		if artifactsDir != "" {
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
-		unsee()
-		cancel()
-		<-s.macSem
 		return
 	}
 
@@ -1435,14 +1575,18 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		cancel:       cancel,
 		artifactsDir: artifactsDir,
 		macosVM:      macVM,
+		macVMID:      vmID,
 		startedAt:    time.Now(),
 	}, event.Provider, labelSetKey(event.Labels))
 
 	log.Info("macOS VM runner ready", "name", claim.RunnerName, "ip", ip)
 
 	// Wait for the job to finish in the background
+	handedOff = true
 	go func() {
-		defer func() { <-s.macSem }()
+		// Backstop only. The release that matters happens the moment the job
+		// is untracked, below.
+		defer slot.release()
 
 		exitCode, err := macVM.Wait(jobCtx)
 		if err != nil {
@@ -1457,14 +1601,42 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 			log.Info("macOS VM exited", "exit_code", exitCode)
 		}
 
-		// Clean up
+		// Clean up. The entry may already be gone if a completed event tore
+		// this VM down by name (see handleCompleted).
 		s.mu.Lock()
 		rj, exists := s.running[key]
 		if exists {
 			s.untrackRunningLocked(key, rj)
-			s.mu.Unlock()
+		}
+		s.mu.Unlock()
+
+		// Release BEFORE teardown, exactly as the local and Linux
+		// wait-goroutines do (PR #190). The job is untracked, so its demand
+		// is gone; everything below can block for a long time and none of it
+		// may delay the next macOS job. macVM.Stop() waits up to 15s for a
+		// graceful guest shutdown before forcing (and on the #196 node the
+		// force did not return either), and ReleaseJob is a GitHub API call
+		// on context.Background() with no deadline at all.
+		//
+		// WHAT MAKES THAT SAFE. Releasing here means the SAME job id can be
+		// dispatched again while this teardown is still running — unsee() has
+		// cleared seen/pending on the failure paths, the poll re-emits a still-
+		// queued job about every 30s, and admitDispatch will admit it. So the
+		// invariant is NOT "a fresh dispatch cannot collide because everything
+		// is keyed by job id" — everything being keyed by job id is precisely
+		// what WOULD collide. The invariant is that every path this teardown
+		// touches is keyed by the PER-ATTEMPT VM instance id (vmID: the VM's
+		// shared dir, its .img/.aux clones, its artifacts dir) or by the
+		// per-claim runner name (ReleaseJob), so a later attempt at the same
+		// job never shares a byte of state with this one and this teardown can
+		// only ever delete its own files.
+		slot.release()
+
+		if exists {
 			metrics.JobsActive.Dec()
-			rj.macosVM.Stop()
+			if rj.macosVM != nil {
+				s.stopVMBounded(rj.macosVM, rj.macRef(key), log)
+			}
 			if rj.artifactsDir != "" {
 				artifacts.Cleanup(rj.artifactsDir, s.cfg.Log)
 			}
@@ -1473,8 +1645,6 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 					log.Debug("deregister runner after macOS VM cleanup", "error", err)
 				}
 			}
-		} else {
-			s.mu.Unlock()
 		}
 
 		// Self-heal: re-provision if this VM's dispatched job never ran.
@@ -1496,11 +1666,33 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 //
 // The only reliable way to interrupt a blocked SSH session call is to drop the
 // connection: force-stopping the VM tears down the guest, the SSH read errors
-// out, and WaitForRunner unwinds. On timeout we do exactly that, then wait for
-// the wait goroutine to return so there is no leak, and report a failure. The
-// caller's normal error path then releases the slot and deregisters the runner
-// — cleanup runs even though the wait had been stuck.
-func (s *Scheduler) waitForMacRunnerBounded(ctx context.Context, macVM vm.MacOSVM, log *slog.Logger) (string, error) {
+// out, and WaitForRunner unwinds. On timeout we do exactly that and report a
+// failure; the caller's error path releases the slot and deregisters the
+// runner, so cleanup runs even though the wait had been stuck.
+//
+// ISSUE #196 — why the teardown is now BOUNDED. The first version of this
+// function force-stopped the VM and then did a bare `<-resCh`, waiting for the
+// wait goroutine to unwind "so there is no leak". That assumed killing the VM
+// always unblocks the guest wait. On the fleet's mac it did not: the VM's own
+// stop path timed out ("macOS VM did not stop gracefully, forcing") and the
+// wait never returned, so this function — which had just logged that it was
+// force-stopping the VM TO RECLAIM THE SLOT — parked on that receive for 28
+// hours, still holding the slot. The job had never been tracked, so
+// active_jobs stayed 0, /healthz stayed 200, and five macOS jobs queued behind
+// it aged out at GitHub's 24-hour limit without ever running.
+//
+// A wedged guest wait is already a leaked goroutine that nothing in this
+// process can kill. resCh is buffered so that goroutine can always complete
+// its send and exit if it ever comes back. What must NOT happen is turning
+// that leaked goroutine into a leaked concurrency slot: teardown gets a
+// bounded grace period to be tidy, and then we return regardless.
+//
+// The second return value reports whether this function already STOPPED the
+// VM. The caller's error path must not stop it again: darwinMacOSVM.Stop is a
+// sync.Once, so a redundant second Stop blocks until the first returns —
+// against a wedged guest that is a full teardown grace of dead time and a
+// third goroutine parked in the Once. See handleMacOSJob.
+func (s *Scheduler) waitForMacRunnerBounded(ctx context.Context, macVM vm.MacOSVM, ref macVMRef, log *slog.Logger) (string, bool, error) {
 	timeout := s.cfg.MacOSProvisionTimeout
 	if timeout <= 0 {
 		timeout = defaultMacOSProvisionTimeout
@@ -1510,8 +1702,13 @@ func (s *Scheduler) waitForMacRunnerBounded(ctx context.Context, macVM vm.MacOSV
 		ip  string
 		err error
 	}
+	// Buffered: the wait goroutine must always be able to finish its send and
+	// exit, even long after we have stopped listening. Nothing below may
+	// depend on it ever getting that far.
 	resCh := make(chan result, 1)
+	unwound := make(chan struct{})
 	go func() {
+		defer close(unwound)
 		ip, err := macVM.WaitForRunner(ctx)
 		resCh <- result{ip: ip, err: err}
 	}()
@@ -1521,17 +1718,107 @@ func (s *Scheduler) waitForMacRunnerBounded(ctx context.Context, macVM vm.MacOSV
 
 	select {
 	case r := <-resCh:
-		return r.ip, r.err
+		return r.ip, false, r.err
 	case <-timer.C:
 		log.Error("macOS VM stuck in provisioning past deadline; force-stopping VM to reclaim the slot", "timeout", timeout)
-		macVM.Stop() // drops the guest connection so WaitForRunner unblocks
-		<-resCh      // wait goroutine unwinds now that the VM is gone
-		return "", fmt.Errorf("timed out after %s waiting for macOS VM runner to become reachable", timeout)
+		s.abandonMacProvision(macVM, unwound, ref, log)
+		return "", true, fmt.Errorf("timed out after %s waiting for macOS VM runner to become reachable", timeout)
 	case <-ctx.Done():
-		macVM.Stop()
-		<-resCh
-		return "", ctx.Err()
+		s.abandonMacProvision(macVM, unwound, ref, log)
+		return "", true, ctx.Err()
 	}
+}
+
+// abandonMacProvision force-stops a macOS VM whose provisioning was given up
+// on and gives the teardown a bounded chance to finish before returning.
+//
+// Stop() runs on its own goroutine for two reasons. The obvious one is that
+// Virtualization.framework's stop can itself hang. The subtle one is
+// sync.Once: darwinMacOSVM.Stop is `stopOnce.Do(m.stop)`, so a SECOND caller
+// does not return early — it blocks until the first invocation returns. The
+// caller's error path stops the VM again as part of its normal cleanup, and if
+// this teardown were still wedged in the Once, that "cleanup" call would hang
+// on a path that is holding a concurrency slot. Off-thread here plus
+// stopVMBounded there means neither can pin the slot.
+func (s *Scheduler) abandonMacProvision(macVM vm.MacOSVM, unwound <-chan struct{}, ref macVMRef, log *slog.Logger) {
+	// Dropping the guest is what unblocks a wedged SSH session call.
+	stopped := stopVMAsync(macVM)
+	if !awaitUnwind(stopped, unwound, s.provisionUnwindGrace()) {
+		log.Error("macOS VM teardown did not finish after the force-stop; abandoning it and reclaiming the concurrency slot anyway",
+			"grace", s.provisionUnwindGrace(),
+			"detail", "a wedged Vz stop or a wedged guest wait must never pin the macOS slot — see issue #196")
+		// Charge the guest we just walked away from. The slot comes back
+		// either way — that is the #196 fix and it is not negotiable — but the
+		// VM is still running and still holding its RAM, so it has to be
+		// counted against the cap that decides whether this node may start
+		// another one. See slots.go.
+		s.abandonVM(stopped, ref, "force-stop after the provisioning deadline did not return", log)
+	}
+}
+
+// stopVMAsync stops macVM on its own goroutine and returns a channel closed
+// when Stop returns. If Stop never returns, that goroutine is leaked — which
+// is the correct trade: the alternative is leaking the concurrency slot, and
+// a leaked slot takes the node's whole macOS capacity with it.
+func stopVMAsync(macVM vm.MacOSVM) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		macVM.Stop()
+	}()
+	return done
+}
+
+// stopVMBounded force-stops a VM without letting the teardown pin the caller,
+// and charges the VM to the abandoned registry if the grace expires.
+//
+// Used by EVERY macOS cleanup path, not just the ones holding a slot. Three of
+// them used to call macosVM.Stop() directly — handleCompleted, destroyAll and
+// sweepOrphanRunners — and the sweep is called synchronously from the
+// cleanupTicker arm of Run's select, i.e. on the scheduler's only event loop.
+// A wedged Vz stop there does not cost one job's slot, it costs the whole
+// daemon: no queued, in_progress or completed handling for any platform, and
+// no drain on SIGTERM. That is strictly worse than the leak this PR fixes, so
+// there is no such thing as a macOS stop that may block its caller.
+func (s *Scheduler) stopVMBounded(macVM vm.MacOSVM, ref macVMRef, log *slog.Logger) {
+	grace := s.teardownGrace()
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	done := stopVMAsync(macVM)
+	select {
+	case <-done:
+	case <-timer.C:
+		log.Warn("macOS VM stop did not return within the grace period; continuing without it",
+			"grace", grace)
+		s.abandonVM(done, ref, "teardown did not return within the stop grace", log)
+	}
+}
+
+// macVMInstanceID names one PROVISIONING ATTEMPT, not one job.
+//
+// Everything a macOS VM owns on disk is named after this: its virtio-fs share
+// (<data>/vm/macos/jobs/<id>), its disk and aux clones (<id>.img, <id>.aux)
+// and its extracted OCI artifacts. Since the #196 fix releases the concurrency
+// slot before teardown, a second attempt at the same job can start while the
+// first attempt's VM is still alive with an unkillable stop pending — and that
+// first attempt's teardown ends in os.Remove(clonePath) and
+// os.RemoveAll(jobDir). Sharing those paths between attempts means attempt 1's
+// late cleanup deletes attempt 2's running disk and its .jit_config; attempt 2
+// then waits out its own deadline for a runner that can never register, and
+// strands another guest doing it.
+//
+// The job id stays in the name because it is what an operator greps for; the
+// random suffix is what makes the attempts disjoint. It is random rather than
+// a counter so that a daemon restart cannot re-issue an id whose files are
+// still on disk from before the restart.
+func macVMInstanceID(jobID int64) string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand does not fail in practice; if it ever does, a
+		// timestamp still discriminates attempts (they are minutes apart).
+		return fmt.Sprintf("%d-%d", jobID, time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%d-%s", jobID, hex.EncodeToString(b[:]))
 }
 
 // handleLocalJob provisions a runner using the local containerd Runtime.
@@ -1549,15 +1836,23 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 	}
 
 	// Acquire concurrency slot
-	select {
-	case s.sem <- struct{}{}:
-	case <-ctx.Done():
+	slot := s.acquireSlot(ctx, s.sem, "local", log)
+	if slot == nil {
 		unsee()
 		return
 	}
+	// Backstop until the wait-goroutine below takes ownership; see the
+	// matching comment in handleLinuxJob and slots.go.
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			slot.release()
+		}
+	}()
+
 	if v := s.admitDispatch(key); v != dispatchAdmit {
 		v.log(log)
-		<-s.sem
+		slot.release()
 		return
 	}
 
@@ -1622,7 +1917,7 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 			artifacts.Cleanup(artifactsDir, s.cfg.Log)
 		}
 		unsee()
-		<-s.sem
+		slot.release()
 		// Replaces the old blind 5s sleep with a rate-aware jittered
 		// retry. No-op when Retry is disabled or the error is not
 		// retryable.
@@ -1666,7 +1961,7 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 		}
 		unsee()
 		cancel()
-		<-s.sem
+		slot.release()
 		// Mirror the claim-failure branch above: without this a job whose
 		// env create failed was dropped forever (GitHub never re-delivers
 		// the webhook) — on metal that was 1h43m of a job sitting queued
@@ -1692,6 +1987,7 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 	log.Info("runner environment ready", "name", claim.RunnerName)
 
 	// Wait for the job to finish in the background
+	handedOff = true
 	go func() {
 		// Slot release is decoupled from teardown. It used to hang off a
 		// bare defer, which meant the slot came back only after Destroy
@@ -1699,14 +1995,7 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 		// MaxConcurrent slot for its whole hang. The slot is released as
 		// soon as the job is untracked below; the deferred call is only
 		// the panic/early-return backstop.
-		released := false
-		release := func() {
-			if !released {
-				released = true
-				<-s.sem
-			}
-		}
-		defer release()
+		defer slot.release()
 
 		exitCode, err := s.cfg.Runtime.Wait(jobCtx, env)
 		if err != nil {
@@ -1740,7 +2029,7 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 		// runner dir, netns/HCN endpoint, dind socket all derive from it —
 		// so a freshly admitted job cannot touch anything this teardown
 		// still owns.
-		release()
+		slot.release()
 
 		if exists {
 			metrics.JobsActive.Dec()
@@ -1911,7 +2200,11 @@ func (s *Scheduler) handleCompleted(ctx context.Context, event providers.JobEven
 	resetBackoff(event.Repo)
 	job.cancel()
 	if job.macosVM != nil {
-		job.macosVM.Stop()
+		// Bounded (#196). This ran as a bare Stop(), so a wedged Vz teardown
+		// parked the completed-event handler forever — and with it the
+		// deferred sweepOrphanRunners above, which is how the node reconciles
+		// runners after every completion.
+		s.stopVMBounded(job.macosVM, job.macRef(ownerKey), log)
 	} else if job.dispatched != "" && s.cfg.LinuxDispatcher != nil {
 		if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), job.dispatched); err != nil {
 			log.Warn("failed to destroy dispatched runner", "error", err)
@@ -1995,7 +2288,13 @@ func (s *Scheduler) destroyAll() {
 		s.cfg.Log.Info("destroying runner on shutdown", "job_id", key.JobID, "provider", key.Provider)
 		job.cancel()
 		if job.macosVM != nil {
-			job.macosVM.Stop()
+			// Bounded (#196). destroyAll is the force-kill arm of drain(), so
+			// a bare Stop() here meant a wedged Vz teardown stopped the daemon
+			// from ever exiting: drain() never returns, Run() never returns,
+			// and SIGTERM has to be escalated to SIGKILL by hand. The
+			// shutdown timeout exists precisely so shutdown is bounded; a
+			// teardown that ignores it defeats it.
+			s.stopVMBounded(job.macosVM, job.macRef(key), s.cfg.Log.With("job_id", key.JobID))
 		} else if job.dispatched != "" && s.cfg.LinuxDispatcher != nil {
 			if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), job.dispatched); err != nil {
 				s.cfg.Log.Warn("failed to destroy dispatched runner", "job_id", key.JobID, "error", err)
@@ -2025,12 +2324,37 @@ func (s *Scheduler) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	draining := s.draining
 	s.mu.Unlock()
 
+	// held_slots/slot_capacity/slots are ADDITIVE — active_jobs and
+	// max_concurrent keep their exact meaning for anything already scraping
+	// this endpoint.
+	//
+	// active_jobs counts TRACKED jobs (len(s.running)). A job that is
+	// provisioning, or one whose slot leaked, is not tracked, so a node with
+	// every slot held reported active_jobs: 0 and looked idle — that is how
+	// the #196 macOS outage stayed invisible for 28 hours while /healthz
+	// returned 200. held_slots is read straight off the semaphores and so
+	// counts the capacity that is actually spoken for. held == capacity with
+	// active_jobs 0, sustained, means a stuck provision or a leak.
+	//
+	// abandoned_macos_vms is the companion number: slots that were given BACK
+	// by walking away from a teardown. It is the cost side of the #196 trade —
+	// each one is a macOS guest still holding its RAM that only a daemon
+	// restart reclaims — and at the cap the macOS pool stops taking work, so
+	// an operator has to be able to see it without reading the log.
 	status := map[string]any{
-		"status":         "ok",
-		"active_jobs":    activeJobs,
-		"max_concurrent": s.cfg.MaxConcurrent,
-		"draining":       draining,
-		"uptime":         time.Since(s.startTime).String(),
+		"status":                 "ok",
+		"active_jobs":            activeJobs,
+		"max_concurrent":         s.cfg.MaxConcurrent,
+		"held_slots":             s.HeldSlots(),
+		"slot_capacity":          s.SlotCapacity(),
+		"slots":                  s.SlotUsage(),
+		"abandoned_macos_vms":    s.AbandonedMacOSVMs(),
+		"abandoned_macos_vm_cap": s.abandonedMacVMCap(),
+		"draining":               draining,
+		"uptime":                 time.Since(s.startTime).String(),
+	}
+	if n := s.AbandonedMacOSVMDetails(); len(n) > 0 {
+		status["abandoned_macos_vm_details"] = n
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -2313,7 +2637,16 @@ func (s *Scheduler) sweepOrphanRunners() {
 		metrics.JobsActive.Dec()
 		v.rj.cancel()
 		if v.rj.macosVM != nil {
-			v.rj.macosVM.Stop()
+			// THE WORST ONE (#196). sweepOrphanRunners is called
+			// SYNCHRONOUSLY from the cleanupTicker arm of Run's select — the
+			// scheduler's only event loop. A tracked macOS job nominated as an
+			// orphan whose Vz stop wedges (the exact failure this PR exists
+			// for) used to block that loop forever: no queued, in_progress or
+			// completed handling for ANY platform, no drain on SIGTERM, the
+			// daemon alive and answering /healthz with 200 and doing nothing.
+			// That is strictly worse than the single leaked slot the rest of
+			// this PR is about, and it is one call away.
+			s.stopVMBounded(v.rj.macosVM, v.rj.macRef(v.key), s.cfg.Log.With("runner", v.name, "job_id", v.key.JobID))
 		} else if v.rj.dispatched != "" && s.cfg.LinuxDispatcher != nil {
 			if err := s.cfg.LinuxDispatcher.Destroy(context.Background(), v.rj.dispatched); err != nil {
 				s.cfg.Log.Warn("failed to destroy orphaned dispatched runner", "runner", v.name, "error", err)
