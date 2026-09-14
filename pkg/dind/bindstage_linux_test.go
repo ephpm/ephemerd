@@ -726,3 +726,50 @@ func TestBindStaging_MountpointTypeMatchesSource(t *testing.T) {
 		t.Errorf("staged file reads %q (err %v), want %q", body, err, "body")
 	}
 }
+
+// TestSweepStagedBindsForJob_SparesOtherJobs pins the fix for the regression
+// #187 introduced: its periodic reaper called the whole-tree
+// SweepStagedBinds, which is documented STARTUP ONLY because it cannot tell a
+// live job's staging dir from a dead one. On the fleet that deleted running
+// jobs' directories, and their next `docker run -v` failed with
+// "creating bind staging mountpoint <data>/dind-binds/<job>/2:
+//
+//	mkdir ...: no such file or directory"
+//
+// because ensureDirLocked had already latched m.ready and would not recreate
+// the parent. No mounts are needed to prove the scoping: plain directories
+// exercise the same path selection.
+func TestSweepStagedBindsForJob_SparesOtherJobs(t *testing.T) {
+	data := t.TempDir()
+	root := stagingRootDir(data)
+
+	dead := filepath.Join(root, "job-dead")
+	live := filepath.Join(root, "job-live")
+	for _, d := range []string{filepath.Join(dead, "0"), filepath.Join(live, "0")} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	SweepStagedBindsForJob(data, "job-dead", discardLog())
+
+	if _, err := os.Lstat(dead); !os.IsNotExist(err) {
+		t.Errorf("reaped job's staging dir still present (err=%v), want removed", err)
+	}
+	// The whole point: a live job sitting next to the reaped one must survive,
+	// mountpoint subdirectory and all, or its next docker run cannot stage.
+	if _, err := os.Lstat(filepath.Join(live, "0")); err != nil {
+		t.Errorf("LIVE job's staging dir was destroyed by a scoped sweep: %v — "+
+			"this is the #187 regression: the next `docker run -v` in that job "+
+			"fails with mkdir ENOENT", err)
+	}
+}
+
+// TestSweepStagedBindsForJob_ToleratesMissing: a job that never staged a bind
+// (no -v in the whole job) must not make the reaper log or fail.
+func TestSweepStagedBindsForJob_ToleratesMissing(t *testing.T) {
+	data := t.TempDir()
+	SweepStagedBindsForJob(data, "never-staged", discardLog())
+	SweepStagedBindsForJob("", "job", discardLog())
+	SweepStagedBindsForJob(data, "", discardLog())
+}
