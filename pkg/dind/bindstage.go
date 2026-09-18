@@ -75,3 +75,33 @@ func SweepStagedBinds(dataDir string, log *slog.Logger) {
 	}
 	sweepStagedBinds(stagingRootDir(dataDir), log)
 }
+
+// SweepStagedBindsForJob removes the bind staging mounts and directory of ONE
+// job. Safe to call while other jobs are running, which is what separates it
+// from SweepStagedBinds.
+//
+// This exists because #187's periodic dead-container reaper called the
+// whole-tree SweepStagedBinds on its sweeper tick. That function is documented
+// STARTUP ONLY for a precise reason, and the reaper violated it: sweeping the
+// root unmounts and deletes the staging directory of every LIVE job too. The
+// running job's already-started containers keep working (their mounts are
+// already in their namespaces), so nothing fails loudly — but the job's NEXT
+// `docker run -v` cannot create its mountpoint, because ensureDirLocked has
+// already latched m.ready and will not recreate the parent:
+//
+//	docker: Error response from daemon: bind mount ... rejected:
+//	  creating bind staging mountpoint <data>/dind-binds/<job>/2:
+//	  mkdir ...: no such file or directory
+//
+// Observed on the fleet's Linux amd64 nodes against ephpm's release workflow,
+// which runs several `docker run -v "$PWD":/w` steps per job — binds 0 and 1
+// stage fine, a reaper tick lands, and bind 2 fails. Scoping the sweep to the
+// container actually being reaped keeps the benefit (releasing the mounts that
+// pin that container's rootfs snapshot, which is why the reaper swept at all)
+// without touching anyone else's.
+func SweepStagedBindsForJob(dataDir, jobID string, log *slog.Logger) {
+	if dataDir == "" || jobID == "" {
+		return
+	}
+	sweepStagedBindsForJob(stagingRootDir(dataDir), jobID, log)
+}

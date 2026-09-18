@@ -563,12 +563,11 @@ func (r *Runtime) ReapDeadContainers(ctx context.Context) error {
 	}
 
 	now := time.Now()
-	// Release leaked dind bind-staging mounts lazily — only once, and only
-	// if we actually find something to reap. Each leaked staging mount pins
-	// the runner rootfs it was bound from, which makes WithSnapshotCleanup
-	// fail with "device or resource busy"; CleanOrphans sweeps them for the
-	// same reason. Skipped entirely on an idle node with nothing to reap.
-	stagedSwept := false
+	// Each leaked staging mount pins the runner rootfs it was bound from,
+	// which makes WithSnapshotCleanup fail with "device or resource busy",
+	// so a container being reaped needs its staging dir released first. That
+	// happens per-container below, NOT once per pass over the whole tree —
+	// see the comment at the call site.
 	for _, c := range containers {
 		id := c.ID()
 		log := r.cfg.Log.With("id", id)
@@ -592,9 +591,18 @@ func (r *Runtime) ReapDeadContainers(ctx context.Context) error {
 			continue
 		}
 
-		if !stagedSwept {
-			dind.SweepStagedBinds(r.cfg.DataDir, r.cfg.Log)
-			stagedSwept = true
+		// Sweep ONLY this container's staging dir. The whole-tree
+		// SweepStagedBinds used to run here once per pass, which broke live
+		// jobs: it is documented STARTUP ONLY precisely because it cannot
+		// tell a live job's staging dir from a dead one, and deleting a
+		// running job's dir makes its NEXT `docker run -v` fail with
+		// "creating bind staging mountpoint ...: no such file or directory"
+		// (ensureDirLocked has latched m.ready and will not recreate the
+		// parent). The reaping motive is unchanged — a leaked staged mount
+		// pins this container's rootfs so its snapshot cannot be deleted —
+		// and scoping to the container being reaped keeps that.
+		{
+			dind.SweepStagedBindsForJob(r.cfg.DataDir, id, r.cfg.Log)
 		}
 
 		log.Info("reaping dead job container", "reason", "task dead past grace, snapshot pinned", "grace", grace)

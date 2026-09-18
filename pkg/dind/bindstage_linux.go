@@ -232,6 +232,25 @@ func stagingRootParent(jobDir string) string { return filepath.Dir(jobDir) }
 // sweepStagedBinds is the startup half of the lifecycle: it unmounts and
 // removes staging directories left by a previous ephemerd process. See
 // SweepStagedBinds for why leaked staging mounts are worse than untidy.
+// sweepStagedBindsForJob unmounts and removes exactly one job's staging
+// directory. Unlike sweepStagedBinds it never reads the root, so a live job's
+// directory sitting next to this one is untouched.
+func sweepStagedBindsForJob(root, jobID string, log *slog.Logger) {
+	dir := filepath.Join(root, jobID)
+	if _, err := os.Lstat(dir); err != nil {
+		return // this job never staged a bind, or it is already gone
+	}
+	if err := unmountTreeAndRemove(dir); err != nil {
+		if log != nil {
+			log.Warn("failed to sweep dind bind staging dir for reaped job", "path", dir, "error", err)
+		}
+		return
+	}
+	if log != nil {
+		log.Info("swept dind bind staging dir for reaped job", "path", dir)
+	}
+}
+
 func sweepStagedBinds(root string, log *slog.Logger) {
 	entries, err := os.ReadDir(root)
 	if err != nil {

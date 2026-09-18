@@ -5,6 +5,7 @@ package dind
 import (
 	"log/slog"
 	"os"
+	"path/filepath"
 )
 
 // newBindStager returns the off-Linux stager. There is no mount(2) here and,
@@ -34,4 +35,10 @@ func (passthroughStager) teardown() {}
 // Linux-side data dir ever gets inspected from a dev host.
 func sweepStagedBinds(root string, log *slog.Logger) {
 	_ = os.RemoveAll(root)
+}
+
+// sweepStagedBindsForJob is the one-job form; same "nothing to unmount"
+// reasoning as above.
+func sweepStagedBindsForJob(root, jobID string, log *slog.Logger) {
+	_ = os.RemoveAll(filepath.Join(root, jobID))
 }
