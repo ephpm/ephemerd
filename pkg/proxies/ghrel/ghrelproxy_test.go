@@ -108,7 +108,18 @@ func client() *http.Client {
 	}
 }
 
-func get(t *testing.T, rawURL string) *http.Response {
+// result is everything these tests need from a response.
+//
+// get() reads and CLOSES the body before returning, so no *http.Response
+// escapes this helper. That is not tidiness: bodyclose flags the CALL SITE of
+// anything that returns a response it cannot see closed, so a helper handing
+// one back can never satisfy the linter no matter how careful the caller is.
+type result struct {
+	code int
+	data []byte
+}
+
+func get(t *testing.T, rawURL string) result {
 	t.Helper()
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -118,17 +129,12 @@ func get(t *testing.T, rawURL string) *http.Response {
 	if err != nil {
 		t.Fatalf("GET %s: %v", rawURL, err)
 	}
-	return resp
-}
-
-func body(t *testing.T, resp *http.Response) []byte {
-	t.Helper()
 	defer func() { _ = resp.Body.Close() }()
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("reading GET %s: %v", rawURL, err)
 	}
-	return b
+	return result{code: resp.StatusCode, data: b}
 }
 
 // --- the rewrite, which is the whole point ---------------------------------
@@ -284,8 +290,8 @@ func TestMetadataIsCachedAndRewritten(t *testing.T) {
 	base := "http://" + p.Addr()
 	const path = "/repos/acme/tool/releases/latest"
 
-	first := body(t, get(t, base+path))
-	second := body(t, get(t, base+path))
+	first := get(t, base+path).data
+	second := get(t, base+path).data
 	if gh.metaHits.Load() != 1 {
 		t.Errorf("upstream metadata hits = %d, want 1", gh.metaHits.Load())
 	}
@@ -316,16 +322,16 @@ func TestAssetIsFetchedThroughTheProxyAndCached(t *testing.T) {
 	base := "http://" + p.Addr()
 
 	var doc map[string]any
-	if err := json.Unmarshal(body(t, get(t, base+"/repos/acme/tool/releases/latest")), &doc); err != nil {
+	if err := json.Unmarshal(get(t, base+"/repos/acme/tool/releases/latest").data, &doc); err != nil {
 		t.Fatal(err)
 	}
 	assetURL := doc["assets"].([]any)[0].(map[string]any)["browser_download_url"].(string)
 
 	for i := range 3 {
 		resp := get(t, assetURL)
-		got := body(t, resp)
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("attempt %d: status %d", i, resp.StatusCode)
+		got := resp.data
+		if resp.code != http.StatusOK {
+			t.Fatalf("attempt %d: status %d", i, resp.code)
 		}
 		if string(got) != string(gh.asset) {
 			t.Fatalf("attempt %d: asset bytes differ", i)
@@ -350,7 +356,7 @@ func TestImmutableAssetsStillServesTheRightBytes(t *testing.T) {
 	u := base + downloadPrefix + "acme/tool/releases/download/v1.2.3/tool.tar.gz"
 
 	for range 2 {
-		if got := body(t, get(t, u)); string(got) != string(gh.asset) {
+		if got := get(t, u).data; string(got) != string(gh.asset) {
 			t.Fatal("asset bytes differ")
 		}
 	}
@@ -370,9 +376,8 @@ func TestUpstream404IsPassedThrough(t *testing.T) {
 		downloadPrefix + "acme/missing/releases/download/v1/x.tgz",
 	} {
 		resp := get(t, base+path)
-		_ = body(t, resp)
-		if resp.StatusCode != http.StatusNotFound {
-			t.Errorf("GET %s = %d, want 404: a nonexistent release is a real answer", path, resp.StatusCode)
+		if resp.code != http.StatusNotFound {
+			t.Errorf("GET %s = %d, want 404: a nonexistent release is a real answer", path, resp.code)
 		}
 	}
 }
@@ -385,8 +390,7 @@ func TestUnroutedPathsAre404(t *testing.T) {
 
 	for _, path := range []string{"/", "/user", "/graphql", downloadPrefix} {
 		resp := get(t, base+path)
-		_ = body(t, resp)
-		if resp.StatusCode == http.StatusOK {
+		if resp.code == http.StatusOK {
 			t.Errorf("GET %s returned 200; only /repos/ and %s are routed", path, downloadPrefix)
 		}
 	}
@@ -412,7 +416,7 @@ func TestWritesAreRejected(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_ = body(t, resp)
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusMethodNotAllowed {
 			t.Errorf("%s returned %d, want 405", method, resp.StatusCode)
 		}
@@ -448,9 +452,8 @@ func TestHealthAndEnvVars(t *testing.T) {
 		t.Fatalf("GHREL_PROXY = %q, want the bound address http://%s", v, p.Addr())
 	}
 	resp := get(t, v+"/repos/acme/tool/releases/latest")
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("the advertised base URL answered %d", resp.StatusCode)
+	if resp.code != http.StatusOK {
+		t.Errorf("the advertised base URL answered %d", resp.code)
 	}
 }
 
@@ -495,12 +498,12 @@ func TestQueryIsPartOfTheCacheKey(t *testing.T) {
 	base := "http://" + p.Addr()
 
 	// Page 1 and page 2 of a release listing are different documents.
-	_ = body(t, get(t, base+"/repos/acme/tool/releases?per_page=1&page=1"))
-	_ = body(t, get(t, base+"/repos/acme/tool/releases?per_page=1&page=2"))
+	_ = get(t, base+"/repos/acme/tool/releases?per_page=1&page=1").data
+	_ = get(t, base+"/repos/acme/tool/releases?per_page=1&page=2").data
 	if gh.metaHits.Load() != 2 {
 		t.Errorf("upstream hits = %d, want 2: two queries shared a cache entry", gh.metaHits.Load())
 	}
-	_ = body(t, get(t, base+"/repos/acme/tool/releases?per_page=1&page=1"))
+	_ = get(t, base+"/repos/acme/tool/releases?per_page=1&page=1").data
 	if gh.metaHits.Load() != 2 {
 		t.Errorf("upstream hits = %d, want 2: the first query was not cached", gh.metaHits.Load())
 	}
@@ -521,13 +524,13 @@ func TestNestedMetadataPathsAreBothCached(t *testing.T) {
 		"/repos/acme/tool/releases/latest", // nested under it
 	}
 	for _, path := range paths {
-		_ = body(t, get(t, base+path))
+		_ = get(t, base+path).data
 	}
 	if gh.metaHits.Load() != 2 {
 		t.Fatalf("upstream hits = %d, want 2", gh.metaHits.Load())
 	}
 	for _, path := range paths {
-		_ = body(t, get(t, base+path))
+		_ = get(t, base+path).data
 	}
 	if got := gh.metaHits.Load(); got != 2 {
 		t.Errorf("upstream hits = %d after re-reading both documents, want 2: one of them is not being cached", got)

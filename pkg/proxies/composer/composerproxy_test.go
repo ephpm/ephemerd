@@ -112,7 +112,18 @@ func client() *http.Client {
 	}
 }
 
-func get(t *testing.T, rawURL string) *http.Response {
+// result is everything these tests need from a response.
+//
+// get() reads and CLOSES the body before returning, so no *http.Response
+// escapes this helper. That is not tidiness: bodyclose flags the CALL SITE of
+// anything that returns a response it cannot see closed, so a helper handing
+// one back can never satisfy the linter no matter how careful the caller is.
+type result struct {
+	code int
+	data []byte
+}
+
+func get(t *testing.T, rawURL string) result {
 	t.Helper()
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -122,17 +133,12 @@ func get(t *testing.T, rawURL string) *http.Response {
 	if err != nil {
 		t.Fatalf("GET %s: %v", rawURL, err)
 	}
-	return resp
-}
-
-func body(t *testing.T, resp *http.Response) []byte {
-	t.Helper()
 	defer func() { _ = resp.Body.Close() }()
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("reading GET %s: %v", rawURL, err)
 	}
-	return b
+	return result{code: resp.StatusCode, data: b}
 }
 
 // distTarget decodes the upstream URL back out of a rewritten dist URL.
@@ -293,9 +299,9 @@ func TestServeDistRefusesNonAllowlistedHosts(t *testing.T) {
 	} {
 		u := base + distPrefix + "archive?u=" + url.QueryEscape(target)
 		resp := get(t, u)
-		got := body(t, resp)
-		if resp.StatusCode != http.StatusForbidden {
-			t.Errorf("dist fetch of %q returned %d, want 403", target, resp.StatusCode)
+		got := resp.data
+		if resp.code != http.StatusForbidden {
+			t.Errorf("dist fetch of %q returned %d, want 403", target, resp.code)
 		}
 		if strings.Contains(string(got), "cloud-metadata-credentials") {
 			t.Fatalf("the proxy relayed a non-allowlisted host: %q", got)
@@ -309,9 +315,8 @@ func TestServeDistRequiresAnUpstream(t *testing.T) {
 	base := "http://" + p.Addr()
 
 	resp := get(t, base+distPrefix+"archive")
-	_ = body(t, resp)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("a dist request with no u= returned %d, want 400", resp.StatusCode)
+	if resp.code != http.StatusBadRequest {
+		t.Errorf("a dist request with no u= returned %d, want 400", resp.code)
 	}
 }
 
@@ -326,8 +331,8 @@ func TestMetadataIsCachedAndDistIsFetchedThroughTheProxy(t *testing.T) {
 	base := "http://" + p.Addr()
 	const path = "/p2/acme/lib.json"
 
-	first := body(t, get(t, base+path))
-	second := body(t, get(t, base+path))
+	first := get(t, base+path).data
+	second := get(t, base+path).data
 	if pk.metaHits.Load() != 1 {
 		t.Errorf("upstream metadata hits = %d, want 1", pk.metaHits.Load())
 	}
@@ -351,9 +356,9 @@ func TestMetadataIsCachedAndDistIsFetchedThroughTheProxy(t *testing.T) {
 	// Follow it exactly as Composer would, repeatedly.
 	for i := range 3 {
 		resp := get(t, distURL)
-		got := body(t, resp)
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("attempt %d: status %d (%q)", i, resp.StatusCode, got)
+		got := resp.data
+		if resp.code != http.StatusOK {
+			t.Fatalf("attempt %d: status %d (%q)", i, resp.code, got)
 		}
 		if string(got) != string(pk.archive) {
 			t.Fatalf("attempt %d: archive bytes differ", i)
@@ -374,16 +379,14 @@ func TestUpstream404IsPassedThrough(t *testing.T) {
 	base := "http://" + p.Addr()
 
 	resp := get(t, base+"/p2/acme/missing.json")
-	_ = body(t, resp)
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("metadata status = %d, want 404: a nonexistent package is a real answer", resp.StatusCode)
+	if resp.code != http.StatusNotFound {
+		t.Errorf("metadata status = %d, want 404: a nonexistent package is a real answer", resp.code)
 	}
 
 	u := base + distPrefix + "archive?u=" + url.QueryEscape(pk.URL+"/repos/acme/missing/zipball/deadbeef")
 	resp2 := get(t, u)
-	_ = body(t, resp2)
-	if resp2.StatusCode != http.StatusNotFound {
-		t.Errorf("archive status = %d, want 404", resp2.StatusCode)
+	if resp2.code != http.StatusNotFound {
+		t.Errorf("archive status = %d, want 404", resp2.code)
 	}
 }
 
@@ -403,7 +406,7 @@ func TestWritesAreRejected(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_ = body(t, resp)
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusMethodNotAllowed {
 			t.Errorf("%s returned %d, want 405", method, resp.StatusCode)
 		}
@@ -439,9 +442,8 @@ func TestHealthAndEnvVars(t *testing.T) {
 		t.Fatalf("COMPOSER_REPO_PACKAGIST = %q, want the bound address http://%s", v, p.Addr())
 	}
 	resp := get(t, v+"/p2/acme/lib.json")
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("the advertised base URL answered %d", resp.StatusCode)
+	if resp.code != http.StatusOK {
+		t.Errorf("the advertised base URL answered %d", resp.code)
 	}
 }
 
@@ -501,14 +503,14 @@ func TestNestedMetadataPathsAreBothCached(t *testing.T) {
 		"/p2/acme/lib.json~dev.json", // a sibling
 	}
 	for _, path := range paths {
-		_ = body(t, get(t, base+path))
+		_ = get(t, base+path).data
 	}
 	want := int64(len(paths))
 	if got := pk.metaHits.Load(); got != want {
 		t.Fatalf("upstream hits = %d, want %d", got, want)
 	}
 	for _, path := range paths {
-		_ = body(t, get(t, base+path))
+		_ = get(t, base+path).data
 	}
 	if got := pk.metaHits.Load(); got != want {
 		t.Errorf("upstream hits = %d after re-reading every document, want %d: something is not being cached", got, want)
