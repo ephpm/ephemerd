@@ -7,6 +7,8 @@ import (
 	"github.com/ephpm/ephemerd/pkg/config"
 	"github.com/ephpm/ephemerd/pkg/networking"
 	"github.com/ephpm/ephemerd/pkg/proxies"
+	composerproxy "github.com/ephpm/ephemerd/pkg/proxies/composer"
+	ghrelproxy "github.com/ephpm/ephemerd/pkg/proxies/ghrel"
 	npmproxy "github.com/ephpm/ephemerd/pkg/proxies/npm"
 	pipproxy "github.com/ephpm/ephemerd/pkg/proxies/pip"
 	pubproxy "github.com/ephpm/ephemerd/pkg/proxies/pub"
@@ -15,19 +17,22 @@ import (
 // Default listen ports for the language package caches, on the bridge
 // gateway alongside the Go module proxy (8082).
 const (
-	defaultNpmProxyPort = 8084
-	defaultPipProxyPort = 8085
-	defaultPubProxyPort = 8086
+	defaultNpmProxyPort      = 8084
+	defaultPipProxyPort      = 8085
+	defaultPubProxyPort      = 8086
+	defaultGhrelProxyPort    = 8087
+	defaultComposerProxyPort = 8088
 )
 
 // healthGated is the interface a cache proxy implements when its env var
 // cannot fail over on its own.
 //
 // GOPROXY has "|direct" and so degrades by itself. npm_config_registry,
-// PIP_INDEX_URL and PUB_HOSTED_URL have no such escape hatch: whatever they
-// name IS the registry. The next best thing is to not name a proxy that is
-// not answering, so these are probed after Start and only injected if the
-// probe passes.
+// PIP_INDEX_URL, PUB_HOSTED_URL, COMPOSER_REPO_PACKAGIST and GHREL_PROXY
+// have no such escape hatch: whatever they name IS the registry, and a
+// consumer only falls back to upstream when the variable is ABSENT. The next
+// best thing is to not name a proxy that is not answering, so these are
+// probed after Start and only injected if the probe passes.
 type healthGated interface {
 	Healthy() bool
 }
@@ -45,11 +50,18 @@ func pkgProxyPorts(cfg *config.Config) []int {
 	if cfg.PubProxy.Enabled {
 		ports = append(ports, cfg.PubProxy.ProxyPort(defaultPubProxyPort))
 	}
+	if cfg.GhrelProxy.Enabled {
+		ports = append(ports, cfg.GhrelProxy.ProxyPort(defaultGhrelProxyPort))
+	}
+	if cfg.ComposerProxy.Enabled {
+		ports = append(ports, cfg.ComposerProxy.ProxyPort(defaultComposerProxyPort))
+	}
 	return ports
 }
 
-// startPkgProxies starts whichever of the npm, pip and pub caches are
-// enabled and returns those that came up healthy, plus a teardown func.
+// startPkgProxies starts whichever of the npm, pip, pub, ghrel and composer
+// caches are enabled and returns those that came up healthy, plus a teardown
+// func.
 //
 // FAIL-OPEN AT STARTUP: a proxy that fails to start, or that starts but does
 // not answer its own health probe, is simply left out of the returned slice.
@@ -108,6 +120,46 @@ func startPkgProxies(cfg *config.Config, dataDir string, net *networking.Manager
 					AllowedHosts: cfg.PubProxy.AllowedHosts,
 					Cleanup:      cfg.PubProxy.Cleanup,
 					Log:          log.With("component", "pub-proxy"),
+				})
+			},
+		},
+		{
+			enabled: cfg.GhrelProxy.Enabled,
+			port:    cfg.GhrelProxy.ProxyPort(defaultGhrelProxyPort),
+			build: func(addr string) (proxies.CacheProxy, error) {
+				return ghrelproxy.New(ghrelproxy.Config{
+					CacheDir: joinPath(dataDir, "cache", "ghrel"),
+					// [ghrel_proxy].upstream is the REST API origin; the
+					// asset origin tracks it rather than being a second
+					// knob, so pointing at GitHub Enterprise moves both.
+					APIUpstream: cfg.GhrelProxy.Upstream,
+					ListenAddr:  addr,
+					MetadataTTL: cfg.GhrelProxy.ProxyIndexTTL(),
+					// AssetTTL is deliberately left at the package default
+					// (24h). It is a backstop against an asset being
+					// replaced in place, not a knob an operator tunes —
+					// the operator-facing choice is immutable_assets.
+					ImmutableAssets: cfg.GhrelProxy.ImmutableAssets,
+					MaxBytes:        cfg.GhrelProxy.ProxyMaxBytes(),
+					AllowedHosts:    cfg.GhrelProxy.AllowedHosts,
+					Cleanup:         cfg.GhrelProxy.Cleanup,
+					Log:             log.With("component", "ghrel-proxy"),
+				})
+			},
+		},
+		{
+			enabled: cfg.ComposerProxy.Enabled,
+			port:    cfg.ComposerProxy.ProxyPort(defaultComposerProxyPort),
+			build: func(addr string) (proxies.CacheProxy, error) {
+				return composerproxy.New(composerproxy.Config{
+					CacheDir:     joinPath(dataDir, "cache", "composer"),
+					Upstream:     cfg.ComposerProxy.Upstream,
+					ListenAddr:   addr,
+					MetadataTTL:  cfg.ComposerProxy.ProxyIndexTTL(),
+					MaxBytes:     cfg.ComposerProxy.ProxyMaxBytes(),
+					AllowedHosts: cfg.ComposerProxy.AllowedHosts,
+					Cleanup:      cfg.ComposerProxy.Cleanup,
+					Log:          log.With("component", "composer-proxy"),
 				})
 			},
 		},

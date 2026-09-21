@@ -105,6 +105,18 @@ func managedCaches() []cacheEntry {
 			LiveSafe:    true,
 		},
 		{
+			Name:        "ghrel",
+			Rel:         filepath.Join("cache", "ghrel"),
+			Description: "GitHub release proxy cache (release metadata + asset bytes) served to job containers",
+			LiveSafe:    true,
+		},
+		{
+			Name:        "composer",
+			Rel:         filepath.Join("cache", "composer"),
+			Description: "Packagist proxy cache (metadata + distribution archives) served to job containers",
+			LiveSafe:    true,
+		},
+		{
 			Name:        "buildkit",
 			Rel:         "buildkit",
 			Description: "Embedded BuildKit solver cache + history (docker build layers)",

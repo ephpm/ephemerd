@@ -372,3 +372,82 @@ func TestFetcherForwardsNoCredentials(t *testing.T) {
 		t.Error("credentials reached the upstream registry")
 	}
 }
+
+// TestServeArtifactRevalidatesStaleMutableEntry covers the one artifact
+// ecosystem that is NOT write-once.
+//
+// npm, PyPI and pub all refuse to re-publish a file, so their proxies mark
+// artifacts Immutable and this path never runs. GitHub does not: a release
+// asset can be deleted and re-uploaded under the same URL. An artifact cache
+// that never revalidates would serve the superseded bytes forever, so a
+// non-immutable entry past its TTL is revalidated with a conditional GET.
+func TestServeArtifactRevalidatesStaleMutableEntry(t *testing.T) {
+	t.Parallel()
+	payload := strings.Repeat("asset-bytes", 100)
+	var full, conditional atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-None-Match") != "" {
+			conditional.Add(1)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		full.Add(1)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("ETag", `"v1"`)
+		_, _ = io.WriteString(w, payload)
+	}))
+	defer upstream.Close()
+
+	f := newTestFetcher(t, 0)
+	// Negative TTL means "always stale", which is what makes this
+	// deterministic without sleeping.
+	req := Request{Key: "dl/aa/bb/asset", URL: upstream.URL + "/asset", TTL: -1}
+
+	for i := range 3 {
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/whatever", nil)
+		if err := f.ServeArtifact(rec, r, req); err != nil {
+			t.Fatalf("attempt %d: %v", i, err)
+		}
+		if rec.Code != http.StatusOK {
+			t.Fatalf("attempt %d: status %d", i, rec.Code)
+		}
+		if rec.Body.String() != payload {
+			t.Fatalf("attempt %d: body mismatch (%d bytes)", i, rec.Body.Len())
+		}
+	}
+	if full.Load() != 1 {
+		t.Errorf("full upstream fetches = %d, want 1: the bytes were re-downloaded instead of revalidated", full.Load())
+	}
+	if conditional.Load() != 2 {
+		t.Errorf("conditional requests = %d, want 2: the stale entry was served without revalidating", conditional.Load())
+	}
+}
+
+// TestServeArtifactImmutableNeverRevalidates pins the property that makes the
+// change above safe for the existing proxies: an Immutable request must not
+// contact upstream again even with a TTL set.
+func TestServeArtifactImmutableNeverRevalidates(t *testing.T) {
+	t.Parallel()
+	var hits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = io.WriteString(w, "wheel")
+	}))
+	defer upstream.Close()
+
+	f := newTestFetcher(t, 0)
+	req := Request{Key: "dl/aa/bb/wheel", URL: upstream.URL + "/wheel", Immutable: true, TTL: -1}
+
+	for i := range 3 {
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/whatever", nil)
+		if err := f.ServeArtifact(rec, r, req); err != nil {
+			t.Fatalf("attempt %d: %v", i, err)
+		}
+	}
+	if hits.Load() != 1 {
+		t.Errorf("upstream hits = %d, want 1: Immutable must win over TTL", hits.Load())
+	}
+}

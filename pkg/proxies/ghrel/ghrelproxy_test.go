@@ -1,0 +1,535 @@
+package ghrelproxy
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// --- harness ---------------------------------------------------------------
+
+// fakeGitHub stands in for both halves of GitHub: the REST API that serves
+// release metadata, and the host that serves the asset bytes. They are
+// separate servers because the proxy points at them with separate config
+// (APIUpstream / DownloadUpstream) and conflating them would hide a wiring
+// mistake between the two.
+type fakeGitHub struct {
+	api      *httptest.Server
+	dl       *httptest.Server
+	metaHits atomic.Int64
+	dlHits   atomic.Int64
+	asset    []byte
+}
+
+func newFakeGitHub(t *testing.T) *fakeGitHub {
+	t.Helper()
+	gh := &fakeGitHub{asset: []byte(strings.Repeat("ASSETBYTES", 512))}
+
+	dlMux := http.NewServeMux()
+	dlMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "missing") {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		gh.dlHits.Add(1)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(gh.asset)
+	})
+	gh.dl = httptest.NewServer(dlMux)
+	t.Cleanup(gh.dl.Close)
+
+	apiMux := http.NewServeMux()
+	apiMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "missing") {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		gh.metaHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", `"rel-v1"`)
+		// Shaped like a real GitHub release: the asset carries several URL
+		// fields and only browser_download_url is the byte source.
+		_, _ = fmt.Fprintf(w, `{
+		  "tag_name": "v1.2.3",
+		  "html_url": "https://github.com/acme/tool/releases/tag/v1.2.3",
+		  "body": "see %s/acme/tool/releases/download/v1.2.3/tool.tar.gz for the build",
+		  "assets": [
+		    {
+		      "name": "tool.tar.gz",
+		      "url": "%s/repos/acme/tool/releases/assets/42",
+		      "browser_download_url": "%s/acme/tool/releases/download/v1.2.3/tool.tar.gz",
+		      "size": 5120
+		    }
+		  ]
+		}`, gh.dl.URL, gh.api.URL, gh.dl.URL)
+	})
+	gh.api = httptest.NewServer(apiMux)
+	t.Cleanup(gh.api.Close)
+	return gh
+}
+
+func startProxy(t *testing.T, cfg Config) *Proxy {
+	t.Helper()
+	if cfg.CacheDir == "" {
+		cfg.CacheDir = t.TempDir()
+	}
+	if cfg.ListenAddr == "" {
+		cfg.ListenAddr = "127.0.0.1:0"
+	}
+	cfg.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	p, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := p.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := p.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
+	return p
+}
+
+func client() *http.Client {
+	return &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func get(t *testing.T, rawURL string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, rawURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client().Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", rawURL, err)
+	}
+	return resp
+}
+
+func body(t *testing.T, resp *http.Response) []byte {
+	t.Helper()
+	defer func() { _ = resp.Body.Close() }()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// --- the rewrite, which is the whole point ---------------------------------
+
+// TestRewriteAssetURLsSingleRelease covers the shape GitHub returns from
+// /releases/latest and /releases/tags/<tag>: one release object.
+func TestRewriteAssetURLsSingleRelease(t *testing.T) {
+	t.Parallel()
+	const base = "http://gw:8087"
+	in := []byte(`{
+	  "tag_name": "v1",
+	  "html_url": "https://github.com/acme/tool/releases/tag/v1",
+	  "body": "grab https://github.com/acme/tool/releases/download/v1/tool.tgz",
+	  "assets": [{
+	    "name": "tool.tgz",
+	    "url": "https://api.github.com/repos/acme/tool/releases/assets/7",
+	    "browser_download_url": "https://github.com/acme/tool/releases/download/v1/tool.tgz"
+	  }]
+	}`)
+
+	out, err := rewriteAssetURLs(in, base)
+	if err != nil {
+		t.Fatalf("rewriteAssetURLs: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+
+	asset := doc["assets"].([]any)[0].(map[string]any)
+	want := base + downloadPrefix + "acme/tool/releases/download/v1/tool.tgz"
+	if got := asset["browser_download_url"]; got != want {
+		t.Errorf("browser_download_url = %q, want %q", got, want)
+	}
+
+	// Everything else must survive byte-for-byte. A blind string replace
+	// would have rewritten the body text and the API asset URL too, and the
+	// API URL is what `gh` uses to fetch an asset from a private repo.
+	if got := asset["url"]; got != "https://api.github.com/repos/acme/tool/releases/assets/7" {
+		t.Errorf("asset.url was rewritten to %q", got)
+	}
+	if got := asset["name"]; got != "tool.tgz" {
+		t.Errorf("asset.name = %q", got)
+	}
+	if got := doc["html_url"]; got != "https://github.com/acme/tool/releases/tag/v1" {
+		t.Errorf("html_url was rewritten to %q", got)
+	}
+	if got := doc["body"].(string); !strings.Contains(got, "https://github.com/acme/tool/releases/download/v1/tool.tgz") {
+		t.Errorf("release body was rewritten to %q", got)
+	}
+	if got := doc["tag_name"]; got != "v1" {
+		t.Errorf("tag_name = %q", got)
+	}
+}
+
+// TestRewriteAssetURLsReleaseArray covers the OTHER shape: /releases returns
+// an array, and a rewriter that only understands an object silently sends
+// every asset in a listing straight to the CDN.
+func TestRewriteAssetURLsReleaseArray(t *testing.T) {
+	t.Parallel()
+	const base = "http://gw:8087"
+	in := []byte(`[
+	  {"tag_name":"v2","assets":[{"browser_download_url":"https://github.com/acme/tool/releases/download/v2/tool.tgz"}]},
+	  {"tag_name":"v1","assets":[
+	     {"browser_download_url":"https://github.com/acme/tool/releases/download/v1/tool.tgz"},
+	     {"browser_download_url":"https://github.com/acme/tool/releases/download/v1/tool.sha256"}
+	  ]}
+	]`)
+
+	out, err := rewriteAssetURLs(in, base)
+	if err != nil {
+		t.Fatalf("rewriteAssetURLs: %v", err)
+	}
+	var docs []map[string]any
+	if err := json.Unmarshal(out, &docs); err != nil {
+		t.Fatalf("an array of releases must stay an array: %v", err)
+	}
+	if len(docs) != 2 {
+		t.Fatalf("got %d releases, want 2", len(docs))
+	}
+
+	var seen []string
+	for _, rel := range docs {
+		for _, a := range rel["assets"].([]any) {
+			u := a.(map[string]any)["browser_download_url"].(string)
+			if !strings.HasPrefix(u, base+downloadPrefix) {
+				t.Errorf("browser_download_url = %q, want it pointed at the proxy", u)
+			}
+			seen = append(seen, u)
+		}
+	}
+	if len(seen) != 3 {
+		t.Errorf("rewrote %d asset URLs, want 3: %v", len(seen), seen)
+	}
+	if seen[0] != base+downloadPrefix+"acme/tool/releases/download/v2/tool.tgz" {
+		t.Errorf("first rewritten URL = %q", seen[0])
+	}
+}
+
+// TestRewriteAssetURLsLeavesOddShapesAlone: the API is not under our control,
+// so a value that is not a usable URL must be passed through rather than
+// guessed at, and nothing structurally odd may panic.
+func TestRewriteAssetURLsLeavesOddShapesAlone(t *testing.T) {
+	t.Parallel()
+	const base = "http://gw:8087"
+
+	out, err := rewriteAssetURLs([]byte(`{"assets":[
+	  {"browser_download_url":"not-a-url"},
+	  {"browser_download_url":""},
+	  {"browser_download_url":42},
+	  {"browser_download_url":"https://github.com/"}
+	]}`), base)
+	if err != nil {
+		t.Fatalf("rewriteAssetURLs: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	assets := doc["assets"].([]any)
+	if got := assets[0].(map[string]any)["browser_download_url"]; got != "not-a-url" {
+		t.Errorf("a non-URL value was rewritten to %q", got)
+	}
+	if got := assets[1].(map[string]any)["browser_download_url"]; got != "" {
+		t.Errorf("an empty value was rewritten to %q", got)
+	}
+	if got := assets[2].(map[string]any)["browser_download_url"]; got != float64(42) {
+		t.Errorf("a non-string value was rewritten to %v", got)
+	}
+	if got := assets[3].(map[string]any)["browser_download_url"]; got != "https://github.com/" {
+		t.Errorf("a pathless URL was rewritten to %q", got)
+	}
+
+	for _, in := range []string{`{"assets":"nope"}`, `{"assets":[5]}`, `[]`, `null`, `"scalar"`} {
+		if _, err := rewriteAssetURLs([]byte(in), base); err != nil {
+			t.Errorf("rewriteAssetURLs(%s): %v", in, err)
+		}
+	}
+	if _, err := rewriteAssetURLs([]byte("not json"), base); err == nil {
+		t.Error("unparseable metadata must be an error so the caller can fail loudly rather than serve unrewritten bytes")
+	}
+}
+
+// --- end to end ------------------------------------------------------------
+
+// TestMetadataIsCachedAndRewritten is the proxy doing its job: one upstream
+// hit for repeated metadata reads, and the asset URLs in what it serves point
+// back at itself.
+func TestMetadataIsCachedAndRewritten(t *testing.T) {
+	t.Parallel()
+	gh := newFakeGitHub(t)
+	p := startProxy(t, Config{APIUpstream: gh.api.URL, DownloadUpstream: gh.dl.URL, MetadataTTL: time.Hour})
+	base := "http://" + p.Addr()
+	const path = "/repos/acme/tool/releases/latest"
+
+	first := body(t, get(t, base+path))
+	second := body(t, get(t, base+path))
+	if gh.metaHits.Load() != 1 {
+		t.Errorf("upstream metadata hits = %d, want 1", gh.metaHits.Load())
+	}
+	if string(first) != string(second) {
+		t.Error("the cached metadata differs from the first response")
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(first, &doc); err != nil {
+		t.Fatal(err)
+	}
+	asset := doc["assets"].([]any)[0].(map[string]any)
+	want := base + downloadPrefix + "acme/tool/releases/download/v1.2.3/tool.tar.gz"
+	if got := asset["browser_download_url"]; got != want {
+		t.Fatalf("browser_download_url = %q, want %q", got, want)
+	}
+	if got := asset["size"]; got != float64(5120) {
+		t.Errorf("asset.size = %v, want it untouched", got)
+	}
+}
+
+// TestAssetIsFetchedThroughTheProxyAndCached follows the rewritten URL out of
+// the metadata exactly as a build tool would.
+func TestAssetIsFetchedThroughTheProxyAndCached(t *testing.T) {
+	t.Parallel()
+	gh := newFakeGitHub(t)
+	p := startProxy(t, Config{APIUpstream: gh.api.URL, DownloadUpstream: gh.dl.URL})
+	base := "http://" + p.Addr()
+
+	var doc map[string]any
+	if err := json.Unmarshal(body(t, get(t, base+"/repos/acme/tool/releases/latest")), &doc); err != nil {
+		t.Fatal(err)
+	}
+	assetURL := doc["assets"].([]any)[0].(map[string]any)["browser_download_url"].(string)
+
+	for i := range 3 {
+		resp := get(t, assetURL)
+		got := body(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("attempt %d: status %d", i, resp.StatusCode)
+		}
+		if string(got) != string(gh.asset) {
+			t.Fatalf("attempt %d: asset bytes differ", i)
+		}
+	}
+	if gh.dlHits.Load() != 1 {
+		t.Errorf("upstream asset hits = %d, want 1: the bytes were not cached", gh.dlHits.Load())
+	}
+}
+
+// TestImmutableAssetsStillServesTheRightBytes: the flag changes only how the
+// entry is revalidated, never what a job receives.
+func TestImmutableAssetsStillServesTheRightBytes(t *testing.T) {
+	t.Parallel()
+	gh := newFakeGitHub(t)
+	p := startProxy(t, Config{
+		APIUpstream:      gh.api.URL,
+		DownloadUpstream: gh.dl.URL,
+		ImmutableAssets:  true,
+	})
+	base := "http://" + p.Addr()
+	u := base + downloadPrefix + "acme/tool/releases/download/v1.2.3/tool.tar.gz"
+
+	for range 2 {
+		if got := body(t, get(t, u)); string(got) != string(gh.asset) {
+			t.Fatal("asset bytes differ")
+		}
+	}
+	if gh.dlHits.Load() != 1 {
+		t.Errorf("upstream asset hits = %d, want 1", gh.dlHits.Load())
+	}
+}
+
+func TestUpstream404IsPassedThrough(t *testing.T) {
+	t.Parallel()
+	gh := newFakeGitHub(t)
+	p := startProxy(t, Config{APIUpstream: gh.api.URL, DownloadUpstream: gh.dl.URL})
+	base := "http://" + p.Addr()
+
+	for _, path := range []string{
+		"/repos/acme/missing/releases/latest",
+		downloadPrefix + "acme/missing/releases/download/v1/x.tgz",
+	} {
+		resp := get(t, base+path)
+		_ = body(t, resp)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("GET %s = %d, want 404: a nonexistent release is a real answer", path, resp.StatusCode)
+		}
+	}
+}
+
+func TestUnroutedPathsAre404(t *testing.T) {
+	t.Parallel()
+	gh := newFakeGitHub(t)
+	p := startProxy(t, Config{APIUpstream: gh.api.URL, DownloadUpstream: gh.dl.URL})
+	base := "http://" + p.Addr()
+
+	for _, path := range []string{"/", "/user", "/graphql", downloadPrefix} {
+		resp := get(t, base+path)
+		_ = body(t, resp)
+		if resp.StatusCode == http.StatusOK {
+			t.Errorf("GET %s returned 200; only /repos/ and %s are routed", path, downloadPrefix)
+		}
+	}
+	if gh.metaHits.Load() != 0 {
+		t.Error("an unrouted path reached the upstream API")
+	}
+}
+
+// TestWritesAreRejected: this is a read-through cache, never a GitHub front
+// end. Nothing that could mutate a release may be relayed.
+func TestWritesAreRejected(t *testing.T) {
+	t.Parallel()
+	gh := newFakeGitHub(t)
+	p := startProxy(t, Config{APIUpstream: gh.api.URL, DownloadUpstream: gh.dl.URL})
+	base := "http://" + p.Addr()
+
+	for _, method := range []string{http.MethodPut, http.MethodPost, http.MethodDelete, http.MethodPatch} {
+		req, err := http.NewRequestWithContext(t.Context(), method, base+"/repos/acme/tool/releases", strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = body(t, resp)
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("%s returned %d, want 405", method, resp.StatusCode)
+		}
+	}
+	if gh.metaHits.Load() != 0 {
+		t.Error("a write method reached the upstream API")
+	}
+}
+
+func TestHealthAndEnvVars(t *testing.T) {
+	t.Parallel()
+	gh := newFakeGitHub(t)
+	p := startProxy(t, Config{APIUpstream: gh.api.URL, DownloadUpstream: gh.dl.URL})
+
+	if !p.Healthy() {
+		t.Error("a running proxy reported unhealthy")
+	}
+	if p.Name() != "ghrel" {
+		t.Errorf("Name = %q, want ghrel", p.Name())
+	}
+
+	env := p.EnvVars()
+	if len(env) != 1 {
+		t.Fatalf("EnvVars = %v, want exactly GHREL_PROXY", env)
+	}
+	k, v, _ := strings.Cut(env[0], "=")
+	if k != "GHREL_PROXY" {
+		t.Fatalf("EnvVars = %v, want GHREL_PROXY", env)
+	}
+	// It must be reachable: a base URL whose port is the one actually bound,
+	// not the ":0" an operator (or a test) asked for.
+	if v != "http://"+p.Addr() {
+		t.Fatalf("GHREL_PROXY = %q, want the bound address http://%s", v, p.Addr())
+	}
+	resp := get(t, v+"/repos/acme/tool/releases/latest")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("the advertised base URL answered %d", resp.StatusCode)
+	}
+}
+
+func TestDefaultsAreApplied(t *testing.T) {
+	t.Parallel()
+	p, err := New(Config{CacheDir: t.TempDir(), ListenAddr: "127.0.0.1:0", Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.cfg.APIUpstream != DefaultAPIUpstream {
+		t.Errorf("APIUpstream = %q, want %q", p.cfg.APIUpstream, DefaultAPIUpstream)
+	}
+	if p.cfg.DownloadUpstream != DefaultDownloadUpstream {
+		t.Errorf("DownloadUpstream = %q, want %q", p.cfg.DownloadUpstream, DefaultDownloadUpstream)
+	}
+	if p.cfg.MetadataTTL != DefaultMetadataTTL {
+		t.Errorf("MetadataTTL = %v, want %v", p.cfg.MetadataTTL, DefaultMetadataTTL)
+	}
+	if p.cfg.AssetTTL != DefaultAssetTTL {
+		t.Errorf("AssetTTL = %v, want %v", p.cfg.AssetTTL, DefaultAssetTTL)
+	}
+	// A trailing slash on an override must not produce "//" in every
+	// upstream URL built from it.
+	p2, err := New(Config{CacheDir: t.TempDir(), ListenAddr: "127.0.0.1:0", APIUpstream: "https://ghe.test/api/v3/", Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p2.cfg.APIUpstream != "https://ghe.test/api/v3" {
+		t.Errorf("APIUpstream = %q, want the trailing slash trimmed", p2.cfg.APIUpstream)
+	}
+	// A GitHub Enterprise upstream must be allowed to serve its own bytes
+	// without the operator restating it in allowed_hosts.
+	if !p2.allow.Allows("https://ghe.test/acme/tool/releases/download/v1/x.tgz") {
+		t.Error("the configured upstream host is not on the allowlist")
+	}
+}
+
+func TestQueryIsPartOfTheCacheKey(t *testing.T) {
+	t.Parallel()
+	gh := newFakeGitHub(t)
+	p := startProxy(t, Config{APIUpstream: gh.api.URL, DownloadUpstream: gh.dl.URL, MetadataTTL: time.Hour})
+	base := "http://" + p.Addr()
+
+	// Page 1 and page 2 of a release listing are different documents.
+	_ = body(t, get(t, base+"/repos/acme/tool/releases?per_page=1&page=1"))
+	_ = body(t, get(t, base+"/repos/acme/tool/releases?per_page=1&page=2"))
+	if gh.metaHits.Load() != 2 {
+		t.Errorf("upstream hits = %d, want 2: two queries shared a cache entry", gh.metaHits.Load())
+	}
+	_ = body(t, get(t, base+"/repos/acme/tool/releases?per_page=1&page=1"))
+	if gh.metaHits.Load() != 2 {
+		t.Errorf("upstream hits = %d, want 2: the first query was not cached", gh.metaHits.Load())
+	}
+}
+
+// TestNestedMetadataPathsAreBothCached: the REST API nests documents —
+// /repos/o/r/releases is one and /repos/o/r/releases/latest is another — and
+// a path-shaped cache key would need "releases" to be a file and a directory
+// at once. The loser is cached silently-not-at-all.
+func TestNestedMetadataPathsAreBothCached(t *testing.T) {
+	t.Parallel()
+	gh := newFakeGitHub(t)
+	p := startProxy(t, Config{APIUpstream: gh.api.URL, DownloadUpstream: gh.dl.URL, MetadataTTL: time.Hour})
+	base := "http://" + p.Addr()
+
+	paths := []string{
+		"/repos/acme/tool/releases",        // the parent, fetched first
+		"/repos/acme/tool/releases/latest", // nested under it
+	}
+	for _, path := range paths {
+		_ = body(t, get(t, base+path))
+	}
+	if gh.metaHits.Load() != 2 {
+		t.Fatalf("upstream hits = %d, want 2", gh.metaHits.Load())
+	}
+	for _, path := range paths {
+		_ = body(t, get(t, base+path))
+	}
+	if got := gh.metaHits.Load(); got != 2 {
+		t.Errorf("upstream hits = %d after re-reading both documents, want 2: one of them is not being cached", got)
+	}
+}
