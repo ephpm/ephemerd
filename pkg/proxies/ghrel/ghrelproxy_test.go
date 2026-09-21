@@ -536,3 +536,65 @@ func TestNestedMetadataPathsAreBothCached(t *testing.T) {
 		t.Errorf("upstream hits = %d after re-reading both documents, want 2: one of them is not being cached", got)
 	}
 }
+
+// TestAPIAssetEndpointServesBytesNotJSON is the regression test for the bug
+// that took out every php-sdk Linux build the day this proxy was first
+// enabled.
+//
+// The asset-DOWNLOAD endpoint lives under /repos/ like the metadata endpoints,
+// but returns BYTES. Routing it to serveMetadata runs a binary body through a
+// JSON rewriter, which fails to parse and answers 502 -- and the client just
+// sees a failed download, with nothing pointing at the proxy. spc fetches
+// asset bytes from exactly this endpoint (it is how an asset is fetched from a
+// private repo), so `type: ghrel` artifacts all went through it.
+func TestAPIAssetEndpointServesBytesNotJSON(t *testing.T) {
+	t.Parallel()
+	payload := []byte(strings.Repeat("BINARY\x00\xff", 400))
+	var hits atomic.Int64
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(payload)
+	}))
+	defer api.Close()
+
+	p := startProxy(t, Config{APIUpstream: api.URL, DownloadUpstream: api.URL})
+	base := "http://" + p.Addr()
+	const path = "/repos/madler/zlib/releases/assets/12345"
+
+	for i := range 2 {
+		got := get(t, base+path)
+		if got.code != http.StatusOK {
+			t.Fatalf("attempt %d: status %d, want 200 (a 502 here is the proxy failing to parse bytes as JSON)", i, got.code)
+		}
+		if string(got.data) != string(payload) {
+			t.Fatalf("attempt %d: body mismatch (%d bytes, want %d)", i, len(got.data), len(payload))
+		}
+	}
+	if hits.Load() != 1 {
+		t.Errorf("upstream hits = %d, want 1: the asset was not cached", hits.Load())
+	}
+}
+
+// TestIsAPIAssetPath pins the routing predicate directly: metadata paths must
+// NOT be mistaken for assets, or every release lookup would be served as
+// opaque bytes and never rewritten.
+func TestIsAPIAssetPath(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		path  string
+		asset bool
+	}{
+		{"/repos/acme/tool/releases/assets/42", true},
+		{"/repos/acme/tool/releases/assets/42/", true},
+		{"/repos/acme/tool/releases/latest", false},
+		{"/repos/acme/tool/releases", false},
+		{"/repos/acme/tool/releases/tags/v1.0.0", false},
+		{"/repos/acme/tool/releases/assets", false},
+		{"/download/acme/tool/releases/download/v1/x.tgz", false},
+	} {
+		if got := isAPIAssetPath(tc.path); got != tc.asset {
+			t.Errorf("isAPIAssetPath(%q) = %v, want %v", tc.path, got, tc.asset)
+		}
+	}
+}

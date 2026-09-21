@@ -66,6 +66,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -238,12 +239,67 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	// MUST precede the apiPrefix case. The asset-download endpoint lives
+	// under /repos/ too but returns BYTES, not JSON -- see isAPIAssetPath.
+	case isAPIAssetPath(r.URL.Path):
+		p.serveAPIAsset(w, r)
 	case strings.HasPrefix(r.URL.Path, apiPrefix):
 		p.serveMetadata(w, r)
 	case strings.HasPrefix(r.URL.Path, downloadPrefix):
 		p.serveAsset(w, r)
 	default:
 		http.NotFound(w, r)
+	}
+}
+
+// apiAssetRe matches GitHub's asset-DOWNLOAD endpoint:
+//
+//	/repos/{owner}/{repo}/releases/assets/{id}
+//
+// which is the one path under /repos/ that does not return JSON. Asked with
+// Accept: application/octet-stream it streams the asset bytes, and that is
+// exactly how a client fetches an asset from a private repository, so it
+// cannot simply be excluded.
+var apiAssetRe = regexp.MustCompile(`^/repos/[^/]+/[^/]+/releases/assets/[^/]+/?$`)
+
+// isAPIAssetPath reports whether a path is the asset-download endpoint.
+//
+// Getting this wrong is not subtle but IS silent-looking: serveMetadata runs
+// every /repos/ response through a JSON rewriter, so a binary body fails to
+// parse and the handler answers 502. The client sees a failed download with no
+// indication the proxy invented the failure. That took out every php-sdk Linux
+// build the day this proxy was first enabled (run 35611830865, "Download
+// artifact 'zlib' failed", curl exit 22 after 8 retries) -- zlib is a
+// `type: ghrel` artifact, and spc fetches its bytes from this endpoint rather
+// than from browser_download_url.
+func isAPIAssetPath(path string) bool {
+	return apiAssetRe.MatchString(path)
+}
+
+// serveAPIAsset streams asset bytes from the API asset endpoint, caching them.
+//
+// Same treatment as serveAsset -- the only difference is which upstream the
+// request goes to, because this path is on the API origin rather than the
+// download origin.
+func (p *Proxy) serveAPIAsset(w http.ResponseWriter, r *http.Request) {
+	upstream := p.cfg.APIUpstream + r.URL.Path
+	if r.URL.RawQuery != "" {
+		upstream += "?" + r.URL.RawQuery
+	}
+
+	req := pkgcache.Request{
+		Key:                "apiasset/" + strings.TrimPrefix(r.URL.Path, "/"),
+		URL:                upstream,
+		DefaultContentType: "application/octet-stream",
+	}
+	if p.cfg.ImmutableAssets {
+		req.Immutable = true
+	} else {
+		req.TTL = p.cfg.AssetTTL
+	}
+
+	if err := p.srv.Fetcher().ServeArtifact(w, r, req); err != nil {
+		p.writeFetchError(w, err, "release asset (api endpoint)")
 	}
 }
 
