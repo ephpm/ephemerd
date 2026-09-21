@@ -36,6 +36,12 @@ type Config struct {
 	NpmProxy    PkgProxyConfig    `toml:"npm_proxy"`
 	PipProxy    PkgProxyConfig    `toml:"pip_proxy"`
 	PubProxy    PkgProxyConfig    `toml:"pub_proxy"`
+	// ComposerProxy caches Packagist metadata and the PHP distribution
+	// archives it points at. Same shape as the other language caches.
+	ComposerProxy PkgProxyConfig `toml:"composer_proxy"`
+	// GhrelProxy caches GitHub release metadata and asset bytes. It carries
+	// one field the others do not — see GhrelProxyConfig.
+	GhrelProxy GhrelProxyConfig `toml:"ghrel_proxy"`
 	// RegistryMirror routes container image pulls through a LAN pull-through
 	// cache instead of the origin registry. See RegistryMirrorConfig.
 	RegistryMirror RegistryMirrorConfig `toml:"registry_mirror"`
@@ -1103,7 +1109,8 @@ func validateMirrorURL(key, raw string) error {
 }
 
 // PkgProxyConfig configures one language package caching proxy. The
-// same shape serves [npm_proxy], [pip_proxy] and [pub_proxy]: all three are
+// same shape serves [npm_proxy], [pip_proxy], [pub_proxy], [composer_proxy]
+// and (embedded in GhrelProxyConfig) [ghrel_proxy]: all of them are
 // pull-through HTTP caches with an immutable-artifact half and a mutable-
 // metadata half, and differ only in their upstream and their defaults.
 //
@@ -1117,13 +1124,16 @@ type PkgProxyConfig struct {
 	Enabled bool `toml:"enabled"`
 
 	// Port is the listen port on the bridge gateway. Zero takes the
-	// per-ecosystem default (npm 8084, pip 8085, pub 8086).
+	// per-ecosystem default (npm 8084, pip 8085, pub 8086, ghrel 8087,
+	// composer 8088).
 	Port int `toml:"port"`
 
 	// Upstream overrides the registry to pull through to (npm:
 	// https://registry.npmjs.org, pip: https://pypi.org, pub:
-	// https://pub.dev). The upstream's own host is always permitted to
-	// serve artifacts, so an override needs no matching allowed_hosts entry.
+	// https://pub.dev, composer: https://repo.packagist.org, ghrel:
+	// https://api.github.com). The upstream's own host is always permitted
+	// to serve artifacts, so an override needs no matching allowed_hosts
+	// entry.
 	Upstream string `toml:"upstream"`
 
 	// IndexTTL is how long cached MUTABLE metadata (an npm packument, a PEP
@@ -1133,6 +1143,9 @@ type PkgProxyConfig struct {
 	//
 	// Immutable artifacts — tarballs, wheels, sdists, archives — ignore
 	// this entirely: they are cached permanently and never revalidated.
+	//
+	// [ghrel_proxy] is the one exception to that second paragraph, because
+	// GitHub lets an asset be replaced in place. See GhrelProxyConfig.
 	IndexTTL time.Duration `toml:"index_ttl"`
 
 	// MaxSizeGB is the cache's disk budget in GiB. When it is exceeded, the
@@ -1185,6 +1198,36 @@ func (p *PkgProxyConfig) ProxyMaxBytes() int64 {
 		return -1
 	}
 	return p.MaxSizeGB << 30
+}
+
+// GhrelProxyConfig configures [ghrel_proxy], the GitHub release cache.
+//
+// It is a PkgProxyConfig plus one flag, rather than its own type, because
+// every other knob means the same thing here as it does for [npm_proxy]:
+// `upstream` is the REST API origin (https://api.github.com by default, or a
+// GitHub Enterprise host), `index_ttl` is how long release METADATA is served
+// before a conditional GET, and `port` defaults to 8087 — continuing npm
+// 8084, pip 8085, pub 8086, with composer at 8088.
+//
+// The extra flag exists because GitHub is the one ecosystem here that does
+// not promise immutable artifacts. PyPI refuses to let a file be re-uploaded
+// even after deletion, and npm and pub are similar, which is why those caches
+// keep an artifact forever and never look at it again. GitHub enforces
+// nothing of the kind: a release asset can be deleted and replaced under the
+// same tag, keeping its name and URL. So asset bytes are revalidated on a
+// long TTL by default — one conditional request per asset per day, answered
+// with a 304 for unchanged bytes, which is cheap next to re-downloading a
+// 200 MB toolchain and stays correct if someone republishes.
+type GhrelProxyConfig struct {
+	PkgProxyConfig
+
+	// ImmutableAssets caches release asset bytes permanently and never
+	// revalidates them, trading the daily conditional request for the
+	// promise that an asset is never overwritten in place (a new build gets
+	// a new tag). Default false: it is a promise the proxy cannot verify,
+	// and getting it wrong is silent — jobs keep building, against bytes
+	// that upstream has replaced.
+	ImmutableAssets bool `toml:"immutable_assets"`
 }
 
 // VMConfig configures virtual machines for cross-OS job execution.

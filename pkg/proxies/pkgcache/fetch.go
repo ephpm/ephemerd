@@ -59,6 +59,24 @@ type Request struct {
 	DefaultContentType string
 }
 
+// serveCachedArtifact writes a cache hit to the response.
+//
+// Cache-Control says "immutable" regardless of whether this entry is
+// revalidatable here. That header governs the JOB's HTTP client, and the
+// identity of an artifact URL does not change under it mid-build; freshness
+// against upstream is this proxy's job, decided by req.TTL above.
+func (f *Fetcher) serveCachedArtifact(w http.ResponseWriter, r *http.Request, req Request, file io.ReadSeekCloser, meta Meta) {
+	w.Header().Set("Content-Type", contentTypeOr(meta.ContentType, req.DefaultContentType))
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	if meta.ETag != "" {
+		w.Header().Set("ETag", meta.ETag)
+	}
+	f.Log.Debug("package cache hit", "key", req.Key, "url", req.URL)
+	// ServeContent handles Range, If-Modified-Since and HEAD. The empty name
+	// suppresses its content sniffing — the type is already set.
+	http.ServeContent(w, r, "", meta.Fetched, file)
+}
+
 // NotFoundError marks an upstream 404/410 so a caller can pass it through as
 // a 404 rather than treating it as an outage. A nonexistent package version
 // must stay distinguishable from a registry being down: the first is a real
@@ -160,21 +178,21 @@ func (f *Fetcher) Document(ctx context.Context, req Request) ([]byte, Meta, erro
 // gigabyte, and several jobs pull concurrently.
 func (f *Fetcher) ServeArtifact(w http.ResponseWriter, r *http.Request, req Request) error {
 	if file, meta, ok := f.Cache.Open(req.Key); ok {
-		defer func() {
-			if cerr := file.Close(); cerr != nil {
-				f.Log.Debug("closing cached artifact", "key", req.Key, "error", cerr)
-			}
-		}()
-		w.Header().Set("Content-Type", contentTypeOr(meta.ContentType, req.DefaultContentType))
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-		if meta.ETag != "" {
-			w.Header().Set("ETag", meta.ETag)
+		if decide(true, req.Immutable, meta.Fetched, time.Now(), req.TTL) == serveCached {
+			defer func() {
+				if cerr := file.Close(); cerr != nil {
+					f.Log.Debug("closing cached artifact", "key", req.Key, "error", cerr)
+				}
+			}()
+			f.serveCachedArtifact(w, r, req, file, meta)
+			return nil
 		}
-		f.Log.Debug("package cache hit", "key", req.Key, "url", req.URL)
-		// ServeContent handles Range, If-Modified-Since and HEAD. The empty
-		// name suppresses its content sniffing — the type is already set.
-		http.ServeContent(w, r, "", meta.Fetched, file)
-		return nil
+		// Stale and revalidatable. Close now rather than defer — this path
+		// does NOT return here, and a deferred close would hold the handle
+		// for the whole upstream round trip.
+		if cerr := file.Close(); cerr != nil {
+			f.Log.Debug("closing stale cached artifact", "key", req.Key, "error", cerr)
+		}
 	}
 
 	mu := f.Cache.Lock(req.Key)
@@ -182,16 +200,60 @@ func (f *Fetcher) ServeArtifact(w http.ResponseWriter, r *http.Request, req Requ
 	defer mu.Unlock()
 
 	// Another goroutine may have filled it while we waited for the lock.
+	// Re-decide rather than assuming fresh: the entry we are looking at may
+	// be the same stale one we just closed.
+	cachedMeta, haveCached := Meta{}, false
 	if file, meta, ok := f.Cache.Open(req.Key); ok {
-		defer func() {
-			if cerr := file.Close(); cerr != nil {
-				f.Log.Debug("closing cached artifact", "key", req.Key, "error", cerr)
+		if decide(true, req.Immutable, meta.Fetched, time.Now(), req.TTL) == serveCached {
+			defer func() {
+				if cerr := file.Close(); cerr != nil {
+					f.Log.Debug("closing cached artifact", "key", req.Key, "error", cerr)
+				}
+			}()
+			f.serveCachedArtifact(w, r, req, file, meta)
+			return nil
+		}
+		if cerr := file.Close(); cerr != nil {
+			f.Log.Debug("closing stale cached artifact", "key", req.Key, "error", cerr)
+		}
+		cachedMeta, haveCached = meta, true
+	}
+
+	// A stale-but-present entry is revalidated with a conditional GET. On 304
+	// the bytes on disk are still correct, so only the freshness stamp moves
+	// and nothing crosses the WAN.
+	//
+	// This is dead weight for every caller that marks artifacts Immutable
+	// (npm tarballs, PyPI wheels, pub archives: registries that refuse to
+	// re-publish a file). It exists for GitHub release assets, which CAN be
+	// replaced in place under the same URL, so "cache it forever" would serve
+	// superseded bytes indefinitely.
+	if haveCached {
+		resp, err := f.do(r.Context(), req, true, cachedMeta)
+		if err == nil && resp.StatusCode == http.StatusNotModified {
+			if cerr := resp.Body.Close(); cerr != nil {
+				f.Log.Debug("closing upstream body", "url", req.URL, "error", cerr)
 			}
-		}()
-		w.Header().Set("Content-Type", contentTypeOr(meta.ContentType, req.DefaultContentType))
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-		http.ServeContent(w, r, "", meta.Fetched, file)
-		return nil
+			cachedMeta.Fetched = time.Now()
+			f.Cache.refreshMeta(req.Key, cachedMeta)
+			if file, meta, ok := f.Cache.Open(req.Key); ok {
+				defer func() {
+					if cerr := file.Close(); cerr != nil {
+						f.Log.Debug("closing cached artifact", "key", req.Key, "error", cerr)
+					}
+				}()
+				f.Log.Debug("package cache revalidated", "key", req.Key, "url", req.URL)
+				f.serveCachedArtifact(w, r, req, file, meta)
+				return nil
+			}
+		}
+		if err == nil && resp != nil {
+			if cerr := resp.Body.Close(); cerr != nil {
+				f.Log.Debug("closing upstream body", "url", req.URL, "error", cerr)
+			}
+		}
+		// Anything else (200, an error, or the entry vanishing under us)
+		// falls through to a full fetch below.
 	}
 
 	f.Log.Debug("package cache miss", "key", req.Key, "url", req.URL)

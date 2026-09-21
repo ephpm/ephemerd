@@ -509,6 +509,44 @@ shutdown_timeout = "5m"
 # max_size_gb = 5
 # cleanup     = false
 
+# GitHub releases. Caches release metadata and the asset bytes it points at —
+# prebuilt toolchains, SDK archives, vendored tarballs, the CI inputs that have
+# no registry to cache them in.
+#
+# Unlike the others this one ADVERTISES rather than intercepts: a GitHub
+# download is a plain https://github.com/... URL with no redirect knob, so
+# ephemerd sets GHREL_PROXY and a tool that understands it uses it. A tool that
+# does not is unaffected, and a build stays correct off-fleet because the
+# variable is simply absent. `upstream` is the REST API origin, so a GitHub
+# Enterprise host moves both halves.
+#
+# immutable_assets is the one key the other caches do not have. GitHub is the
+# only ecosystem here that lets an asset be deleted and replaced under the same
+# tag and URL, so assets are revalidated on a long TTL by default. Set this
+# true only if your publishing discipline guarantees an asset is never
+# overwritten in place — it is a promise the proxy cannot verify, and getting
+# it wrong is silent.
+# [ghrel_proxy]
+# enabled          = false
+# port             = 8087
+# upstream         = "https://api.github.com"
+# index_ttl        = "5m"
+# max_size_gb      = 5
+# immutable_assets = false
+# cleanup          = false
+
+# PHP Composer. Injects COMPOSER_REPO_PACKAGIST, so both the Packagist metadata
+# and the distribution archives it points at come from the LAN. A repository
+# declared explicitly in composer.json still wins, and private/authenticated
+# repositories are not proxied — this cache forwards no credentials.
+# [composer_proxy]
+# enabled     = false
+# port        = 8088
+# upstream    = "https://repo.packagist.org"
+# index_ttl   = "5m"
+# max_size_gb = 5
+# cleanup     = false
+
 [log]
 # Log level: debug, info, warn, error
 level = "info"
