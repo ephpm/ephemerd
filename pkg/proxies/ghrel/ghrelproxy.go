@@ -287,10 +287,28 @@ func (p *Proxy) serveAPIAsset(w http.ResponseWriter, r *http.Request) {
 		upstream += "?" + r.URL.RawQuery
 	}
 
+	// Accept is NOT optional here. GitHub's asset endpoint serves the asset's
+	// METADATA as JSON by default and only returns the bytes when asked for
+	// application/octet-stream. Omitting it does not fail — it quietly returns
+	// a ~1.4 KB JSON document with a 200, which then gets cached under the
+	// tarball's key and served to every build. On 2026-09-21 that fed spc a
+	// JSON blob in place of zlib-1.3.2.tar.gz; only spc's own sha256 check
+	// turned it into a visible failure instead of a corrupt PHP binary.
+	//
+	// The client's own Accept is deliberately not forwarded. Whatever spc or
+	// curl happens to send, this path exists to return bytes, and the cache
+	// key does not vary on Accept — so honoring a caller that asked for JSON
+	// would poison the same key for everyone else.
 	req := pkgcache.Request{
 		Key:                "apiasset/" + strings.TrimPrefix(r.URL.Path, "/"),
 		URL:                upstream,
+		Accept:             "application/octet-stream",
 		DefaultContentType: "application/octet-stream",
+		// Belt and braces: if upstream answers with JSON anyway (a rate-limit
+		// body, an error document, a future API change), refuse it rather than
+		// storing it. A wrong-typed response on this path is never the
+		// artifact, and caching one is indistinguishable from corruption.
+		RejectContentTypes: []string{"application/json"},
 	}
 	if p.cfg.ImmutableAssets {
 		req.Immutable = true
