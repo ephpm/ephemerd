@@ -576,6 +576,73 @@ func TestAPIAssetEndpointServesBytesNotJSON(t *testing.T) {
 	}
 }
 
+// The asset endpoint is CONTENT-NEGOTIATED: GitHub returns the asset's
+// metadata as JSON unless the request asks for application/octet-stream. The
+// upstream above ignores Accept and always returns bytes, which is why it kept
+// passing while production served JSON — so this one behaves like GitHub.
+//
+// Regression for 2026-09-21: the proxy omitted Accept, cached 1.4 KB of
+// metadata JSON under zlib-1.3.2.tar.gz's key, and served it to every build.
+// It was spc's sha256 check, not anything here, that turned that into a
+// visible failure rather than a corrupt PHP binary.
+func TestAPIAssetSendsOctetStreamAccept(t *testing.T) {
+	t.Parallel()
+	payload := []byte(strings.Repeat("BINARY\x00\xff", 400))
+	const metadataJSON = `{"url":"https://api.github.com/repos/madler/zlib/releases/assets/357391855","name":"zlib-1.3.2.tar.gz"}`
+
+	var sawAccept atomic.Value
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawAccept.Store(r.Header.Get("Accept"))
+		if r.Header.Get("Accept") != "application/octet-stream" {
+			// Exactly what GitHub does: a 200, with metadata, not the asset.
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			_, _ = io.WriteString(w, metadataJSON)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(payload)
+	}))
+	defer api.Close()
+
+	p := startProxy(t, Config{APIUpstream: api.URL, DownloadUpstream: api.URL})
+	got := get(t, "http://"+p.Addr()+"/repos/madler/zlib/releases/assets/357391855")
+
+	if acc, _ := sawAccept.Load().(string); acc != "application/octet-stream" {
+		t.Errorf("upstream saw Accept %q, want application/octet-stream", acc)
+	}
+	if got.code != http.StatusOK {
+		t.Fatalf("status %d, want 200", got.code)
+	}
+	if string(got.data) != string(payload) {
+		t.Fatalf("served %d bytes, want the %d-byte asset; body starts %.60q",
+			len(got.data), len(payload), got.data)
+	}
+}
+
+// Second line of defence, independent of Accept: if upstream answers an asset
+// path with JSON anyway — a rate-limit body, an error document, an API change
+// — that response must not be cached or served. A 200 carrying the wrong media
+// type is the dangerous shape, because it looks like success everywhere except
+// in the bytes.
+func TestAPIAssetRefusesJSONResponse(t *testing.T) {
+	t.Parallel()
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = io.WriteString(w, `{"message":"API rate limit exceeded"}`)
+	}))
+	defer api.Close()
+
+	p := startProxy(t, Config{APIUpstream: api.URL, DownloadUpstream: api.URL})
+	got := get(t, "http://"+p.Addr()+"/repos/madler/zlib/releases/assets/357391855")
+
+	if got.code == http.StatusOK {
+		t.Fatalf("status 200 with a JSON body: the proxy served metadata as an artifact\n%.120q", got.data)
+	}
+	if strings.Contains(string(got.data), "rate limit") {
+		t.Errorf("upstream JSON was passed through to the caller: %.120q", got.data)
+	}
+}
+
 // TestIsAPIAssetPath pins the routing predicate directly: metadata paths must
 // NOT be mistaken for assets, or every release lookup would be served as
 // opaque bytes and never rewritten.

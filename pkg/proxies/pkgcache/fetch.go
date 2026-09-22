@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -57,6 +58,37 @@ type Request struct {
 	Accept string
 	// DefaultContentType is used when upstream does not supply one.
 	DefaultContentType string
+	// RejectContentTypes lists media types that must never be cached or
+	// served for this request, matched against the response's Content-Type
+	// ignoring parameters. Empty means accept whatever upstream sends.
+	//
+	// For artifact paths where a wrong type is PROOF the response is not the
+	// artifact. A registry that answers a tarball URL with
+	// application/json is handing back an error document or metadata, and a
+	// 200 makes it indistinguishable from success: it gets cached under the
+	// artifact's key and served to every subsequent job until someone
+	// notices. Checked BEFORE any bytes are written, so the caller's normal
+	// upstream-failure path handles it.
+	RejectContentTypes []string
+}
+
+// rejectedContentType reports whether ct is one of req's rejected media types.
+// Parameters are ignored — "application/json; charset=utf-8" matches
+// "application/json", which is how GitHub actually labels its API responses.
+func (req Request) rejectedContentType(ct string) bool {
+	if len(req.RejectContentTypes) == 0 || ct == "" {
+		return false
+	}
+	media := strings.TrimSpace(strings.ToLower(ct))
+	if i := strings.IndexByte(media, ';'); i >= 0 {
+		media = strings.TrimSpace(media[:i])
+	}
+	for _, bad := range req.RejectContentTypes {
+		if media == strings.TrimSpace(strings.ToLower(bad)) {
+			return true
+		}
+	}
+	return false
 }
 
 // serveCachedArtifact writes a cache hit to the response.
@@ -271,6 +303,13 @@ func (f *Fetcher) ServeArtifact(w http.ResponseWriter, r *http.Request, req Requ
 		return &NotFoundError{URL: req.URL}
 	case resp.StatusCode != http.StatusOK:
 		return fmt.Errorf("fetching %s: upstream status %d", req.URL, resp.StatusCode)
+	case req.rejectedContentType(resp.Header.Get("Content-Type")):
+		// A 200 carrying the wrong media type is the dangerous case: it looks
+		// like success everywhere except in the bytes. Bail before writing
+		// headers or opening a cache writer, so nothing is stored and the
+		// caller reports an upstream failure.
+		return fmt.Errorf("fetching %s: upstream returned %s, which cannot be this artifact",
+			req.URL, resp.Header.Get("Content-Type"))
 	}
 
 	meta := metaFrom(resp, req)
