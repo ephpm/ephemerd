@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -49,6 +50,7 @@ type Cloudflared struct {
 	ln       net.Listener
 	waitDone chan struct{} // closed by the single waiter goroutine after cmd.Wait returns
 	closing  bool          // set by close() so the waiter can tell shutdown from crash
+	lifetime io.Closer     // OS-level parent binding (Windows Job Object); nil elsewhere
 }
 
 // NewCloudflared validates options and returns a provider. It does not
@@ -168,6 +170,18 @@ func (c *Cloudflared) start(ctx context.Context) (net.Listener, string, error) {
 		_ = ln.Close()
 		return nil, "", fmt.Errorf("cloudflared: start subprocess: %w", err)
 	}
+	// Bind the child to this process at the OS level. On Windows this is the
+	// ONLY thing that reaps cloudflared when ephemerd is stopped as a service,
+	// because that path never runs close(). Failing to bind is not fatal — a
+	// tunnel that works but may leak beats no tunnel at all — but it is the
+	// difference between one stray process and one per restart forever, so it
+	// is a warning rather than a debug line.
+	lifetime, err := bindChildLifetime(cmd)
+	if err != nil {
+		slog.Warn("could not bind cloudflared's lifetime to ephemerd; it may outlive this process",
+			"error", err)
+	}
+	c.lifetime = lifetime
 	c.cmd = cmd
 	c.ln = ln
 	c.closing = false
@@ -213,10 +227,25 @@ func (c *Cloudflared) close() error {
 	cmd := c.cmd
 	ln := c.ln
 	waitDone := c.waitDone
+	lifetime := c.lifetime
 	c.closing = true
 	c.cmd = nil
 	c.ln = nil
+	c.lifetime = nil
 	c.mu.Unlock()
+
+	// Releasing the OS binding is itself a guaranteed kill on Windows (the Job
+	// Object is KILL_ON_JOB_CLOSE), so it runs after the graceful attempts
+	// below rather than instead of them — a clean cloudflared shutdown closes
+	// its edge connections properly, an abrupt one leaves Cloudflare to time
+	// them out.
+	defer func() {
+		if lifetime != nil {
+			if err := lifetime.Close(); err != nil {
+				slog.Debug("releasing cloudflared lifetime binding", "error", err)
+			}
+		}
+	}()
 
 	if ln != nil {
 		_ = ln.Close()

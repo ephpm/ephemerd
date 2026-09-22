@@ -3,6 +3,7 @@
 package tunnel
 
 import (
+	"io"
 	"os/exec"
 	"syscall"
 )
@@ -20,3 +21,8 @@ func applyPdeathsig(cmd *exec.Cmd) {
 	// stay attached to it (and thus get reaped when it does).
 	cmd.SysProcAttr.Setpgid = true
 }
+
+// bindChildLifetime is a no-op on Linux: Pdeathsig above already binds the
+// child to this process at the kernel level, and it applies from the moment
+// the child is created rather than after Start.
+func bindChildLifetime(_ *exec.Cmd) (io.Closer, error) { return nil, nil }
