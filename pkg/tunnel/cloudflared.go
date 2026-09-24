@@ -124,6 +124,14 @@ func (c *Cloudflared) start(ctx context.Context) (net.Listener, string, error) {
 		return nil, "", err
 	}
 
+	// Sweep strays from a previous ephemerd BEFORE starting ours. bindChildLifetime
+	// covers children this binary spawns; it cannot adopt one already running, so
+	// without this an orphan survives until the host reboots — and an orphan is
+	// not idle, it keeps re-registering edge connections for the same tunnel and
+	// eventually starves the live daemon of them. No-op off Windows, where
+	// Pdeathsig makes an orphan impossible to create.
+	reapStrayCloudflared(binary, slog.Default())
+
 	creds, err := decodeToken(c.opts.Token)
 	if err != nil {
 		return nil, "", err
