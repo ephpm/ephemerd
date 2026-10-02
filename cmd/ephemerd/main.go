@@ -599,6 +599,21 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		}
 	}
 
+	// Each proxy advertises the address it was asked to bind: the CNI bridge
+	// gateway. That is correct ONLY where job containers share this host's
+	// bridge, i.e. on Linux. On macOS and Windows hosts, jobs run inside a VM
+	// and that address resolves to the VM's own bridge, where nothing listens —
+	// the proxies are out here on the host. Left uncorrected it looks like a
+	// working cache that never gets a single hit: this fleet's Mac ran 169 days
+	// with all four caches at 0 bytes while every proxy reported healthy,
+	// because the existing health gate probes loopback, which always answers.
+	//
+	// resolveJobProxyEnv is per-platform: identity on Linux, rewrite-and-probe
+	// on darwin, and nil on Windows until its VM-visible host address is
+	// confirmed on metal. Returning nil is the safe failure — a missing GOPROXY
+	// costs bandwidth, an unreachable one hangs Windows builds outright.
+	cacheProxyEnvVars = resolveJobProxyEnv(cacheProxyEnvVars, log)
+
 	// Start the shared embedded BuildKit solver. One solver serves every
 	// job's `docker build` calls through pkg/dind. Only enabled when dind
 	// is enabled and on platforms buildkit supports (linux, windows).
