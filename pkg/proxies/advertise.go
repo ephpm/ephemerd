@@ -46,19 +46,57 @@ func RewriteEnvHost(env []string, host string) []string {
 			out = append(out, e)
 			continue
 		}
-		u, err := url.Parse(v)
-		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-			out = append(out, e)
-			continue
-		}
-		if port := u.Port(); port != "" {
-			u.Host = net.JoinHostPort(host, port)
-		} else {
-			u.Host = host
-		}
-		out = append(out, k+"="+u.String())
+		out = append(out, k+"="+rewriteURLList(v, host))
 	}
 	return out
+}
+
+// rewriteURLList rewrites every URL element of a value that may be a LIST.
+//
+// GOPROXY is not a URL, it is a fallback list: Go accepts elements separated by
+// "," or "|", mixed with the literals "direct" and "off". Production emits
+//
+//	GOPROXY=http://10.88.0.1:8082|direct
+//
+// and url.Parse on that whole string yields no usable host:port, so the naive
+// single-URL version silently left GOPROXY alone while correctly rewriting
+// RUSTUP_DIST_SERVER, GHREL_PROXY and COMPOSER_REPO_PACKAGIST. Three of four
+// vars fixed looks like success in a log line and leaves Go — the heaviest
+// consumer on a Go codebase — still pointed at an unreachable address.
+//
+// Caught only by reading the real env off a live node. The original test used a
+// bare GOPROXY=http://host:port, an input invented rather than observed, and it
+// passed.
+func rewriteURLList(v, host string) string {
+	var b strings.Builder
+	start := 0
+	for i := 0; i <= len(v); i++ {
+		if i < len(v) && v[i] != ',' && v[i] != '|' {
+			continue
+		}
+		b.WriteString(rewriteOneURL(v[start:i], host))
+		if i < len(v) {
+			b.WriteByte(v[i]) // keep the caller's separator exactly
+		}
+		start = i + 1
+	}
+	return b.String()
+}
+
+// rewriteOneURL swaps the host of a single http(s) URL, preserving port and
+// path. Anything that is not such a URL — "direct", "off", "sparse", a bare
+// value — is returned untouched.
+func rewriteOneURL(s, host string) string {
+	u, err := url.Parse(s)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return s
+	}
+	if port := u.Port(); port != "" {
+		u.Host = net.JoinHostPort(host, port)
+	} else {
+		u.Host = host
+	}
+	return u.String()
 }
 
 // HostAddrVisibleTo returns the local address that peerIP can reach this host
@@ -156,25 +194,37 @@ func EnvHostPorts(env []string) []string {
 		if !ok {
 			continue
 		}
-		u, err := url.Parse(v)
-		if err != nil || u.Host == "" {
-			continue
-		}
-		hp := u.Host
-		if u.Port() == "" {
-			switch u.Scheme {
-			case "http":
-				hp = net.JoinHostPort(u.Hostname(), "80")
-			case "https":
-				hp = net.JoinHostPort(u.Hostname(), "443")
-			default:
+		// Walk LIST elements, not the whole value: GOPROXY is
+		// "http://host:port|direct", and parsing that as one URL yields no
+		// usable authority — so the probe would skip the Go proxy entirely and
+		// happily advertise an address it never checked.
+		for _, el := range strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == '|' }) {
+			hp, ok := hostPortOf(el)
+			if !ok || seen[hp] {
 				continue
 			}
-		}
-		if !seen[hp] {
 			seen[hp] = true
 			out = append(out, hp)
 		}
 	}
 	return out
+}
+
+// hostPortOf returns the dialable authority of an http(s) URL, defaulting the
+// port from the scheme when absent.
+func hostPortOf(s string) (string, bool) {
+	u, err := url.Parse(s)
+	if err != nil || u.Host == "" {
+		return "", false
+	}
+	if u.Port() != "" {
+		return u.Host, true
+	}
+	switch u.Scheme {
+	case "http":
+		return net.JoinHostPort(u.Hostname(), "80"), true
+	case "https":
+		return net.JoinHostPort(u.Hostname(), "443"), true
+	}
+	return "", false
 }
