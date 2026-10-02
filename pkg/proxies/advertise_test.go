@@ -9,10 +9,17 @@ import (
 	"time"
 )
 
-// The exact env the fleet's proxies emit, with the exact host that broke it.
+// The env the fleet's proxies ACTUALLY emit, copied verbatim off
+// mfl-mac-arm64's log on 2026-10-02 — note GOPROXY carries Go's "|direct"
+// fallback list, which the first version of this test did not.
+//
+// That omission is why a half-working fix shipped: with a bare
+// GOPROXY=http://host:port the tests passed, while production left GOPROXY
+// unrewritten and pointed at an unreachable address. Keep this fixture
+// byte-identical to observed output; do not "tidy" it.
 func fleetEnv() []string {
 	return []string{
-		"GOPROXY=http://10.88.0.1:8082",
+		"GOPROXY=http://10.88.0.1:8082|direct",
 		"GOSUMDB=off",
 		"CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse",
 		"RUSTUP_DIST_SERVER=http://10.88.0.1:8083/rustup",
@@ -25,7 +32,7 @@ func TestRewriteEnvHostFixesTheAdvertisedAddress(t *testing.T) {
 	got := RewriteEnvHost(fleetEnv(), "192.168.64.1")
 
 	want := []string{
-		"GOPROXY=http://192.168.64.1:8082",
+		"GOPROXY=http://192.168.64.1:8082|direct",
 		"GOSUMDB=off",
 		"CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse",
 		"RUSTUP_DIST_SERVER=http://192.168.64.1:8083/rustup",
@@ -185,5 +192,36 @@ func TestHostAddrInSubnet(t *testing.T) {
 	}
 	if _, ok := HostAddrInSubnet(nil); ok {
 		t.Error("HostAddrInSubnet(nil) matched")
+	}
+}
+
+// Regression for the half-working fix shipped on 2026-10-02: GOPROXY is a
+// fallback LIST, not a URL. Production emits "http://host:port|direct"; the
+// single-URL rewrite silently skipped it, so Go — the heaviest consumer in a Go
+// codebase — kept pointing at an unreachable proxy while three other vars were
+// correctly rewritten and the log line claimed success.
+func TestRewriteEnvHostHandlesGoProxyLists(t *testing.T) {
+	for _, tc := range []struct{ name, in, want string }{
+		{"pipe direct", "http://10.88.0.1:8082|direct", "http://192.168.64.1:8082|direct"},
+		{"comma direct", "http://10.88.0.1:8082,direct", "http://192.168.64.1:8082,direct"},
+		{"two proxies then direct", "http://10.88.0.1:8082|https://proxy.golang.org|direct",
+			"http://192.168.64.1:8082|https://192.168.64.1|direct"},
+		{"off literal", "off", "off"},
+		{"direct only", "direct", "direct"},
+		{"trailing separator kept", "http://10.88.0.1:8082|", "http://192.168.64.1:8082|"},
+	} {
+		got := RewriteEnvHost([]string{"GOPROXY=" + tc.in}, "192.168.64.1")
+		if got[0] != "GOPROXY="+tc.want {
+			t.Errorf("%s:\n got %q\nwant %q", tc.name, got[0], "GOPROXY="+tc.want)
+		}
+	}
+}
+
+// The probe must see the Go proxy's address too, or it advertises a host it
+// never verified — defeating the entire point of the gate.
+func TestEnvHostPortsSeesListElements(t *testing.T) {
+	got := EnvHostPorts([]string{"GOPROXY=http://10.88.0.1:8082|direct"})
+	if len(got) != 1 || got[0] != "10.88.0.1:8082" {
+		t.Errorf("got %q, want [10.88.0.1:8082] — the probe is blind to list elements", got)
 	}
 }
