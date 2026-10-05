@@ -61,6 +61,17 @@ var (
 	// so waiting this long against a pool that nothing is tracked against is
 	// reported at Error.
 	slotLeakSuspectAfter = 15 * time.Minute
+
+	// maxSlotWait bounds how long a dispatch may sit blocked on a full pool
+	// before it gives up. Without it a wait had no end at all: on 2026-10-05
+	// the Windows node had dispatches 24h and 28h into their wait, for jobs
+	// GitHub had cancelled days before, and each one that won a slot booted a
+	// runner that idled out the full orphan grace window. Giving up loses
+	// nothing — a job that is still genuinely queued is rediscovered by the
+	// reconcile poll and the next queued event and dispatched fresh. Six hours
+	// is long enough to queue behind any real build (GitHub's own job limit)
+	// and short enough that the backlog cannot outlive the jobs in it.
+	maxSlotWait = 6 * time.Hour
 )
 
 // slotToken is a one-shot handle to an acquired concurrency slot.
@@ -72,6 +83,11 @@ var (
 type slotToken struct {
 	sem  chan struct{}
 	once sync.Once
+
+	// waited is how long acquiring this slot blocked; zero on the fast path.
+	// admitDispatch uses it to decide whether the dispatch decision is stale
+	// enough to re-check with the platform before claiming a runner.
+	waited time.Duration
 }
 
 // release returns the slot to its pool. Safe to call any number of times from
@@ -86,8 +102,9 @@ func (t *slotToken) release() {
 	t.once.Do(func() { <-t.sem })
 }
 
-// acquireSlot takes a slot from sem, blocking until one is free or ctx is
-// done. It returns nil when ctx ended first; the caller must not provision.
+// acquireSlot takes a slot from sem, blocking until one is free, ctx is done,
+// or maxSlotWait elapses. It returns nil when it did not get a slot; the caller
+// must not provision.
 //
 // The only behavioural difference from the raw `select { case sem <- ... }`
 // it replaces is that a wait which actually BLOCKS becomes visible in the log.
@@ -110,14 +127,23 @@ func (s *Scheduler) acquireSlot(ctx context.Context, sem chan struct{}, pool str
 	start := time.Now()
 	timer := time.NewTimer(slotWaitLogAfter)
 	defer timer.Stop()
+	giveUp := time.NewTimer(maxSlotWait)
+	defer giveUp.Stop()
 	for {
 		select {
 		case sem <- struct{}{}:
+			waited := time.Since(start)
 			log.Info("acquired concurrency slot after waiting",
-				"pool", pool, "waited", time.Since(start).Truncate(time.Second),
+				"pool", pool, "waited", waited.Truncate(time.Second),
 				"held", len(sem), "capacity", cap(sem))
-			return &slotToken{sem: sem}
+			return &slotToken{sem: sem, waited: waited}
 		case <-ctx.Done():
+			return nil
+		case <-giveUp.C:
+			log.Warn("abandoning dispatch: waited too long for a concurrency slot",
+				"pool", pool, "waited", time.Since(start).Truncate(time.Second),
+				"max_wait", maxSlotWait,
+				"detail", "if the job is still queued, the reconcile poll or its next queued event dispatches it fresh")
 			return nil
 		case <-timer.C:
 			// PER-POOL, not global. The first version of this compared the

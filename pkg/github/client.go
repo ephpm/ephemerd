@@ -286,6 +286,38 @@ func (c *Client) RunnerBusy(ctx context.Context, repo string, runnerID int64) (b
 	return runner.GetBusy(), nil
 }
 
+// JobAwaitingRunner reports whether a workflow job is still waiting for a
+// runner, from GitHub's own view of the job.
+//
+// Anything short of in_progress or completed counts as waiting: queued is the
+// common case, and waiting/pending/requested (environment approvals, run
+// concurrency groups) are jobs that will still need a runner once released.
+// A job that no longer exists (404 — its run was deleted) does not need one.
+// Every other error is returned, and the caller must treat it as unknown.
+//
+// The jobs endpoint is repo-scoped whether runners are registered at the org
+// or the repo level, so there is no org-level variant to choose between.
+func (c *Client) JobAwaitingRunner(ctx context.Context, repo string, jobID int64) (bool, error) {
+	job, resp, err := c.client.Actions.GetWorkflowJobByID(ctx, c.cfg.Owner, repo, jobID)
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			return false, nil
+		}
+		return false, fmt.Errorf("reading job %d: %w", jobID, err)
+	}
+	return jobAwaitsRunner(job.GetStatus()), nil
+}
+
+// jobAwaitsRunner maps a workflow job status onto "still needs a runner".
+// Split out so the mapping is testable without an API server.
+func jobAwaitsRunner(status string) bool {
+	switch status {
+	case "in_progress", "completed":
+		return false
+	}
+	return true
+}
+
 // FetchJobImage fetches the workflow run's job definition and reads the
 // container image declared in the job's `container:` field. This requires an
 // extra API call per job but lets users specify the image directly in their

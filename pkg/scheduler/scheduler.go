@@ -1118,6 +1118,11 @@ const (
 	// dispatchAbandonCordoned: the node was cordoned while this dispatch
 	// waited for a concurrency slot.
 	dispatchAbandonCordoned
+	// dispatchAbandonGone: the platform says the job no longer needs a runner
+	// — it finished, was cancelled, or is running elsewhere — and this node
+	// never saw the event that would have said so (or saw it so long ago that
+	// the record expired).
+	dispatchAbandonGone
 )
 
 // log emits the verdict's explanation on the caller's job-scoped logger, so
@@ -1130,6 +1135,9 @@ func (v dispatchVerdict) log(log *slog.Logger) {
 	case dispatchAbandonCordoned:
 		log.Info("abandoning dispatch: scheduler was cordoned while this dispatch waited for a concurrency slot",
 			"detail", "cordon means stop claiming NEW work; the job stays queued for another node or for this node after uncordon")
+	case dispatchAbandonGone:
+		log.Info("abandoning dispatch: the platform reports the job no longer needs a runner",
+			"detail", "it finished, was cancelled, or ran elsewhere while this dispatch waited for a concurrency slot")
 	}
 }
 
@@ -1172,21 +1180,69 @@ func (v dispatchVerdict) log(log *slog.Logger) {
 //
 // Jobs ALREADY RUNNING are unaffected — this gate is only ever consulted on the
 // path to a new claim, never on a running job's lifecycle.
-func (s *Scheduler) admitDispatch(key jobKey) dispatchVerdict {
+//
+//  3. Staleness (dispatchAbandonGone). Check 1 trusts the started map, which is
+//     in memory and pruned after roughly JobTimeout. A slot wait had no bound,
+//     so a dispatch could outlive that record by days: on 2026-10-05 the
+//     Windows node admitted dispatches 24h and 28h old, for jobs cancelled on
+//     10-02, and every one booted a runner that idled out the 90-minute orphan
+//     grace while live jobs queued behind it. So when the dispatch actually
+//     WAITED (waited > 0), ask the platform. A dispatch that found a free slot
+//     at once skips the call: its webhook is seconds old.
+func (s *Scheduler) admitDispatch(ctx context.Context, event providers.JobEvent, waited time.Duration) dispatchVerdict {
+	key := keyFor(event)
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.pending, key)
 	if s.draining {
+		s.mu.Unlock()
 		return dispatchAbandonCordoned
 	}
-	if !s.webhookMode {
+	if _, done := s.started[key]; done && s.webhookMode {
 		// started is only populated from in_progress/completed webhooks.
-		return dispatchAdmit
-	}
-	if _, done := s.started[key]; done {
+		s.mu.Unlock()
 		return dispatchAbandonSatisfied
 	}
+	s.mu.Unlock()
+
+	if waited > 0 && !s.jobStillWanted(ctx, event) {
+		return dispatchAbandonGone
+	}
 	return dispatchAdmit
+}
+
+// jobStillWantedTimeout bounds the platform lookup so a slow API cannot stall
+// a dispatch that has a slot in hand.
+const jobStillWantedTimeout = 15 * time.Second
+
+// jobStillWanted asks the job's provider whether the job still needs a runner.
+//
+// It fails OPEN: a provider that cannot answer, or an API error, returns true
+// and the dispatch proceeds exactly as it did before this check existed. The
+// asymmetry is deliberate — a wrong "gone" strands a live job, while a wrong
+// "wanted" costs one runner that the orphan sweep reclaims.
+//
+// A "gone" answer is recorded in started, the same satisfied signal a
+// completed webhook leaves, so the re-provision path and later gates see it
+// without asking again.
+func (s *Scheduler) jobStillWanted(ctx context.Context, event providers.JobEvent) bool {
+	reporter, ok := event.Provider.(providers.JobStateReporter)
+	if !ok {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(ctx, jobStillWantedTimeout)
+	defer cancel()
+	wanted, err := reporter.JobAwaitingRunner(ctx, &event)
+	if err != nil {
+		s.cfg.Log.Warn("could not confirm the job still needs a runner; provisioning anyway",
+			"job_id", event.JobID, "repo", event.Repo, "error", err)
+		return true
+	}
+	if !wanted {
+		s.mu.Lock()
+		s.started[keyFor(event)] = time.Now()
+		s.mu.Unlock()
+	}
+	return wanted
 }
 
 // handleLinuxJob dispatches a Linux job to the Linux VM worker via gRPC.
@@ -1222,7 +1278,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		}
 	}()
 
-	if v := s.admitDispatch(key); v != dispatchAdmit {
+	if v := s.admitDispatch(ctx, event, slot.waited); v != dispatchAdmit {
 		v.log(log)
 		slot.release()
 		return
@@ -1421,7 +1477,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		}
 	}()
 
-	if v := s.admitDispatch(key); v != dispatchAdmit {
+	if v := s.admitDispatch(ctx, event, slot.waited); v != dispatchAdmit {
 		v.log(log)
 		slot.release()
 		return
@@ -1850,7 +1906,7 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 		}
 	}()
 
-	if v := s.admitDispatch(key); v != dispatchAdmit {
+	if v := s.admitDispatch(ctx, event, slot.waited); v != dispatchAdmit {
 		v.log(log)
 		slot.release()
 		return
@@ -2369,6 +2425,20 @@ func (s *Scheduler) cleanSeen() {
 	for id, t := range s.seen {
 		if time.Since(t) > seenTTL {
 			delete(s.seen, id)
+			// A job this node is still holding — blocked on a slot (pending)
+			// or with a runner up (running) — has NOT left the queue; its seen
+			// stamp merely aged. Resetting its zombie counter here is what
+			// made maxProvisionAttempts unreachable: every strand cycle lasts
+			// longer than seenTTL (a 90-minute orphan grace, or hours on a
+			// slot), so the counter was back to zero by each re-provision and
+			// cancelled jobs looped for days. Its labels stay too — a waiting
+			// job is still demand for its fungibility class.
+			if _, ok := s.pending[id]; ok {
+				continue
+			}
+			if _, ok := s.running[id]; ok {
+				continue
+			}
 			// Job stopped appearing in the queue (finished/cancelled) — reset
 			// its zombie counter so a future legitimate rerun starts fresh.
 			delete(s.attempts, id)
@@ -2853,11 +2923,25 @@ func (s *Scheduler) reprovisionIfStranded(ctx context.Context, event providers.J
 		dispatchCtx = ctx
 	}
 
-	s.cfg.Log.Info("dispatched runner exited but its job was never observed running; re-provisioning",
-		"job_id", key.JobID,
-		"repo", event.Repo,
-		"detail", "same-label JIT runners are fungible; the runner likely ran a sibling job and left this one queued")
-	go s.handleQueued(dispatchCtx, event)
+	go func() {
+		// Ask before re-queuing. "Never observed running" is a statement about
+		// this node's memory, not about the job: the completed webhook may have
+		// been missed, or recorded so long ago that started has forgotten it.
+		// Without this check the loop below re-provisioned cancelled jobs for
+		// days — runner boots, idles out the orphan grace, exits unassigned,
+		// re-provision — and the attempt cap never fired (see cleanSeen).
+		if !s.jobStillWanted(dispatchCtx, event) {
+			s.cfg.Log.Info("dispatched runner exited unassigned, and the platform reports the job no longer needs a runner; not re-provisioning",
+				"job_id", key.JobID,
+				"repo", event.Repo)
+			return
+		}
+		s.cfg.Log.Info("dispatched runner exited but its job was never observed running; re-provisioning",
+			"job_id", key.JobID,
+			"repo", event.Repo,
+			"detail", "same-label JIT runners are fungible; the runner likely ran a sibling job and left this one queued")
+		s.handleQueued(dispatchCtx, event)
+	}()
 }
 
 // runReconcileLoop periodically re-runs each provider's catch-up poll while in

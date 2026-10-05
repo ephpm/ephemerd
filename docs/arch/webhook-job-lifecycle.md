@@ -113,6 +113,9 @@ N_B exits -> reprovisionIfStranded(B): started[B] set -> no-op
   (e.g. a superseded workflow run GitHub keeps listing as queued but never
   dispatches) would otherwise re-provision on every runner exit forever.
 - **draining** — shutting down.
+- **the platform says the job no longer needs a runner** — asked via
+  `JobStateReporter` after the guards above pass, before re-queuing. See
+  [Stale dispatch decisions](#stale-dispatch-decisions).
 
 Re-dispatch is launched as `go s.handleQueued(...)` so it never blocks on the
 concurrency slot the exiting wait-goroutine is about to release, and it uses
@@ -149,6 +152,34 @@ original claim-retry path, which would misroute a re-claim failure.
   can't check `started[X]` — until its long job finishes, up to `JobTimeout`
   after dispatch. Pruning `started[X]` earlier would let that late exit falsely
   re-provision the already-run X.
+
+## Stale dispatch decisions
+
+`started` is in memory and expires; a dispatch decision can be far older. On
+2026-10-05 the Windows node (2 slots) was admitting dispatches 24h and 28h into
+their slot wait, for jobs GitHub had cancelled three days earlier. `started`
+had long forgotten them, so `admitDispatch` admitted each one; the runner idled
+out the 90-minute orphan grace; `reprovisionIfStranded` saw `started` unset and
+re-queued it; repeat. ~23 dead runners a day against ~10 real jobs, and live
+jobs queued for hours behind them. Three changes close it:
+
+- **Ask the platform.** Providers implementing `JobStateReporter`
+  (`JobAwaitingRunner`: GitHub reads `GET /repos/{o}/{r}/actions/jobs/{id}`)
+  are consulted by `admitDispatch` when the dispatch *waited* for its slot,
+  and by `reprovisionIfStranded` before every re-queue. A "gone" answer
+  (in_progress, completed, or 404) abandons the dispatch and is recorded in
+  `started`. It **fails open**: an API error provisions as before, because a
+  stranded live job costs more than one wasted runner. A dispatch that found a
+  free slot at once skips the call — its webhook is seconds old.
+- **Bound the wait.** `acquireSlot` gives up after `maxSlotWait` (6h). The
+  job loses nothing: if it is still queued, the reconcile poll or its next
+  `queued` event dispatches it fresh.
+- **Keep the zombie counter while the job is held.** `cleanSeen` used to reset
+  `attempts[key]` whenever `seen[key]` aged past `seenTTL` (10m), including
+  for jobs still pending on a slot or running. Every strand cycle is longer
+  than 10 minutes, so the counter was zero at each re-provision and
+  `maxProvisionAttempts` never fired. It now survives while the key is in
+  `pending` or `running`.
 
 ## The reconcile poll is now a backstop only
 
@@ -221,12 +252,14 @@ sorted, deduped) into a **fungibility class**. `Scheduler.jobLabels` records the
 class of every accepted job; `runnerBinding.labelSet` records the class each
 dispatched runner serves.
 
-1. **`admitDispatch(key)`** — the last gate before claiming, called by all four
-   provisioning paths immediately after they acquire their concurrency slot.
-   It returns false when the job was observed running while the handler sat
-   blocked, so the dispatch is *discharged by the sibling's execution* instead
-   of becoming an orphan. The caller releases its slot, keeping
-   `max_concurrent` accounting correct.
+1. **`admitDispatch(ctx, event, waited)`** — the last gate before claiming,
+   called by all provisioning paths immediately after they acquire their
+   concurrency slot. It abandons the dispatch when the job was observed running
+   while the handler sat blocked, so the dispatch is *discharged by the
+   sibling's execution* instead of becoming an orphan — or, when the handler
+   waited, when the platform reports the job no longer needs a runner (see
+   [Stale dispatch decisions](#stale-dispatch-decisions)). The caller releases
+   its slot, keeping `max_concurrent` accounting correct.
 
 2. **Label-set reconciliation in `sweepOrphanRunners`** — an unbound runner
    whose intent job ran elsewhere is a *spare*. Spares are allocated against
