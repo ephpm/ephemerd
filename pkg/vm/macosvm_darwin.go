@@ -615,6 +615,12 @@ if [ -f "$RUNNER_SRC/run.sh" ]; then
   cp -R "$RUNNER_SRC" "$RUNNER_DIR"
   chown -R admin:staff "$RUNNER_DIR"
 fi
+# Cache-proxy env, staged by ephemerd only after every proxy answered from
+# inside this VM (see macos_proxyenv.go). The runner loads .env into each job.
+if [ -f /tmp/ephemerd-runner.env ]; then
+  cat /tmp/ephemerd-runner.env >> "$RUNNER_DIR/.env"
+  chown admin:staff "$RUNNER_DIR/.env"
+fi
 cd "$RUNNER_DIR"
 ./run.sh --jitconfig '%s' </dev/null >/tmp/runner.log 2>&1 &
 RUNNER_PID=$!
@@ -634,6 +640,11 @@ echo "runner started (pid=$RUNNER_PID)"
 // provision) would otherwise wedge the reachability wait forever. Closing the
 // session on deadline unblocks the pending call.
 const sshCommandTimeout = 90 * time.Second
+
+// macOSProxyEnvStage is where the verified cache-proxy env is staged inside
+// the guest (see macos_proxyenv.go); macOSRunnerSetupScript reads the same
+// path. A per-job VM boots from a fresh clone, so nothing stale is there.
+const macOSProxyEnvStage = "/tmp/ephemerd-runner.env"
 
 // runSSHCommand runs cmd on client with a hard deadline, returning its combined
 // output. On timeout or ctx cancellation it closes the session — which unblocks
@@ -793,6 +804,8 @@ func (m *darwinMacOSVM) setupRunnerViaSSH(ctx context.Context, ip string) error 
 	// The runner is copied fresh into the VM before this runs; see
 	// macOSRunnerSetupScript for why we always refresh it. Only the JIT
 	// config is per-job, passed inline.
+	m.stageProxyEnv(ctx, client)
+
 	setupScript := fmt.Sprintf(macOSRunnerSetupScript, strings.TrimSpace(string(jitData)))
 
 	session, err := client.NewSession()
@@ -819,6 +832,30 @@ func (m *darwinMacOSVM) setupRunnerViaSSH(ctx context.Context, ip string) error 
 	}
 
 	return nil
+}
+
+// stageProxyEnv verifies the cache proxies from inside the guest and stages
+// their env for the runner setup script to pick up. Every failure leaves
+// nothing staged and the job runs exactly as it did before — uncached, never
+// broken — so errors are logged, not returned.
+func (m *darwinMacOSVM) stageProxyEnv(ctx context.Context, client *ssh.Client) {
+	script := macOSProxyEnvScript(m.cfg.JobEnv, macOSProxyEnvStage)
+	if script == "" {
+		return
+	}
+	out, err := runSSHCommand(ctx, client, script, sshCommandTimeout)
+	status := strings.TrimSpace(string(out))
+	switch {
+	case err != nil:
+		m.cfg.Log.Warn("could not stage cache-proxy env in the macOS VM; job runs without cache proxies",
+			"id", m.id, "error", err)
+	case macOSProxyEnvStaged(status):
+		m.cfg.Log.Info("cache proxies reachable from the macOS VM; advertised to the job",
+			"id", m.id, "status", status)
+	default:
+		m.cfg.Log.Warn("cache proxies not reachable from inside the macOS VM; job runs without them",
+			"id", m.id, "status", status)
+	}
 }
 
 func (m *darwinMacOSVM) Stop() {

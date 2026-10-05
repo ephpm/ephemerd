@@ -928,7 +928,11 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 				SSHPubKey: sshPubKey,
 				CPUs:      cfg.VM.MacOS.CPUs,
 				MemoryMB:  cfg.VM.MacOS.MemoryMB,
-				Log:       log,
+				// Container jobs get this env from the runtime; a macOS VM
+				// job has no container, so without it every macOS job
+				// bypassed the caches entirely.
+				JobEnv: cacheProxyEnvVars,
+				Log:    log,
 			})
 			log.Info("macOS VM support ready", "disk_image", files.DiskImage)
 		}()

@@ -120,6 +120,11 @@ type MacOSVMConfig struct {
 	// MemoryMB per macOS VM. Defaults to 8192.
 	MemoryMB uint64
 
+	// JobEnv is extra KEY=VALUE env for every job's runner: the cache-proxy
+	// env, already rewritten to the host's address on the VM NAT. It is
+	// verified reachable from inside each VM before use; see macos_proxyenv.go.
+	JobEnv []string
+
 	Log *slog.Logger
 }
 
