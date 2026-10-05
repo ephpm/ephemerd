@@ -39,6 +39,7 @@ var (
 	_ providers.Webhook            = (*Provider)(nil)
 	_ providers.RunnerNameReporter = (*Provider)(nil)
 	_ providers.RunnerBusyReporter = (*Provider)(nil)
+	_ providers.JobStateReporter   = (*Provider)(nil)
 )
 
 // New creates a GitHub provider wrapping an existing GitHub client.
@@ -163,6 +164,16 @@ func (p *Provider) RunnerBusy(ctx context.Context, claim *providers.Claim) (bool
 		return false, fmt.Errorf("nil claim")
 	}
 	return p.client.RunnerBusy(ctx, claim.Repo, claim.RunnerID)
+}
+
+// JobAwaitingRunner implements providers.JobStateReporter. One GET per stale
+// dispatch decision — a dispatch that waited for a slot, or a re-provision —
+// never on the fast path of a job that found a free slot immediately.
+func (p *Provider) JobAwaitingRunner(ctx context.Context, event *providers.JobEvent) (bool, error) {
+	if event == nil {
+		return false, fmt.Errorf("nil event")
+	}
+	return p.client.JobAwaitingRunner(ctx, event.Repo, event.JobID)
 }
 
 func (p *Provider) FetchJobImage(ctx context.Context, event *providers.JobEvent) string {

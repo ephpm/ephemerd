@@ -143,6 +143,28 @@ type RunnerBusyReporter interface {
 	RunnerBusy(ctx context.Context, claim *Claim) (bool, error)
 }
 
+// JobStateReporter is optionally implemented by providers that can be asked,
+// on demand, whether a job still needs a runner.
+//
+// It is the authority the scheduler consults before turning a STALE dispatch
+// decision into a runner: one that sat blocked on a concurrency slot, or one
+// being re-provisioned after its runner exited unassigned. Both decisions were
+// taken from a webhook that may be hours or days old, and the scheduler's own
+// record of the job finishing (the started map) is in memory and expires. On
+// 2026-10-05 the Windows node was booting runners for jobs that had been
+// cancelled three days earlier, each one idling for the full orphan grace
+// window while live jobs queued behind it.
+type JobStateReporter interface {
+	Provider
+
+	// JobAwaitingRunner reports whether the job is still waiting for a runner
+	// to pick it up. false means it is running elsewhere, finished, or gone.
+	// An error means "could not determine" — callers must fail OPEN and
+	// provision anyway, because a skipped live job is worse than one wasted
+	// runner.
+	JobAwaitingRunner(ctx context.Context, event *JobEvent) (bool, error)
+}
+
 // PollConfig provides settings for poll-based job discovery.
 type PollConfig struct {
 	PollInterval int // seconds between polls (0 = provider default)
