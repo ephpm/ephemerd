@@ -315,19 +315,20 @@ func TestUncordon_RestoresDispatchGate(t *testing.T) {
 	s := New(Config{Log: quietLogger()})
 	s.bindContexts(context.Background())
 	s.webhookMode = true
-	key := jobKey{Provider: "github", JobID: 601}
+	event := providers.JobEvent{Provider: newMockProvider("github"), Repo: "myrepo", JobID: 601}
+	key := keyFor(event)
 
-	if got := s.admitDispatch(key); got != dispatchAdmit {
+	if got := s.admitDispatch(context.Background(), event, 0); got != dispatchAdmit {
 		t.Fatalf("admitDispatch on a healthy scheduler = %v, want dispatchAdmit", got)
 	}
 
 	s.Cordon()
-	if got := s.admitDispatch(key); got != dispatchAbandonCordoned {
+	if got := s.admitDispatch(context.Background(), event, 0); got != dispatchAbandonCordoned {
 		t.Errorf("admitDispatch while cordoned = %v, want dispatchAbandonCordoned", got)
 	}
 
 	s.Uncordon()
-	if got := s.admitDispatch(key); got != dispatchAdmit {
+	if got := s.admitDispatch(context.Background(), event, 0); got != dispatchAdmit {
 		t.Errorf("admitDispatch after Uncordon = %v, want dispatchAdmit; claiming was not restored", got)
 	}
 
@@ -337,7 +338,7 @@ func TestUncordon_RestoresDispatchGate(t *testing.T) {
 	s.mu.Lock()
 	s.started[key] = time.Now()
 	s.mu.Unlock()
-	if got := s.admitDispatch(key); got != dispatchAbandonSatisfied {
+	if got := s.admitDispatch(context.Background(), event, 0); got != dispatchAbandonSatisfied {
 		t.Errorf("admitDispatch for an already-satisfied job = %v, want dispatchAbandonSatisfied", got)
 	}
 }
