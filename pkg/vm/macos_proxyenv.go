@@ -32,10 +32,6 @@ import (
 // ("|direct"), but cargo and rustup do not — a dead RUSTUP_DIST_SERVER fails the
 // build. A missing proxy costs bandwidth; a black-holed one costs a build.
 
-// macOSProxyEnvStage is where the verified env is staged inside the guest. A
-// per-job VM boots from a fresh clone, so nothing stale can be sitting there.
-const macOSProxyEnvStage = "/tmp/ephemerd-runner.env"
-
 // safeHostPort limits what may be interpolated into the probe loop. The values
 // come from ephemerd's own config, but they are pasted into a shell script, so
 // anything that is not plainly a host:port is refused rather than quoted.

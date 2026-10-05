@@ -641,6 +641,11 @@ echo "runner started (pid=$RUNNER_PID)"
 // session on deadline unblocks the pending call.
 const sshCommandTimeout = 90 * time.Second
 
+// macOSProxyEnvStage is where the verified cache-proxy env is staged inside
+// the guest (see macos_proxyenv.go); macOSRunnerSetupScript reads the same
+// path. A per-job VM boots from a fresh clone, so nothing stale is there.
+const macOSProxyEnvStage = "/tmp/ephemerd-runner.env"
+
 // runSSHCommand runs cmd on client with a hard deadline, returning its combined
 // output. On timeout or ctx cancellation it closes the session — which unblocks
 // the underlying CombinedOutput — and returns an error. The result channel is
