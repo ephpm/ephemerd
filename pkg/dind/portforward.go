@@ -6,13 +6,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"runtime"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+// forwardDialTimeout bounds the dial to the container behind a published
+// port. Without it a dial whose SYN is never answered blocks for the kernel's
+// ~2 minute connect timeout while the client, already accepted on 127.0.0.1,
+// sees an open connection that never sends a byte. A var so tests can
+// shorten it.
+var forwardDialTimeout = 5 * time.Second
 
 // startPortForwardProxy starts a userspace TCP proxy that listens on
 // hostIP:hostPort *inside the runner container's net namespace* and forwards
@@ -31,12 +40,15 @@ import (
 //
 // Returns a stop function that closes the listener (idempotent), or an error
 // if setup fails.
-func startPortForwardProxy(netnsPath, hostIP, hostPort, targetIP, targetPort string) (stop func(), err error) {
+func startPortForwardProxy(netnsPath, hostIP, hostPort, targetIP, targetPort string, log *slog.Logger) (stop func(), err error) {
 	if netnsPath == "" {
 		return nil, errors.New("runner netns not set")
 	}
 	if hostIP == "" {
 		hostIP = "127.0.0.1"
+	}
+	if log == nil {
+		log = slog.Default()
 	}
 
 	// Channel to receive (listener, error) from the namespace-locked goroutine.
@@ -74,16 +86,24 @@ func startPortForwardProxy(netnsPath, hostIP, hostPort, targetIP, targetPort str
 		}
 		resultCh <- listenResult{listener: listener}
 
-		// Accept loop runs in the runner's netns. Each forwarded connection
-		// dials targetIP:targetPort from THIS namespace too — the kindest/node
-		// is on the same CNI bridge, so the runner can reach it directly.
+		// Accept loop runs in the runner's netns. Each accepted connection is
+		// handed to a new goroutine, which is NOT locked to this thread, so
+		// the dial to targetIP:targetPort goes out from the daemon's own
+		// namespace — the container sits on the CNI bridge the daemon owns,
+		// so it is reachable from there.
 		target := net.JoinHostPort(targetIP, targetPort)
+		listen := net.JoinHostPort(hostIP, hostPort)
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
 				return
 			}
-			go forwardConn(conn, target)
+			go func() {
+				if err := forwardConn(conn, target); err != nil {
+					log.Warn("port forward: cannot reach container; closed the client connection",
+						"listen", listen, "target", target, "error", err)
+				}
+			}()
 		}
 	}()
 
@@ -102,12 +122,16 @@ func startPortForwardProxy(netnsPath, hostIP, hostPort, targetIP, targetPort str
 	return stop, nil
 }
 
-func forwardConn(client net.Conn, target string) {
+// forwardConn relays client to target until either side closes. If target
+// cannot be dialed within forwardDialTimeout it closes client and returns the
+// dial error, so the client sees the failure at once instead of an open
+// connection that never answers.
+func forwardConn(client net.Conn, target string) error {
 	defer func() { _ = client.Close() }()
 
-	server, err := net.Dial("tcp", target)
+	server, err := net.DialTimeout("tcp", target, forwardDialTimeout)
 	if err != nil {
-		return
+		return err
 	}
 	defer func() { _ = server.Close() }()
 
@@ -121,4 +145,5 @@ func forwardConn(client net.Conn, target string) {
 		done <- struct{}{}
 	}()
 	<-done
+	return nil
 }

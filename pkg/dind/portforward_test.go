@@ -44,7 +44,7 @@ func TestForwardConn_Bidirectional(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		forwardConn(server, target.Addr().String())
+		_ = forwardConn(server, target.Addr().String())
 		close(done)
 	}()
 
@@ -87,7 +87,7 @@ func TestForwardConn_TargetUnreachable(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		forwardConn(server, "127.0.0.1:1") // port 1 is reserved → ECONNREFUSED
+		_ = forwardConn(server, "127.0.0.1:1") // port 1 is reserved → ECONNREFUSED
 		close(done)
 	}()
 
@@ -119,7 +119,7 @@ func TestForwardConn_TargetUnreachable(t *testing.T) {
 // when called without a netns path — guarding against misconfiguration where
 // the dind server hasn't been told about the runner's namespace yet.
 func TestStartPortForwardProxy_NoNetns(t *testing.T) {
-	stop, err := startPortForwardProxy("", "127.0.0.1", "1234", "10.0.0.1", "80")
+	stop, err := startPortForwardProxy("", "127.0.0.1", "1234", "10.0.0.1", "80", nil)
 	if err == nil {
 		if stop != nil {
 			stop()
@@ -131,7 +131,7 @@ func TestStartPortForwardProxy_NoNetns(t *testing.T) {
 // TestStartPortForwardProxy_InvalidNetns confirms a bad netns path produces
 // an error rather than a partially-initialized proxy.
 func TestStartPortForwardProxy_InvalidNetns(t *testing.T) {
-	stop, err := startPortForwardProxy("/proc/self/ns/nonexistent", "127.0.0.1", "1234", "10.0.0.1", "80")
+	stop, err := startPortForwardProxy("/proc/self/ns/nonexistent", "127.0.0.1", "1234", "10.0.0.1", "80", nil)
 	if err == nil {
 		if stop != nil {
 			stop()
@@ -177,7 +177,7 @@ func TestStartPortForwardProxy_OwnNetns(t *testing.T) {
 	stop, err := startPortForwardProxy(
 		"/proc/self/ns/net",
 		"127.0.0.1", itoa(addr.Port),
-		"127.0.0.1", itoa(targetAddr.Port),
+		"127.0.0.1", itoa(targetAddr.Port), nil,
 	)
 	if err != nil {
 		t.Skipf("setns into own ns failed (likely sandbox restriction): %v", err)
@@ -216,4 +216,40 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(b[i:])
+}
+
+// TestForwardConn_DialIsBounded pins the dial timeout. Before it, a client
+// accepted on 127.0.0.1 whose container never answered the SYN sat on an
+// open, silent connection for the kernel's ~2 minute connect timeout (ephpm
+// run 39710247641 saw PDO hang until max_execution_time). 192.0.2.1 is
+// TEST-NET-1: it either black-holes the SYN (timeout) or is unroutable
+// (immediate error); either way forwardConn must give up fast and close the
+// client.
+func TestForwardConn_DialIsBounded(t *testing.T) {
+	old := forwardDialTimeout
+	forwardDialTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { forwardDialTimeout = old })
+
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- forwardConn(server, "192.0.2.1:3306") }()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("forwardConn to an unreachable target returned nil; want the dial error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("forwardConn still dialing after 3s; the dial timeout is not applied")
+	}
+
+	// The pipe refusing a deadline already means forwardConn closed it.
+	if err := client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		return
+	}
+	if _, err := client.Read(make([]byte, 1)); err == nil {
+		t.Error("client still open after the dial failed; want it closed")
+	}
 }
