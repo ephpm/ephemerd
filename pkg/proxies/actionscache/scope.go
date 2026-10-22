@@ -22,15 +22,6 @@ type Scope struct {
 	Reads []string
 }
 
-func (s Scope) canRead(ref string) bool {
-	for _, r := range s.Reads {
-		if r == ref {
-			return true
-		}
-	}
-	return false
-}
-
 // repoNamespace is the registry repository prefix one forge repo's entries
 // live under: actions-cache/<owner>/<repo>-<hash>.
 //

@@ -2,8 +2,6 @@ package actionscache
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -120,11 +118,6 @@ func configBlob(e *entry) []byte {
 		"created": e.Created.UTC().Format(time.RFC3339Nano),
 	})
 	return b
-}
-
-func blobDigest(b []byte) string {
-	sum := sha256.Sum256(b)
-	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // scopeIndex is the in-memory view of one registry repository (one ref of

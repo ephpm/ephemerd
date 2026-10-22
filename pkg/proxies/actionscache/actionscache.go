@@ -941,8 +941,7 @@ func parseRange(h string, size int64) (start, end int64, ok bool) {
 	if !found {
 		return 0, 0, false
 	}
-	switch {
-	case a == "":
+	if a == "" {
 		n, err := strconv.ParseInt(b, 10, 64)
 		if err != nil || n <= 0 {
 			return 0, 0, false
@@ -951,20 +950,19 @@ func parseRange(h string, size int64) (start, end int64, ok bool) {
 			n = size
 		}
 		return size - n, size - 1, true
-	default:
-		s, err := strconv.ParseInt(a, 10, 64)
-		if err != nil || s < 0 || s >= size {
+	}
+	s, err := strconv.ParseInt(a, 10, 64)
+	if err != nil || s < 0 || s >= size {
+		return 0, 0, false
+	}
+	e := size - 1
+	if b != "" {
+		if e, err = strconv.ParseInt(b, 10, 64); err != nil || e < s {
 			return 0, 0, false
 		}
-		e := size - 1
-		if b != "" {
-			if e, err = strconv.ParseInt(b, 10, 64); err != nil || e < s {
-				return 0, 0, false
-			}
-			if e >= size {
-				e = size - 1
-			}
+		if e >= size {
+			e = size - 1
 		}
-		return s, e, true
 	}
+	return s, e, true
 }

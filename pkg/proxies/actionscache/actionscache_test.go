@@ -81,7 +81,7 @@ func (h *harness) twirp(method string, req map[string]any) map[string]any {
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var out map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		h.t.Fatalf("%s: decoding response (status %s): %v", method, resp.Status, err)
@@ -92,7 +92,7 @@ func (h *harness) twirp(method string, req map[string]any) map[string]any {
 	return out
 }
 
-func put(t *testing.T, url string, body []byte) *http.Response {
+func put(t *testing.T, url string, body []byte) int {
 	t.Helper()
 	req, _ := http.NewRequest(http.MethodPut, url, bytes.NewReader(body))
 	req.Header.Set("x-ms-blob-type", "BlockBlob")
@@ -101,8 +101,8 @@ func put(t *testing.T, url string, body []byte) *http.Response {
 		t.Fatal(err)
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	return resp
+	_ = resp.Body.Close()
+	return resp.StatusCode
 }
 
 // save runs the client's whole save flow; blocks > 1 uses Put Block in
@@ -115,8 +115,8 @@ func (h *harness) save(key, version string, data []byte, blocks int) map[string]
 	}
 	up := cr["signed_upload_url"].(string)
 	if blocks <= 1 {
-		if r := put(h.t, up, data); r.StatusCode != http.StatusCreated {
-			h.t.Fatalf("Put Blob: %s", r.Status)
+		if code := put(h.t, up, data); code != http.StatusCreated {
+			h.t.Fatalf("Put Blob: %d", code)
 		}
 	} else {
 		size := (len(data) + blocks - 1) / blocks
@@ -129,8 +129,8 @@ func (h *harness) save(key, version string, data []byte, blocks int) map[string]
 			if hi > len(data) {
 				hi = len(data)
 			}
-			if r := put(h.t, up+"?comp=block&blockid="+ids[i], data[lo:hi]); r.StatusCode != http.StatusCreated {
-				h.t.Fatalf("Put Block %d: %s", i, r.Status)
+			if code := put(h.t, up+"?comp=block&blockid="+ids[i], data[lo:hi]); code != http.StatusCreated {
+				h.t.Fatalf("Put Block %d: %d", i, code)
 			}
 		}
 		var xml strings.Builder
@@ -139,8 +139,8 @@ func (h *harness) save(key, version string, data []byte, blocks int) map[string]
 			xml.WriteString("<Latest>" + id + "</Latest>")
 		}
 		xml.WriteString("</BlockList>")
-		if r := put(h.t, up+"?comp=blocklist", []byte(xml.String())); r.StatusCode != http.StatusCreated {
-			h.t.Fatalf("Put Block List: %s", r.Status)
+		if code := put(h.t, up+"?comp=blocklist", []byte(xml.String())); code != http.StatusCreated {
+			h.t.Fatalf("Put Block List: %d", code)
 		}
 	}
 	return h.twirp("FinalizeCacheEntryUpload", map[string]any{
@@ -164,7 +164,7 @@ func (h *harness) restore(key string, restoreKeys []string, version string) (str
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		h.t.Fatalf("download: %s", resp.Status)
@@ -233,7 +233,7 @@ func TestRestore_RangeAcrossBlocks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	got, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusPartialContent || !bytes.Equal(got, data[240:761]) {
 		t.Fatalf("range 240-760 = %s, %d bytes; want 206 and the exact slice", resp.Status, len(got))
@@ -354,7 +354,7 @@ func TestSignedURLsAreBoundToTheirJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("another job fetched a download URL it was not granted: %s", resp.Status)
 	}
@@ -385,7 +385,7 @@ func TestFinalizeRejectsSizeMismatch(t *testing.T) {
 	h.p.Track("runner-1")
 	h.p.Bind("runner-1", mainScope)
 	cr := h.twirp("CreateCacheEntry", map[string]any{"key": "k", "version": "v"})
-	put(t, cr["signed_upload_url"].(string), []byte("12345"))
+	_ = put(t, cr["signed_upload_url"].(string), []byte("12345"))
 	fr := h.twirp("FinalizeCacheEntryUpload", map[string]any{"key": "k", "version": "v", "size_bytes": 99})
 	if fr["ok"] != false {
 		t.Fatal("finalize accepted a size that does not match what was uploaded")
@@ -397,8 +397,8 @@ func TestEntrySizeLimit(t *testing.T) {
 	h.p.Track("runner-1")
 	h.p.Bind("runner-1", mainScope)
 	cr := h.twirp("CreateCacheEntry", map[string]any{"key": "k", "version": "v"})
-	if r := put(t, cr["signed_upload_url"].(string), payload(101)); r.StatusCode >= 500 || r.StatusCode < 400 {
-		t.Fatalf("oversize upload answered %s; want a non-retryable 4xx", r.Status)
+	if code := put(t, cr["signed_upload_url"].(string), payload(101)); code >= 500 || code < 400 {
+		t.Fatalf("oversize upload answered %d; want a non-retryable 4xx", code)
 	}
 	if fr := h.twirp("FinalizeCacheEntryUpload", map[string]any{"key": "k", "version": "v", "size_bytes": 101}); fr["ok"] != false {
 		t.Fatal("an oversize entry was finalized")
@@ -453,8 +453,8 @@ func TestForgetRevokesEverything(t *testing.T) {
 	h.p.Bind("runner-1", mainScope)
 	cr := h.twirp("CreateCacheEntry", map[string]any{"key": "k", "version": "v"})
 	h.p.Forget("runner-1")
-	if r := put(t, cr["signed_upload_url"].(string), []byte("x")); r.StatusCode != http.StatusNotFound {
-		t.Fatalf("upload after Forget answered %s; want 404", r.Status)
+	if code := put(t, cr["signed_upload_url"].(string), []byte("x")); code != http.StatusNotFound {
+		t.Fatalf("upload after Forget answered %d; want 404", code)
 	}
 }
 
@@ -475,7 +475,7 @@ func TestRelayPassesNonCacheCallsToGitHub(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || gotPath != art || gotAuth != "Bearer job-token" {
 		t.Fatalf("relay: status %s path %q auth %q; artifacts must reach GitHub unchanged", resp.Status, gotPath, gotAuth)
 	}
@@ -488,7 +488,7 @@ func TestRelayPassesNonCacheCallsToGitHub(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("an untracked source used the relay: %s; it must not be an open relay", resp.Status)
 	}
