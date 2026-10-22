@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -53,6 +54,8 @@ type Client struct {
 	client   *gh.Client
 	app      *AppAuth      // nil when using PAT
 	lastRate *rateSnapshot // last observed rate-limit state (nil in tests using SetHTTPClient)
+
+	defaultBranches sync.Map // repo name -> defaultBranchEntry (see RunCacheFacts)
 }
 
 // RateSnapshot returns the last-observed rate-limit state. The scheduler
