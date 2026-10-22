@@ -2003,6 +2003,12 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 				JITConfig:  claim.RunnerConfig,
 				Env:        claim.Env,
 				Entrypoint: claim.Entrypoint,
+				// Provider+Repo scope the job's dind image cache. Without
+				// them dind.CacheNamespace returns "" and every `docker
+				// pull` in the job goes to the registry: ducks pulled
+				// mysql:8.0 78 times in 3 days before these were passed.
+				Provider: providerName(event),
+				Repo:     event.Repo,
 			})
 			return cerr
 		})
