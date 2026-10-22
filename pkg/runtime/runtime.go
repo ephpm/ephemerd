@@ -29,6 +29,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/networking"
 	"github.com/ephpm/ephemerd/pkg/proxies"
 	"github.com/ephpm/ephemerd/pkg/registrymirror"
+	"github.com/ephpm/ephemerd/pkg/runner"
 	craneTarball "github.com/google/go-containerregistry/pkg/v1/tarball"
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -1022,6 +1023,13 @@ type CreateConfig struct {
 	// When nil and JITConfig is set, uses the GitHub "--jitconfig" mode.
 	// When nil and JITConfig is empty, uses the image's default CMD.
 	Entrypoint []string
+
+	// ResultsURL turns on ephemerd's LAN Actions cache for this job: it
+	// becomes the container's ACTIONS_RESULTS_URL, and the job's copy of the
+	// runner is patched so the runner stops overwriting it (see
+	// pkg/runner.PatchResultsURL). Linux only; "" leaves the job exactly as
+	// it was — GitHub's cache, unpatched runner.
+	ResultsURL string
 }
 
 // Create provisions an ephemeral runner environment.
@@ -1116,6 +1124,15 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	envVars = append(envVars, r.cfg.CacheProxyEnv...)
 	for k, v := range cfg.Env {
 		envVars = append(envVars, k+"="+v)
+	}
+	// LAN Actions cache. Setting the variable is harmless on its own: an
+	// unpatched runner overwrites it with GitHub's address for every step,
+	// so if the patch below cannot be applied the job simply keeps using
+	// GitHub's cache. Only the patch makes the variable stick.
+	resultsURL := ""
+	if cfg.ResultsURL != "" && goruntime.GOOS == "linux" {
+		resultsURL = cfg.ResultsURL
+		envVars = append(envVars, runner.ResultsURLVar+"="+resultsURL)
 	}
 	opts := []oci.SpecOpts{
 		oci.WithDefaultSpecForPlatform(targetPlatform),
@@ -1219,6 +1236,11 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			return nil, fmt.Errorf("preparing runner dir for %s: %w", id, err)
 		}
 		runnerWritableDir = writableDir
+		if resultsURL != "" {
+			// The mounted runner: patch into this job's writable layer (the
+			// overlay upper), never the shared tree other jobs mount.
+			r.logResultsPatch(id, "embedded runner")(runner.PatchResultsURLFile(r.cfg.RunnerDir, writableDir))
+		}
 		// Hyper-V isolated containers on Windows mount this host directory
 		// into the utility VM via a VSMB share. The parent runners dir has
 		// already been granted traverse at startup; we grant Modify scoped
@@ -1267,6 +1289,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			BuildKit:        r.cfg.BuildKit,
 			AllowPrivileged: r.cfg.DindAllowPrivileged,
 			RegistryMirror:  r.cfg.RegistryMirror,
+			ResultsURL:      resultsURL,
 			Transport:       resolveDindTransport(r.cfg.LinuxRuntime, goruntime.GOOS),
 			Log:             r.cfg.Log,
 		})
@@ -1384,6 +1407,12 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			}
 		}
 		return nil, fmt.Errorf("creating container %s: %w", id, err)
+	}
+
+	// An official runner image runs its own runner, baked into the image:
+	// patch it inside this container's snapshot, before the task mounts it.
+	if resultsURL != "" && !needsRunnerMount && snapshotter != nil {
+		r.logResultsPatch(id, "image runner")(patchSnapshotRunner(ctx, snapshotter, snapshotName))
 	}
 
 	// Create and start the task with per-job log capture.

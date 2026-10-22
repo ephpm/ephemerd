@@ -490,7 +490,7 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(req.Env) > 0 {
-		opts = append(opts, oci.WithEnv(req.Env))
+		opts = append(opts, oci.WithEnv(translateResultsEnv(req.Env, s.resultsURL)))
 	}
 
 	if req.WorkingDir != "" {

@@ -48,6 +48,7 @@ type Server struct {
 	jobID          string
 	jobNamespace   string    // per-job containerd namespace for isolation
 	cacheNamespace string    // per-(provider,repo) shared image cache namespace; empty disables caching
+	resultsURL     string    // ACTIONS_RESULTS_URL for container steps; see resultsenv.go
 	transport      Transport // how the API is exposed to the job container; see listen.go
 	dockerDir      string    // <DataDir>/jobs/<JobID>/docker — per-job scratch, exists on every transport
 	sockPath       string    // host-side unix socket path; empty on the TCP transport
@@ -198,6 +199,11 @@ type Config struct {
 	// See listen.go.
 	Transport Transport
 
+	// ResultsURL is the ACTIONS_RESULTS_URL the job's steps must see: the
+	// LAN Actions cache when it is on for this job, "" otherwise. See
+	// resultsenv.go for why dind has to restore it at all.
+	ResultsURL string
+
 	Log *slog.Logger
 }
 
@@ -240,6 +246,7 @@ func New(cfg Config) (*Server, error) {
 		allowPrivileged: cfg.AllowPrivileged,
 		stager:          newBindStager(cfg.DataDir, cfg.JobID, cfg.Log),
 		mirror:          cfg.RegistryMirror,
+		resultsURL:      cfg.ResultsURL,
 		log:             cfg.Log.With("component", "dind", "job_id", cfg.JobID),
 		images:          make(map[string]*imageEntry),
 		containers:      make(map[string]*containerEntry),

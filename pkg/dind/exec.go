@@ -125,6 +125,7 @@ func (s *Server) handleExecCreate(w http.ResponseWriter, r *http.Request, contai
 		env = append(env, spec.Process.Env...)
 	}
 	env = append(env, req.Env...)
+	env = translateResultsEnv(env, s.resultsURL)
 
 	exec := &execEntry{
 		ID:          execID,

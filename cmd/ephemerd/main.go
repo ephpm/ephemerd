@@ -478,6 +478,8 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	}
 	// Language package caches (npm, pip, pub) — see pkgproxies.go.
 	gatewayPorts = append(gatewayPorts, pkgProxyPorts(cfg)...)
+	// LAN Actions cache — see actionscache.go.
+	gatewayPorts = append(gatewayPorts, actionsCachePorts(cfg)...)
 
 	// Initialize container networking, retrying through the cold-boot window.
 	//
@@ -585,6 +587,12 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	pkgProxies, stopPkgProxies := startPkgProxies(cfg, configDir, net, log)
 	defer stopPkgProxies()
 	cacheProxies = append(cacheProxies, pkgProxies...)
+
+	// The LAN Actions cache is per-job, not a CacheProxy: its env var is set
+	// only for jobs the scheduler turns it on for, so it is not collected
+	// into cacheProxyEnvVars below.
+	actionsCache, stopActionsCache := startActionsCache(cfg, net, log)
+	defer stopActionsCache()
 
 	// Collect env vars and mounts from all cache proxies for injection into
 	// containers. Only proxies that actually STARTED are in cacheProxies, so
@@ -873,6 +881,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		RunnerImageForRepo:    cfg.Runner.ImageForRepoOS,
 		Retry:                 retryCfg,
 		OrphanSweep:           orphanCfg,
+		ActionsCache:          actionsCache,
 		Log:                   log,
 	})
 

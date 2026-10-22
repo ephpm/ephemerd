@@ -45,11 +45,14 @@ type Config struct {
 	// RegistryMirror routes container image pulls through a LAN pull-through
 	// cache instead of the origin registry. See RegistryMirrorConfig.
 	RegistryMirror RegistryMirrorConfig `toml:"registry_mirror"`
-	Runtime        RuntimeConfig        `toml:"runtime"`
-	Runner         RunnerConfig         `toml:"runner"`
-	Metrics        MetricsConfig        `toml:"metrics"`
-	Dispatch       DispatchConfig       `toml:"dispatch"`
-	Log            LogConfig            `toml:"log"`
+	// ActionsCache serves GitHub Actions' cache from the LAN, backed by a
+	// writable registry. See ActionsCacheConfig.
+	ActionsCache ActionsCacheConfig `toml:"actions_cache"`
+	Runtime      RuntimeConfig      `toml:"runtime"`
+	Runner       RunnerConfig       `toml:"runner"`
+	Metrics      MetricsConfig      `toml:"metrics"`
+	Dispatch     DispatchConfig     `toml:"dispatch"`
+	Log          LogConfig          `toml:"log"`
 }
 
 // DispatchConfig configures the host<->VM dispatch gRPC channel. On Windows
@@ -1981,6 +1984,10 @@ func (c *Config) validate() error {
 	}
 
 	if err := c.RegistryMirror.validate(); err != nil {
+		return err
+	}
+
+	if err := c.ActionsCache.validate(); err != nil {
 		return err
 	}
 
