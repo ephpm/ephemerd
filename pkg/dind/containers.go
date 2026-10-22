@@ -522,6 +522,10 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	if !privileged {
 		opts = append(opts, nonPrivilegedHardeningOpts(s.log)...)
 	}
+	// Privileged or not, a sibling counts its own processes: it shares the
+	// host UID with every other job's containers, so RLIMIT_NPROC cannot
+	// bound it per job.
+	opts = append(opts, pidsLimitOpts(s.pidsLimit)...)
 
 	if req.HostConfig != nil {
 		// Privileged mode: all capabilities, all devices, disable seccomp/apparmor,

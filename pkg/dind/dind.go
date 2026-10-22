@@ -70,6 +70,7 @@ type Server struct {
 	buildkit        *buildkit.Server // shared embedded BuildKit solver (nil → fall back to platform default)
 	runnerNetNS     string           // path to runner container's net namespace; used to install DNAT rules for port bindings
 	allowPrivileged bool             // gate for docker run --privileged / --cap-add; see config.DindConfig.AllowPrivileged
+	pidsLimit       int64            // cgroup pids.max for siblings; 0 = no limit
 
 	// stager publishes every job-supplied bind source at a path under
 	// <DataDir>/dind-binds/<JobID>/ that only root can reach, so the path
@@ -184,6 +185,11 @@ type Config struct {
 	// for the threat model.
 	AllowPrivileged bool
 
+	// PidsLimit is the cgroup pids.max applied to every sibling container,
+	// the same bound the runner container gets; 0 means no limit. See
+	// config.RuntimeConfig.PidsLimit.
+	PidsLimit int64
+
 	// RegistryMirror routes this job's image pulls through a LAN
 	// pull-through cache. Nil disables mirroring, leaving the pulls
 	// identical to what they were before the feature existed.
@@ -238,7 +244,8 @@ func New(cfg Config) (*Server, error) {
 		buildkit:        cfg.BuildKit,
 		runnerNetNS:     cfg.RunnerNetNS,
 		allowPrivileged: cfg.AllowPrivileged,
-		stager:          newBindStager(cfg.DataDir, cfg.JobID, cfg.Log),
+		pidsLimit:       cfg.PidsLimit,
+		stager:         newBindStager(cfg.DataDir, cfg.JobID, cfg.Log),
 		mirror:          cfg.RegistryMirror,
 		log:             cfg.Log.With("component", "dind", "job_id", cfg.JobID),
 		images:          make(map[string]*imageEntry),

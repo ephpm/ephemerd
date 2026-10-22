@@ -112,6 +112,10 @@ type Config struct {
 	// process. Zero values fall back to the containerd default (1024).
 	// Applies on Linux only; ignored on Windows (HCS uses a different model).
 	Rlimits config.RuntimeRlimits
+	// PidsLimit is the cgroup pids.max for the runner container and every
+	// dind sibling of its job; 0 means no limit. A resolved value: callers
+	// pass cfg.Runtime.ResolvedPidsLimit(). Linux only.
+	PidsLimit int64
 	// AllowNewPrivileges permits privilege escalation via execve in the
 	// runner container (NoNewPrivileges=false), which is what makes
 	// `sudo` work. See config.RuntimeConfig.AllowNewPrivileges.
@@ -1157,6 +1161,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	// apt-get install` works. See config.RuntimeConfig.AllowNewPrivileges.
 	opts = append(opts, newPrivilegesOpts(r.cfg.AllowNewPrivileges)...)
 	opts = append(opts, rlimitsOpts(r.cfg.Rlimits)...)
+	opts = append(opts, pidsLimitOpts(r.cfg.PidsLimit)...)
 	switch {
 	case len(cfg.Entrypoint) > 0:
 		// Forge mode: custom entrypoint (e.g. act_runner register + daemon).
@@ -1266,6 +1271,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			Network:         r.cfg.Network,
 			BuildKit:        r.cfg.BuildKit,
 			AllowPrivileged: r.cfg.DindAllowPrivileged,
+			PidsLimit:       r.cfg.PidsLimit,
 			RegistryMirror:  r.cfg.RegistryMirror,
 			Transport:       resolveDindTransport(r.cfg.LinuxRuntime, goruntime.GOOS),
 			Log:             r.cfg.Log,

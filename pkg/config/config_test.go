@@ -2096,8 +2096,8 @@ func TestRuntimeRlimitsResolved_Defaults(t *testing.T) {
 	if got.Nofile != 1024 {
 		t.Errorf("Nofile = %d, want 1024 (containerd default)", got.Nofile)
 	}
-	if got.Nproc != 1024 {
-		t.Errorf("Nproc = %d, want 1024 default", got.Nproc)
+	if got.Nproc != defaultNproc {
+		t.Errorf("Nproc = %d, want %d default (NPROC is host-wide per UID; pids.max bounds jobs)", got.Nproc, defaultNproc)
 	}
 }
 
@@ -2116,8 +2116,8 @@ func TestRuntimeRlimitsResolved_NegativeFallsBack(t *testing.T) {
 	if got.Nofile != 1024 {
 		t.Errorf("Nofile(-1) resolved to %d, want 1024", got.Nofile)
 	}
-	if got.Nproc != 1024 {
-		t.Errorf("Nproc(-100) resolved to %d, want 1024", got.Nproc)
+	if got.Nproc != defaultNproc {
+		t.Errorf("Nproc(-100) resolved to %d, want %d", got.Nproc, defaultNproc)
 	}
 }
 
@@ -2128,8 +2128,8 @@ func TestRuntimeRlimitsResolved_MixedZeroAndExplicit(t *testing.T) {
 	if got.Nofile != 65536 {
 		t.Errorf("Nofile = %d, want 65536 (preserved)", got.Nofile)
 	}
-	if got.Nproc != 1024 {
-		t.Errorf("Nproc = %d, want 1024 (default fill)", got.Nproc)
+	if got.Nproc != defaultNproc {
+		t.Errorf("Nproc = %d, want %d (default fill)", got.Nproc, defaultNproc)
 	}
 }
 
@@ -2180,8 +2180,8 @@ owner = "testorg"
 		t.Errorf("Rlimits.Nofile (raw) = %d, want 0 before Resolved()", cfg.Runtime.Rlimits.Nofile)
 	}
 	resolved := cfg.Runtime.Rlimits.Resolved()
-	if resolved.Nofile != 1024 || resolved.Nproc != 1024 {
-		t.Errorf("Resolved() = %+v, want {1024, 1024}", resolved)
+	if resolved.Nofile != 1024 || resolved.Nproc != defaultNproc {
+		t.Errorf("Resolved() = %+v, want {1024, %d}", resolved, defaultNproc)
 	}
 }
 
@@ -2497,6 +2497,20 @@ func TestResolvedDestroyTimeout(t *testing.T) {
 		r := RuntimeConfig{DestroyTimeout: c.in}
 		if got := r.ResolvedDestroyTimeout(); got != c.want {
 			t.Errorf("ResolvedDestroyTimeout(%v) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestRuntimeConfig_ResolvedPidsLimit(t *testing.T) {
+	for _, tc := range []struct {
+		in, want int64
+	}{
+		{0, DefaultPidsLimit}, // unset: the safe per-job default
+		{4096, 4096},
+		{-1, 0}, // explicit opt-out: no limit
+	} {
+		if got := (RuntimeConfig{PidsLimit: tc.in}).ResolvedPidsLimit(); got != tc.want {
+			t.Errorf("ResolvedPidsLimit(%d) = %d, want %d", tc.in, got, tc.want)
 		}
 	}
 }
