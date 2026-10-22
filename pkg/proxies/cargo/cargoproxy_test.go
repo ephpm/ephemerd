@@ -695,12 +695,42 @@ func TestEnvVars_PointRustupAtTheProxy(t *testing.T) {
 	p, _ := newTestProxy(t, up, nil)
 
 	env := p.EnvVars()
-	if len(env) != 1 {
-		t.Fatalf("EnvVars() = %v, want exactly the rustup dist server", env)
+	want := []string{
+		"RUSTUP_DIST_SERVER=" + p.advertiseBase() + "/rustup",
+		"GIT_HTTP_LOW_SPEED_LIMIT=1000",
+		"GIT_HTTP_LOW_SPEED_TIME=30",
 	}
-	want := "RUSTUP_DIST_SERVER=" + p.advertiseBase() + "/rustup"
-	if env[0] != want {
-		t.Errorf("EnvVars()[0] = %q, want %q", env[0], want)
+	if strings.Join(env, "\n") != strings.Join(want, "\n") {
+		t.Errorf("EnvVars() = %v, want %v", env, want)
+	}
+}
+
+// TestNetTOML_GitFetchBounded: git dependencies bypass the cache, so the
+// only thing that stops a stalled GitHub fetch from eating a whole job is
+// handing it to the git CLI (bounded by GIT_HTTP_LOW_SPEED_*). Both configs
+// carry it — the inert one is what is live exactly when the network is bad.
+// Windows images have no git binary, so there it must stay off.
+func TestNetTOML_GitFetchBounded(t *testing.T) {
+	for _, goos := range []string{"linux", "darwin"} {
+		for name, cfg := range map[string]string{
+			"caching": containerConfigTOML("http://10.88.0.1:8083", goos),
+			"inert":   inertConfigTOML(goos),
+		} {
+			if !strings.Contains(cfg, "git-fetch-with-cli = true") {
+				t.Errorf("%s/%s config lacks git-fetch-with-cli:\n%s", goos, name, cfg)
+			}
+			if !strings.Contains(cfg, "retry = 3") {
+				t.Errorf("%s/%s config lost net.retry:\n%s", goos, name, cfg)
+			}
+		}
+	}
+	for name, cfg := range map[string]string{
+		"caching": containerConfigTOML("http://10.88.0.1:8083", "windows"),
+		"inert":   inertConfigTOML("windows"),
+	} {
+		if strings.Contains(cfg, "git-fetch-with-cli") {
+			t.Errorf("windows/%s config sets git-fetch-with-cli, but Windows images have no git:\n%s", name, cfg)
+		}
 	}
 }
 

@@ -485,7 +485,7 @@ func TestParseCrateDownloadPath(t *testing.T) {
 }
 
 func TestContainerConfigTOML(t *testing.T) {
-	got := containerConfigTOML("http://10.88.0.1:8083/")
+	got := containerConfigTOML("http://10.88.0.1:8083/", "linux")
 
 	// Source replacement is the whole point — without both halves Cargo
 	// silently keeps using crates.io.
