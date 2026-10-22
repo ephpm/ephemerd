@@ -44,7 +44,7 @@ func TestForwardConn_Bidirectional(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		forwardConn(server, target.Addr().String())
+		_ = forwardConn(server, target.Addr().String())
 		close(done)
 	}()
 
@@ -87,7 +87,7 @@ func TestForwardConn_TargetUnreachable(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		forwardConn(server, "127.0.0.1:1") // port 1 is reserved → ECONNREFUSED
+		_ = forwardConn(server, "127.0.0.1:1") // port 1 is reserved → ECONNREFUSED
 		close(done)
 	}()
 
