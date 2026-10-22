@@ -34,6 +34,10 @@ type darwinMacOSVM struct {
 	done      chan struct{}
 	stopOnce  sync.Once // Stop is idempotent: the provisioning watchdog and the
 	// normal teardown path can both call it.
+	diskGrown bool // the clone was extended before boot; the guest container still has to follow
+	// guestTuned records that the one-shot guest tweaks (disk grow, brew
+	// untap) ran. setupRunnerViaSSH is retried on failure; these must not be.
+	guestTuned bool
 }
 
 // NewMacOSVM creates a new per-job macOS VM. Call Start() to boot it.
@@ -102,6 +106,7 @@ func (m *darwinMacOSVM) Start(ctx context.Context) error {
 	if err := apfsCopy(ctx, files.AuxStorage, m.auxPath, m.cfg.Log); err != nil {
 		return fmt.Errorf("copying aux storage: %w", err)
 	}
+	m.growClone()
 
 	// Ensure job shared directory exists for JIT config exchange
 	if err := os.MkdirAll(m.jobDir, 0o755); err != nil {
@@ -723,6 +728,15 @@ func (m *darwinMacOSVM) setupRunnerViaSSH(ctx context.Context, ip string) error 
 		m.cfg.Log.Warn("chown failed", "output", string(out), "error", err)
 	}
 
+	// Before the runner starts, so the job sees the full disk from its first step.
+	if !m.guestTuned {
+		m.guestTuned = true
+		if m.diskGrown {
+			m.growGuestDisk(ctx, client)
+		}
+		m.untapBuildkite(ctx, client)
+	}
+
 	// Read JIT config to pass inline via SSH
 	jitData, err := os.ReadFile(filepath.Join(m.jobDir, ".jit_config"))
 	if err != nil {
@@ -855,6 +869,70 @@ func (m *darwinMacOSVM) stageProxyEnv(ctx context.Context, client *ssh.Client) {
 	default:
 		m.cfg.Log.Warn("cache proxies not reachable from inside the macOS VM; job runs without them",
 			"id", m.id, "status", status)
+	}
+}
+
+// growClone extends this job's disk clone to the configured size (step 1 in
+// macos_disk.go). Sparse, so it is instant and costs no host disk until the
+// guest writes. Failure leaves the clone as it was and the job on the base
+// image's size.
+func (m *darwinMacOSVM) growClone() {
+	if m.cfg.DiskSizeGB == 0 {
+		return
+	}
+	fi, err := os.Stat(m.clonePath)
+	if err != nil {
+		m.cfg.Log.Warn("cannot grow macOS VM disk; job keeps the base image size", "id", m.id, "error", err)
+		return
+	}
+	size, grow := macOSDiskGrowBytes(fi.Size(), m.cfg.DiskSizeGB)
+	if !grow {
+		return
+	}
+	if err := os.Truncate(m.clonePath, size); err != nil {
+		m.cfg.Log.Warn("cannot grow macOS VM disk; job keeps the base image size", "id", m.id, "error", err)
+		return
+	}
+	m.diskGrown = true
+	m.cfg.Log.Info("grew macOS VM disk clone", "id", m.id, "from_bytes", fi.Size(), "to_gib", m.cfg.DiskSizeGB)
+}
+
+// growGuestDisk grows the guest's boot container into the space growClone
+// added (step 2 in macos_disk.go). Best-effort: every failure is a WARN and
+// the job runs on the smaller disk.
+func (m *darwinMacOSVM) growGuestDisk(ctx context.Context, client *ssh.Client) {
+	info, err := runSSHCommand(ctx, client, macOSDiskInfoCmd, sshCommandTimeout)
+	if err != nil {
+		m.cfg.Log.Warn("cannot read the macOS VM's disk layout; job keeps the base image size", "id", m.id, "error", err)
+		return
+	}
+	store, whole, err := parseAPFSPhysicalStore(string(info))
+	if err != nil {
+		m.cfg.Log.Warn("cannot find the macOS VM's boot container; job keeps the base image size", "id", m.id, "error", err)
+		return
+	}
+	out, err := runSSHCommand(ctx, client, macOSDiskGrowScript(whole, store), macOSDiskGrowTimeout)
+	status := strings.TrimSpace(string(out))
+	if err != nil || !strings.Contains(status, "resize=ok") {
+		m.cfg.Log.Warn("growing the macOS VM's boot container failed; job keeps the base image size",
+			"id", m.id, "store", store, "status", status, "error", err)
+		return
+	}
+	m.cfg.Log.Info("grew macOS VM boot container", "id", m.id, "store", store, "status", status)
+}
+
+// untapBuildkite drops the base image's untrusted buildkite/buildkite tap
+// (see macOSBrewUntapScript). Purely cosmetic for the job, so failures are
+// debug-level.
+func (m *darwinMacOSVM) untapBuildkite(ctx context.Context, client *ssh.Client) {
+	out, err := runSSHCommand(ctx, client, macOSBrewUntapScript, macOSBrewUntapTimeout)
+	status := strings.TrimSpace(string(out))
+	if err != nil || status == "untap-failed" {
+		m.cfg.Log.Debug("could not untap buildkite/buildkite in the macOS VM", "id", m.id, "status", status, "error", err)
+		return
+	}
+	if status == "untapped" {
+		m.cfg.Log.Info("untapped buildkite/buildkite in the macOS VM", "id", m.id)
 	}
 }
 

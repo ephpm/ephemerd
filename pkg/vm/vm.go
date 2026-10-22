@@ -120,6 +120,11 @@ type MacOSVMConfig struct {
 	// MemoryMB per macOS VM. Defaults to 8192.
 	MemoryMB uint64
 
+	// DiskSizeGB grows each job's disk clone to this many GiB before boot and
+	// the guest's boot container with it (see macos_disk.go). 0 keeps the
+	// base image's size. Pass it through ResolveMacOSDiskSize first.
+	DiskSizeGB uint64
+
 	// JobEnv is extra KEY=VALUE env for every job's runner: the cache-proxy
 	// env, already rewritten to the host's address on the VM NAT. It is
 	// verified reachable from inside each VM before use; see macos_proxyenv.go.

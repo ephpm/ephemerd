@@ -1814,6 +1814,7 @@ disk_size_gb = 100
 disk_image = "/path/to/macos.img"
 cpus = 8
 memory_mb = 16384
+disk_size_gb = 100
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -1846,6 +1847,9 @@ memory_mb = 16384
 	}
 	if cfg.VM.MacOS.MemoryMB != 16384 {
 		t.Errorf("VM.MacOS.MemoryMB = %d, want 16384", cfg.VM.MacOS.MemoryMB)
+	}
+	if cfg.VM.MacOS.DiskSizeGB != 100 {
+		t.Errorf("VM.MacOS.DiskSizeGB = %d, want 100", cfg.VM.MacOS.DiskSizeGB)
 	}
 }
 
