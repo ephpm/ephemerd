@@ -134,13 +134,13 @@ func platformCleanup(dataDir string, pass, warn, fail func(string)) {
 	// <id>.aux disk clones next to them. Only the directories used to go,
 	// which left the multi-GB disk clones behind. Doctor only cleans with the
 	// daemon stopped, so nothing here can belong to a running VM — no age gate.
-	removed, failed := vm.SweepStaleMacOSClones(dataDir, 0, time.Now(), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	for _, f := range failed {
+	res := vm.SweepStaleMacOSClones(dataDir, nil, 0, time.Now(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	for _, f := range res.Failed {
 		warn("could not remove stale VM clone " + f)
 	}
-	if removed > 0 {
-		pass(fmt.Sprintf("removed %d stale macOS VM clone(s)", removed))
-	} else if len(failed) == 0 {
+	if res.Removed > 0 {
+		pass(fmt.Sprintf("removed %d stale macOS VM clone(s), %.1f GB", res.Removed, float64(res.FreedBytes)/1e9))
+	} else if len(res.Failed) == 0 {
 		pass("no stale macOS VM clones")
 	}
 }

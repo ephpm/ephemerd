@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -140,51 +139,3 @@ if "$B" tap 2>/dev/null | grep -qx buildkite/buildkite; then "$B" untap --force 
 // macOSBrewUntapTimeout bounds the untap. `brew tap` is a local listing, so a
 // slow one means something is wrong; give up rather than delay the job.
 const macOSBrewUntapTimeout = 60 * time.Second
-
-// SweepStaleMacOSClones deletes leftovers in <dataDir>/vm/macos/jobs — disk
-// clones (<id>.img), aux clones (<id>.aux) and virtio-fs share directories
-// (<id>/) — whose modification time is older than olderThan. It returns how
-// many entries it removed and the paths it failed to remove.
-//
-// A VM removes its own clones in Stop, but nothing removes them when Stop
-// never runs: a daemon restart or crash mid-job, or a stop that wedged inside
-// Virtualization.framework and was abandoned (scheduler.abandonVM). The
-// guests die with the daemon process, their files do not, and each .img is a
-// full-size clone that diverges from base.img as the job wrote to it — one
-// from 2026-10-01 had grown to 38 GB on the fleet's Mac before anyone noticed.
-//
-// Called at startup, before macOS jobs are accepted, so no VM of this process
-// can own anything here. The age gate is a second guard on top of that: a
-// running guest keeps writing to its .img, so a live clone always looks
-// recent. olderThan <= 0 removes everything (for `ephemerd doctor`, which
-// only cleans with the daemon stopped).
-func SweepStaleMacOSClones(dataDir string, olderThan time.Duration, now time.Time, log *slog.Logger) (removed int, failed []string) {
-	dir := filepath.Join(dataDir, "vm", "macos", "jobs")
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Warn("cannot list macOS VM clones for the stale sweep", "dir", dir, "error", err)
-		}
-		return 0, nil
-	}
-	for _, e := range entries {
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		if olderThan > 0 && now.Sub(info.ModTime()) < olderThan {
-			continue
-		}
-		path := filepath.Join(dir, e.Name())
-		size := info.Size()
-		if err := os.RemoveAll(path); err != nil {
-			log.Warn("could not remove stale macOS VM clone", "path", path, "error", err)
-			failed = append(failed, path)
-			continue
-		}
-		removed++
-		log.Info("removed stale macOS VM clone", "path", path,
-			"modified", info.ModTime().UTC().Format(time.RFC3339), "apparent_size_gib", fmt.Sprintf("%.1f", float64(size)/gib))
-	}
-	return removed, failed
-}

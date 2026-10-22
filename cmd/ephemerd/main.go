@@ -921,11 +921,6 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 				log.Error("macOS VM disk provisioning failed — macOS jobs will be unavailable", "error", err)
 				return
 			}
-			// No macOS job can be running yet: clean up what earlier daemon
-			// runs left behind before accepting new ones.
-			if n, _ := vm.SweepStaleMacOSClones(configDir, 24*time.Hour, time.Now(), log); n > 0 {
-				log.Info("swept stale macOS VM clones", "removed", n)
-			}
 			sched.SetMacOSVMConfig(&vm.MacOSVMConfig{
 				DataDir:    configDir,
 				DiskImage:  files.DiskImage,

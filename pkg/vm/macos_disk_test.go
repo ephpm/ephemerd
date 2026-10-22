@@ -142,61 +142,37 @@ func TestMacOSDiskGrowScript(t *testing.T) {
 	}
 }
 
-// TestSweepStaleMacOSClones: old leftovers (disk clone, aux clone, share
-// dir) go; anything recently written — a live guest's clone — stays.
-func TestSweepStaleMacOSClones(t *testing.T) {
-	data := t.TempDir()
-	jobs := filepath.Join(data, "vm", "macos", "jobs")
-	if err := os.MkdirAll(filepath.Join(jobs, "110392856702-a9e5c1a4"), 0o755); err != nil {
-		t.Fatal(err)
+// TestMacOSGuestTuning_Bounded: the guest-side steps run inside the macOS
+// provisioning deadline (5m by default), so a wedged diskutil or brew can
+// only cost the job its extra disk or a warning — never the job.
+func TestMacOSGuestTuning_Bounded(t *testing.T) {
+	const provisionDeadline = 5 * time.Minute
+	// info + grow + untap, all before the runner starts.
+	if total := 90*time.Second + macOSDiskGrowTimeout + macOSBrewUntapTimeout; total >= provisionDeadline {
+		t.Errorf("guest tuning can take %s, not inside the %s provisioning deadline", total, provisionDeadline)
 	}
-	if err := os.MkdirAll(filepath.Join(jobs, "119992881741-825ce005"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	stale := []string{"110392856702-a9e5c1a4.img", "110392856702-a9e5c1a4.aux"}
-	fresh := []string{"119992881741-825ce005.img", "119992881741-825ce005.aux"}
-	for _, n := range append(append([]string{}, stale...), fresh...) {
-		if err := os.WriteFile(filepath.Join(jobs, n), []byte("x"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	now := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
-	old := now.Add(-21 * 24 * time.Hour)
-	recent := now.Add(-time.Hour)
-	for _, n := range append(stale, "110392856702-a9e5c1a4") {
-		if err := os.Chtimes(filepath.Join(jobs, n), old, old); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, n := range append(fresh, "119992881741-825ce005") {
-		if err := os.Chtimes(filepath.Join(jobs, n), recent, recent); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	removed, failed := SweepStaleMacOSClones(data, 24*time.Hour, now, discardLog())
-	if removed != 3 || len(failed) != 0 {
-		t.Errorf("removed=%d failed=%v, want 3 removed (img, aux, share dir) and no failures", removed, failed)
-	}
-	for _, n := range append(stale, "110392856702-a9e5c1a4") {
-		if _, err := os.Stat(filepath.Join(jobs, n)); !os.IsNotExist(err) {
-			t.Errorf("stale %s survived the sweep", n)
-		}
-	}
-	for _, n := range append(fresh, "119992881741-825ce005") {
-		if _, err := os.Stat(filepath.Join(jobs, n)); err != nil {
-			t.Errorf("recent %s was swept: %v", n, err)
-		}
-	}
-
-	// olderThan <= 0 (doctor, daemon stopped) takes everything.
-	if removed, _ := SweepStaleMacOSClones(data, 0, now, discardLog()); removed != 3 {
-		t.Errorf("unconditional sweep removed %d, want the 3 remaining", removed)
+	if !strings.Contains(macOSDiskInfoCmd, "diskutil info /System/Volumes/Data") || !strings.Contains(macOSDiskInfoCmd, "|| diskutil info /") {
+		t.Errorf("info command must ask the Data volume and fall back to /: %q", macOSDiskInfoCmd)
 	}
 }
 
-func TestSweepStaleMacOSClones_NoJobsDir(t *testing.T) {
-	if removed, failed := SweepStaleMacOSClones(t.TempDir(), 24*time.Hour, time.Now(), discardLog()); removed != 0 || failed != nil {
-		t.Errorf("missing jobs dir: got (%d, %v), want (0, nil)", removed, failed)
+// TestMacOSBrewUntapScript: brew runs as the guest's admin user (it refuses
+// root, and the tap belongs to admin), never auto-updates (that would make
+// every job reach the network for a cosmetic step), and only the buildkite
+// tap is touched.
+func TestMacOSBrewUntapScript(t *testing.T) {
+	if strings.Contains(macOSBrewUntapScript, "sudo") {
+		t.Error("brew must not run as root")
+	}
+	for _, want := range []string{
+		"HOMEBREW_NO_AUTO_UPDATE=1",
+		"grep -qx buildkite/buildkite",
+		`untap --force buildkite/buildkite`,
+		"echo no-brew; exit 0",
+	} {
+		if !strings.Contains(macOSBrewUntapScript, want) {
+			t.Errorf("untap script missing %q", want)
+		}
 	}
 }
+

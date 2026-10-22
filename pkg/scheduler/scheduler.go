@@ -295,6 +295,10 @@ type Scheduler struct {
 	// default; only tests set it.
 	macAbandonedCap int
 
+	// macClones runs the periodic stale-clone sweep for macOS VMs and keeps
+	// its totals for status. See macclones.go.
+	macClones macCloneSweeper
+
 	// busyProbe overrides the ground-truth "is this runner executing a
 	// job" check that vetoes orphan teardown. Nil (the default) uses
 	// probeRunnerBusy: local container/VM/process introspection, falling
@@ -324,8 +328,11 @@ const maxProvisionAttempts = 5
 // finishes.
 func (s *Scheduler) SetMacOSVMConfig(cfg *vm.MacOSVMConfig) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.cfg.MacOSVMConfig = cfg
+	s.mu.Unlock()
+	// macOS jobs can start any moment now: sweep what earlier daemons left
+	// behind first. The sweep runs on its own goroutine (see Run).
+	s.macClones.kickNow()
 }
 
 // failureBackoff tracks per-repo failure counts to compute exponential backoff.
@@ -646,6 +653,9 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	if s.retry != nil {
 		go s.retry.Run(ctx)
 	}
+
+	// Stale macOS VM clones: idle until macOS support is configured.
+	go s.runMacCloneSweeper(ctx)
 
 	// Clean old job logs on startup, then periodically every hour.
 	// Retention period is configurable via [log] log_retention (default 7d).
@@ -2417,6 +2427,12 @@ func (s *Scheduler) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 	if n := s.AbandonedMacOSVMDetails(); len(n) > 0 {
 		status["abandoned_macos_vm_details"] = n
+	}
+	// Leaked macOS disk clones the sweeper removed since start. Non-zero means
+	// some teardown did not clean up after itself — see macclones.go.
+	if n, freed := s.macClones.totals(); n > 0 {
+		status["macos_clones_swept"] = n
+		status["macos_clone_bytes_swept"] = freed
 	}
 
 	w.Header().Set("Content-Type", "application/json")
