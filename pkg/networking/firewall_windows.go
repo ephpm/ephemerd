@@ -467,6 +467,7 @@ func (w *windowsNetworking) closeHostPort(port int, containerIP string) {
 // scope per job at this layer. No-op.
 func (w *windowsNetworking) joinJobNetwork(_, _, _ string) error { return nil }
 func (w *windowsNetworking) leaveJobNetwork(_ string)            {}
+func (w *windowsNetworking) jobForIP(_ string) string            { return "" }
 
 // hostPortRulePrefix is the DisplayName prefix of every per-job host-port allow
 // (see hostPortAllowRule). Swept by prefix on shutdown so a hard kill — which

@@ -497,6 +497,23 @@ func (l *linuxNetworking) joinJobNetwork(cniID, jobID, containerIP string) error
 	return nil
 }
 
+// jobForIP returns the job whose member holds ip, or "".
+func (l *linuxNetworking) jobForIP(ip string) string {
+	parsed := net.ParseIP(strings.TrimSpace(ip))
+	if parsed == nil {
+		return ""
+	}
+	want := parsed.String()
+	l.c2cMu.Lock()
+	defer l.c2cMu.Unlock()
+	for _, m := range l.c2cMember {
+		if m.ip == want {
+			return m.jobID
+		}
+	}
+	return ""
+}
+
 // leaveJobNetwork removes the container attached under cniID from its job and
 // deletes the intra-job ACCEPT pairs it shared with every remaining member.
 // Best-effort on the iptables side: a rule that fails to delete is logged and

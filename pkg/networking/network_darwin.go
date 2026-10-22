@@ -65,3 +65,4 @@ func (d *darwinNetworking) closeHostPort(int, string)      {}
 // has no container bridge of its own.
 func (d *darwinNetworking) joinJobNetwork(_, _, _ string) error { return nil }
 func (d *darwinNetworking) leaveJobNetwork(_ string)            {}
+func (d *darwinNetworking) jobForIP(_ string) string            { return "" }

@@ -531,6 +531,34 @@ func TestJoinJobNetwork_SkipsUnusableIP(t *testing.T) {
 	l.leaveJobNetwork("never-joined")
 }
 
+// TestJobForIP maps a source address back to its job — the attribution the
+// LAN Actions cache relies on — and forgets it once the container leaves.
+// Membership is seeded directly so no iptables is needed.
+func TestJobForIP(t *testing.T) {
+	l := &linuxNetworking{cfg: Config{Subnet: "10.88.0.0/16", Log: testLogger()}}
+	l.c2cMember = map[string]c2cMember{
+		"runner-a":  {jobID: "runner-a", ip: "10.88.0.7"},
+		"sibling-a": {jobID: "runner-a", ip: "10.88.0.8"},
+		"runner-b":  {jobID: "runner-b", ip: "10.88.0.9"},
+	}
+	l.c2cJob = map[string]map[string]bool{
+		"runner-a": {"10.88.0.7": true, "10.88.0.8": true},
+		"runner-b": {"10.88.0.9": true},
+	}
+	for ip, want := range map[string]string{
+		"10.88.0.7": "runner-a", "10.88.0.8": "runner-a", " 10.88.0.9 ": "runner-b",
+		"10.88.0.99": "", "garbage": "", "": "",
+	} {
+		if got := l.jobForIP(ip); got != want {
+			t.Errorf("jobForIP(%q) = %q, want %q", ip, got, want)
+		}
+	}
+	delete(l.c2cMember, "sibling-a") // what leaveJobNetwork does first
+	if got := l.jobForIP("10.88.0.8"); got != "" {
+		t.Errorf("a departed container still maps to %q", got)
+	}
+}
+
 // The port is the whole scope on the deny side, so a caller passing an
 // address the CNI result did not produce must fail rather than open
 // something wider or something wrong.
