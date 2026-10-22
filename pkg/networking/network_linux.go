@@ -87,8 +87,18 @@ func (l *linuxNetworking) init(cfg Config) error {
 }
 
 func (l *linuxNetworking) setup(ctx context.Context, id string, netns string) (*SetupResult, error) {
-	result, err := l.cni.Setup(ctx, id, netns)
+	// A failed ADD can leave an allocated IP or a veth behind; CNI DEL is
+	// idempotent, so release unconditionally after any failure.
+	undo := func() {
+		if rmErr := l.cni.Remove(ctx, id, netns); rmErr != nil {
+			l.cfg.Log.Debug("CNI cleanup after failed setup", "id", id, "error", rmErr)
+		}
+	}
+	result, err := retrySetup(ctx,
+		func() (*cni.Result, error) { return l.cni.Setup(ctx, id, netns) },
+		undo)
 	if err != nil {
+		undo()
 		return nil, fmt.Errorf("CNI setup for %s: %w", id, err)
 	}
 

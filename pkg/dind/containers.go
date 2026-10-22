@@ -801,32 +801,42 @@ func (s *Server) handleContainerStart(w http.ResponseWriter, r *http.Request, id
 		netns := fmt.Sprintf("/proc/%d/ns/net", pid)
 		result, err := s.network.Setup(ctx, id, netns)
 		if err != nil {
-			s.log.Warn("failed to setup network for dind container", "id", id, "error", err)
-		} else {
-			entry.NetNS = result.NetNS
-			entry.IP = result.IP
-			s.log.Info("network attached to dind container", "id", id, "ip", entry.IP)
+			// Fail the start. A container left running without an IP has no
+			// port forwards either, so the job just waits on a port that never
+			// opens (ephpm run 39690226239 sat 4 minutes on one).
+			s.log.Error("failed to setup network for dind container", "id", id, "error", err)
+			if _, delErr := task.Delete(ctx, client.WithProcessKill); delErr != nil {
+				s.log.Debug("task cleanup after failed network setup", "error", delErr)
+			}
+			entry.Task = nil
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"message": fmt.Sprintf("setting up network for container %s: %v", id, err),
+			})
+			return
+		}
+		entry.NetNS = result.NetNS
+		entry.IP = result.IP
+		s.log.Info("network attached to dind container", "id", id, "ip", entry.IP)
 
-			// Update the "bridge" network entry with the real CNI-assigned IP.
-			s.mu.Lock()
-			if info, ok := entry.Networks["bridge"]; ok {
-				info.IPAddress = result.IP
-				info.MacAddress = generateMAC(result.IP)
-				entry.Networks["bridge"] = info
-			}
-			if br := s.defaultNetwork(); br != nil {
-				br.Containers[id] = result.IP
-			}
-			s.mu.Unlock()
+		// Update the "bridge" network entry with the real CNI-assigned IP.
+		s.mu.Lock()
+		if info, ok := entry.Networks["bridge"]; ok {
+			info.IPAddress = result.IP
+			info.MacAddress = generateMAC(result.IP)
+			entry.Networks["bridge"] = info
+		}
+		if br := s.defaultNetwork(); br != nil {
+			br.Containers[id] = result.IP
+		}
+		s.mu.Unlock()
 
-			// Register this sibling as a member of the job so the runner and the
-			// job's other `services:`/sibling containers can reach it, while the
-			// bridge keeps other jobs out. Keyed by the same container id used
-			// for Setup/Teardown. Best-effort: a failure only limits within-job
-			// reach and never opens a cross-job path.
-			if jErr := s.network.JoinJobNetwork(id, s.jobID, result.IP); jErr != nil {
-				s.log.Warn("failed to register dind container in job network (intra-job reach may be limited)", "id", id, "error", jErr)
-			}
+		// Register this sibling as a member of the job so the runner and the
+		// job's other `services:`/sibling containers can reach it, while the
+		// bridge keeps other jobs out. Keyed by the same container id used
+		// for Setup/Teardown. Best-effort: a failure only limits within-job
+		// reach and never opens a cross-job path.
+		if jErr := s.network.JoinJobNetwork(id, s.jobID, result.IP); jErr != nil {
+			s.log.Warn("failed to register dind container in job network (intra-job reach may be limited)", "id", id, "error", jErr)
 		}
 	}
 
@@ -840,8 +850,10 @@ func (s *Server) handleContainerStart(w http.ResponseWriter, r *http.Request, id
 		}
 	}
 
-	if err := task.Start(ctx); err != nil {
-		// Clean up on failure.
+	// abortStart undoes everything above and fails the request, leaving the
+	// container in "created" exactly as Docker does when a start fails.
+	abortStart := func(msg string) {
+		s.removePortForwards(entry)
 		if _, delErr := task.Delete(ctx, client.WithProcessKill); delErr != nil {
 			s.log.Debug("task cleanup after failed start", "error", delErr)
 		}
@@ -854,9 +866,25 @@ func (s *Server) handleContainerStart(w http.ResponseWriter, r *http.Request, id
 			entry.IP = ""
 		}
 		entry.Task = nil
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"message": fmt.Sprintf("starting task: %v", err),
-		})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"message": msg})
+	}
+
+	// Publish port bindings before the task starts, so a binding that cannot
+	// be honoured fails the start instead of leaving a running container whose
+	// port never opens. KIND's `kind create cluster` creates the kindest/node
+	// with -p 127.0.0.1:<random>:6443 and writes a kubeconfig pointing at that
+	// 127.0.0.1:<random>; without the forward in the runner's netns, tilt +
+	// kubectl get connection refused. Listening early is harmless: a client
+	// that connects before the service is up is refused, just as it would be
+	// at the service's own port.
+	if err := s.installPortForwards(entry); err != nil {
+		s.log.Error("port forward install failed", "id", id, "error", err)
+		abortStart(fmt.Sprintf("starting container %s: %v", id, err))
+		return
+	}
+
+	if err := task.Start(ctx); err != nil {
+		abortStart(fmt.Sprintf("starting task: %v", err))
 		return
 	}
 
@@ -870,12 +898,6 @@ func (s *Server) handleContainerStart(w http.ResponseWriter, r *http.Request, id
 	if entry.started != nil {
 		close(entry.started)
 	}
-
-	// Install DNAT rules for any port bindings. KIND's `kind create cluster`
-	// creates the kindest/node with -p 127.0.0.1:<random>:6443 and writes a
-	// kubeconfig pointing at that 127.0.0.1:<random>. Without DNAT in the
-	// runner's netns, tilt + kubectl get connection refused.
-	s.installPortForwards(entry)
 
 	// Monitor for unexpected exit so we can diagnose crashes.
 	bgCtx := namespaces.WithNamespace(context.Background(), s.jobNamespace)
@@ -1393,12 +1415,20 @@ func (s *Server) assignContainerNetwork(entry *containerEntry, req createRequest
 
 // installPortForwards starts userspace TCP proxies for every PortBindings
 // entry on the container. Each proxy listens on hostIP:hostPort inside the
-// runner's net namespace and forwards to entry.IP:containerPort. Best-effort
-// — failures log a warning and don't abort container start.
-func (s *Server) installPortForwards(entry *containerEntry) {
-	if s.runnerNetNS == "" || entry.IP == "" || len(entry.PortBindings) == 0 {
-		return
+// runner's net namespace and forwards to entry.IP:containerPort.
+//
+// A binding that cannot be honoured is an error, as it is for `docker run -p`
+// ("port is already allocated"): the caller fails the start rather than run a
+// container whose published port silently never opens. On error the proxies
+// already started for this container are left in entry.PortForwards for the
+// caller's cleanup to stop.
+func (s *Server) installPortForwards(entry *containerEntry) error {
+	if s.runnerNetNS == "" || len(entry.PortBindings) == 0 {
+		return nil
 	}
+	// A container started a second time must not collide with its own
+	// listeners from the first start.
+	s.removePortForwards(entry)
 	for containerSpec, bindings := range entry.PortBindings {
 		// containerSpec is e.g. "6443/tcp"; we only handle tcp.
 		port, proto, ok := strings.Cut(containerSpec, "/")
@@ -1409,14 +1439,12 @@ func (s *Server) installPortForwards(entry *containerEntry) {
 			if b.HostPort == "" {
 				continue
 			}
-			stop, err := startPortForwardProxy(s.runnerNetNS, b.HostIP, b.HostPort, entry.IP, port)
+			if entry.IP == "" {
+				return fmt.Errorf("cannot publish %s:%s: container has no IP to forward to", b.HostIP, b.HostPort)
+			}
+			stop, err := startPortForwardProxy(s.runnerNetNS, b.HostIP, b.HostPort, entry.IP, port, s.log)
 			if err != nil {
-				s.log.Warn("port forward install failed",
-					"container", entry.ID[:12],
-					"host", b.HostIP+":"+b.HostPort,
-					"target", entry.IP+":"+port,
-					"error", err)
-				continue
+				return fmt.Errorf("publishing %s:%s -> %s:%s: %w", b.HostIP, b.HostPort, entry.IP, port, err)
 			}
 			entry.PortForwards = append(entry.PortForwards, stop)
 			s.log.Info("port forward installed",
@@ -1425,6 +1453,7 @@ func (s *Server) installPortForwards(entry *containerEntry) {
 				"target", entry.IP+":"+port)
 		}
 	}
+	return nil
 }
 
 // removePortForwards stops every running port-forward proxy goroutine for
