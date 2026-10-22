@@ -332,10 +332,20 @@ func (p *Proxy) advertiseBase() string {
 //
 // Only rustup is configured here. Cargo's registry redirect cannot be done
 // with environment variables (see Mounts).
+//
+// The GIT_HTTP_LOW_SPEED pair makes git give up on a transfer that moves
+// under 1 KB/s for 30 seconds. It is what bounds the git-dependency fetches
+// Cargo runs through the git binary (see netTOML); without it git, like
+// libgit2, waits on a dead connection indefinitely. Real fetches never run
+// that slowly, so actions/checkout and other git users lose nothing.
 func (p *Proxy) EnvVars() []string {
-	return []string{
+	env := []string{
 		"RUSTUP_DIST_SERVER=" + p.advertiseBase() + rustupRoute,
 	}
+	if p.containerOS() != "windows" {
+		env = append(env, "GIT_HTTP_LOW_SPEED_LIMIT=1000", "GIT_HTTP_LOW_SPEED_TIME=30")
+	}
+	return env
 }
 
 // Mounts returns the read-only bind mount that carries the generated Cargo
@@ -386,9 +396,9 @@ func (p *Proxy) writeContainerConfigLocked(active bool) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("creating cargo conf dir %q: %w", dir, err)
 	}
-	body := containerConfigTOML(p.advertiseBase())
+	body := containerConfigTOML(p.advertiseBase(), p.containerOS())
 	if !active {
-		body = inertConfigTOML()
+		body = inertConfigTOML(p.containerOS())
 	}
 	target := filepath.Join(dir, "config.toml")
 	tmp, err := os.CreateTemp(dir, ".config-*.toml")
