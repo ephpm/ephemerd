@@ -13,3 +13,8 @@ import (
 func rlimitsOpts(_ config.RuntimeRlimits) []oci.SpecOpts {
 	return nil
 }
+
+// pidsLimitOpts is a no-op off Linux: pids.max is a Linux cgroup control.
+func pidsLimitOpts(_ int64) []oci.SpecOpts {
+	return nil
+}

@@ -11,6 +11,28 @@ import (
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
+// pidsLimitOpts sets the container's cgroup pids.max. limit <= 0 adds
+// nothing (no limit). dind applies the same limit to sibling containers
+// (dind.pidsLimitOpt) — see config.RuntimeConfig.PidsLimit.
+func pidsLimitOpts(limit int64) []oci.SpecOpts {
+	if limit <= 0 {
+		return nil
+	}
+	return []oci.SpecOpts{
+		func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
+			if s.Linux == nil {
+				s.Linux = &ocispec.Linux{}
+			}
+			if s.Linux.Resources == nil {
+				s.Linux.Resources = &ocispec.LinuxResources{}
+			}
+			l := limit
+			s.Linux.Resources.Pids = &ocispec.LinuxPids{Limit: &l}
+			return nil
+		},
+	}
+}
+
 // rlimitsOpts sets RLIMIT_NOFILE and RLIMIT_NPROC on the container's OCI
 // process spec. We deliberately replace the rlimits slice (rather than
 // append) so the containerd default RLIMIT_NOFILE=1024 entry from

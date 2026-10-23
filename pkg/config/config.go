@@ -344,6 +344,21 @@ type ContainerdConfig struct {
 type RuntimeConfig struct {
 	Rlimits RuntimeRlimits `toml:"rlimits"`
 
+	// PidsLimit is the cgroup pids.max for each runner container and each
+	// sibling container its job starts through dind: the most processes
+	// plus threads that container may hold at once. 0 (unset) means
+	// DefaultPidsLimit; -1 means no limit.
+	//
+	// This, not RLIMIT_NPROC, is the per-job process bound. NPROC counts
+	// every task owned by the UID across the whole host, and every runner
+	// container runs as the same UID, so concurrent jobs drew from one
+	// shared budget: on ducks (2026-10-22) four parallel Rust builds hit
+	// the old 1024 default and rustc panicked with "failed to spawn work
+	// thread: Resource temporarily unavailable". A cgroup limit is
+	// counted per container, so one job's fork bomb cannot starve the
+	// others and a busy neighbour cannot fail a build.
+	PidsLimit int64 `toml:"pids_limit"`
+
 	// AllowNewPrivileges controls whether a process in the runner
 	// container may gain privileges through execve — i.e. whether setuid
 	// binaries and file capabilities take effect. When true the OCI spec
@@ -465,9 +480,34 @@ func (r RuntimeConfig) ResolvedAllowNewPrivileges() bool {
 	return true
 }
 
+// DefaultPidsLimit is the per-container pids.max when [runtime]
+// pids_limit is unset. A -j30 Rust build peaks in the low thousands of
+// threads (cargo jobs × rustc codegen threads × LLVM workers), so this
+// leaves an order of magnitude of headroom while still stopping a fork
+// bomb long before the host's kernel.threads-max.
+const DefaultPidsLimit = 32768
+
+// ResolvedPidsLimit returns the pids.max to apply, or 0 for "no limit".
+func (r RuntimeConfig) ResolvedPidsLimit() int64 {
+	switch {
+	case r.PidsLimit < 0:
+		return 0
+	case r.PidsLimit == 0:
+		return DefaultPidsLimit
+	default:
+		return r.PidsLimit
+	}
+}
+
+// defaultNproc is RLIMIT_NPROC when [runtime.rlimits] nproc is unset. It is
+// deliberately effectively unlimited: NPROC is enforced per UID across the
+// host, not per container, so as a per-job limit it only ever made
+// concurrent jobs fail each other. PidsLimit bounds each job instead.
+const defaultNproc = 1 << 20
+
 // RuntimeRlimits sets POSIX resource limits (RLIMIT_*) on each runner
-// container's OCI spec. Defaults match containerd's built-in OCI spec
-// (nofile=1024, nproc=1024) so an empty config is a no-behavior-change.
+// container's OCI spec. nofile defaults to containerd's built-in 1024;
+// nproc defaults to defaultNproc (see there for why it is not 1024).
 //
 // Set higher when CI workloads need more file descriptors or processes
 // than containerd's defaults allow. Common case: a build tool calling
@@ -482,7 +522,8 @@ type RuntimeRlimits struct {
 	// and hard get set to this value. Default 1024 (containerd default).
 	Nofile int64 `toml:"nofile"`
 	// Nproc is RLIMIT_NPROC (max processes/threads for the container's
-	// user). Both soft and hard get set to this value. Default 1024.
+	// user, counted host-wide). Both soft and hard get set to this value.
+	// Default defaultNproc.
 	Nproc int64 `toml:"nproc"`
 }
 
@@ -494,7 +535,7 @@ func (r RuntimeRlimits) Resolved() RuntimeRlimits {
 		r.Nofile = 1024
 	}
 	if r.Nproc <= 0 {
-		r.Nproc = 1024
+		r.Nproc = defaultNproc
 	}
 	return r
 }

@@ -37,8 +37,8 @@ func TestRlimitsOpts_AppliesConfiguredValues(t *testing.T) {
 }
 
 func TestRlimitsOpts_AppliesDefaultsWhenZero(t *testing.T) {
-	// Zero values must produce the containerd-default 1024 entries —
-	// emitting Rlimits with Soft=Hard=0 would cripple the container.
+	// Zero values must resolve to the defaults — emitting Rlimits with
+	// Soft=Hard=0 would cripple the container.
 	spec := &oci.Spec{Process: &ocispec.Process{}}
 	opts := rlimitsOpts(config.RuntimeRlimits{})
 	for _, opt := range opts {
@@ -46,9 +46,13 @@ func TestRlimitsOpts_AppliesDefaultsWhenZero(t *testing.T) {
 			t.Fatalf("opt: %v", err)
 		}
 	}
+	want := map[string]uint64{
+		"RLIMIT_NOFILE": 1024,
+		"RLIMIT_NPROC":  uint64(config.RuntimeRlimits{}.Resolved().Nproc),
+	}
 	for _, rl := range spec.Process.Rlimits {
-		if rl.Soft != 1024 || rl.Hard != 1024 {
-			t.Errorf("%s: soft=%d hard=%d, want 1024/1024", rl.Type, rl.Soft, rl.Hard)
+		if rl.Soft != want[rl.Type] || rl.Hard != want[rl.Type] {
+			t.Errorf("%s: soft=%d hard=%d, want %d", rl.Type, rl.Soft, rl.Hard, want[rl.Type])
 		}
 	}
 }
@@ -99,5 +103,24 @@ func TestRlimitsOpts_NilProcessSpec(t *testing.T) {
 	}
 	if len(spec.Process.Rlimits) != 2 {
 		t.Errorf("len(Rlimits) = %d, want 2", len(spec.Process.Rlimits))
+	}
+}
+
+// TestPidsLimitOpts pins the per-job process bound: a positive limit lands
+// in the spec's cgroup pids controller, and "no limit" adds nothing rather
+// than writing pids.max=0, which would forbid every fork.
+func TestPidsLimitOpts(t *testing.T) {
+	spec := &oci.Spec{}
+	for _, opt := range pidsLimitOpts(32768) {
+		if err := opt(context.Background(), nil, nil, spec); err != nil {
+			t.Fatalf("opt: %v", err)
+		}
+	}
+	if spec.Linux == nil || spec.Linux.Resources == nil || spec.Linux.Resources.Pids == nil ||
+		spec.Linux.Resources.Pids.Limit == nil || *spec.Linux.Resources.Pids.Limit != 32768 {
+		t.Fatalf("pids limit not applied: %+v", spec.Linux)
+	}
+	if opts := pidsLimitOpts(0); len(opts) != 0 {
+		t.Errorf("pidsLimitOpts(0) returned %d opts, want none", len(opts))
 	}
 }
