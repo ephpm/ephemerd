@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -53,6 +54,8 @@ type Client struct {
 	client   *gh.Client
 	app      *AppAuth      // nil when using PAT
 	lastRate *rateSnapshot // last observed rate-limit state (nil in tests using SetHTTPClient)
+
+	defaultBranches sync.Map // repo name -> defaultBranchEntry (see RunCacheFacts)
 }
 
 // RateSnapshot returns the last-observed rate-limit state. The scheduler
@@ -489,29 +492,56 @@ func (c *Client) pollOrg(ctx context.Context) ([]JobEvent, error) {
 	return events, nil
 }
 
-// pollRepo checks a single repo for queued workflow jobs.
+// pollRepo checks a single repo for workflow jobs and reports them the way
+// webhooks would: "queued" for self-hosted jobs waiting on a runner, and
+// "in_progress" for self-hosted jobs a runner has taken.
+//
+// Runs are listed in both the queued and the in_progress state. A run is
+// in_progress as soon as its first job starts, so a later job waiting on
+// `needs:` sits queued inside an in_progress run — listing queued runs alone
+// never finds it. And the in_progress events are what tell the scheduler
+// which job a runner actually took; without them polling mode could not
+// bind a runner's LAN Actions cache scope, so every save was refused.
 func (c *Client) pollRepo(ctx context.Context, repo string) ([]JobEvent, error) {
 	var events []JobEvent
 
-	runs, _, err := c.client.Actions.ListRepositoryWorkflowRuns(ctx, c.cfg.Owner, repo, &gh.ListWorkflowRunsOptions{
-		Status: "queued",
-	})
-	if err != nil {
-		return nil, err
+	seen := map[int64]bool{}
+	var runs []*gh.WorkflowRun
+	for i, status := range []string{"queued", "in_progress"} {
+		page, _, err := c.client.Actions.ListRepositoryWorkflowRuns(ctx, c.cfg.Owner, repo, &gh.ListWorkflowRunsOptions{
+			Status: status,
+		})
+		if err != nil {
+			if i == 0 {
+				return nil, err
+			}
+			// The queued listing already worked; losing the in_progress
+			// half costs only latency, so keep what we have.
+			c.cfg.Log.Debug("listing in-progress runs failed", "repo", repo, "error", err)
+			continue
+		}
+		for _, run := range page.WorkflowRuns {
+			if !seen[run.GetID()] {
+				seen[run.GetID()] = true
+				runs = append(runs, run)
+			}
+		}
 	}
 
-	for _, run := range runs.WorkflowRuns {
+	for _, run := range runs {
 		runJobs, _, err := c.client.Actions.ListWorkflowJobs(ctx, c.cfg.Owner, repo, run.GetID(), nil)
 		if err != nil {
 			continue
 		}
 		for _, job := range runJobs.Jobs {
-			if job.GetStatus() == "queued" && isSelfHosted(job.Labels) {
-				events = append(events, JobEvent{
-					Action: "queued",
-					Repo:   repo,
-					Job:    job,
-				})
+			if !isSelfHosted(job.Labels) {
+				continue
+			}
+			switch {
+			case job.GetStatus() == "queued":
+				events = append(events, JobEvent{Action: "queued", Repo: repo, Job: job})
+			case job.GetStatus() == "in_progress" && job.GetRunnerName() != "":
+				events = append(events, JobEvent{Action: "in_progress", Repo: repo, Job: job})
 			}
 		}
 	}

@@ -111,6 +111,10 @@ type Config struct {
 	// and finally the runtime's host-aware default. Nil-safe.
 	RunnerImageForRepo func(repo, os string) string
 
+	// ActionsCache is ephemerd's LAN Actions cache, nil when it is off. See
+	// ActionsCache and actionscache.go.
+	ActionsCache ActionsCache
+
 	Log *slog.Logger
 }
 
@@ -2001,6 +2005,7 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 	// here are far cheaper than release-and-requeue. The retry queue
 	// below is the real safety net when these run out.
 	jobCtx, cancel := s.jobContext()
+	resultsURL := s.actionsCacheFor(event, claim.RunnerName)
 	var env *runtime.RunnerEnv
 	err = retryEnvCreate(jobCtx, log, createEnvBackoffs,
 		func(err error) bool { return classifyErr(err) != errNonRetryable },
@@ -2019,11 +2024,14 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 				// mysql:8.0 78 times in 3 days before these were passed.
 				Provider: providerName(event),
 				Repo:     event.Repo,
+				// "" unless the LAN Actions cache is on for this job.
+				ResultsURL: resultsURL,
 			})
 			return cerr
 		})
 	if err != nil {
 		log.Error("failed to create runner environment", "error", err, "error_class", classifyErr(err))
+		s.forgetActionsCache(claim.RunnerName)
 		// Remove the ghost runner since the container won't start
 		if rmErr := event.Provider.ReleaseJob(ctx, claim); rmErr != nil {
 			log.Warn("failed to remove ghost runner", "runner_id", claim.RunnerID, "error", rmErr)
@@ -2108,6 +2116,7 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 			if err := s.cfg.Runtime.Destroy(context.Background(), env); err != nil {
 				log.Warn("failed to destroy runner environment", "error", err)
 			}
+			s.forgetActionsCache(claim.RunnerName)
 			if rj.artifactsDir != "" {
 				artifacts.Cleanup(rj.artifactsDir, s.cfg.Log)
 			}
@@ -2154,15 +2163,23 @@ func (s *Scheduler) handleInProgress(event providers.JobEvent) {
 	s.mu.Lock()
 	rb, owned := s.runners[name]
 	var intentKey jobKey
+	already := false
 	if owned {
+		// Polling reports a running job on every poll, not once like the
+		// webhook does; the first report did the binding.
+		already = rb.bound && rb.boundKey == key
 		rb.bound = true
 		rb.boundKey = key
 		intentKey = rb.intentKey
 	}
 	s.mu.Unlock()
 
-	if !owned {
+	if !owned || already {
 		return
+	}
+	// The job that ACTUALLY took this runner decides its cache scope.
+	if s.cfg.ActionsCache != nil {
+		go s.bindActionsCache(event, name)
 	}
 	if intentKey != key {
 		// The observability line for the fungibility race: GitHub gave

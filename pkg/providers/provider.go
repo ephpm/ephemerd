@@ -122,6 +122,32 @@ type RunnerNameReporter interface {
 	ReportsRunnerNames() bool
 }
 
+// CacheScope is what one job may do with ephemerd's LAN Actions cache.
+// Mirrors actionscache.Scope; kept here so providers need not import the
+// proxy.
+type CacheScope struct {
+	// Repo is the forge-native "owner/repo".
+	Repo string
+	// Write is the ref the job saves entries under; "" = read-only.
+	Write string
+	// Reads are the refs a restore searches, in order.
+	Reads []string
+}
+
+// CacheScoper is optionally implemented by providers that can say, from
+// their own record of a job's run, which cache scope that job gets.
+//
+// It is asked for the job that ACTUALLY took a runner (the in_progress
+// event), never the one the runner was dispatched for: same-label JIT
+// runners are fungible, so dispatch intent says nothing about whose code
+// will run. An error means "unknown" and the job gets no cache access —
+// a miss, never a wider scope.
+type CacheScoper interface {
+	Provider
+
+	CacheScope(ctx context.Context, event *JobEvent) (CacheScope, error)
+}
+
 // RunnerBusyReporter is optionally implemented by providers that can be
 // asked, on demand, whether a runner they registered is executing a job
 // right now.

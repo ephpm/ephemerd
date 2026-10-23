@@ -1244,3 +1244,62 @@ func TestIsSelfHosted_EdgeCases(t *testing.T) {
 		})
 	}
 }
+
+// TestPollJobs_ReportsRunningJobsAndNeedsJobs covers what polling used to
+// miss: a run is in_progress once its first job starts, so (a) a `needs:`
+// job still queued inside it was never found, and (b) the running job was
+// never reported, so the scheduler could not learn which job a runner took
+// (and could not bind its LAN Actions cache scope). A run listed under both
+// statuses must be read once.
+func TestPollJobs_ReportsRunningJobsAndNeedsJobs(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/testorg/repo1/actions/runs", func(w http.ResponseWriter, r *http.Request) {
+		runs := []map[string]any{}
+		switch r.URL.Query().Get("status") {
+		case "in_progress":
+			runs = append(runs, map[string]any{"id": 300, "status": "in_progress"})
+		case "queued":
+			runs = append(runs, map[string]any{"id": 300, "status": "queued"}) // same run, both lists
+		}
+		if err := json.NewEncoder(w).Encode(map[string]any{"total_count": len(runs), "workflow_runs": runs}); err != nil {
+			t.Logf("encoding: %v", err)
+		}
+	})
+	mux.HandleFunc("/repos/testorg/repo1/actions/runs/300/jobs", func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"total_count": 3,
+			"jobs": []map[string]any{
+				{"id": 1, "status": "in_progress", "runner_name": "ephemerd-a", "labels": []string{"self-hosted", "linux"}},
+				{"id": 2, "status": "queued", "labels": []string{"self-hosted", "linux"}},
+				{"id": 3, "status": "in_progress", "runner_name": "GitHub Actions 7", "labels": []string{"ubuntu-latest"}},
+			},
+		}
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Logf("encoding: %v", err)
+		}
+	})
+
+	c, srv := newTestClientWithServer(t, mux)
+	defer srv.Close()
+
+	events, err := c.PollJobs(context.Background())
+	if err != nil {
+		t.Fatalf("PollJobs() error: %v", err)
+	}
+	got := map[int64]string{}
+	for _, e := range events {
+		if _, dup := got[e.Job.GetID()]; dup {
+			t.Errorf("job %d reported twice; the run was listed under both statuses and must be read once", e.Job.GetID())
+		}
+		got[e.Job.GetID()] = e.Action
+	}
+	if got[1] != "in_progress" {
+		t.Errorf("running self-hosted job: action %q, want in_progress", got[1])
+	}
+	if got[2] != "queued" {
+		t.Errorf("needs-job queued inside an in_progress run: action %q, want queued", got[2])
+	}
+	if _, ok := got[3]; ok {
+		t.Errorf("GitHub-hosted job must not be reported")
+	}
+}

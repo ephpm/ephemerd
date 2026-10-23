@@ -253,6 +253,10 @@ type platformNetworking interface {
 	// so both are no-ops.
 	joinJobNetwork(cniID, jobID, containerIP string) error
 	leaveJobNetwork(cniID string)
+
+	// jobForIP returns the jobID a container at ip joined under, or "" when
+	// no current member has that address. Backs JobForIP.
+	jobForIP(ip string) string
 }
 
 // New creates and initializes the networking manager for the current platform.
@@ -378,6 +382,23 @@ func (m *Manager) LeaveJobNetwork(cniID string) {
 	if m.platform != nil {
 		m.platform.leaveJobNetwork(cniID)
 	}
+}
+
+// JobForIP reports which job the container at ip belongs to — the jobID it
+// joined under via JoinJobNetwork (the runner container and every dind
+// sibling of one job share it) — or "" when no current member has that
+// address.
+//
+// It lets a host-side service tell which job a request came from by its
+// source address alone. That holds on the CNI bridge because each container
+// owns its address inside its own netns and job containers lack CAP_NET_RAW,
+// so one cannot complete a TCP handshake as another. Always "" on Windows
+// and macOS, which do not track membership.
+func (m *Manager) JobForIP(ip string) string {
+	if m == nil || m.platform == nil {
+		return ""
+	}
+	return m.platform.jobForIP(ip)
 }
 
 // Cleanup removes all networking state: firewall rules, bridge interface,
