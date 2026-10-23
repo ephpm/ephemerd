@@ -410,6 +410,29 @@ func (r *Runtime) SweepOrphans(ctx context.Context) error {
 	return r.sweepOrphanState(ctx, live)
 }
 
+// LiveJobIDs returns the ids of the jobs this runtime is running or
+// provisioning: every runner container in the runtime namespace plus the
+// in-flight provisioning set. The job cgroup sweep skips these, so it never
+// removes a live job's parent cgroup even while that job momentarily has no
+// container in it.
+func (r *Runtime) LiveJobIDs(ctx context.Context) (map[string]bool, error) {
+	ctx = namespaces.WithNamespace(ctx, namespace)
+	containers, err := r.client.Containers(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing containers: %w", err)
+	}
+	keep := make(map[string]struct{}, len(containers))
+	for _, c := range containers {
+		keep[c.ID()] = struct{}{}
+	}
+	r.addProvisioning(keep)
+	live := make(map[string]bool, len(keep))
+	for id := range keep {
+		live[id] = true
+	}
+	return live, nil
+}
+
 // sweepOrphanState is the shared body of CleanOrphans and SweepOrphans.
 // live is the set of container IDs whose on-disk state must be preserved;
 // nil means "nothing is live".

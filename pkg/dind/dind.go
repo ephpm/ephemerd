@@ -261,7 +261,7 @@ func New(cfg Config) (*Server, error) {
 		allowPrivileged: cfg.AllowPrivileged,
 		pidsLimit:       cfg.PidsLimit,
 		memoryLimit:     cfg.MemoryLimit,
-		stager:        newBindStager(cfg.DataDir, cfg.JobID, cfg.Log),
+		stager:          newBindStager(cfg.DataDir, cfg.JobID, cfg.Log),
 		mirror:          cfg.RegistryMirror,
 		resultsURL:      cfg.ResultsURL,
 		log:             cfg.Log.With("component", "dind", "job_id", cfg.JobID),

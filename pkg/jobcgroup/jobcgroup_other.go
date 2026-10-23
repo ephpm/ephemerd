@@ -14,7 +14,9 @@ func Ensure(_, _ string, _ Limits) error { return nil }
 func Remove(_, _ string) error { return nil }
 
 // SweepStale is a no-op off Linux.
-func SweepStale(_ string, _ time.Duration, _ time.Time) (int, error) { return 0, nil }
+func SweepStale(_ string, _ time.Duration, _ time.Time, _ map[string]bool) (int, error) {
+	return 0, nil
+}
 
 // Sweep is a no-op off Linux.
-func Sweep(_ time.Duration, _ *slog.Logger) {}
+func Sweep(_ time.Duration, _ map[string]bool, _ *slog.Logger) {}

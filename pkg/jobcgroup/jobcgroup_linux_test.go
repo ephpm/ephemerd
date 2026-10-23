@@ -148,8 +148,11 @@ func TestSweepStale(t *testing.T) {
 	if err := os.MkdirAll(recent, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// A live job between two sibling containers: empty and old, but the
+	// daemon is still running it.
+	liveJob := mk(Prefix+"live-job", map[string]string{"cgroup.procs": ""})
 
-	n, err := SweepStale(root, 10*time.Minute, time.Now())
+	n, err := SweepStale(root, 10*time.Minute, time.Now(), map[string]bool{"live-job": true})
 	if err != nil {
 		t.Fatalf("SweepStale: %v", err)
 	}
@@ -161,10 +164,18 @@ func TestSweepStale(t *testing.T) {
 			t.Errorf("%s: idle stale job cgroup not removed", filepath.Base(gone))
 		}
 	}
-	for _, kept := range []string{busy, parent, other, recent} {
+	for _, kept := range []string{busy, parent, other, recent, liveJob} {
 		if _, err := os.Stat(kept); err != nil {
-			t.Errorf("%s: must be kept (procs, children, not ours, or inside the grace period): %v", filepath.Base(kept), err)
+			t.Errorf("%s: must be kept (procs, children, not ours, inside the grace period, or live): %v", filepath.Base(kept), err)
 		}
+	}
+
+	// Once the job is no longer live, its empty parent goes.
+	if n, err := SweepStale(root, 10*time.Minute, time.Now(), nil); err != nil || n != 1 {
+		t.Errorf("SweepStale with no live jobs = (%d, %v), want (1, nil)", n, err)
+	}
+	if _, err := os.Stat(liveJob); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("finished job's empty parent not removed")
 	}
 }
 

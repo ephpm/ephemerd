@@ -1134,18 +1134,6 @@ func buildkitGCConfig(cfg *config.Config) buildkit.GCConfig {
 	}
 }
 
-// runNodeDiskSweeper is the periodic half of node disk hygiene, on one
-// timer: an orphan sweep, a sweep of dead jobs' BuildKit export records,
-// and a disk-pressure image collection pass.
-//
-// All three were previously startup-only or absent, which is why long-lived
-// daemons accumulated build records, snapshots and images for their entire
-// uptime. Each pass is cheap on an idle node — a container list, a couple
-// of directory reads and one statfs — and the image collection is a no-op
-// unless a watermark is crossed.
-//
-// Errors from one pass are logged and the loop continues; the next tick
-// retries.
 // memoryLimit resolves [runtime] memory_limit_mb / memory_high_percent into
 // the job cgroup budget the runtime and dind apply.
 func memoryLimit(r config.RuntimeConfig) jobcgroup.Limits {
@@ -1159,10 +1147,40 @@ func memoryLimit(r config.RuntimeConfig) jobcgroup.Limits {
 // (daemon crash, host reboot) and for the backlog older daemons left.
 const jobCgroupSweepGrace = 10 * time.Minute
 
+// sweepJobCgroups runs the leaked job cgroup sweep, skipping every job rt is
+// still running or provisioning. If the live set cannot be read the pass is
+// skipped: removing a live job's parent is worse than leaking one a tick
+// longer.
+func sweepJobCgroups(ctx context.Context, rt *runtime.Runtime, log *slog.Logger) {
+	var live map[string]bool
+	if rt != nil {
+		var err error
+		if live, err = rt.LiveJobIDs(ctx); err != nil {
+			log.Debug("job cgroup sweep skipped: cannot list live jobs", "error", err)
+			return
+		}
+	}
+	jobcgroup.Sweep(jobCgroupSweepGrace, live, log)
+}
+
+// runNodeDiskSweeper is the periodic half of node disk hygiene, on one
+// timer: an orphan sweep, a sweep of dead jobs' BuildKit export records,
+// and a disk-pressure image collection pass.
+//
+// All three were previously startup-only or absent, which is why long-lived
+// daemons accumulated build records, snapshots and images for their entire
+// uptime. Each pass is cheap on an idle node — a container list, a couple
+// of directory reads and one statfs — and the image collection is a no-op
+// unless a watermark is crossed.
+//
+// Errors from one pass are logged and the loop continues; the next tick
+// retries.
 func runNodeDiskSweeper(ctx context.Context, gc *imagegc.Collector, rt *runtime.Runtime, c *containerdclient.Client, interval time.Duration, repair brokenChainRepair, log *slog.Logger) {
 	log = log.With("component", "node-disk-sweeper", "interval", interval)
 	log.Info("starting node disk sweeper")
-	jobcgroup.Sweep(jobCgroupSweepGrace, log)
+	startCtx, startCancel := context.WithTimeout(ctx, time.Minute)
+	sweepJobCgroups(startCtx, rt, log)
+	startCancel()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -1186,7 +1204,7 @@ func runNodeDiskSweeper(ctx context.Context, gc *imagegc.Collector, rt *runtime.
 				}
 			}
 			sweepDeadBuildRecords(passCtx, c, log)
-			jobcgroup.Sweep(jobCgroupSweepGrace, log)
+			sweepJobCgroups(passCtx, rt, log)
 			// Correctness repair, not capacity policy — so it runs on
 			// every tick whether or not image GC is enabled, and before
 			// the collector, which would otherwise plan against records

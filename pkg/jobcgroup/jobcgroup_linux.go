@@ -109,15 +109,20 @@ func Remove(root, jobID string) error {
 }
 
 // SweepStale removes job parent cgroups under root that hold no processes and
-// no child cgroups and have not changed for grace. It never removes one with
-// either: a live job's parent always holds its containers' leaves, and with a
-// job memory limit the runner's leaf is in it for the job's whole life.
-// Without a limit, a live job's parent can be briefly empty between two
-// sibling containers; removing it then is harmless because runc recreates it,
-// and the grace period makes it unlikely in the first place.
+// no child cgroups, whose directory has not changed for grace, and whose job
+// is not in live. It never removes one with processes or children, and never
+// one belonging to a job this daemon is still running: without a memory
+// limit a live job's parent is empty between two of its sibling containers,
+// and an rmdir landing inside runc's mkdir-parent/mkdir-leaf window would
+// fail that container's start. live is keyed by job (runner container) id;
+// nil means no job is live.
+//
+// The grace is measured against the directory's mtime, which cgroupfs bumps
+// when a child cgroup is created or removed (not when processes join or a
+// limit is written). It backstops a job the live set cannot see yet.
 //
 // Returns how many it removed.
-func SweepStale(root string, grace time.Duration, now time.Time) (int, error) {
+func SweepStale(root string, grace time.Duration, now time.Time, live map[string]bool) (int, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return 0, fmt.Errorf("reading %s: %w", root, err)
@@ -125,6 +130,9 @@ func SweepStale(root string, grace time.Duration, now time.Time) (int, error) {
 	removed := 0
 	for _, e := range entries {
 		if !e.IsDir() || !strings.HasPrefix(e.Name(), Prefix) {
+			continue
+		}
+		if live[strings.TrimPrefix(e.Name(), Prefix)] {
 			continue
 		}
 		dir := filepath.Join(root, e.Name())
@@ -164,8 +172,8 @@ func idle(dir string) bool {
 
 // Sweep is SweepStale on the real cgroupfs, logged. A sweep failure is never
 // fatal — the leak it cleans up is slow and harmless in the short term.
-func Sweep(grace time.Duration, log *slog.Logger) {
-	n, err := SweepStale(Root, grace, time.Now())
+func Sweep(grace time.Duration, live map[string]bool, log *slog.Logger) {
+	n, err := SweepStale(Root, grace, time.Now(), live)
 	if err != nil {
 		log.Debug("job cgroup sweep failed", "error", err)
 		return
