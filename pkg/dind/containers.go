@@ -526,6 +526,10 @@ func (s *Server) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	// host UID with every other job's containers, so RLIMIT_NPROC cannot
 	// bound it per job.
 	opts = append(opts, pidsLimitOpts(s.pidsLimit)...)
+	// The job's memory budget lives on the job parent cgroup this sibling is
+	// created under; (re)write it now so it holds even if the periodic sweep
+	// removed an empty parent between two of the job's containers.
+	opts = append(opts, jobMemoryOpts(s.jobID, s.memoryLimit, s.log)...)
 
 	if req.HostConfig != nil {
 		// Privileged mode: all capabilities, all devices, disable seccomp/apparmor,

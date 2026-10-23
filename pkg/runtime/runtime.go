@@ -26,6 +26,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/config"
 	"github.com/ephpm/ephemerd/pkg/dind"
 	"github.com/ephpm/ephemerd/pkg/imagegc"
+	"github.com/ephpm/ephemerd/pkg/jobcgroup"
 	"github.com/ephpm/ephemerd/pkg/networking"
 	"github.com/ephpm/ephemerd/pkg/proxies"
 	"github.com/ephpm/ephemerd/pkg/registrymirror"
@@ -117,6 +118,11 @@ type Config struct {
 	// dind sibling of its job; 0 means no limit. A resolved value: callers
 	// pass cfg.Runtime.ResolvedPidsLimit(). Linux only.
 	PidsLimit int64
+	// MemoryLimit is the per-job memory budget shared by the runner
+	// container and every dind sibling of its job (see pkg/jobcgroup).
+	// Zero means no limit and leaves the runner in its historical cgroup.
+	// Linux only.
+	MemoryLimit jobcgroup.Limits
 	// AllowNewPrivileges permits privilege escalation via execve in the
 	// runner container (NoNewPrivileges=false), which is what makes
 	// `sudo` work. See config.RuntimeConfig.AllowNewPrivileges.
@@ -402,6 +408,29 @@ func (r *Runtime) SweepOrphans(ctx context.Context) error {
 	// Jobs mid-provision have on-disk state but no container yet: keep them.
 	r.addProvisioning(live)
 	return r.sweepOrphanState(ctx, live)
+}
+
+// LiveJobIDs returns the ids of the jobs this runtime is running or
+// provisioning: every runner container in the runtime namespace plus the
+// in-flight provisioning set. The job cgroup sweep skips these, so it never
+// removes a live job's parent cgroup even while that job momentarily has no
+// container in it.
+func (r *Runtime) LiveJobIDs(ctx context.Context) (map[string]bool, error) {
+	ctx = namespaces.WithNamespace(ctx, namespace)
+	containers, err := r.client.Containers(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing containers: %w", err)
+	}
+	keep := make(map[string]struct{}, len(containers))
+	for _, c := range containers {
+		keep[c.ID()] = struct{}{}
+	}
+	r.addProvisioning(keep)
+	live := make(map[string]bool, len(keep))
+	for id := range keep {
+		live[id] = true
+	}
+	return live, nil
 }
 
 // sweepOrphanState is the shared body of CleanOrphans and SweepOrphans.
@@ -1179,6 +1208,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	opts = append(opts, newPrivilegesOpts(r.cfg.AllowNewPrivileges)...)
 	opts = append(opts, rlimitsOpts(r.cfg.Rlimits)...)
 	opts = append(opts, pidsLimitOpts(r.cfg.PidsLimit)...)
+	opts = append(opts, jobCgroupOpts(id, r.cfg.MemoryLimit, r.cfg.Log)...)
 	switch {
 	case len(cfg.Entrypoint) > 0:
 		// Forge mode: custom entrypoint (e.g. act_runner register + daemon).
@@ -1294,6 +1324,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			BuildKit:        r.cfg.BuildKit,
 			AllowPrivileged: r.cfg.DindAllowPrivileged,
 			PidsLimit:       r.cfg.PidsLimit,
+			MemoryLimit:     r.cfg.MemoryLimit,
 			RegistryMirror:  r.cfg.RegistryMirror,
 			ResultsURL:      resultsURL,
 			Transport:       resolveDindTransport(r.cfg.LinuxRuntime, goruntime.GOOS),
@@ -1790,6 +1821,15 @@ func (r *Runtime) destroySteps(ctx context.Context, env *RunnerEnv) {
 	// Delete container and snapshot
 	if err := env.Container.Delete(ctx, client.WithSnapshotCleanup); err != nil {
 		r.cfg.Log.Warn("failed to delete container", "id", env.ID, "error", err)
+	}
+
+	// The job parent cgroup (the dind siblings' parent, and the runner's too
+	// under a job memory limit). runc removes only container leaves, so
+	// without this every job left an empty directory behind. The task delete
+	// and Dind.Stop above have already removed the leaves; anything still
+	// busy is retried by the periodic sweep.
+	if err := jobcgroup.Remove(jobcgroup.Root, env.ID); err != nil {
+		r.cfg.Log.Debug("job cgroup not removed yet; the sweep will retry", "id", env.ID, "error", err)
 	}
 
 	// Clean up per-job runner directory copy.

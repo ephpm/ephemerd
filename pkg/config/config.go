@@ -362,6 +362,29 @@ type RuntimeConfig struct {
 	// others and a busy neighbour cannot fail a build.
 	PidsLimit int64 `toml:"pids_limit"`
 
+	// MemoryLimitMB is the memory budget for one JOB: the runner container
+	// and every sibling it starts through dind, together, share one cgroup
+	// with this memory.max. 0 (unset) means no limit, which is the
+	// historical behaviour.
+	//
+	// It is a per-job budget, not per-container, because the heavy work
+	// in a `container:` job runs inside a dind sibling: a per-container
+	// limit would let one job spend N × the limit. When the budget is hit
+	// the kernel OOM-kills inside that job only — usually the largest
+	// process (a linker), failing the step — instead of the host-wide OOM
+	// that on sharks (2026-10-23 03:00Z, 40 GB, 5 slots) killed processes
+	// in three concurrent jobs at once.
+	MemoryLimitMB int64 `toml:"memory_limit_mb"`
+
+	// MemoryHighPercent sets memory.high as a percentage of MemoryLimitMB.
+	// Above memory.high the kernel reclaims the job's page cache and
+	// throttles it before memory.max is reached, so a build that only
+	// looks big because of cache (target/ dirs, registry layers) slows
+	// down rather than getting killed. 0 (unset) means
+	// DefaultMemoryHighPercent; valid range 50-100, where 100 disables the
+	// soft limit. Ignored when MemoryLimitMB is 0.
+	MemoryHighPercent int `toml:"memory_high_percent"`
+
 	// AllowNewPrivileges controls whether a process in the runner
 	// container may gain privileges through execve — i.e. whether setuid
 	// binaries and file capabilities take effect. When true the OCI spec
@@ -500,6 +523,46 @@ func (r RuntimeConfig) ResolvedPidsLimit() int64 {
 	default:
 		return r.PidsLimit
 	}
+}
+
+// DefaultMemoryHighPercent is memory.high as a share of [runtime]
+// memory_limit_mb when memory_high_percent is unset.
+const DefaultMemoryHighPercent = 90
+
+// minMemoryLimitMB is the smallest per-job budget accepted. Anything below
+// it cannot hold the runner itself, and is far more likely a units mistake
+// (GB written as MB) than a deliberate setting.
+const minMemoryLimitMB = 512
+
+// ResolvedMemoryLimit returns the job cgroup's memory.max and memory.high in
+// bytes. Both are 0 when no limit is configured; high is 0 (no soft limit)
+// when memory_high_percent is 100.
+func (r RuntimeConfig) ResolvedMemoryLimit() (maxBytes, highBytes int64) {
+	if r.MemoryLimitMB <= 0 {
+		return 0, 0
+	}
+	maxBytes = r.MemoryLimitMB << 20
+	pct := r.MemoryHighPercent
+	if pct == 0 {
+		pct = DefaultMemoryHighPercent
+	}
+	if pct >= 100 {
+		return maxBytes, 0
+	}
+	return maxBytes, maxBytes * int64(pct) / 100
+}
+
+func (r RuntimeConfig) validate() error {
+	if r.MemoryLimitMB < 0 {
+		return fmt.Errorf("[runtime] memory_limit_mb = %d: must be 0 (no limit) or at least %d", r.MemoryLimitMB, minMemoryLimitMB)
+	}
+	if r.MemoryLimitMB > 0 && r.MemoryLimitMB < minMemoryLimitMB {
+		return fmt.Errorf("[runtime] memory_limit_mb = %d: below the %d MB floor (the value is in megabytes — 16 GiB is 16384)", r.MemoryLimitMB, minMemoryLimitMB)
+	}
+	if p := r.MemoryHighPercent; p != 0 && (p < 50 || p > 100) {
+		return fmt.Errorf("[runtime] memory_high_percent = %d: must be between 50 and 100", p)
+	}
+	return nil
 }
 
 // defaultNproc is RLIMIT_NPROC when [runtime.rlimits] nproc is unset. It is
@@ -2035,6 +2098,10 @@ func (c *Config) validate() error {
 	}
 
 	if err := c.ActionsCache.validate(); err != nil {
+		return err
+	}
+
+	if err := c.Runtime.validate(); err != nil {
 		return err
 	}
 

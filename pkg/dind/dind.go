@@ -32,6 +32,7 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/ephpm/ephemerd/pkg/buildkit"
+	"github.com/ephpm/ephemerd/pkg/jobcgroup"
 	"github.com/ephpm/ephemerd/pkg/networking"
 	"github.com/ephpm/ephemerd/pkg/registrymirror"
 )
@@ -72,6 +73,7 @@ type Server struct {
 	runnerNetNS     string           // path to runner container's net namespace; used to install DNAT rules for port bindings
 	allowPrivileged bool             // gate for docker run --privileged / --cap-add; see config.DindConfig.AllowPrivileged
 	pidsLimit       int64            // cgroup pids.max for siblings; 0 = no limit
+	memoryLimit     jobcgroup.Limits // the job's memory budget, written on the job parent cgroup
 
 	// stager publishes every job-supplied bind source at a path under
 	// <DataDir>/dind-binds/<JobID>/ that only root can reach, so the path
@@ -191,6 +193,13 @@ type Config struct {
 	// config.RuntimeConfig.PidsLimit.
 	PidsLimit int64
 
+	// MemoryLimit is the job's memory budget, shared by the runner and every
+	// sibling: siblings already live under the job parent cgroup (it is the
+	// cgroup containerd derives from the job's namespace), so applying the
+	// budget means writing it on that parent before each sibling starts.
+	// Zero means no limit. See pkg/jobcgroup.
+	MemoryLimit jobcgroup.Limits
+
 	// RegistryMirror routes this job's image pulls through a LAN
 	// pull-through cache. Nil disables mirroring, leaving the pulls
 	// identical to what they were before the feature existed.
@@ -251,7 +260,8 @@ func New(cfg Config) (*Server, error) {
 		runnerNetNS:     cfg.RunnerNetNS,
 		allowPrivileged: cfg.AllowPrivileged,
 		pidsLimit:       cfg.PidsLimit,
-		stager:         newBindStager(cfg.DataDir, cfg.JobID, cfg.Log),
+		memoryLimit:     cfg.MemoryLimit,
+		stager:          newBindStager(cfg.DataDir, cfg.JobID, cfg.Log),
 		mirror:          cfg.RegistryMirror,
 		resultsURL:      cfg.ResultsURL,
 		log:             cfg.Log.With("component", "dind", "job_id", cfg.JobID),

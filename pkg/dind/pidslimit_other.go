@@ -2,10 +2,20 @@
 
 package dind
 
-import "github.com/containerd/containerd/v2/pkg/oci"
+import (
+	"log/slog"
+
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/ephpm/ephemerd/pkg/jobcgroup"
+)
 
 // pidsLimitOpts is a no-op off Linux: pids.max is a Linux cgroup control, and
 // dind siblings only run on Linux (see nonPrivilegedHardeningOpts).
 func pidsLimitOpts(_ int64) []oci.SpecOpts {
+	return nil
+}
+
+// jobMemoryOpts is a no-op off Linux, for the same reason.
+func jobMemoryOpts(_ string, _ jobcgroup.Limits, _ *slog.Logger) []oci.SpecOpts {
 	return nil
 }

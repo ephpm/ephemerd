@@ -1,4 +1,4 @@
-﻿package config
+package config
 
 import (
 	"bytes"
@@ -2515,6 +2515,43 @@ func TestRuntimeConfig_ResolvedPidsLimit(t *testing.T) {
 	} {
 		if got := (RuntimeConfig{PidsLimit: tc.in}).ResolvedPidsLimit(); got != tc.want {
 			t.Errorf("ResolvedPidsLimit(%d) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestRuntimeConfig_ResolvedMemoryLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		in                RuntimeConfig
+		wantMax, wantHigh int64
+	}{
+		{"unset: no limit", RuntimeConfig{}, 0, 0},
+		{"default soft limit", RuntimeConfig{MemoryLimitMB: 16384}, 16 << 30, (16 << 30) * DefaultMemoryHighPercent / 100},
+		{"explicit percent", RuntimeConfig{MemoryLimitMB: 1000, MemoryHighPercent: 50}, 1000 << 20, 500 << 20},
+		{"100 percent: no soft limit", RuntimeConfig{MemoryLimitMB: 2048, MemoryHighPercent: 100}, 2048 << 20, 0},
+	} {
+		gotMax, gotHigh := tc.in.ResolvedMemoryLimit()
+		if gotMax != tc.wantMax || gotHigh != tc.wantHigh {
+			t.Errorf("%s: ResolvedMemoryLimit() = (%d, %d), want (%d, %d)", tc.name, gotMax, gotHigh, tc.wantMax, tc.wantHigh)
+		}
+	}
+}
+
+func TestRuntimeConfig_ValidateMemoryLimit(t *testing.T) {
+	for _, tc := range []struct {
+		in      RuntimeConfig
+		wantErr bool
+	}{
+		{RuntimeConfig{}, false},
+		{RuntimeConfig{MemoryLimitMB: 16384}, false},
+		{RuntimeConfig{MemoryLimitMB: 16384, MemoryHighPercent: 85}, false},
+		{RuntimeConfig{MemoryLimitMB: 16}, true}, // GB typed as MB
+		{RuntimeConfig{MemoryLimitMB: -1}, true},
+		{RuntimeConfig{MemoryLimitMB: 4096, MemoryHighPercent: 40}, true},
+		{RuntimeConfig{MemoryLimitMB: 4096, MemoryHighPercent: 101}, true},
+	} {
+		if err := tc.in.validate(); (err != nil) != tc.wantErr {
+			t.Errorf("validate(%+v) = %v, wantErr %v", tc.in, err, tc.wantErr)
 		}
 	}
 }
