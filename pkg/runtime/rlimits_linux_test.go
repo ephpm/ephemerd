@@ -4,10 +4,13 @@ package runtime
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"testing"
 
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/ephpm/ephemerd/pkg/config"
+	"github.com/ephpm/ephemerd/pkg/jobcgroup"
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -122,5 +125,37 @@ func TestPidsLimitOpts(t *testing.T) {
 	}
 	if opts := pidsLimitOpts(0); len(opts) != 0 {
 		t.Errorf("pidsLimitOpts(0) returned %d opts, want none", len(opts))
+	}
+}
+
+// TestJobCgroupOpts: with a job memory budget the runner moves under the
+// job parent cgroup (so one memory.max covers it and its dind siblings);
+// without one, or when the parent cannot be prepared, it keeps its default
+// cgroup.
+func TestJobCgroupOpts(t *testing.T) {
+	old := ensureJobCgroup
+	t.Cleanup(func() { ensureJobCgroup = old })
+	limits := jobcgroup.Limits{MaxBytes: 1 << 30}
+
+	apply := func(opts []oci.SpecOpts) *oci.Spec {
+		spec := &oci.Spec{Linux: &ocispec.Linux{CgroupsPath: "/ephemerd/job-1"}}
+		for _, opt := range opts {
+			if err := opt(context.Background(), nil, nil, spec); err != nil {
+				t.Fatalf("opt: %v", err)
+			}
+		}
+		return spec
+	}
+
+	ensureJobCgroup = func(string, string, jobcgroup.Limits) error { return nil }
+	if got := apply(jobCgroupOpts("job-1", limits, slog.Default())).Linux.CgroupsPath; got != jobcgroup.RunnerPath("job-1") {
+		t.Errorf("CgroupsPath = %q, want %q", got, jobcgroup.RunnerPath("job-1"))
+	}
+	if opts := jobCgroupOpts("job-1", jobcgroup.Limits{}, slog.Default()); len(opts) != 0 {
+		t.Errorf("no budget produced %d opts, want none", len(opts))
+	}
+	ensureJobCgroup = func(string, string, jobcgroup.Limits) error { return errors.New("read-only cgroupfs") }
+	if got := apply(jobCgroupOpts("job-1", limits, slog.Default())).Linux.CgroupsPath; got != "/ephemerd/job-1" {
+		t.Errorf("CgroupsPath after a failed Ensure = %q, want the default kept (fail-open)", got)
 	}
 }

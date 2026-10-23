@@ -22,6 +22,7 @@ import (
 	"github.com/ephpm/ephemerd/pkg/dind"
 	"github.com/ephpm/ephemerd/pkg/github"
 	"github.com/ephpm/ephemerd/pkg/imagegc"
+	"github.com/ephpm/ephemerd/pkg/jobcgroup"
 	"github.com/ephpm/ephemerd/pkg/metrics"
 	"github.com/ephpm/ephemerd/pkg/networking"
 	"github.com/ephpm/ephemerd/pkg/providers"
@@ -361,6 +362,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 			DindAllowPrivileged: cfg.Dind.ResolvedAllowPrivileged(),
 			Rlimits:             cfg.Runtime.Rlimits.Resolved(),
 			PidsLimit:           cfg.Runtime.ResolvedPidsLimit(),
+			MemoryLimit:         memoryLimit(cfg.Runtime),
 			AllowNewPrivileges:  cfg.Runtime.ResolvedAllowNewPrivileges(),
 			LinuxRuntime:        cfg.Runner.Linux.ContainerdRuntime(),
 			Network:             net,
@@ -685,6 +687,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		CacheProxyMounts:    cacheProxyMounts,
 		Rlimits:             cfg.Runtime.Rlimits.Resolved(),
 		PidsLimit:           cfg.Runtime.ResolvedPidsLimit(),
+		MemoryLimit:         memoryLimit(cfg.Runtime),
 		AllowNewPrivileges:  cfg.Runtime.ResolvedAllowNewPrivileges(),
 		LinuxRuntime:        cfg.Runner.Linux.ContainerdRuntime(),
 		Network:             net,
@@ -1143,9 +1146,23 @@ func buildkitGCConfig(cfg *config.Config) buildkit.GCConfig {
 //
 // Errors from one pass are logged and the loop continues; the next tick
 // retries.
+// memoryLimit resolves [runtime] memory_limit_mb / memory_high_percent into
+// the job cgroup budget the runtime and dind apply.
+func memoryLimit(r config.RuntimeConfig) jobcgroup.Limits {
+	maxBytes, highBytes := r.ResolvedMemoryLimit()
+	return jobcgroup.Limits{MaxBytes: maxBytes, HighBytes: highBytes}
+}
+
+// jobCgroupSweepGrace is how long an empty job parent cgroup must sit
+// unchanged before the periodic sweep removes it. Teardown removes a job's
+// own parent; the sweep is the backstop for jobs that never reached teardown
+// (daemon crash, host reboot) and for the backlog older daemons left.
+const jobCgroupSweepGrace = 10 * time.Minute
+
 func runNodeDiskSweeper(ctx context.Context, gc *imagegc.Collector, rt *runtime.Runtime, c *containerdclient.Client, interval time.Duration, repair brokenChainRepair, log *slog.Logger) {
 	log = log.With("component", "node-disk-sweeper", "interval", interval)
 	log.Info("starting node disk sweeper")
+	jobcgroup.Sweep(jobCgroupSweepGrace, log)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -1169,6 +1186,7 @@ func runNodeDiskSweeper(ctx context.Context, gc *imagegc.Collector, rt *runtime.
 				}
 			}
 			sweepDeadBuildRecords(passCtx, c, log)
+			jobcgroup.Sweep(jobCgroupSweepGrace, log)
 			// Correctness repair, not capacity policy — so it runs on
 			// every tick whether or not image GC is enabled, and before
 			// the collector, which would otherwise plan against records
