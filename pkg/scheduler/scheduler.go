@@ -2153,14 +2153,18 @@ func (s *Scheduler) handleInProgress(event providers.JobEvent) {
 	s.mu.Lock()
 	rb, owned := s.runners[name]
 	var intentKey jobKey
+	already := false
 	if owned {
+		// Polling reports a running job on every poll, not once like the
+		// webhook does; the first report did the binding.
+		already = rb.bound && rb.boundKey == key
 		rb.bound = true
 		rb.boundKey = key
 		intentKey = rb.intentKey
 	}
 	s.mu.Unlock()
 
-	if !owned {
+	if !owned || already {
 		return
 	}
 	// The job that ACTUALLY took this runner decides its cache scope.

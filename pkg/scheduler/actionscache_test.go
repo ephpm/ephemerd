@@ -8,6 +8,7 @@ import (
 	goruntime "runtime"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ephpm/ephemerd/pkg/providers"
 )
@@ -104,5 +105,53 @@ func TestBindActionsCache_LookupFailureLeavesUnbound(t *testing.T) {
 	s.bindActionsCache(providers.JobEvent{Provider: scoper, RunID: 1, Repo: "r"}, "r1")
 	if _, ok := ac.bound["r1"]; ok {
 		t.Fatal("a failed scope lookup still bound a scope")
+	}
+}
+
+// countingScoper counts scope lookups, each of which is a GitHub API call.
+type countingScoper struct {
+	*mockProvider
+	mu sync.Mutex
+	n  int
+}
+
+func (p *countingScoper) CacheScope(context.Context, *providers.JobEvent) (providers.CacheScope, error) {
+	p.mu.Lock()
+	p.n++
+	p.mu.Unlock()
+	return providers.CacheScope{Repo: "o/r", Write: "refs/heads/main", Reads: []string{"refs/heads/main"}}, nil
+}
+
+// Polling reports a running job on every poll, not once like a webhook.
+// The binding — one API lookup — must happen on the first report only.
+func TestHandleInProgress_RepeatedReportsBindOnce(t *testing.T) {
+	ac := newFakeActionsCache()
+	prov := &countingScoper{mockProvider: newMockProvider("github")}
+	s := New(Config{Providers: []providers.Provider{prov}, ActionsCache: ac, Log: quietLogger()})
+	key := jobKey{Provider: prov.Name(), JobID: 7}
+	s.mu.Lock()
+	s.runners["r1"] = &runnerBinding{intentKey: key}
+	s.mu.Unlock()
+
+	ev := providers.JobEvent{Provider: prov, Action: "in_progress", Repo: "r", JobID: 7, RunnerName: "r1"}
+	for i := 0; i < 5; i++ {
+		s.handleInProgress(ev)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ac.mu.Lock()
+		_, bound := ac.bound["r1"]
+		ac.mu.Unlock()
+		if bound || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // let any duplicate binding goroutine run
+	prov.mu.Lock()
+	n := prov.n
+	prov.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("scope looked up %d times for one job; want 1", n)
 	}
 }
