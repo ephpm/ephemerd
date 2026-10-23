@@ -51,6 +51,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/ephpm/ephemerd/pkg/proxies"
 )
 
 // Config configures the cache server.
@@ -223,7 +225,13 @@ func (p *Proxy) Start() error {
 	p.cancel = cancel
 	p.probe(ctx)
 
-	ln, err := net.Listen("tcp", p.cfg.ListenAddr)
+	// proxies.Listen, not net.Listen: the gateway address only exists once
+	// the first job container brings the CNI bridge up, which is after the
+	// daemon starts this server — a plain bind fails with EADDRNOTAVAIL on
+	// every fresh start. The wildcard fallback is safe here because the
+	// server attributes every request to a job by source IP and refuses the
+	// rest; the advertised URL is AdvertiseBase, never the bound address.
+	ln, err := proxies.Listen(p.cfg.ListenAddr, p.log)
 	if err != nil {
 		cancel()
 		return fmt.Errorf("actionscache: listen %s: %w", p.cfg.ListenAddr, err)

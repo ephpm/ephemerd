@@ -562,3 +562,34 @@ func TestNaming(t *testing.T) {
 		}
 	}
 }
+
+// TestStart_BeforeTheBridgeExists pins the fresh-boot case found on a live
+// run: the daemon starts this server before any job has brought the CNI
+// bridge (and so the gateway IP) up, and a plain bind failed with
+// "cannot assign requested address", leaving every job on GitHub's cache.
+// 192.0.2.1 (TEST-NET-1) is never assigned locally, so Start must fall back
+// to the wildcard on the same port rather than fail.
+func TestStart_BeforeTheBridgeExists(t *testing.T) {
+	reg, _ := newFakeRegistry(t)
+	regSrv := httptest.NewServer(reg)
+	t.Cleanup(regSrv.Close)
+	p, err := New(Config{
+		ListenAddr:       "192.0.2.1:0",
+		AdvertiseBase:    "http://192.0.2.1:8089",
+		Registry:         regSrv.URL,
+		RegistryUser:     "cache",
+		RegistryPassword: "s3cret",
+		HealthInterval:   -1,
+		JobForIP:         func(string) string { return "" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(); err != nil {
+		t.Fatalf("Start with the gateway address not yet assigned: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+	if got := p.ResultsURL(); got != "http://192.0.2.1:8089/" {
+		t.Errorf("ResultsURL = %q; it must stay the advertised gateway, not the wildcard bind", got)
+	}
+}
