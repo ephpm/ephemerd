@@ -34,6 +34,10 @@ type darwinMacOSVM struct {
 	done      chan struct{}
 	stopOnce  sync.Once // Stop is idempotent: the provisioning watchdog and the
 	// normal teardown path can both call it.
+	diskGrown bool // the clone was extended before boot; the guest container still has to follow
+	// guestTuned records that the one-shot guest tweaks (disk grow, brew
+	// untap) ran. setupRunnerViaSSH is retried on failure; these must not be.
+	guestTuned bool
 }
 
 // NewMacOSVM creates a new per-job macOS VM. Call Start() to boot it.
@@ -49,6 +53,9 @@ func NewMacOSVM(cfg MacOSVMConfig, jobID string) (MacOSVM, error) {
 
 	jobDir := filepath.Join(cfg.DataDir, "vm", "macos", "jobs", jobID)
 
+	// Owned from here until stop() has removed everything (see macos_clones.go):
+	// the stale-clone sweep must never touch this id's files in between.
+	registerMacVM(jobID)
 	return &darwinMacOSVM{
 		cfg:    cfg,
 		id:     jobID,
@@ -82,7 +89,7 @@ func (m *darwinMacOSVM) WriteJITConfig(encodedJIT string) error {
 	return nil
 }
 
-func (m *darwinMacOSVM) Start(ctx context.Context) error {
+func (m *darwinMacOSVM) Start(ctx context.Context) (err error) {
 	// Clone-on-write copy of the base image for this job.
 	// APFS clones are near-instant — no data is copied until writes occur.
 	cloneDir := filepath.Join(m.cfg.DataDir, "vm", "macos", "jobs")
@@ -92,6 +99,15 @@ func (m *darwinMacOSVM) Start(ctx context.Context) error {
 
 	m.clonePath = filepath.Join(cloneDir, m.id+".img")
 	m.auxPath = filepath.Join(cloneDir, m.id+".aux")
+	// A boot that fails after the clones exist removes them here, without
+	// relying on the caller's Stop. Before vm.Start there is no guest that
+	// could have them open, so this is plain cleanup; stop() repeats it
+	// harmlessly.
+	defer func() {
+		if err != nil && m.vm == nil {
+			removeMacVMFiles([]string{m.clonePath, m.auxPath}, nil, m.cfg.Log)
+		}
+	}()
 
 	// Use APFS clone (cp -c) for instant copy-on-write
 	if err := apfsCopy(ctx, m.cfg.DiskImage, m.clonePath, m.cfg.Log); err != nil {
@@ -102,6 +118,7 @@ func (m *darwinMacOSVM) Start(ctx context.Context) error {
 	if err := apfsCopy(ctx, files.AuxStorage, m.auxPath, m.cfg.Log); err != nil {
 		return fmt.Errorf("copying aux storage: %w", err)
 	}
+	m.growClone()
 
 	// Ensure job shared directory exists for JIT config exchange
 	if err := os.MkdirAll(m.jobDir, 0o755); err != nil {
@@ -723,6 +740,15 @@ func (m *darwinMacOSVM) setupRunnerViaSSH(ctx context.Context, ip string) error 
 		m.cfg.Log.Warn("chown failed", "output", string(out), "error", err)
 	}
 
+	// Before the runner starts, so the job sees the full disk from its first step.
+	if !m.guestTuned {
+		m.guestTuned = true
+		if m.diskGrown {
+			m.growGuestDisk(ctx, client)
+		}
+		m.untapBuildkite(ctx, client)
+	}
+
 	// Read JIT config to pass inline via SSH
 	jitData, err := os.ReadFile(filepath.Join(m.jobDir, ".jit_config"))
 	if err != nil {
@@ -858,6 +884,70 @@ func (m *darwinMacOSVM) stageProxyEnv(ctx context.Context, client *ssh.Client) {
 	}
 }
 
+// growClone extends this job's disk clone to the configured size (step 1 in
+// macos_disk.go). Sparse, so it is instant and costs no host disk until the
+// guest writes. Failure leaves the clone as it was and the job on the base
+// image's size.
+func (m *darwinMacOSVM) growClone() {
+	if m.cfg.DiskSizeGB == 0 {
+		return
+	}
+	fi, err := os.Stat(m.clonePath)
+	if err != nil {
+		m.cfg.Log.Warn("cannot grow macOS VM disk; job keeps the base image size", "id", m.id, "error", err)
+		return
+	}
+	size, grow := macOSDiskGrowBytes(fi.Size(), m.cfg.DiskSizeGB)
+	if !grow {
+		return
+	}
+	if err := os.Truncate(m.clonePath, size); err != nil {
+		m.cfg.Log.Warn("cannot grow macOS VM disk; job keeps the base image size", "id", m.id, "error", err)
+		return
+	}
+	m.diskGrown = true
+	m.cfg.Log.Info("grew macOS VM disk clone", "id", m.id, "from_bytes", fi.Size(), "to_gib", m.cfg.DiskSizeGB)
+}
+
+// growGuestDisk grows the guest's boot container into the space growClone
+// added (step 2 in macos_disk.go). Best-effort: every failure is a WARN and
+// the job runs on the smaller disk.
+func (m *darwinMacOSVM) growGuestDisk(ctx context.Context, client *ssh.Client) {
+	info, err := runSSHCommand(ctx, client, macOSDiskInfoCmd, sshCommandTimeout)
+	if err != nil {
+		m.cfg.Log.Warn("cannot read the macOS VM's disk layout; job keeps the base image size", "id", m.id, "error", err)
+		return
+	}
+	store, whole, err := parseAPFSPhysicalStore(string(info))
+	if err != nil {
+		m.cfg.Log.Warn("cannot find the macOS VM's boot container; job keeps the base image size", "id", m.id, "error", err)
+		return
+	}
+	out, err := runSSHCommand(ctx, client, macOSDiskGrowScript(whole, store), macOSDiskGrowTimeout)
+	status := strings.TrimSpace(string(out))
+	if err != nil || !strings.Contains(status, "resize=ok") {
+		m.cfg.Log.Warn("growing the macOS VM's boot container failed; job keeps the base image size",
+			"id", m.id, "store", store, "status", status, "error", err)
+		return
+	}
+	m.cfg.Log.Info("grew macOS VM boot container", "id", m.id, "store", store, "status", status)
+}
+
+// untapBuildkite drops the base image's untrusted buildkite/buildkite tap
+// (see macOSBrewUntapScript). Purely cosmetic for the job, so failures are
+// debug-level.
+func (m *darwinMacOSVM) untapBuildkite(ctx context.Context, client *ssh.Client) {
+	out, err := runSSHCommand(ctx, client, macOSBrewUntapScript, macOSBrewUntapTimeout)
+	status := strings.TrimSpace(string(out))
+	if err != nil || status == "untap-failed" {
+		m.cfg.Log.Debug("could not untap buildkite/buildkite in the macOS VM", "id", m.id, "status", status, "error", err)
+		return
+	}
+	if status == "untapped" {
+		m.cfg.Log.Info("untapped buildkite/buildkite in the macOS VM", "id", m.id)
+	}
+}
+
 func (m *darwinMacOSVM) Stop() {
 	m.stopOnce.Do(m.stop)
 }
@@ -865,44 +955,45 @@ func (m *darwinMacOSVM) Stop() {
 func (m *darwinMacOSVM) stop() {
 	m.cfg.Log.Info("stopping macOS VM", "id", m.id)
 
-	if m.vm != nil {
-		if m.vm.CanRequestStop() {
-			if _, err := m.vm.RequestStop(); err != nil {
-				m.cfg.Log.Debug("RequestStop failed", "id", m.id, "error", err)
-			}
-		}
-
-		select {
-		case <-m.done:
-		case <-time.After(15 * time.Second):
-			m.cfg.Log.Warn("macOS VM did not stop gracefully, forcing", "id", m.id)
-			if err := m.vm.Stop(); err != nil {
-				m.cfg.Log.Warn("force stop failed", "id", m.id, "error", err)
-			}
-		}
-	}
+	// The clones and the share go whether or not Virtualization.framework
+	// ever lets go of the guest: when this used to wait for the stop and
+	// delete afterwards, every wedged stop (#196) leaked a full disk clone
+	// for good. See macos_clones.go.
+	//
+	// Stop itself still returns only once the guest is really stopped. The
+	// scheduler's abandoned-VM accounting depends on that: a Stop that
+	// returns is how it learns a guest stopped holding RAM, and returning
+	// early for a wedged guest would let the cap admit VMs the host cannot
+	// hold.
+	_, stopped := teardownMacVMFiles(m.stopGuest, macVMStopBound,
+		[]string{m.clonePath, m.auxPath}, []string{m.jobDir}, m.cfg.Log)
+	<-stopped
 
 	if m.cancel != nil {
 		m.cancel()
 	}
-
-	// Delete the clones
-	for _, path := range []string{m.clonePath, m.auxPath} {
-		if path != "" {
-			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-				m.cfg.Log.Warn("failed to remove VM clone", "path", path, "error", err)
-			}
-		}
-	}
-
-	// Clean up the job shared directory
-	if m.jobDir != "" {
-		if err := os.RemoveAll(m.jobDir); err != nil {
-			m.cfg.Log.Warn("failed to remove job directory", "path", m.jobDir, "error", err)
-		}
-	}
-
+	unregisterMacVM(m.id)
 	m.cfg.Log.Info("macOS VM destroyed", "id", m.id)
+}
+
+// stopGuest asks the guest to shut down and forces it after 15 s.
+func (m *darwinMacOSVM) stopGuest() {
+	if m.vm == nil {
+		return
+	}
+	if m.vm.CanRequestStop() {
+		if _, err := m.vm.RequestStop(); err != nil {
+			m.cfg.Log.Debug("RequestStop failed", "id", m.id, "error", err)
+		}
+	}
+	select {
+	case <-m.done:
+	case <-time.After(15 * time.Second):
+		m.cfg.Log.Warn("macOS VM did not stop gracefully, forcing", "id", m.id)
+		if err := m.vm.Stop(); err != nil {
+			m.cfg.Log.Warn("force stop failed", "id", m.id, "error", err)
+		}
+	}
 }
 
 // apfsCopy uses APFS clone-on-write (cp -c) for instant copies, falling

@@ -1294,6 +1294,12 @@ type MacOSVMToml struct {
 	MemoryMB      uint64 `toml:"memory_mb"`      // memory per VM in MB (default: 8192)
 	MaxConcurrent int    `toml:"max_concurrent"` // max simultaneous macOS VMs (default: auto-detected from host CPUs)
 
+	// DiskSizeGB grows each job's disk to this many GiB. 0 (the default)
+	// keeps the base image's size. The clone is sparse, so host disk is only
+	// spent as the guest writes. A value not larger than the base image is
+	// ignored with a warning — the disk is never shrunk. See pkg/vm/macos_disk.go.
+	DiskSizeGB uint64 `toml:"disk_size_gb"`
+
 	// ProvisionTimeout bounds the pre-registration provisioning phase of a
 	// macOS VM job (boot + wait for the runner to become reachable). If a VM
 	// has not registered its runner within this window it is force-stopped and

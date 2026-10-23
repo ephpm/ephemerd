@@ -4,11 +4,16 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
+
+	"github.com/ephpm/ephemerd/pkg/vm"
 )
 
 func platformChecks(pass, warn, fail func(string)) {
@@ -125,25 +130,17 @@ func checkEmbeddedAssets(pass, warn, fail func(string)) {
 }
 
 func platformCleanup(dataDir string, pass, warn, fail func(string)) {
-	// Clean stale VM clone directories
-	clonesDir := fmt.Sprintf("%s/vm/macos/jobs", dataDir)
-	if entries, err := os.ReadDir(clonesDir); err == nil {
-		removed := 0
-		for _, e := range entries {
-			if !e.IsDir() {
-				continue
-			}
-			path := fmt.Sprintf("%s/%s", clonesDir, e.Name())
-			if err := os.RemoveAll(path); err != nil {
-				warn(fmt.Sprintf("could not remove stale VM clone %s: %v", e.Name(), err))
-			} else {
-				removed++
-			}
-		}
-		if removed > 0 {
-			pass(fmt.Sprintf("removed %d stale macOS VM clone(s)", removed))
-		} else {
-			pass("no stale macOS VM clones")
-		}
+	// Clean stale VM clones: the per-job share directories AND the <id>.img /
+	// <id>.aux disk clones next to them. Only the directories used to go,
+	// which left the multi-GB disk clones behind. Doctor only cleans with the
+	// daemon stopped, so nothing here can belong to a running VM — no age gate.
+	res := vm.SweepStaleMacOSClones(dataDir, nil, 0, time.Now(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	for _, f := range res.Failed {
+		warn("could not remove stale VM clone " + f)
+	}
+	if res.Removed > 0 {
+		pass(fmt.Sprintf("removed %d stale macOS VM clone(s), %.1f GB", res.Removed, float64(res.FreedBytes)/1e9))
+	} else if len(res.Failed) == 0 {
+		pass("no stale macOS VM clones")
 	}
 }
