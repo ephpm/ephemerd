@@ -1,0 +1,176 @@
+name: Runner Bump
+
+# Keeps ephemerd's embedded GitHub Actions runner current. GitHub deprecates
+# old runner versions and then refuses their connections, which silently stalls
+# every job on the affected pool (the macOS pool once ran ZERO jobs for a week on
+# a stale runner), so this must not depend on someone remembering to bump it.
+#
+# Daily, it asks the GitHub release API for the newest non-draft,
+# non-prerelease actions/runner release. If that is newer than RunnerVersion in
+# mage/download/download.go, `go run ./mage/runnerbump` rewrites every pin site
+# (RunnerVersion, the five runner entries of pinnedSHA256, and ARG
+# RUNNER_VERSION in images/runner-ci-*/Dockerfile) with checksums taken from
+# the release API's per-asset `digest` field, and this job opens a PR. It never
+# merges: review and merge stay manual.
+#
+# Idempotency: one fixed branch, bot/actions-runner-bump, regenerated from main
+# on every run. No new release -> nothing happens. Same release as the open PR
+# -> nothing is pushed (so CI is not retriggered on the self-hosted fleet). A
+# newer release -> the branch is force-pushed and the existing PR is retitled
+# and re-described rather than a second one opened. If main reaches the latest
+# release some other way (a manual bump), the stale bot PR is closed. The
+# branch is machine-owned: do not push commits to it, they will be overwritten.
+#
+# Token: PRs opened with the default GITHUB_TOKEN do not trigger CI (GitHub's
+# recursion guard), and the ephpm org also has "Allow GitHub Actions to create
+# and approve pull requests" switched off, so the default token cannot open the
+# PR at all. Configure a GitHub App and this job uses its installation token
+# instead, which both opens the PR and lets ci.yml run on it:
+#   - repo or org variable  BOT_APP_CLIENT_ID    the App's Client ID
+#   - repo or org secret    BOT_APP_PRIVATE_KEY  a private key (.pem) of the App
+# The App needs Contents: read & write and Pull requests: read & write, and must
+# be installed on ephpm/ephemerd. Without those, the job falls back to
+# GITHUB_TOKEN: it still pushes the branch, and fails with instructions if the
+# PR cannot be opened.
+#
+# Runs on GitHub-hosted ubuntu-latest so it never takes a slot on the
+# self-hosted fleet.
+
+on:
+  schedule:
+    # Daily, off the top of the hour.
+    - cron: "23 7 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact actions/runner version to bump to (e.g. 2.338.0). Empty = latest stable release."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: runner-bump
+  cancel-in-progress: false
+
+env:
+  BRANCH: bot/actions-runner-bump
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Mint GitHub App token
+        id: app
+        if: vars.BOT_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.BOT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ steps.app.outputs.token || github.token }}
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          # runnerbump is stdlib-only; restoring the repo's module cache would
+          # cost more than it saves.
+          cache: false
+
+      - name: Bump the runner pins if a newer release exists
+        id: bump
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version || '' }}
+        run: |
+          set -euo pipefail
+          go run ./mage/runnerbump -version "$VERSION" -body-out "$RUNNER_TEMP/pr-body.md"
+
+      - name: Validate the edit
+        if: steps.bump.outputs.bump == 'true'
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l mage/)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt reports unformatted files after the bump: $unformatted"
+            exit 1
+          fi
+          go build ./mage/...
+          git --no-pager diff --stat
+
+      - name: Open or update the bump PR
+        if: steps.bump.outputs.bump == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          USING_APP: ${{ steps.app.outputs.token && 'true' || 'false' }}
+          CURRENT: ${{ steps.bump.outputs.current }}
+          LATEST: ${{ steps.bump.outputs.latest }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+
+          files=(mage/download/download.go images/runner-ci-linux/Dockerfile images/runner-ci-macos/Dockerfile images/runner-ci-windows/Dockerfile)
+          title="fix(runner): bump embedded actions runner to ${LATEST}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add "${files[@]}"
+          git commit -q -m "$title" \
+            -m "Bump the embedded actions/runner from ${CURRENT} to ${LATEST}: RunnerVersion and the five runner pinnedSHA256 entries in mage/download/download.go, and ARG RUNNER_VERSION in the CI runner images. Checksums are the release API's asset digests." \
+            -m "Automated by .github/workflows/runner-bump.yml." \
+            || fail "nothing to commit after the bump; runnerbump and this list of files are out of step"
+
+          # Push only when the bumped files differ from what the bot branch
+          # already carries, so a rerun for the same release is a no-op and
+          # does not retrigger CI.
+          if git fetch -q --depth=1 origin "refs/heads/${BRANCH}" 2>/dev/null \
+             && git diff --quiet FETCH_HEAD HEAD -- "${files[@]}"; then
+            echo "${BRANCH} already carries runner ${LATEST}; not pushing"
+          else
+            git push --force origin "HEAD:refs/heads/${BRANCH}" || fail "pushing ${BRANCH} failed"
+            echo "pushed ${BRANCH} (runner ${LATEST})"
+          fi
+
+          pr=$(gh pr list --head "$BRANCH" --base main --state open --json number --jq '.[0].number // empty')
+          if [ -n "$pr" ]; then
+            gh pr edit "$pr" --title "$title" --body-file "$RUNNER_TEMP/pr-body.md" \
+              || fail "updating PR #${pr} failed"
+            echo "::notice::updated PR #${pr} for runner ${LATEST}"
+            exit 0
+          fi
+
+          if ! gh pr create --base main --head "$BRANCH" --title "$title" --body-file "$RUNNER_TEMP/pr-body.md"; then
+            compare="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/main...${BRANCH}?expand=1"
+            if [ "$USING_APP" != "true" ]; then
+              fail "could not open the PR with GITHUB_TOKEN. Set the BOT_APP_CLIENT_ID variable and BOT_APP_PRIVATE_KEY secret (see the header of runner-bump.yml), or enable 'Allow GitHub Actions to create and approve pull requests' in the repo's Actions settings. The branch is pushed; open it by hand: ${compare}"
+            fi
+            fail "opening the PR failed; the branch is pushed: ${compare}"
+          fi
+          echo "::notice::opened a PR for runner ${LATEST}"
+
+      - name: Close a bot PR that main has caught up with
+        # Only on unpinned runs: a dispatch for an older explicit version must
+        # not close a PR for a newer one.
+        if: steps.bump.outputs.bump == 'false' && !inputs.version
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          CURRENT: ${{ steps.bump.outputs.current }}
+        run: |
+          set -euo pipefail
+          pr=$(gh pr list --head "$BRANCH" --base main --state open --json number --jq '.[0].number // empty')
+          if [ -z "$pr" ]; then
+            echo "no open bot PR; nothing to do"
+            exit 0
+          fi
+          gh pr close "$pr" --delete-branch \
+            --comment "main is already on actions/runner ${CURRENT}, the latest stable release, so this bump is no longer needed."
+          echo "::notice::closed stale PR #${pr}"

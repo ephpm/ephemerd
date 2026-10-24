@@ -57,7 +57,10 @@ const (
 //
 // Hashes are the upstream-published checksums for the versions pinned in the
 // const block above:
-//   - runner:        release body "SHA" markers (github.com/actions/runner)
+//   - runner:        the release API's per-asset "digest" (github.com/actions/runner),
+//     cross-checked against the release body "SHA" markers. Bumped
+//     automatically by .github/workflows/runner-bump.yml via mage/runnerbump;
+//     keep the runner pin sites in the shape runnerbump expects.
 //   - cni:           <asset>.tgz.sha256
 //   - containerd:    <asset>.tar.gz.sha256sum
 //   - runc:          runc.sha256sum (per-arch runc.<arch> lines)
