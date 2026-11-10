@@ -128,6 +128,12 @@ func TestStoreExtractSwapRollbackPrune(t *testing.T) {
 	if err := s.Swap(shaC, "2.339.0"); err != nil {
 		t.Fatal(err)
 	}
+	// Something that is not one of this store's extractions (a per-job
+	// overlay upper that landed here by mistake) must survive a prune.
+	foreign := filepath.Join(s.extractedRoot(), "job-0123", "upper", "_work")
+	if err := os.MkdirAll(foreign, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.Prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -137,6 +143,9 @@ func TestStoreExtractSwapRollbackPrune(t *testing.T) {
 	}
 	if _, err := os.Stat(dirA); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("pruned extraction still present: %v", err)
+	}
+	if _, err := os.Stat(foreign); err != nil {
+		t.Fatalf("prune removed a foreign entry under extracted/: %v", err)
 	}
 
 	// Rollback: B current, C previous.

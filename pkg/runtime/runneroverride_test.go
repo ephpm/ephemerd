@@ -1,6 +1,9 @@
 package runtime
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 type fakeOverride struct {
 	dir string
@@ -21,7 +24,8 @@ func TestPlanRunnerMount(t *testing.T) {
 
 	// Historical behaviour, untouched: custom image mounts the configured
 	// runner; official image on Linux mounts nothing; Windows always mounts.
-	if p := planRunnerMount(true, "linux", cfgDir, cfgMount, nil, "foo/bar:1"); !p.needsMount || p.dir != cfgDir || p.mount != cfgMount || p.override {
+	runnersRoot := filepath.Dir(cfgDir)
+	if p := planRunnerMount(true, "linux", cfgDir, cfgMount, nil, "foo/bar:1"); !p.needsMount || p.dir != cfgDir || p.mount != cfgMount || p.jobRoot != runnersRoot || p.override {
 		t.Fatalf("custom: %+v", p)
 	}
 	if p := planRunnerMount(false, "linux", cfgDir, cfgMount, nil, official); p.needsMount {
@@ -45,6 +49,15 @@ func TestPlanRunnerMount(t *testing.T) {
 	}
 	if engaged.got != official {
 		t.Fatalf("source asked about %q", engaged.got)
+	}
+	// The per-job writable tree stays under the configured runners dir,
+	// never beside the override lowerdir inside the verified store (which
+	// Prune would delete and the orphan sweep would never see).
+	if p.jobRoot != runnersRoot {
+		t.Fatalf("engaged jobRoot = %q, want %q", p.jobRoot, runnersRoot)
+	}
+	if p := planRunnerMount(false, "linux", "", "", engaged, official); p.jobRoot != filepath.Dir(engaged.dir) {
+		t.Fatalf("engaged without configured runner: jobRoot = %q", p.jobRoot)
 	}
 	// A custom image is never masked even with an override engaged: it
 	// already gets the configured runner at /actions-runner.

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	goruntime "runtime"
 	"strings"
 	"sync"
@@ -77,6 +78,10 @@ const (
 	tmpPrefix       = ".tmp-"
 	extractedMarker = ".extracted"
 )
+
+// extractedNameRe matches the directory names extractedDir produces
+// ("2.338.2-linux"); Prune deletes nothing that does not match.
+var extractedNameRe = regexp.MustCompile(`^\d+\.\d+\.\d+-[a-z0-9]+$`)
 
 // NewStore creates a store rooted at <dataDir>/runners/verified. Init must
 // be called before use.
@@ -477,6 +482,13 @@ func (s *Store) Prune() error {
 	for _, d := range dirs {
 		p := filepath.Join(s.extractedRoot(), d.Name())
 		if keepDir[filepath.Clean(p)] {
+			continue
+		}
+		// Only this store's own "<version>-<goos>" extractions are ours to
+		// delete. Anything else under the root (a per-job tree created in
+		// the wrong place, an operator's file) is reported, never removed.
+		if !extractedNameRe.MatchString(d.Name()) {
+			s.log.Warn("foreign entry under the runner store's extracted root; leaving it", "path", p)
 			continue
 		}
 		if err := os.RemoveAll(p); err != nil {

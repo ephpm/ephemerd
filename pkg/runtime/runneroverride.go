@@ -1,5 +1,7 @@
 package runtime
 
+import "path/filepath"
+
 // Self-healing runner version: the official-image override seam.
 //
 // For an official runner image (isOfficialRunnerImage) the container runs
@@ -34,6 +36,15 @@ type runnerMountPlan struct {
 	needsMount bool
 	dir        string // host runner tree (overlay lowerdir / Windows copy source)
 	mount      string // container path
+	// jobRoot is the host directory the per-job writable tree
+	// ("job-<id>": the overlay upper/work on Linux, the byte copy on
+	// Windows) is created under. It is ALWAYS the configured runners
+	// directory (the parent of RunnerDir) when one is set: Destroy and the
+	// orphan sweep look for job-* there, and the verified store prunes
+	// everything it does not own under its own extracted/ root — a job
+	// tree created next to an override lowerdir would be invisible to the
+	// former and deleted by the latter.
+	jobRoot string
 	// override is true when the mount masks an official image's runner.
 	override bool
 }
@@ -46,11 +57,15 @@ type runnerMountPlan struct {
 // image), so the override never applies there.
 func planRunnerMount(customImage bool, goos, cfgDir, cfgMount string, src RunnerOverrideSource, image string) runnerMountPlan {
 	if (customImage || goos == "windows") && cfgDir != "" && cfgMount != "" {
-		return runnerMountPlan{needsMount: true, dir: cfgDir, mount: cfgMount}
+		return runnerMountPlan{needsMount: true, dir: cfgDir, mount: cfgMount, jobRoot: filepath.Dir(cfgDir)}
 	}
 	if !customImage && goos != "windows" && src != nil {
 		if dir, ok := src.OfficialRunnerOverride(image); ok && dir != "" {
-			return runnerMountPlan{needsMount: true, dir: dir, mount: officialRunnerRoot, override: true}
+			jobRoot := filepath.Dir(dir)
+			if cfgDir != "" {
+				jobRoot = filepath.Dir(cfgDir)
+			}
+			return runnerMountPlan{needsMount: true, dir: dir, mount: officialRunnerRoot, jobRoot: jobRoot, override: true}
 		}
 	}
 	return runnerMountPlan{}

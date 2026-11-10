@@ -1277,7 +1277,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		}
 	}()
 	if needsRunnerMount {
-		jobRunnerDir = filepath.Join(filepath.Dir(plan.dir), "job-"+id)
+		jobRunnerDir = filepath.Join(plan.jobRoot, "job-"+id)
 		writableDir, runnerOpt, err := prepareJobRunnerTree(plan.dir, jobRunnerDir, plan.mount)
 		if err != nil {
 			return nil, fmt.Errorf("preparing runner dir for %s: %w", id, err)

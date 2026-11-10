@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync/atomic"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/ephpm/ephemerd/pkg/runnerversion"
@@ -43,7 +44,10 @@ func (r *Runtime) ProbeImageRunner(ctx context.Context, image string) (runnerver
 	}
 	parent := identity.ChainID(diffIDs).String()
 	sn := r.client.SnapshotService(ss)
-	key := fmt.Sprintf("ephemerd-runner-probe-%d", probeSeq.Add(1))
+	// The key carries the boot time as well as a sequence number: a view
+	// left behind by a crash mid-probe must not collide with the first
+	// probe of the next boot (sequence numbers restart at 1).
+	key := fmt.Sprintf("ephemerd-runner-probe-%d-%d", probeEpoch, probeSeq.Add(1))
 	mounts, err := sn.View(ctx, key, parent)
 	if err != nil {
 		return runnerversion.TreeInfo{}, fmt.Errorf("view snapshot of %s: %w", image, err)
@@ -66,5 +70,9 @@ func (r *Runtime) ProbeImageRunner(ctx context.Context, image string) (runnerver
 	return info, nil
 }
 
-// probeSeq makes view-snapshot keys unique across concurrent probes.
-var probeSeq atomic.Int64
+// probeSeq makes view-snapshot keys unique across concurrent probes;
+// probeEpoch makes them unique across daemon restarts.
+var (
+	probeSeq   atomic.Int64
+	probeEpoch = time.Now().UnixNano()
+)

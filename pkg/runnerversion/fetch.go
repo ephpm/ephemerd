@@ -124,7 +124,21 @@ func (f *Fetcher) fetch(ctx context.Context, url string, meta Sidecar) (string, 
 
 	client := f.Client
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Minute}
+		client = &http.Client{
+			Timeout: 10 * time.Minute,
+			// The https-only rule covers the whole redirect chain, not
+			// just the first hop: a release asset hands off to a CDN, and
+			// that hop must not be allowed to drop to plain http.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 10 {
+					return fmt.Errorf("%w: too many redirects", ErrFetch)
+				}
+				if req.URL.Scheme != "https" {
+					return fmt.Errorf("%w: redirect to non-https url %s", ErrFetch, req.URL)
+				}
+				return nil
+			},
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
