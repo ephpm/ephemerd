@@ -81,7 +81,12 @@ type Config struct {
 	Client       *client.Client
 	RunnerDir    string // host path to extracted runner binary
 	RunnerMount  string // container path to mount runner at
-	DefaultImage string // override default container image (auto-detected if empty)
+	// RunnerOverride, when non-nil, can make an official Linux runner image
+	// run a host runner tree mounted over /home/runner instead of the one
+	// baked into the image (the self-healing runner subsystem; see
+	// runneroverride.go). Nil preserves the historical behaviour exactly.
+	RunnerOverride RunnerOverrideSource
+	DefaultImage   string // override default container image (auto-detected if empty)
 	ImagesDir    string // directory containing pre-downloaded OCI image tarballs to import on startup
 	LogDir       string // directory for per-job container logs
 	DataDir      string // ephemerd data directory (used for dind socket paths)
@@ -1243,9 +1248,16 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 	// else: no entrypoint override — use image default CMD/ENTRYPOINT.
 
 	// Mount the embedded runner binary into the container.
-	// On Linux with the official GHA image, the runner is pre-installed so no mount needed.
-	// On Windows, always mount because there's no Windows GHA runner image.
-	needsRunnerMount := (customImage || goruntime.GOOS == "windows") && r.cfg.RunnerDir != "" && r.cfg.RunnerMount != ""
+	// On Linux with the official GHA image, the runner is pre-installed so no mount needed —
+	// unless the self-heal override is engaged, in which case a verified host
+	// runner tree is overlaid on /home/runner to mask a stale baked-in runner
+	// (see runneroverride.go). On Windows, always mount because there's no
+	// Windows GHA runner image.
+	plan := planRunnerMount(customImage, goruntime.GOOS, r.cfg.RunnerDir, r.cfg.RunnerMount, r.cfg.RunnerOverride, image)
+	needsRunnerMount := plan.needsMount
+	if plan.override {
+		r.cfg.Log.Warn("masking the image's baked-in runner with a host runner tree", "id", id, "image", image, "runner_dir", plan.dir, "mount", plan.mount)
+	}
 	var jobRunnerDir string
 	// runnerWritableDir is the host path holding this job's WRITABLE copy of
 	// the runner tree (the overlay upperdir on Linux, the byte copy on
@@ -1265,8 +1277,8 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		}
 	}()
 	if needsRunnerMount {
-		jobRunnerDir = filepath.Join(filepath.Dir(r.cfg.RunnerDir), "job-"+id)
-		writableDir, runnerOpt, err := prepareJobRunnerTree(r.cfg.RunnerDir, jobRunnerDir, r.cfg.RunnerMount)
+		jobRunnerDir = filepath.Join(filepath.Dir(plan.dir), "job-"+id)
+		writableDir, runnerOpt, err := prepareJobRunnerTree(plan.dir, jobRunnerDir, plan.mount)
 		if err != nil {
 			return nil, fmt.Errorf("preparing runner dir for %s: %w", id, err)
 		}
@@ -1274,7 +1286,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		if resultsURL != "" {
 			// The mounted runner: patch into this job's writable layer (the
 			// overlay upper), never the shared tree other jobs mount.
-			r.logResultsPatch(id, "embedded runner")(runner.PatchResultsURLFile(r.cfg.RunnerDir, writableDir))
+			r.logResultsPatch(id, "mounted runner")(runner.PatchResultsURLFile(plan.dir, writableDir))
 		}
 		// Hyper-V isolated containers on Windows mount this host directory
 		// into the utility VM via a VSMB share. The parent runners dir has
@@ -1602,7 +1614,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 		hostDataDir := filepath.Dir(r.cfg.LogDir)
 		bindMappings["/etc/hosts"] = filepath.Join(hostDataDir, "hosts", id+".hosts")
 		bindMappings["/etc/resolv.conf"] = filepath.Join(hostDataDir, "dns", id+".conf")
-		if runnerWritableDir != "" && r.cfg.RunnerMount != "" {
+		if runnerWritableDir != "" && plan.mount != "" {
 			// Map the runner mount to the job's WRITABLE layer, not the shared
 			// tree. On Linux that is the overlay upperdir: the runner creates
 			// _work/ (job checkouts, _temp, _actions) under the mount, all of
@@ -1622,7 +1634,7 @@ func (r *Runtime) Create(ctx context.Context, cfg CreateConfig) (*RunnerEnv, err
 			// upper, so this is a benign known limitation rather than a
 			// resolution error; a follow-up could add the lowerdir to the dind
 			// resolver's search path if a workflow ever needs it.
-			bindMappings[r.cfg.RunnerMount] = runnerWritableDir
+			bindMappings[plan.mount] = runnerWritableDir
 		}
 		dindServer.SetRunnerRootfs(snapshotName, runnerRootfsPath, bindMappings)
 	}

@@ -119,3 +119,42 @@ func TestSelectorBootVerify(t *testing.T) {
 		t.Fatal("expected hash error")
 	}
 }
+
+func TestSelectorBootVerifyImagePath(t *testing.T) {
+	withEmbeddedVersion(t, "2.337.0")
+	rm := runner.New(t.TempDir(), testLog())
+	m := validManifest("2.338.2", "2.338.0", zeroSHA)
+	sel := &Selector{
+		Embedded:     rm,
+		Store:        newTestStore(t),
+		Log:          testLog(),
+		HashEmbedded: func() (string, error) { return zeroSHA, nil },
+		ProbeImage:   func() (TreeInfo, error) { return tree("2.336.0"), nil },
+	}
+
+	// The outage: image 2.336.0 and embedded 2.337.0 both below floor 2.338.0.
+	rep, err := sel.BootVerify(m, "linux-x64")
+	if err != nil || rep.Image == nil || rep.ImageErr != nil {
+		t.Fatalf("%v %+v", err, rep)
+	}
+	if rep.Image.Override || !rep.Image.NeedFetch || !rep.Image.ImageBelowFloor {
+		t.Fatalf("both below floor: %+v", rep.Image)
+	}
+
+	// After the break-glass fetch: the cache tree is what gets mounted.
+	swapIn(t, sel.Store, "2.338.2")
+	rep, err = sel.BootVerify(m, "linux-x64")
+	if err != nil || rep.Image == nil {
+		t.Fatalf("%v %+v", err, rep)
+	}
+	if !rep.Image.Override || rep.Image.AvailableVersion != "2.338.2" || rep.Image.NeedFetch {
+		t.Fatalf("cache lifts image: %+v", rep.Image)
+	}
+
+	// A probe failure is reported and never turns into an override.
+	sel.ProbeImage = func() (TreeInfo, error) { return TreeInfo{}, os.ErrNotExist }
+	rep, err = sel.BootVerify(m, "linux-x64")
+	if err != nil || rep.Image != nil || rep.ImageErr == nil {
+		t.Fatalf("probe failure: %v %+v", err, rep)
+	}
+}

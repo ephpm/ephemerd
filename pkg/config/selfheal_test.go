@@ -66,14 +66,15 @@ func TestSelfHealValidateRejects(t *testing.T) {
 		mutate func(*SelfHealToml)
 		want   string
 	}{
-		"auto_upgrade without enabled": {func(c *SelfHealToml) { c.Enabled = false; c.AutoUpgrade = true }, "requires enabled"},
-		"http manifest":                {func(c *SelfHealToml) { c.ManifestURL = "http://example.com/m.json" }, "https"},
-		"missing manifest":             {func(c *SelfHealToml) { c.ManifestURL = "" }, "https"},
-		"bad channel":                  {func(c *SelfHealToml) { c.Channel = "nightly" }, "channel"},
-		"bad duration":                 {func(c *SelfHealToml) { c.ZeroWorkWindow = "soon" }, "zero_work_window"},
-		"negative duration":            {func(c *SelfHealToml) { c.BreakerCooldown = "-1m" }, "positive"},
-		"negative threshold":           {func(c *SelfHealToml) { c.ZeroWorkThreshold = -1 }, "zero_work_threshold"},
-		"bad pr repo":                  {func(c *SelfHealToml) { c.AutoUpgradePRRepo = "ephemerd" }, "owner/repo"},
+		"auto_upgrade without enabled":   {func(c *SelfHealToml) { c.Enabled = false; c.AutoUpgrade = true }, "requires enabled"},
+		"image_override without enabled": {func(c *SelfHealToml) { c.Enabled = false; c.ImageOverride = true }, "requires enabled"},
+		"http manifest":                  {func(c *SelfHealToml) { c.ManifestURL = "http://example.com/m.json" }, "https"},
+		"missing manifest":               {func(c *SelfHealToml) { c.ManifestURL = "" }, "https"},
+		"bad channel":                    {func(c *SelfHealToml) { c.Channel = "nightly" }, "channel"},
+		"bad duration":                   {func(c *SelfHealToml) { c.ZeroWorkWindow = "soon" }, "zero_work_window"},
+		"negative duration":              {func(c *SelfHealToml) { c.BreakerCooldown = "-1m" }, "positive"},
+		"negative threshold":             {func(c *SelfHealToml) { c.ZeroWorkThreshold = -1 }, "zero_work_threshold"},
+		"bad pr repo":                    {func(c *SelfHealToml) { c.AutoUpgradePRRepo = "ephemerd" }, "owner/repo"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

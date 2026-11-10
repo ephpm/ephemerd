@@ -55,6 +55,16 @@ type SelfHealToml struct {
 	// Requires Enabled.
 	AutoUpgrade bool `toml:"auto_upgrade"`
 
+	// ImageOverride lets the HOST mask a stale runner baked into an
+	// official Linux runner image (runner-ci-linux is FROM
+	// ghcr.io/actions/actions-runner and runs its own /home/runner) by
+	// mounting a verified, newer runner tree over /home/runner for every
+	// job until a rebuilt image rolls out. The tree comes from the embedded
+	// runner when that is new enough, otherwise from the break-glass fetch
+	// (which additionally needs auto_upgrade). Default false. Requires
+	// Enabled.
+	ImageOverride bool `toml:"image_override"`
+
 	// MaxArchiveMB refuses runner downloads larger than this. Default 512.
 	MaxArchiveMB int `toml:"max_archive_mb"`
 
@@ -89,6 +99,9 @@ func (c SelfHealToml) Validate() error {
 	if !c.Enabled {
 		if c.AutoUpgrade {
 			return errors.New("[runner.self_heal] auto_upgrade = true requires enabled = true")
+		}
+		if c.ImageOverride {
+			return errors.New("[runner.self_heal] image_override = true requires enabled = true")
 		}
 		return nil
 	}

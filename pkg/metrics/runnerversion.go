@@ -19,6 +19,9 @@ const (
 	RunnerSourceEmbedded      = "embedded"
 	RunnerSourceVerifiedCache = "verified-cache"
 	RunnerSourceBelowFloor    = "embedded-below-floor"
+	// RunnerSourceImageOverride means a verified tree is mounted over an
+	// official image's /home/runner (the Linux self-heal).
+	RunnerSourceImageOverride = "image-override"
 )
 
 var (
@@ -50,6 +53,22 @@ var (
 		Name: "ephemerd_runner_breaker_open",
 		Help: "1 while the zero-work circuit breaker has suspended provisioning for a platform.",
 	}, []string{"platform"})
+
+	// RunnerImageOverrideActive is 1 while a verified runner tree is
+	// mounted over the official image's /home/runner because the image's
+	// baked-in runner is stale. Alert while 1: the permanent fix (rebuild
+	// the runner-ci-linux image) is still outstanding.
+	RunnerImageOverrideActive = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "ephemerd_runner_image_override_active",
+		Help: "1 while a verified runner is mounted over the official image's baked-in runner.",
+	})
+
+	// RunnerImageVersionInfo is 1 for the runner version baked into the
+	// official Linux image this node uses, as probed at boot.
+	RunnerImageVersionInfo = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ephemerd_runner_image_version_info",
+		Help: "The actions/runner version baked into the official Linux runner image (1 = probed).",
+	}, []string{"image", "version"})
 
 	// RunnerManifestErrors counts manifest problems by reason
 	// ("fetch", "signature", "schema", "disagree", "checksum").

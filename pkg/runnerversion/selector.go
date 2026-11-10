@@ -28,6 +28,14 @@ type Selector struct {
 	// (tests: the test binary embeds no runner). Nil = read it from the
 	// embedded FS.
 	HashEmbedded func() (string, error)
+	// ProbeImage reads the runner baked into the official Linux image this
+	// node dispatches to (runtime.ProbeImageRunner). Nil = no image path on
+	// this node (Windows/macOS hosts, or a custom default image). This is
+	// the dominant path on the fleet: see override.go.
+	ProbeImage func() (TreeInfo, error)
+	// BreakerOpen reports whether the linux zero-work breaker has tripped;
+	// consulted by the image decision when no manifest is available.
+	BreakerOpen func() bool
 }
 
 func (s *Selector) hashEmbedded() (string, error) {
@@ -119,6 +127,10 @@ type BootReport struct {
 	BelowFloor bool
 	// Cache holds the store's verification results (nil without a store).
 	Cache []VerifyResult
+	// Image is the official-image probe and override decision (nil when
+	// Selector.ProbeImage is nil). ImageErr is a failed probe.
+	Image    *ImageDecision
+	ImageErr error
 }
 
 // BootVerify is mechanism 1: re-hash the embedded archive, verify the
@@ -156,6 +168,22 @@ func (s *Selector) BootVerify(m *Manifest, platform string) (BootReport, error) 
 		source = metrics.RunnerSourceBelowFloor
 	}
 	metrics.SetRunnerVersion(rep.Selected.Version, source)
+
+	// The Linux official-image path: what the jobs ACTUALLY run. A probe
+	// failure is reported, not fatal — the node keeps serving as today.
+	if s.ProbeImage != nil {
+		img, err := s.ProbeImage()
+		if err != nil {
+			rep.ImageErr = err
+		} else {
+			breaker := false
+			if s.BreakerOpen != nil {
+				breaker = s.BreakerOpen()
+			}
+			d := DecideImageOverride(img, rep.Selected, m, breaker)
+			rep.Image = &d
+		}
+	}
 	return rep, nil
 }
 

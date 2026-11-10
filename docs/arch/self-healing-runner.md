@@ -2,12 +2,20 @@
 
 > **Status: foundation implemented, flag-off.** The signed manifest, the
 > verified fetch + content-addressed cache + atomic swap, the zero-work
-> detector + circuit breaker, and the three metrics live in
-> `pkg/runnerversion` (+ `pkg/metrics/runnerversion.go`,
-> `pkg/config/selfheal.go`). Nothing is wired into `cmd/ephemerd` yet and
-> `[runner.self_heal] enabled` defaults to `false`. The break-glass
-> auto-upgrade (`auto_upgrade`) is additionally gated and defaults to
-> `false`. The auto-PR step is designed here but not implemented.
+> detector + circuit breaker, the official-image probe + override seam, and
+> the metrics live in `pkg/runnerversion` (+ `pkg/runtime/runneroverride.go`,
+> `pkg/runtime/runnerprobe_linux.go`, `pkg/metrics/runnerversion.go`,
+> `pkg/config/selfheal.go`). Nothing is wired into `cmd/ephemerd` yet;
+> `runtime.Config.RunnerOverride` is nil everywhere, and
+> `[runner.self_heal] enabled`, `image_override` and `auto_upgrade` all
+> default to `false`. The auto-PR step is designed here but not implemented.
+>
+> **Correction (2026-11-10, same day).** The first draft of this document
+> assumed the runner the fleet runs is the embedded tarball. For Linux —
+> the dominant path — it is not: see
+> [The Linux official-image path](#the-linux-official-image-path-the-dominant-one).
+> Mechanisms 1–3 still apply; what changed is *which* runner tree they
+> must verify and *how* a fresh one is put in front of a job.
 
 ## The outage this prevents
 
@@ -31,8 +39,142 @@ Two things made it a day instead of a minute:
 1. **Nothing distinguished "ran a job and exited" from "never got a job and
    exited".** `exit_code=0` is the teardown status of `run.sh`, not a job
    result; keying anything off it is wrong.
-2. **The only remedy was a new ephemerd release**, because the runner is
-   embedded at build time.
+2. **The only remedy was a new build** — of ephemerd for the embedded
+   runner, and of the `runner-ci-linux` image for the runner Linux jobs
+   actually run (see the next section). On 2026-11-10 the image shipped
+   2.336.0 and every Linux job died regardless of the embedded pin.
+
+## The Linux official-image path (the dominant one)
+
+`images/runner-ci-linux/Dockerfile` is `FROM
+ghcr.io/actions/actions-runner:latest`, so the image carries its own
+runner at `/home/runner` (owned by the image's unprivileged `runner` user,
+uid/gid 1001, which is also the `USER` the container runs as).
+`pkg/runtime.isOfficialRunnerImage` lists `ephpm/ephemerd:runner-ci-linux`
+as official, and for an official image `runtime.Create`:
+
+- runs `/home/runner/run.sh --jitconfig …` straight from the image;
+- sets `needsRunnerMount = false` — the embedded/extracted runner is
+  **never mounted**. It is mounted only for custom images (at
+  `/actions-runner`) and on Windows/macOS.
+
+So on every Linux node the runner that talks to GitHub is whatever the
+image was built with, and the embedded tarball is irrelevant to it. A
+selector over "embedded ∪ cache" alone does not touch the path that
+stalled the fleet.
+
+### Why not patch the image
+
+It was tried on metal the same day: editing the runner inside the image's
+overlayfs lower layer in place is **unreliable**. The kernel page cache
+kept serving the stale files to new container mounts; one job latched the
+patched runner after a `drop_caches`, then subsequent jobs reverted.
+Layer edits are also invisible to containerd's content store (the digest
+no longer matches the bytes), which is exactly the kind of thing the SHA
+pinning exists to prevent. Not a mechanism we build on.
+
+### The mechanism: a verified tree mounted over `/home/runner`
+
+ephemerd already has the right machinery for custom images:
+`prepareJobRunnerTree` mounts a shared runner tree into the container as
+an **overlayfs** with the shared tree as the read-only lowerdir and a
+per-job upperdir/workdir (the F1 containment fix — no job can mutate the
+shared tree). The self-heal uses that machinery, pointed at the official
+runner root:
+
+```
+official image, override engaged:
+   mount /home/runner  ←  overlay(lowerdir = <verified fresh runner tree>,
+                                   upperdir = <data>/runners/job-<id>/upper,
+                                   workdir  = <data>/runners/job-<id>/work)
+   entrypoint unchanged: /home/runner/run.sh --jitconfig …
+```
+
+The mount is set up by runc as part of the container's OCI spec, so it is
+new on every job, bypasses whatever the page cache holds for the image
+layer, and goes away with the job. The image is never modified. The
+`_work/` tree, `.runner`, and the regenerated `run-helper.sh` land in the
+per-job upper exactly as they do for custom images, so dind's bind-source
+resolution (`bindMappings[/home/runner] = upperdir`) keeps working.
+
+Two details that matter:
+
+- **Ownership.** The merged `/home/runner` inherits its owner from the
+  lowerdir's top directory. ephemerd extracts runner trees as root, and
+  the image runs as uid 1001, which could then not create `_work/`. The
+  override tree is therefore chowned to the uid/gid the image probe reports
+  for `/home/runner` before it is engaged (`PrepareOverrideTree`).
+- **Which tree.** The lowerdir is the best verified tree on the node —
+  the embedded extraction when it is new enough (image 2.336.0, embedded
+  2.337.0 ≥ floor → no download needed at all), otherwise the verified
+  cache entry the break-glass fetch produced. In the 2026-11-10 shape both
+  were below the floor, so the fetch was the only way out; the override
+  engages the moment the cache has a tree ≥ floor.
+
+### Seam in `pkg/runtime`
+
+`runtime.Config.RunnerOverride` is an interface
+(`OfficialRunnerOverride(image) (dir, ok)`); `planRunnerMount` is the
+pure decision that replaced the inline `needsRunnerMount` expression. With
+a nil source the plan is byte-for-byte the old rule (custom || windows).
+With an engaged override and an official image on Linux it returns
+`{needsMount: true, dir: <override tree>, mount: /home/runner}`. Windows
+is never affected (no official image path there), and a custom image is
+never masked (it already gets the configured runner at `/actions-runner`).
+
+### Probing the image
+
+Boot-verify and the zero-work handler need to know what the image ships.
+`runtime.ProbeImageRunner(ctx, image)` (Linux only) mounts a read-only
+**view** snapshot of the image rootfs with `mount.WithTempMount` — the
+same technique `patchSnapshotRunner` uses — and reads
+`/home/runner/bin/Runner.Listener.deps.json`, whose `.NET` target entry is
+`"Runner.Listener/2.337.0"` (verified against the 2.337.0 archive; it is
+the only version marker present in an unconfigured tree, since `.runner`
+only exists after `config.sh`). The probe also returns the uid/gid of
+`/home/runner` for the ownership fix above. The view is removed
+afterwards; nothing is written.
+
+`ephemerd_runner_image_version_info{image,version}` publishes the result.
+
+### Decision
+
+`DecideImageOverride(image, available, manifest, breakerOpen)`:
+
+| image vs floor | best verified tree on node | result |
+|---|---|---|
+| ≥ floor | anything | no override (a healthy image is never masked) |
+| < floor | newer than image AND ≥ floor | **override** with that tree |
+| < floor | nothing newer-and-≥-floor | `NeedFetch` → break-glass fetch, then re-decide |
+| no manifest, breaker open | newer than image | override (embedded over image) |
+| no manifest, breaker open | nothing newer | `NeedFetch` |
+| no manifest, breaker closed | — | nothing; never on a hunch |
+
+### Which hosts
+
+- **Linux hosts (coyotes, ducks, sharks)**: host daemon == runtime; the
+  override tree lives in the host data dir and is mounted directly.
+- **macOS hosts**: the Linux runtime runs in the VM, but the host
+  `DataDir` is shared into it over virtio-fs (`ContainerDataDir`), so a
+  tree the host fetched and verified is visible to the in-VM runtime at
+  the rewritten path. Wiring must pass the VM-side path.
+- **Windows hosts (WSL2 VM)**: the in-VM daemon has its own data dir and
+  no view of the host's. The host must push the verified blob to the VM
+  over the existing Dispatch channel (a streaming `PushRunnerArchive`
+  that the VM side re-hashes before committing; the VM never fetches from
+  the internet). **Not designed in detail here; deferred.** Until then the
+  override covers Linux and macOS hosts.
+
+### What the alert must say
+
+The override is a bridge. While `ephemerd_runner_image_override_active`
+is 1 the node logs, at error level, the fixed line
+`runner image override engaged: IMAGE RUNNER IS STALE` naming the image,
+the mounted version and the action (rebuild and push `runner-ci-linux`
+with a current `actions/runner`, then bump the pin). It is routed as
+non-silenceable until the gauge returns to 0, which happens when a probe
+of the (rebuilt, re-pulled) image reports a version ≥ floor and the
+override clears itself.
 
 The SHA pinning is deliberate supply-chain hardening — fork PRs run as root
 inside these runners — so the fix must never run a binary whose hash was
@@ -43,12 +185,14 @@ preserves that; see [How every path preserves SHA pinning](#how-every-path-prese
 
 | # | Mechanism | Trigger | Effect | Flag |
 |---|-----------|---------|--------|------|
-| 1 | **Boot-time verify** | daemon start, then every manifest poll | refuse to serve jobs on a runner that fails its SHA check or is below the manifest floor; fetch the current one (verified) first | `self_heal.enabled` |
+| 1 | **Boot-time verify** | daemon start, then every manifest poll | re-hash the embedded/cached runner, **probe the official Linux image's `/home/runner`**, compare both against the manifest floor; refuse to serve on a stale runner; fetch the current one (verified) first | `self_heal.enabled` |
 | 2 | **Zero-work detector + circuit breaker** | runner exit | count registered→exited-without-a-job; after K in a row on a platform, open the breaker (stop provisioning), mark the pool degraded, alert | `self_heal.enabled` |
-| 3 | **Break-glass verified auto-upgrade** | breaker opens, or routine poll finds embedded < floor | host daemon fetches the current runner, verifies it against **two independent sources**, swaps it in content-addressed storage, alerts loudly, opens a PR to make the pin permanent | `self_heal.auto_upgrade` (requires 1) |
+| 3a | **Image override** (Linux) | image probe < floor, or breaker open with a newer tree on the node | mount a verified newer runner tree **over `/home/runner`** on every job until a rebuilt image rolls out; alert | `self_heal.image_override` (requires 1) |
+| 3b | **Break-glass verified auto-upgrade** | 3a needs a tree the node does not have, or embedded < floor on a mounted path | host daemon fetches the current runner, verifies it against **two independent sources**, stores it content-addressed; the next job uses it (via 3a on the image path, via the selector on the mounted paths); alerts loudly; opens a PR to make the pin permanent | `self_heal.auto_upgrade` (requires 1) |
 
-Mechanism 3 is a bridge: it keeps the fleet alive until a properly pinned
-ephemerd release rolls out. It is not a replacement for the pin.
+Mechanisms 3a/3b are bridges: they keep the fleet alive until a rebuilt
+`runner-ci-linux` image and a properly pinned ephemerd release roll out.
+They do not replace the pin, and the alert says so until they do.
 
 ## Signed manifest
 
@@ -357,10 +501,19 @@ extractor) and the store:
   the `source` label on `ephemerd_runner_version_info`.
 
 The selector does not *replace* `runner.Manager`; it sits in front of
-it. The integration point is the two `RunnerDir: rm.Dir()` call sites in
-`cmd/ephemerd/main.go` (one for the host scheduler, one for the
-`--containerd-only` worker), which become `sel.Dir()`. That is a Phase 1
-reconciliation and is **not** done in this increment.
+it. It governs the **mounted** paths only — custom images, Windows,
+macOS — and is the source of the override tree for the official-image
+path. The integration points are:
+
+1. the two `RunnerDir: rm.Dir()` call sites in `cmd/ephemerd/main.go`
+   (host scheduler and `--containerd-only` worker), which become
+   `sel.Dir()`;
+2. `runtime.Config.RunnerOverride`, set to the `*runnerversion.ImageOverride`
+   the self-heal controls (nil today);
+3. `Selector.ProbeImage`, set to `rt.ProbeImageRunner` bound to the
+   resolved default Linux image.
+
+None of the three is done in this increment.
 
 ## Break-glass auto-upgrade
 
@@ -458,6 +611,8 @@ Declared in `pkg/metrics/runnerversion.go`:
 | `ephemerd_runner_pin_age_seconds` | gauge | – | now − `published_at` of the **embedded** pin's `actions/runner` release. Alert at, say, 45 d: GitHub's floor has historically trailed the current release by a few minor versions |
 | `ephemerd_runner_zero_work_total` | counter | `platform` | zero-work verdicts |
 | `ephemerd_runner_breaker_open` | gauge | `platform` | 1 while the breaker is OPEN or HALF-OPEN |
+| `ephemerd_runner_image_version_info` | gauge (=1) | `image`, `version` | what the official Linux image's `/home/runner` ships, as probed |
+| `ephemerd_runner_image_override_active` | gauge | – | 1 while a verified tree is mounted over `/home/runner`; alert while 1 (image rebuild outstanding) |
 
 **Known prerequisite.** mayfly never renders `[metrics] bind_addr` into
 the node config, so every node's metrics listener binds `127.0.0.1` and
@@ -479,7 +634,8 @@ poll_interval = "1h"           # manifest re-check cadence
 zero_work_window = "120s"      # registered→self-exit under this with no job-started = zero-work
 zero_work_threshold = 3        # consecutive zero-work runners per platform that open the breaker
 breaker_cooldown = "15m"       # OPEN → HALF-OPEN
-auto_upgrade = false           # break-glass; requires enabled; host daemon only
+image_override = false         # Linux: mount a verified newer runner over the official image's /home/runner; requires enabled
+auto_upgrade = false           # break-glass fetch; requires enabled; host daemon only
 max_archive_mb = 512           # refuse larger downloads
 min_free_gb = 5                # refuse to fetch below this much free space on the cache volume
 auto_upgrade_pr_repo = ""      # "ephpm/ephemerd"; empty disables the auto-PR
@@ -502,6 +658,10 @@ is an error, `manifest_url` must be `https://`, durations must parse,
 | Disk below `min_free_gb` | fetch refused with a specific error; alert; existing runner keeps serving |
 | Crash during fetch/extract/swap | see crash safety above; worst case an unreferenced blob until the next Prune |
 | Verified-cache runner is itself refused by GitHub | breaker reopens on the probe; the upgrader sees `selected.version == manifest.version` and does nothing (no loop); alert stays up for a human |
+| Image probe fails (no `deps.json`, view mount error) | reported in `BootReport.ImageErr`, image treated as unknown: **no override on a guess**; the node runs the image as today and the alert says the probe failed |
+| Override engaged but the image's `runner` uid differs from the tree's owner | the probe's uid/gid is applied to the tree before engaging; if chown fails the override is refused with the error, not engaged broken |
+| Override engaged, then the image is rebuilt and re-pulled | next poll's probe reports ≥ floor → override clears, gauge → 0, alert resolves; the per-job overlay simply stops being added |
+| Windows-host Linux VM | the override tree is not visible in the VM; the override is not engaged there (documented gap, see "Which hosts") |
 | `in_progress` webhooks stop arriving (webhook outage) | every short runner looks zero-work → breaker opens → **false positive**. The alert text says "or webhook delivery is broken"; the half-open probe reopens it every cooldown. Mitigation (next increment): the detector also treats a provider busy-poll (`RunnerBusy`) as job-started, which the orphan sweep already consults |
 | Embedded key placeholder still empty | every verify fails closed; `enabled = true` logs an error at boot naming the missing key; nothing else changes |
 | `auto_upgrade` on, breaker open, no manifest at all | nothing happens except the alert — no manifest, no upgrade |
@@ -530,6 +690,10 @@ is an error, `manifest_url` must be `https://`, durations must parse,
 - **Select**: a candidate is only eligible if its on-disk archive
   verified this boot. The embedded runner, whose pin was verified at
   build time, is the floor.
+- **Image override**: the tree mounted over `/home/runner` is one of
+  those same verified candidates — never anything else — and the image
+  layer is never written to. Masking is by a fresh per-job overlay mount,
+  which is also what makes it reliable where a layer edit was not.
 - **Rollback**: a pointer swap between two already-verified blobs; no new
   bytes.
 - **Auto-PR**: proposes the exact hashes that were verified; a human
@@ -560,6 +724,16 @@ checked against a value ephemerd trusted before the bytes arrived.
 - `pkg/runnerversion/detector.go` — zero-work detector + per-platform
   breaker + `OnDegraded`.
 - `pkg/runnerversion/diag.go` — `_diag` corroboration scan.
+- `pkg/runnerversion/imageprobe.go` — `ProbeRunnerTree` /
+  `ParseListenerDepsVersion` (version + owner of any runner tree).
+- `pkg/runnerversion/override.go` — `ImageOverride` (the engaged state
+  the runtime consults), `DecideImageOverride`, `PrepareOverrideTree`.
+- `pkg/runtime/runneroverride.go` — `RunnerOverrideSource`,
+  `planRunnerMount`; `Create` now takes its mount decision from the plan
+  (`runtime.Config.RunnerOverride`, nil = unchanged behaviour).
+- `pkg/runtime/runnerprobe_linux.go` — `Runtime.ProbeImageRunner` (view
+  snapshot + temp mount + `ProbeRunnerTree`). Needs containerd; covered
+  by e2e, not unit tests.
 - `pkg/runner/version.go` — **new file**: exported `ParseVersion`,
   `CompareVersions`, `EmbeddedArchive`, `ExtractArchive` wrappers around
   the existing unexported helpers. No existing function in `pkg/runner`
@@ -568,9 +742,13 @@ checked against a value ephemerd trusted before the bytes arrived.
 - `pkg/config/selfheal.go` — `[runner.self_heal]`, defaults, validation.
   One field added to `RunnerConfig`.
 
-Not wired: nothing in `cmd/ephemerd` or `pkg/scheduler` calls any of it.
-The next increment is (1) `Selector` in front of the two `rm.Dir()` call
-sites, (2) `Detector.Registered/JobStarted/Exited` from `trackRunning`,
-`handleInProgress` and the two wait-goroutines, (3) `Allow(platform)` in
-`admitDispatch`, (4) the manifest poll loop and alert routing, (5) the
-auto-PR.
+Not wired: nothing in `cmd/ephemerd` or `pkg/scheduler` calls any of it,
+and `runtime.Config.RunnerOverride` is nil. The next increment is (1)
+`Selector` in front of the two `rm.Dir()` call sites, (2)
+`Config.RunnerOverride = imageOverride` and `Selector.ProbeImage =
+rt.ProbeImageRunner(defaultLinuxImage)`, (3) the boot/poll handler that
+turns `BootReport.Image` into `Engage`/`Clear`/fetch-then-engage, (4)
+`Detector.Registered/JobStarted/Exited` from `trackRunning`,
+`handleInProgress` and the two wait-goroutines, (5) `Allow(platform)` in
+`admitDispatch`, (6) the manifest poll loop and alert routing, (7) the
+auto-PR, (8) the Windows-host VM blob push.
