@@ -1637,6 +1637,10 @@ type RunnerConfig struct {
 	// intended job went elsewhere and that never got a job of its own is
 	// destroyed after the grace window.
 	OrphanSweep OrphanSweepToml `toml:"orphan_sweep"`
+
+	// SelfHeal configures the self-healing runner version subsystem
+	// (docs/arch/self-healing-runner.md). Off by default; see SelfHealToml.
+	SelfHeal SelfHealToml `toml:"self_heal"`
 }
 
 // OrphanSweepToml configures the scheduler's orphaned-runner sweep.
