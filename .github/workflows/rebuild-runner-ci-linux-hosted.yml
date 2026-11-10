@@ -1,0 +1,53 @@
+# Rebuild the multi-arch runner-ci-linux image on GitHub-HOSTED runners.
+#
+# This exists because the normal build-images.yml runs on the self-hosted
+# linux/x64 pool — so when that pool is wedged (e.g. the baked actions-runner
+# base drifts below GitHub's dispatch floor and every runner dies), the image
+# that would FIX it can't be built. This workflow breaks that deadlock: it
+# uses the hosted runners' real Docker/BuildKit, depends on nothing in the
+# fleet, and pushes both the moving `:runner-ci-linux` manifest tag and a
+# dated tag (point the fleet at the DATED tag to force a clean re-pull, since
+# ephemerd never re-pulls a tag it already has — see runtime.go).
+#
+# Trigger: workflow_dispatch (run from any branch), or a push to the hotfix
+# branch below.
+name: Rebuild runner-ci-linux (hosted, multi-arch)
+
+on:
+  workflow_dispatch:
+
+env:
+  IMAGE_REPO: ephpm/ephemerd
+
+jobs:
+  build:
+    name: Build & push runner-ci-linux (amd64+arm64, hosted)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set date tag
+        run: echo "DATE_TAG=$(date +%Y%m%d)" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # Multi-arch build. arm64 runs under QEMU emulation (slower, but this is
+      # an occasional image rebuild, not a per-job cost). The Dockerfile's
+      # `FROM ghcr.io/actions/actions-runner:latest` pulls the current runner
+      # for each platform, so /home/runner is freshly current on both arches.
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: images/runner-ci-linux
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE_REPO }}:runner-ci-linux
+            ${{ env.IMAGE_REPO }}:runner-ci-linux-${{ env.DATE_TAG }}
