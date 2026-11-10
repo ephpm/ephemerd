@@ -25,7 +25,28 @@ type fakeRegistry struct {
 	packumentHits atomic.Int64
 	tarballHits   atomic.Int64
 	fail          atomic.Bool
-	tarball       []byte
+	// down simulates a dead registry: every connection is dropped without
+	// a response while the listener stays bound. See deadUpstream.
+	down    atomic.Bool
+	tarball []byte
+}
+
+// deadUpstream wraps h so that, once down is set, each request's connection
+// is aborted with no response — what a dead registry looks like to the
+// proxy — while the port stays BOUND to this server.
+//
+// Closing the httptest server instead would release its ephemeral port, and
+// since every test in this package runs in parallel, another test's fake
+// registry or proxy can be bound to that very port moments later. The
+// "dead" upstream then answers 200 from a stranger (seen in CI:
+// "packument status = 200, want 307 to the origin").
+func deadUpstream(down *atomic.Bool, h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if down.Load() {
+			panic(http.ErrAbortHandler)
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 func newFakeRegistry(t *testing.T) *fakeRegistry {
@@ -76,7 +97,7 @@ func newFakeRegistry(t *testing.T) *fakeRegistry {
 		  }
 		}`, reg.URL)
 	})
-	reg.Server = httptest.NewServer(mux)
+	reg.Server = httptest.NewServer(deadUpstream(&reg.down, mux))
 	t.Cleanup(reg.Close)
 	return reg
 }
@@ -274,7 +295,7 @@ func TestFailOpenRedirectsWhenUpstreamIsDown(t *testing.T) {
 	reg := newFakeRegistry(t)
 	p := startProxy(t, Config{Upstream: reg.URL})
 	base := "http://" + p.Addr()
-	reg.Close() // upstream gone, cache cold
+	reg.down.Store(true) // upstream gone, cache cold (port stays ours)
 
 	resp := get(t, noRedirect(), base+"/express", nil)
 	defer func() { _ = resp.Body.Close() }()
