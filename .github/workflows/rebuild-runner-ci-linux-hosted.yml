@@ -15,10 +15,6 @@ name: Rebuild runner-ci-linux (hosted, multi-arch)
 
 on:
   workflow_dispatch:
-  push:
-    branches: [fix/runner-2338-and-apk-mirror]
-    paths:
-      - ".github/workflows/rebuild-runner-ci-linux-hosted.yml"
 
 env:
   IMAGE_REPO: ephpm/ephemerd
