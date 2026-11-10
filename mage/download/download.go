@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	RunnerVersion       = "2.337.0"
+	RunnerVersion       = "2.338.2"
 	CNIVersion          = "1.6.2"
 	ContainerdVersion   = "2.2.2"
 	RuncVersion         = "1.3.4"
@@ -68,12 +68,12 @@ const (
 // upstream checksum source in the SAME change — a stale hash fails the build
 // loudly (which is the point), but it must be fixed, never removed.
 var pinnedSHA256 = map[string]string{
-	// GitHub Actions runner (actions/runner v2.337.0)
-	"actions-runner-linux-x64-2.337.0.tar.gz":   "70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613",
-	"actions-runner-linux-arm64-2.337.0.tar.gz": "9b1dc70626422526e3c94767cf024896beb15da5342a3f4819bf2feac13e0393",
-	"actions-runner-win-x64-2.337.0.zip":        "1150692afa94e71f872017e254ea55b6eece1eece3fe7e3a6d4c93d0a1b85cfc",
-	"actions-runner-osx-x64-2.337.0.tar.gz":     "d383f505d7ed041b1873ab68c35dd766fc093f2252330f95bb427be8f2c6dcfc",
-	"actions-runner-osx-arm64-2.337.0.tar.gz":   "5a2cd92908a93d7276a194e1de6008099f3e7946f3f8e14aa7a1a7b4a31fdec2",
+	// GitHub Actions runner (actions/runner v2.338.2)
+	"actions-runner-linux-x64-2.338.2.tar.gz":   "baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40",
+	"actions-runner-linux-arm64-2.338.2.tar.gz": "670adb2f268fe21dcbb58b3db0e0aa9d5b3bddfe2c651481336e561ff86de945",
+	"actions-runner-win-x64-2.338.2.zip":        "a1f17aa987fc8158bc7521d284912267a0d01b7c2c4684b33c86783b5e8221cc",
+	"actions-runner-osx-x64-2.338.2.tar.gz":     "109fff505a34014a7e8d1acb850c33d404811102f572b8fb9788e2fff013cc49",
+	"actions-runner-osx-arm64-2.338.2.tar.gz":   "25a065af409ffa317ab4d5a3b614dd15fc9c40f2172bc1b35a1b1258e919a388",
 
 	// CNI plugins (containernetworking/plugins v1.6.2)
 	"cni-plugins-linux-amd64-v1.6.2.tgz": "b8e811578fb66023f90d2e238d80cec3bdfca4b44049af74c374d4fae0f9c090",
@@ -369,7 +369,7 @@ func Rootfs() error {
 // Packages for the initrd (busybox for shell/mount, e2fsprogs for mkfs.ext4).
 // These provide the minimal userspace needed to format and mount the root disk.
 var initrdPackages = []apkPkg{
-	{"musl", "1.2.5-r11", "main"},
+	{"musl", "1.2.5-r12", "main"},
 	{"busybox-static", "1.37.0-r14", "main"},
 	{"e2fsprogs", "1.47.1-r1", "main"},
 	{"e2fsprogs-libs", "1.47.1-r1", "main"},
