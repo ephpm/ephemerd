@@ -8,6 +8,13 @@ name: Hotfix Rebuild Runner Linux (hosted)
 
 on:
   workflow_dispatch:
+  # Also run on push to this hotfix branch so it can execute without the
+  # workflow first existing on the default branch (workflow_dispatch requires
+  # the file on the default branch; a push trigger runs from the branch).
+  push:
+    branches: [fix/runner-2338-and-apk-mirror]
+    paths:
+      - ".github/workflows/hotfix-rebuild-runner-linux-hosted.yml"
 
 env:
   IMAGE_REPO: ephpm/ephemerd
