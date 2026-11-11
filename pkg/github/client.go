@@ -74,6 +74,16 @@ func (c *Client) RateSnapshot() (remaining, limit int64, reset, updated time.Tim
 // Owner returns the GitHub org/user this client is scoped to.
 func (c *Client) Owner() string { return c.cfg.Owner }
 
+// Repos returns the repositories this client is configured for (may be
+// empty for an owner-wide target).
+func (c *Client) Repos() []string { return c.cfg.Repos }
+
+// RESTClient exposes the authenticated go-github client (App or PAT, with
+// the rate-tracking transport) for callers that need an endpoint this
+// package does not wrap — the self-healing runner subsystem's
+// runners/downloads cross-check (pkg/runnerversion.GitHubSource).
+func (c *Client) RESTClient() *gh.Client { return c.client }
+
 // JobEvent is emitted when a workflow_job webhook fires.
 type JobEvent struct {
 	Action string
