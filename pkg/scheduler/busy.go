@@ -273,7 +273,23 @@ func (s *Scheduler) runnerBusy(ctx context.Context, rj *runningJob) (runnerbusy.
 //  3. Unknown — which the caller must treat as possibly busy.
 //
 // The second return value names the authority that answered, for logs.
+//
+// A Busy answer from any layer is also a job-started signal for the
+// zero-work detector: in polling mode (or on a webhook outage) it is the
+// only evidence that the platform is dispatching to our runners, and it
+// is what keeps a webhook outage from tripping the breaker on runners
+// that are in fact working.
 func (s *Scheduler) probeRunnerBusy(ctx context.Context, rj *runningJob) (runnerbusy.State, string) {
+	state, source := s.probeRunnerBusyLayers(ctx, rj)
+	if state == runnerbusy.Busy && s.cfg.RunnerHealth != nil {
+		if name := rj.runnerName(); name != "" {
+			s.cfg.RunnerHealth.JobStarted(name)
+		}
+	}
+	return state, source
+}
+
+func (s *Scheduler) probeRunnerBusyLayers(ctx context.Context, rj *runningJob) (runnerbusy.State, string) {
 	ctx, cancel := context.WithTimeout(ctx, busyProbeTimeout)
 	defer cancel()
 
