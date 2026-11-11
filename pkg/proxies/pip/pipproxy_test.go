@@ -28,8 +28,25 @@ type fakeIndex struct {
 	fileHits  atomic.Int64
 	metaHits  atomic.Int64
 	fail      atomic.Bool
-	wheel     []byte
-	metadata  []byte
+	// down simulates a dead index: every connection is dropped without a
+	// response while the listener stays bound. See deadUpstream.
+	down     atomic.Bool
+	wheel    []byte
+	metadata []byte
+}
+
+// deadUpstream wraps h so that, once down is set, each request's connection
+// is aborted with no response while the port stays BOUND to this server.
+// Closing the httptest server would release its ephemeral port, which a
+// parallel test's server can then be bound to, turning "upstream down"
+// into a 200 from a stranger (the npm package saw exactly that in CI).
+func deadUpstream(down *atomic.Bool, h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if down.Load() {
+			panic(http.ErrAbortHandler)
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 const wheelName = "requests-2.31.0-py3-none-any.whl"
@@ -112,7 +129,7 @@ func newFakeIndex(t *testing.T) *fakeIndex {
 			`</body></html>`, idx.URL, wheelName, wheelName)
 	})
 
-	idx.Server = httptest.NewServer(mux)
+	idx.Server = httptest.NewServer(deadUpstream(&idx.down, mux))
 	t.Cleanup(idx.Close)
 	return idx
 }
@@ -357,7 +374,7 @@ func TestFailOpenRedirectsWhenUpstreamIsDown(t *testing.T) {
 	idx := newFakeIndex(t)
 	p := startProxy(t, Config{Upstream: idx.URL})
 	base := "http://" + p.Addr()
-	idx.Close() // upstream gone, cache cold
+	idx.down.Store(true) // upstream gone, cache cold (port stays ours)
 
 	resp := get(t, noRedirect(), base+"/simple/requests/", nil)
 	defer func() { _ = resp.Body.Close() }()
