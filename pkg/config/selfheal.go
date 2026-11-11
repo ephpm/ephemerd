@@ -10,18 +10,34 @@ import (
 // SelfHealToml configures [runner.self_heal]: the self-healing runner
 // version subsystem (docs/arch/self-healing-runner.md).
 //
-// EVERYTHING here is off by default. With enabled = false nothing in
-// pkg/runnerversion runs and the daemon behaves exactly as before. With
-// enabled = true the daemon verifies its runner against a signed manifest
-// at boot and watches for runners that exit without a job; it still never
-// fetches a runner unless auto_upgrade = true as well.
+// The subsystem is ON BY DEFAULT and is part of the product, not a feature
+// flag: a node with no [runner.self_heal] table at all verifies its runner
+// against the signed manifest at boot, watches for runners that exit
+// without a job, masks a stale runner baked into the official Linux image,
+// and — when nothing on the node is new enough — fetches the current runner
+// from two independently verified sources. The one operator control that
+// matters is the kill-switch:
+//
+//	[runner.self_heal]
+//	enabled = false
+//
+// which turns ALL of it off without a redeploy (the zero-work breaker
+// suspends provisioning, so a false positive must be recoverable by
+// config). Everything else has a built-in default and is tuning.
+//
+// Every boolean here is a *bool so that "not set" can be told apart from
+// "explicitly false": TOML decodes a missing key as the zero value, and
+// the zero value of a plain bool would make the product default off.
 type SelfHealToml struct {
-	// Enabled is the master switch. Default false.
-	Enabled bool `toml:"enabled"`
+	// Enabled is the master kill-switch. Default TRUE. Set enabled = false
+	// to disable the whole subsystem; the daemon then behaves exactly as
+	// it did before the subsystem existed.
+	Enabled *bool `toml:"enabled"`
 
 	// ManifestURL is the https URL of runner-manifest.json. The detached
-	// signature is fetched from ManifestURL + ".minisig". Required when
-	// Enabled.
+	// signature is fetched from ManifestURL + ".minisig". Default:
+	// DefaultSelfHealManifestURL, the stable release asset published by
+	// the runner-manifest workflow on ephpm/ephemerd.
 	ManifestURL string `toml:"manifest_url"`
 
 	// PublicKey overrides the minisign public key compiled into ephemerd
@@ -48,12 +64,13 @@ type SelfHealToml struct {
 	// probe runner is allowed. Default "15m".
 	BreakerCooldown string `toml:"breaker_cooldown"`
 
-	// AutoUpgrade is the break-glass switch: on a tripped breaker or a
-	// below-floor boot, the HOST daemon fetches the manifest's runner,
-	// verifies it against both the signed manifest and GitHub's
-	// runners/downloads checksum, and swaps it in. Default false.
-	// Requires Enabled.
-	AutoUpgrade bool `toml:"auto_upgrade"`
+	// AutoUpgrade is the break-glass network fetch: on a tripped breaker
+	// or a below-floor runner, the HOST daemon fetches the manifest's
+	// runner, verifies it against both the signed manifest and GitHub's
+	// runners/downloads checksum, and uses it on the next job. Default
+	// TRUE. Meaningful only when Enabled; setting it true with
+	// enabled = false is a config error.
+	AutoUpgrade *bool `toml:"auto_upgrade"`
 
 	// ImageOverride lets the HOST mask a stale runner baked into an
 	// official Linux runner image (runner-ci-linux is FROM
@@ -61,9 +78,9 @@ type SelfHealToml struct {
 	// mounting a verified, newer runner tree over /home/runner for every
 	// job until a rebuilt image rolls out. The tree comes from the embedded
 	// runner when that is new enough, otherwise from the break-glass fetch
-	// (which additionally needs auto_upgrade). Default false. Requires
-	// Enabled.
-	ImageOverride bool `toml:"image_override"`
+	// (which additionally needs auto_upgrade). Default TRUE. Meaningful
+	// only when Enabled.
+	ImageOverride *bool `toml:"image_override"`
 
 	// MaxArchiveMB refuses runner downloads larger than this. Default 512.
 	MaxArchiveMB int `toml:"max_archive_mb"`
@@ -83,6 +100,12 @@ type SelfHealToml struct {
 }
 
 const (
+	// DefaultSelfHealManifestURL is where the runner-manifest workflow on
+	// ephpm/ephemerd publishes the signed manifest: a stable, overwritten
+	// release asset (tag "runner-manifest"), so the URL never changes and
+	// no node config needs to name it.
+	DefaultSelfHealManifestURL = "https://github.com/ephpm/ephemerd/releases/download/runner-manifest/runner-manifest.json"
+
 	DefaultSelfHealPollInterval      = time.Hour
 	DefaultSelfHealZeroWorkWindow    = 120 * time.Second
 	DefaultSelfHealZeroWorkThreshold = 3
@@ -92,20 +115,48 @@ const (
 	DefaultSelfHealPRDeadline        = 72 * time.Hour
 )
 
-// Validate checks the table. It is cheap to call when Enabled is false
-// (everything is accepted then, so a stray key cannot break a node that
-// has not opted in).
+// ResolvedEnabled is the kill-switch: true unless the operator wrote
+// enabled = false.
+func (c SelfHealToml) ResolvedEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
+}
+
+// ResolvedAutoUpgrade is true when the subsystem is enabled and the
+// operator did not write auto_upgrade = false.
+func (c SelfHealToml) ResolvedAutoUpgrade() bool {
+	return c.ResolvedEnabled() && (c.AutoUpgrade == nil || *c.AutoUpgrade)
+}
+
+// ResolvedImageOverride is true when the subsystem is enabled and the
+// operator did not write image_override = false.
+func (c SelfHealToml) ResolvedImageOverride() bool {
+	return c.ResolvedEnabled() && (c.ImageOverride == nil || *c.ImageOverride)
+}
+
+// ResolvedManifestURL returns ManifestURL or the built-in default.
+func (c SelfHealToml) ResolvedManifestURL() string {
+	if c.ManifestURL == "" {
+		return DefaultSelfHealManifestURL
+	}
+	return c.ManifestURL
+}
+
+// Validate checks the table. It is called from Config.Load, so a bad
+// table fails the daemon fast with a clear error instead of being
+// discovered at the first poll. With enabled = false everything but the
+// "requires enabled" invariants is accepted, so a stray tuning key cannot
+// keep a node that opted out from starting.
 func (c SelfHealToml) Validate() error {
-	if !c.Enabled {
-		if c.AutoUpgrade {
+	if !c.ResolvedEnabled() {
+		if c.AutoUpgrade != nil && *c.AutoUpgrade {
 			return errors.New("[runner.self_heal] auto_upgrade = true requires enabled = true")
 		}
-		if c.ImageOverride {
+		if c.ImageOverride != nil && *c.ImageOverride {
 			return errors.New("[runner.self_heal] image_override = true requires enabled = true")
 		}
 		return nil
 	}
-	if !strings.HasPrefix(c.ManifestURL, "https://") {
+	if !strings.HasPrefix(c.ResolvedManifestURL(), "https://") {
 		return errors.New("[runner.self_heal] manifest_url must be an https:// URL")
 	}
 	switch c.Channel {
