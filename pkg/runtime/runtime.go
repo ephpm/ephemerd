@@ -2196,6 +2196,12 @@ func prepareJobRunnerTree(runnerDir, jobRunnerDir, containerDir string) (writabl
 	if merr := os.MkdirAll(work, 0o755); merr != nil {
 		return "", nil, merr
 	}
+	// The merged root presents the UPPER root's owner; make it the tree's
+	// owner so an unprivileged runner (the official image's uid 1001 under
+	// the self-heal override) can write at the top of its own home.
+	if oerr := matchTreeOwner(upper, runnerDir); oerr != nil {
+		return "", nil, oerr
+	}
 	return upper, withRunnerOverlay(runnerDir, upper, work, containerDir), nil
 }
 

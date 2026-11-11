@@ -84,6 +84,16 @@ func SetRunnerVersion(version, source string) {
 	RunnerVersionInfo.WithLabelValues(version, source).Set(1)
 }
 
+// SetRunnerImageVersion publishes the probed image runner, clearing any
+// previous series (a rebuilt image changes the version label).
+func SetRunnerImageVersion(image, version string) {
+	RunnerImageVersionInfo.Reset()
+	if version == "" {
+		return
+	}
+	RunnerImageVersionInfo.WithLabelValues(image, version).Set(1)
+}
+
 // SetRunnerPinPublishedAt sets RunnerPinAgeSeconds from the embedded pin's
 // release time.
 func SetRunnerPinPublishedAt(publishedAt, now time.Time) {

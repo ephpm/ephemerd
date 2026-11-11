@@ -15,10 +15,10 @@ import (
 // exit_code is deliberately NOT an input: run.sh exits 0 after a refused
 // connection, a completed job and a cancelled job alike.
 //
-// Wiring (next increment): Registered from trackRunning, JobStarted from
-// handleInProgress (and a busy-poll verdict), Exited from the wait
-// goroutines with killedByUs = (jobCtx.Err() != nil || orphan sweep ||
-// drain), Allow from admitDispatch.
+// Wired through scheduler.Config.RunnerHealth: Registered from
+// trackRunning, JobStarted from handleInProgress and the busy probe, Exited
+// from the wait goroutines with killedByUs = (jobCtx.Err() != nil), Allow
+// from admitDispatch. OnDegraded is installed by the Controller.
 type Detector struct {
 	// Window is the registered→self-exit lifetime below which a runner
 	// with no job-started signal is zero-work. Default 120s.

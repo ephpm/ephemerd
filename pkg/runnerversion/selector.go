@@ -15,11 +15,11 @@ import (
 // the embedded runner and the verified cache's current entry, with the
 // embedded runner as the last-resort floor.
 //
-// INTEGRATION POINT (not wired in this increment): cmd/ephemerd/main.go
-// passes rm.Dir() as RunnerDir in two places (host scheduler and the
-// --containerd-only worker). Those become sel.Dir(). The Selector wraps
-// *runner.Manager; it does not change runner.go's own selection among
-// embedded archives.
+// Integration (cmd/ephemerd/selfheal.go): runtime.Config.RunnerDir stays
+// the embedded tree; the runtime consults MountedRunnerDir on every Create
+// (pkg/runtime.MountedRunnerSource) so a verified-cache runner takes effect
+// on the next job. The Selector wraps *runner.Manager; it does not change
+// runner.go's own selection among embedded archives.
 type Selector struct {
 	Embedded *runner.Manager
 	Store    *Store
@@ -128,9 +128,28 @@ type BootReport struct {
 	// Cache holds the store's verification results (nil without a store).
 	Cache []VerifyResult
 	// Image is the official-image probe and override decision (nil when
-	// Selector.ProbeImage is nil). ImageErr is a failed probe.
-	Image    *ImageDecision
-	ImageErr error
+	// Selector.ProbeImage is nil). ImageErr is a failed probe. ImageInfo
+	// is the raw probe (version + owner), kept so the controller can
+	// prepare an override tree and re-decide after a fetch without
+	// probing again.
+	Image     *ImageDecision
+	ImageInfo TreeInfo
+	ImageErr  error
+}
+
+// MountedRunnerDir is the runtime-facing lookup for the MOUNTED runner
+// paths (custom Linux images, Windows): it returns the verified-cache
+// runner directory and true when the cache holds a runner strictly newer
+// than the embedded one, or "", false when the configured (embedded) tree
+// should be mounted. Consulted on every Create, so a break-glass fetch
+// takes effect on the next job without a restart. It satisfies
+// pkg/runtime.MountedRunnerSource.
+func (s *Selector) MountedRunnerDir() (string, bool) {
+	sel := s.Select()
+	if sel.Source != metrics.RunnerSourceVerifiedCache {
+		return "", false
+	}
+	return sel.Dir, true
 }
 
 // BootVerify is mechanism 1: re-hash the embedded archive, verify the
@@ -176,6 +195,7 @@ func (s *Selector) BootVerify(m *Manifest, platform string) (BootReport, error) 
 		if err != nil {
 			rep.ImageErr = err
 		} else {
+			rep.ImageInfo = img
 			breaker := false
 			if s.BreakerOpen != nil {
 				breaker = s.BreakerOpen()

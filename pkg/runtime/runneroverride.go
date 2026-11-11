@@ -29,6 +29,28 @@ type RunnerOverrideSource interface {
 	OfficialRunnerOverride(image string) (dir string, ok bool)
 }
 
+// MountedRunnerSource is the companion seam for the MOUNTED runner paths
+// (custom Linux images, Windows): it can point the per-job mount at a
+// verified-cache runner newer than the configured (embedded) tree, so a
+// break-glass fetch takes effect on the next job without a restart. The
+// per-job writable tree stays under the configured runners directory
+// regardless (see runnerMountPlan.jobRoot). Optional: a RunnerOverrideSource
+// that does not implement it leaves the mounted paths exactly as before.
+type MountedRunnerSource interface {
+	// MountedRunnerDir returns the host runner tree to mount instead of
+	// the configured one and true, or "", false to use the configured tree.
+	MountedRunnerDir() (dir string, ok bool)
+}
+
+// DefaultLinuxImage is the image Linux jobs run on when neither the config
+// nor the workflow names one. Exported so the self-heal controller probes
+// the same image Create would use.
+func DefaultLinuxImage() string { return defaultImageLinux }
+
+// IsOfficialRunnerImage reports whether image runs the runner baked in at
+// /home/runner (and so is subject to the override), see isOfficialRunnerImage.
+func IsOfficialRunnerImage(image string) bool { return isOfficialRunnerImage(image) }
+
 // runnerMountPlan is the per-job runner mount decision.
 type runnerMountPlan struct {
 	// needsMount is the former needsRunnerMount: install a runner tree in
@@ -57,7 +79,16 @@ type runnerMountPlan struct {
 // image), so the override never applies there.
 func planRunnerMount(customImage bool, goos, cfgDir, cfgMount string, src RunnerOverrideSource, image string) runnerMountPlan {
 	if (customImage || goos == "windows") && cfgDir != "" && cfgMount != "" {
-		return runnerMountPlan{needsMount: true, dir: cfgDir, mount: cfgMount, jobRoot: filepath.Dir(cfgDir)}
+		dir := cfgDir
+		if ms, ok := src.(MountedRunnerSource); ok && ms != nil {
+			if d, ok := ms.MountedRunnerDir(); ok && d != "" {
+				dir = d
+			}
+		}
+		// jobRoot is ALWAYS the configured runners directory, even when the
+		// lowerdir comes from the verified cache: Destroy and the orphan
+		// sweep look for job-* there.
+		return runnerMountPlan{needsMount: true, dir: dir, mount: cfgMount, jobRoot: filepath.Dir(cfgDir)}
 	}
 	if !customImage && goos != "windows" && src != nil {
 		if dir, ok := src.OfficialRunnerOverride(image); ok && dir != "" {
