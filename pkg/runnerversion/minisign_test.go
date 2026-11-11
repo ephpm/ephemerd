@@ -1,6 +1,7 @@
 package runnerversion
 
 import (
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -69,12 +70,28 @@ func TestPublicKeyParseAndString(t *testing.T) {
 	}
 }
 
-func TestEmbeddedPublicKeyIsPlaceholder(t *testing.T) {
-	// Until an operator generates a key the embed is a comment-only file
-	// and every verify must fail closed.
-	_, err := EmbeddedPublicKey()
-	if !errors.Is(err, ErrNoPublicKey) {
-		t.Fatalf("placeholder key should yield ErrNoPublicKey, got %v", err)
+// The trust root compiled into every ephemerd build. Its key id is pinned
+// here so a rotation is a deliberate, reviewed change to BOTH files: the
+// matching secret key is the RUNNER_MANIFEST_MINISIGN_KEY repository
+// secret that signs the published manifest.
+const embeddedKeyID = "CCFDB74C12C7F433"
+
+func TestEmbeddedPublicKeyIsReal(t *testing.T) {
+	pk, err := EmbeddedPublicKey()
+	if err != nil {
+		t.Fatalf("embedded key must parse: %v", err)
+	}
+	if got := strings.ToUpper(hex.EncodeToString(pk.KeyID[:])); got != embeddedKeyID {
+		t.Fatalf("embedded key id %s, want %s (rotation must update this test deliberately)", got, embeddedKeyID)
+	}
+	// A manifest signed by any OTHER key fails closed under it.
+	_, sk, err := GenerateKeypair(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := manifestJSON(t, validManifest("2.338.2", "2.338.0", zeroSHA))
+	if err := pk.Verify(data, sk.Sign(data, "c")); !errors.Is(err, ErrKeyMismatch) {
+		t.Fatalf("foreign signature must be ErrKeyMismatch, got %v", err)
 	}
 }
 

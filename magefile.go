@@ -15,6 +15,8 @@ import (
 	build "github.com/ephpm/ephemerd/mage/build"
 	// mage:import download
 	download "github.com/ephpm/ephemerd/mage/download"
+	// mage:import manifest
+	_ "github.com/ephpm/ephemerd/mage/manifest"
 )
 
 // Default target when running mage with no args.

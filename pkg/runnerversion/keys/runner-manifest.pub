@@ -1,1 +1,2 @@
-untrusted comment: PLACEHOLDER - no runner-manifest signing key has been generated yet. Generate one offline with `minisign -G -p runner-manifest.pub -s <offline path>` and replace this file. Until then every manifest verification fails closed. See docs/arch/self-healing-runner.md.
+untrusted comment: ephemerd runner-manifest signing key CCFDB74C12C7F433 (minisign)
+RWTM/bdMEsf0M8VGqa3wwoQT9Hzc9cLSot1RmEHs+mPdAZ3l4PwCOsXD

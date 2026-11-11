@@ -47,6 +47,12 @@ var (
 // image for the corresponding job OS. Empty values defer to the built-in
 // Linux default and (for Windows) the runtime's host-matched servercore
 // fallback.
+// Client exposes the underlying GitHub client (owner, repos, authenticated
+// REST client) for subsystems that need a GitHub endpoint this provider
+// does not wrap — the self-healing runner subsystem's runners/downloads
+// cross-check.
+func (p *Provider) Client() *github.Client { return p.client }
+
 func New(client *github.Client, log *slog.Logger, linuxImage, windowsImage string) *Provider {
 	return &Provider{
 		client:         client,

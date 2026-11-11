@@ -36,9 +36,8 @@ import (
 var embeddedPublicKeyText string
 
 var (
-	// ErrNoPublicKey is returned when the embedded key file holds no key
-	// (the placeholder shipped until an operator generates one). Every
-	// verify fails closed in that state.
+	// ErrNoPublicKey is returned when a key file holds no key (an empty or
+	// comment-only .pub). Every verify fails closed in that state.
 	ErrNoPublicKey = errors.New("no runner-manifest public key embedded")
 	// ErrBadSignature is returned when a signature does not verify.
 	ErrBadSignature = errors.New("runner manifest signature invalid")

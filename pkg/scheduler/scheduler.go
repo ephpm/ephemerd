@@ -115,7 +115,29 @@ type Config struct {
 	// ActionsCache and actionscache.go.
 	ActionsCache ActionsCache
 
+	// RunnerHealth observes runner lifecycles for the self-healing runner
+	// subsystem's zero-work detector and gates provisioning on its circuit
+	// breaker (docs/arch/self-healing-runner.md). Nil = the historical
+	// scheduler: nothing observed, nothing gated.
+	RunnerHealth RunnerHealth
+
 	Log *slog.Logger
+}
+
+// RunnerHealth is the scheduler-facing surface of the zero-work detector
+// (pkg/runnerversion.Detector, adapted in cmd/ephemerd). Platform is the
+// dispatch class: "linux", "windows" or "macos".
+type RunnerHealth interface {
+	// Registered: a runner was provisioned on a platform.
+	Registered(runnerName, platform string)
+	// JobStarted: a job-started signal (in_progress webhook naming the
+	// runner, or a busy probe) was observed for a runner.
+	JobStarted(runnerName string)
+	// Exited: the runner's process ended; killedByUs is true when ephemerd
+	// ended it (timeout, drain, orphan sweep, shutdown).
+	Exited(runnerName string, killedByUs bool)
+	// Allow reports whether a runner may be provisioned for a platform.
+	Allow(platform string) bool
 }
 
 // resolveImage returns the runner image to launch for an event.
@@ -449,6 +471,38 @@ func (s *Scheduler) trackRunning(key jobKey, rj *runningJob, provider providers.
 	}
 	s.mu.Unlock()
 	metrics.JobsActive.Inc()
+	// Zero-work detection needs the job-started signal to be observable;
+	// for a provider that never reports runner names every short job
+	// would look like a refused runner. Same restriction as the orphan
+	// sweep.
+	if s.cfg.RunnerHealth != nil && observable {
+		if name := rj.runnerName(); name != "" {
+			s.cfg.RunnerHealth.Registered(name, rj.platform())
+		}
+	}
+}
+
+// platform is the runner's dispatch class for the zero-work breaker.
+func (rj *runningJob) platform() string {
+	switch {
+	case rj.macosVM != nil:
+		return "macos"
+	case rj.dispatched != "":
+		return "linux"
+	default:
+		return goruntime.GOOS
+	}
+}
+
+// runnerExited reports a runner exit to the zero-work detector. Call it
+// from every wait-goroutine with the job context's error: a cancelled job
+// context means ephemerd ended the runner (timeout, drain, completed-event
+// teardown, orphan sweep, shutdown), which is never zero-work.
+func (s *Scheduler) runnerExited(name string, jobCtx context.Context) {
+	if s.cfg.RunnerHealth == nil || name == "" {
+		return
+	}
+	s.cfg.RunnerHealth.Exited(name, jobCtx.Err() != nil)
 }
 
 // untrackRunningLocked removes a runner's bookkeeping (running entry +
@@ -1137,7 +1191,19 @@ const (
 	// never saw the event that would have said so (or saw it so long ago that
 	// the record expired).
 	dispatchAbandonGone
+	// dispatchAbandonBreaker: the zero-work circuit breaker for this
+	// platform is open — the last N runners registered and exited without
+	// ever receiving a job, so provisioning another would be the same
+	// waste. The job is queued for a retry (the breaker half-opens after
+	// its cooldown and admits one probe).
+	dispatchAbandonBreaker
 )
+
+// errBreakerOpen is the retry-queue error for a breaker rejection. It is
+// an "unknown" class for classifyErr: retried on the backoff ladder within
+// MaxAge, so the job comes back on its own once the breaker closes rather
+// than waiting for the reconcile sweep.
+var errBreakerOpen = errors.New("runner zero-work breaker open for this platform; provisioning suspended")
 
 // log emits the verdict's explanation on the caller's job-scoped logger, so
 // every provisioning path reports an abandonment identically.
@@ -1152,6 +1218,11 @@ func (v dispatchVerdict) log(log *slog.Logger) {
 	case dispatchAbandonGone:
 		log.Info("abandoning dispatch: the platform reports the job no longer needs a runner",
 			"detail", "it finished, was cancelled, or ran elsewhere while this dispatch waited for a concurrency slot")
+	case dispatchAbandonBreaker:
+		log.Warn("abandoning dispatch: runner zero-work breaker is open for this platform",
+			"detail", "consecutive runners registered and exited without a job (runner below GitHub's minimum version, or webhook delivery is broken); "+
+				"the job stays queued and is retried; the breaker admits one probe runner after its cooldown. "+
+				"Disable with [runner.self_heal] enabled = false if this is a false positive")
 	}
 }
 
@@ -1203,7 +1274,7 @@ func (v dispatchVerdict) log(log *slog.Logger) {
 //     grace while live jobs queued behind it. So when the dispatch actually
 //     WAITED (waited > 0), ask the platform. A dispatch that found a free slot
 //     at once skips the call: its webhook is seconds old.
-func (s *Scheduler) admitDispatch(ctx context.Context, event providers.JobEvent, waited time.Duration) dispatchVerdict {
+func (s *Scheduler) admitDispatch(ctx context.Context, event providers.JobEvent, waited time.Duration, platform string) dispatchVerdict {
 	key := keyFor(event)
 	s.mu.Lock()
 	delete(s.pending, key)
@@ -1220,6 +1291,15 @@ func (s *Scheduler) admitDispatch(ctx context.Context, event providers.JobEvent,
 
 	if waited > 0 && !s.jobStillWanted(ctx, event) {
 		return dispatchAbandonGone
+	}
+	// Admission gate: the zero-work breaker. Checked last, so a job that is
+	// gone or satisfied is not queued for retry, and after the slot wait, so
+	// a breaker that opened while this dispatch was parked is honoured. One
+	// Allow call per admitted dispatch: in HALF-OPEN it hands out exactly
+	// one probe, and that probe's exit decides the breaker.
+	if s.cfg.RunnerHealth != nil && !s.cfg.RunnerHealth.Allow(platform) {
+		s.enqueueRetryIfEligible(ctx, event, errBreakerOpen)
+		return dispatchAbandonBreaker
 	}
 	return dispatchAdmit
 }
@@ -1292,7 +1372,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		}
 	}()
 
-	if v := s.admitDispatch(ctx, event, slot.waited); v != dispatchAdmit {
+	if v := s.admitDispatch(ctx, event, slot.waited, "linux"); v != dispatchAdmit {
 		v.log(log)
 		slot.release()
 		return
@@ -1375,6 +1455,7 @@ func (s *Scheduler) handleLinuxJob(ctx context.Context, event providers.JobEvent
 		} else {
 			log.Info("dispatched runner exited", "exit_code", exitCode)
 		}
+		s.runnerExited(claim.RunnerName, jobCtx)
 
 		// Always clean up. The entry may already be gone if a completed
 		// event tore this runner down by name (see handleCompleted).
@@ -1491,7 +1572,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		}
 	}()
 
-	if v := s.admitDispatch(ctx, event, slot.waited); v != dispatchAdmit {
+	if v := s.admitDispatch(ctx, event, slot.waited, "macos"); v != dispatchAdmit {
 		v.log(log)
 		slot.release()
 		return
@@ -1670,6 +1751,7 @@ func (s *Scheduler) handleMacOSJob(ctx context.Context, event providers.JobEvent
 		} else {
 			log.Info("macOS VM exited", "exit_code", exitCode)
 		}
+		s.runnerExited(claim.RunnerName, jobCtx)
 
 		// Clean up. The entry may already be gone if a completed event tore
 		// this VM down by name (see handleCompleted).
@@ -1920,7 +2002,7 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 		}
 	}()
 
-	if v := s.admitDispatch(ctx, event, slot.waited); v != dispatchAdmit {
+	if v := s.admitDispatch(ctx, event, slot.waited, goruntime.GOOS); v != dispatchAdmit {
 		v.log(log)
 		slot.release()
 		return
@@ -2091,6 +2173,7 @@ func (s *Scheduler) handleLocalJob(ctx context.Context, event providers.JobEvent
 		} else {
 			log.Info("runner exited", "exit_code", exitCode)
 		}
+		s.runnerExited(claim.RunnerName, jobCtx)
 
 		// Always clean up — whether normal exit, crash, OOM, or timeout
 		s.mu.Lock()
@@ -2176,6 +2259,9 @@ func (s *Scheduler) handleInProgress(event providers.JobEvent) {
 
 	if !owned || already {
 		return
+	}
+	if s.cfg.RunnerHealth != nil {
+		s.cfg.RunnerHealth.JobStarted(name)
 	}
 	// The job that ACTUALLY took this runner decides its cache scope.
 	if s.cfg.ActionsCache != nil {

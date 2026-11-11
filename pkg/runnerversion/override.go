@@ -125,10 +125,15 @@ type ImageDecision struct {
 //	breakerOpen — the linux zero-work breaker has tripped
 //
 // The image is stale when it is below the manifest floor, or — with no
-// manifest — when the breaker tripped and the available tree is newer. The
-// override engages only when the available tree is strictly newer than the
-// image AND itself at or above the floor; otherwise NeedFetch says the
-// break-glass fetch is required first. A healthy image is never masked.
+// manifest — when the breaker tripped and the available tree is newer, or
+// — with a manifest — when the breaker tripped AND the available tree is
+// newer than the manifest's own version (a break-glass fetch of GitHub's
+// latest; the manifest cannot vouch for a version it does not know, so
+// the breaker's evidence decides). The override engages only when the
+// available tree is strictly newer than the image AND itself at or above
+// the floor; otherwise NeedFetch says the break-glass fetch is required
+// first. A healthy image is never masked on the breaker alone when the
+// manifest is current.
 func DecideImageOverride(image TreeInfo, available Selection, m *Manifest, breakerOpen bool) ImageDecision {
 	d := ImageDecision{ImageVersion: image.Version, AvailableVersion: available.Version}
 	if image.Version == "" || len(image.Parts) == 0 {
@@ -138,7 +143,8 @@ func DecideImageOverride(image TreeInfo, available Selection, m *Manifest, break
 	if m != nil {
 		d.ImageBelowFloor = m.BelowFloor(image.Parts)
 	}
-	stale := d.ImageBelowFloor || (m == nil && breakerOpen)
+	breakGlassTree := m != nil && len(available.Parts) > 0 && runner.CompareVersions(available.Parts, m.VersionParts()) > 0
+	stale := d.ImageBelowFloor || (breakerOpen && (m == nil || breakGlassTree))
 	if !stale {
 		d.Reason = "image runner is not stale"
 		return d
@@ -154,6 +160,8 @@ func DecideImageOverride(image TreeInfo, available Selection, m *Manifest, break
 	switch {
 	case d.ImageBelowFloor:
 		d.Reason = fmt.Sprintf("image runner %s is below manifest floor %s; mounting %s", image.Version, m.Floor, available.Version)
+	case breakGlassTree:
+		d.Reason = fmt.Sprintf("linux breaker open and the node holds %s, newer than the signed manifest's %s (break-glass); mounting it over image runner %s", available.Version, m.Version, image.Version)
 	default:
 		d.Reason = fmt.Sprintf("linux breaker open and image runner %s is older than %s; mounting it", image.Version, available.Version)
 	}

@@ -1,14 +1,19 @@
 # Self-Healing Runner Version
 
-> **Status: foundation implemented, flag-off.** The signed manifest, the
-> verified fetch + content-addressed cache + atomic swap, the zero-work
-> detector + circuit breaker, the official-image probe + override seam, and
-> the metrics live in `pkg/runnerversion` (+ `pkg/runtime/runneroverride.go`,
-> `pkg/runtime/runnerprobe_linux.go`, `pkg/metrics/runnerversion.go`,
-> `pkg/config/selfheal.go`). Nothing is wired into `cmd/ephemerd` yet;
-> `runtime.Config.RunnerOverride` is nil everywhere, and
-> `[runner.self_heal] enabled`, `image_override` and `auto_upgrade` all
-> default to `false`. The auto-PR step is designed here but not implemented.
+> **Status: wired and ON BY DEFAULT since 0.3.0.** The engine from #220
+> (`pkg/runnerversion`: signed manifest, verified fetch + content-addressed
+> cache + atomic swap, zero-work detector + circuit breaker, official-image
+> probe + override) is driven by `runnerversion.Controller` and assembled in
+> `cmd/ephemerd/selfheal.go` for both the host scheduler daemon and the
+> in-VM worker. A node with no `[runner.self_heal]` table gets all of it:
+> boot-verify, zero-work detection + breaker, mount-over-stale-image, and
+> the break-glass two-source fetch. The single operator control is the
+> kill-switch `[runner.self_heal] enabled = false`, which leaves every seam
+> nil and restores the pre-0.3.0 daemon byte for byte. The manifest is
+> built from the pinned runner table and signed in CI (`mage manifest:*`,
+> `.github/workflows/runner-manifest.yml`); the minisign public key is
+> compiled in. See [Operating it](#operating-it) for the two one-time
+> manual steps. The auto-PR step is still designed only.
 >
 > **Correction (2026-11-10, same day).** The first draft of this document
 > assumed the runner the fleet runs is the embedded tarball. For Linux —
@@ -99,11 +104,18 @@ resolution (`bindMappings[/home/runner] = upperdir`) keeps working.
 
 Two details that matter:
 
-- **Ownership.** The merged `/home/runner` inherits its owner from the
-  lowerdir's top directory. ephemerd extracts runner trees as root, and
-  the image runs as uid 1001, which could then not create `_work/`. The
-  override tree is therefore chowned to the uid/gid the image probe reports
-  for `/home/runner` before it is engaged (`PrepareOverrideTree`).
+- **Ownership.** Two things must carry the image's `runner` uid/gid
+  (1001, as the probe reports for `/home/runner`), or the merged
+  `/home/runner` is root-owned and `run.sh`'s first write (copying
+  `run-helper.sh`, then `.runner`, then `_work/`) fails with EACCES:
+  the **lowerdir** (ephemerd extracts runner trees as root;
+  `PrepareOverrideTree` chowns the override tree before it is engaged) and
+  the **per-job upperdir root**, because overlayfs takes the merged root's
+  attributes from the upper root when it exists — and it always exists
+  here, `prepareJobRunnerTree` creates it. `matchTreeOwner`
+  (`pkg/runtime/treeowner_linux.go`) chowns the fresh upper to the
+  lowerdir's owner on every job; for the custom-image path (root-owned
+  tree) it is a no-op. The containerd e2e asserts the write as uid 1001.
 - **Which tree.** The lowerdir is the best verified tree on the node —
   the embedded extraction when it is new enough (image 2.336.0, embedded
   2.337.0 ≥ floor → no download needed at all), otherwise the verified
@@ -133,7 +145,11 @@ same technique `patchSnapshotRunner` uses — and reads
 the only version marker present in an unconfigured tree, since `.runner`
 only exists after `config.sh`). The probe also returns the uid/gid of
 `/home/runner` for the ownership fix above. The view is removed
-afterwards; nothing is written.
+afterwards; nothing is written. The view is created under a short-lived
+containerd **lease** so a GC pass cannot remove it (or the layers under
+it) mid-probe, and `SweepRunnerProbeViews` removes `ephemerd-runner-probe-*`
+views a crashed previous daemon left behind, once at boot before the first
+probe.
 
 `ephemerd_runner_image_version_info{image,version}` publishes the result.
 
@@ -150,20 +166,47 @@ afterwards; nothing is written.
 | no manifest, breaker open | nothing newer | `NeedFetch` |
 | no manifest, breaker closed | — | nothing; never on a hunch |
 
+The decision is pure; the controller adds the lifecycle around it:
+
+- **A verified manifest is authoritative.** When one says the image is
+  at/above the floor, an engaged override is **cleared** — including one
+  engaged on the breaker alone during a manifest outage. Without that the
+  "no manifest + breaker open" branch was sticky and would have kept the
+  `IMAGE RUNNER IS STALE` alert up for a webhook outage.
+- **No manifest never clears.** An override engaged while the manifest
+  was unreachable stays engaged until a verified manifest arrives; clearing
+  it on "breaker closed" would let the next three runners die every poll
+  interval to re-learn the same thing.
+- **Breaker open + manifest says healthy** is *not* an override: the
+  manifest knows the floor better than three refused runners do. The log
+  says to republish the manifest with a higher floor if GitHub moved it.
+- **Engage resets the linux breaker**, so the next runner (now on a current
+  tree) is admitted immediately instead of after the cooldown.
+- `NeedFetch` triggers the break-glass fetch when it is available, then the
+  decision is re-run on the fresh selection without a second probe.
+
 ### Which hosts
 
 - **Linux hosts (coyotes, ducks, sharks)**: host daemon == runtime; the
+  host daemon runs the whole subsystem (detector included) and the
   override tree lives in the host data dir and is mounted directly.
-- **macOS hosts**: the Linux runtime runs in the VM, but the host
-  `DataDir` is shared into it over virtio-fs (`ContainerDataDir`), so a
-  tree the host fetched and verified is visible to the in-VM runtime at
-  the rewritten path. Wiring must pass the VM-side path.
-- **Windows hosts (WSL2 VM)**: the in-VM daemon has its own data dir and
-  no view of the host's. The host must push the verified blob to the VM
-  over the existing Dispatch channel (a streaming `PushRunnerArchive`
-  that the VM side re-hashes before committing; the VM never fetches from
-  the internet). **Not designed in detail here; deferred.** Until then the
-  override covers Linux and macOS hosts.
+- **Windows and macOS hosts**: Linux jobs are dispatched into the sidecar
+  VM, whose `--containerd-only` worker daemon runs **its own** self-heal:
+  boot-verify, image probe + override (from its embedded runner), and the
+  break-glass fetch when its config carries a GitHub **token** (Windows
+  stages the host `config.toml` into the VM; an App credential needs a key
+  file the VM does not have, so only the PAT form is used). The zero-work
+  detector lives on the host (it needs the webhooks), so the
+  "no manifest + breaker open" path does not cross into the VM: the VM
+  acts on the manifest floor only. The host daemon itself has no
+  official-image path there (`Image = ""`), but its detector/breaker still
+  gates `linux` dispatch, and its own mounted-path runner (win-x64) is
+  verified and fetched like any other.
+- The verified-cache runner also takes effect on the **mounted** paths
+  (custom Linux images, Windows) on the next job without a restart:
+  `Selector.MountedRunnerDir` is consulted per Create through the
+  `runtime.MountedRunnerSource` seam, with the per-job writable tree staying
+  under the configured runners directory.
 
 ### What the alert must say
 
@@ -183,12 +226,12 @@ preserves that; see [How every path preserves SHA pinning](#how-every-path-prese
 
 ## Overview: three mechanisms
 
-| # | Mechanism | Trigger | Effect | Flag |
-|---|-----------|---------|--------|------|
-| 1 | **Boot-time verify** | daemon start, then every manifest poll | re-hash the embedded/cached runner, **probe the official Linux image's `/home/runner`**, compare both against the manifest floor; refuse to serve on a stale runner; fetch the current one (verified) first | `self_heal.enabled` |
-| 2 | **Zero-work detector + circuit breaker** | runner exit | count registered→exited-without-a-job; after K in a row on a platform, open the breaker (stop provisioning), mark the pool degraded, alert | `self_heal.enabled` |
+| # | Mechanism | Trigger | Effect | Switch (all default ON) |
+|---|-----------|---------|--------|--------------------------|
+| 1 | **Boot-time verify** | daemon start, then every manifest poll | re-hash the embedded/cached runner, **probe the official Linux image's `/home/runner`**, compare both against the manifest floor; fetch the current one (verified) when below it | `self_heal.enabled` |
+| 2 | **Zero-work detector + circuit breaker** | runner exit | count registered→exited-without-a-job; after K in a row on a platform, open the breaker (stop provisioning, queue the jobs for retry), alert | `self_heal.enabled` |
 | 3a | **Image override** (Linux) | image probe < floor, or breaker open with a newer tree on the node | mount a verified newer runner tree **over `/home/runner`** on every job until a rebuilt image rolls out; alert | `self_heal.image_override` (requires 1) |
-| 3b | **Break-glass verified auto-upgrade** | 3a needs a tree the node does not have, or embedded < floor on a mounted path | host daemon fetches the current runner, verifies it against **two independent sources**, stores it content-addressed; the next job uses it (via 3a on the image path, via the selector on the mounted paths); alerts loudly; opens a PR to make the pin permanent | `self_heal.auto_upgrade` (requires 1) |
+| 3b | **Break-glass verified auto-upgrade** | 3a needs a tree the node does not have, or embedded < floor on a mounted path | the daemon fetches the current runner, verifies it against **two independent sources**, stores it content-addressed; the next job uses it (via 3a on the image path, via the selector on the mounted paths); alerts loudly; (designed: opens a PR to make the pin permanent) | `self_heal.auto_upgrade` (requires 1) |
 
 Mechanisms 3a/3b are bridges: they keep the fleet alive until a rebuilt
 `runner-ci-linux` image and a properly pinned ephemerd release roll out.
@@ -278,11 +321,41 @@ dependency tree (`sigstore-go`), network access to Rekor at verify time
 updating. Not worth it until there is more than one signer. The manifest
 format does not change if we move to it later; only `Verifier` does.
 
-The embedded public key placeholder ships empty in this increment. Until a
-real key is generated (`minisign -G -p runner-manifest.pub -s <offline>`)
-and committed, `EmbeddedPublicKey()` returns an error and every verify
-fails closed. The signing key never lives on a node or in CI; manifests
-are signed by an operator and uploaded.
+**The trust root.** `pkg/runnerversion/keys/runner-manifest.pub` is a real
+key since 0.3.0 (key id `CCFDB74C12C7F433`, pinned by
+`TestEmbeddedPublicKeyIsReal` so a rotation is a reviewed change to both).
+It was generated with `mage manifest:keygen`, which uses the same code
+that verifies (`GenerateKeypair`) and writes minisign-compatible `.pub` and
+unencrypted `.key` files (`minisign -G -W` layout; a password-protected
+key is rejected with a clear error — the CI secret is a machine credential
+with nobody to type a password).
+
+**The pipeline.** `mage manifest:build` composes `dist/runner-manifest.json`
+from `mage/download`'s pinned table (`RunnerVersion`, `RunnerFloor`,
+`pinnedSHA256` via `RunnerArtifacts()` — the hashes are never re-typed) and
+round-trips it through the daemon's own parser. `mage manifest:sign` signs
+it in pure Go (`SecretKey.Sign`, pre-hashed `ED` mode, minisign's
+`timestamp:… file:… hashed` trusted comment) with the key from
+`RUNNER_MANIFEST_MINISIGN_KEY` (the GitHub Actions secret; contents of the
+`.key` file or its base64 line) or `RUNNER_MANIFEST_MINISIGN_KEY_FILE`.
+`mage manifest:verify` then checks the pair against the **compiled-in** key,
+so a secret that does not match the trust root fails in CI, not on every
+node. `.github/workflows/runner-manifest.yml` runs the three on every
+published ephemerd release and on `workflow_dispatch` (inputs: `floor`
+override, `channel`, `rollback`) and uploads both files to a rolling
+prerelease whose tag never changes (`runner-manifest`, or
+`runner-manifest-canary`), marked not-latest so it cannot take the
+`releases/latest` slot `ephemerd upgrade` follows. That gives the stable
+URL every node carries by default
+(`config.DefaultSelfHealManifestURL`). The signing key never lives on a
+node.
+
+**Rotation.** `mage manifest:keygen` into a scratch directory, commit the
+new `.pub` over `keys/runner-manifest.pub` and update the pinned key id in
+the test, replace the repository secret, republish the manifest, then roll
+the release: nodes on the old binary keep verifying the old manifest until
+they upgrade (the old `.minisig` stays valid for them only if you keep
+publishing one; usually you do not, and they run on what verified).
 
 `[runner.self_heal] public_key` can override the embedded key (a single
 base64 line, as in the `.pub` file). It exists for key rotation and
@@ -291,10 +364,17 @@ already be made to run anything.
 
 ## Boot-time verify flow
 
-Runs in `cmd/ephemerd serve` **before** the scheduler accepts work, and
-again on every manifest poll (default hourly). Host-side only; the
-in-VM worker (`--containerd-only`) never does this — it receives the
-runner directory from the host as today.
+Runs from `runnerversion.Controller.Run`, started by `cmd/ephemerd serve`
+in the background right after the runtime and providers exist, and again
+on every breaker trip (the **primary trigger**: `OnDegraded → Kick`
+reconciles at once) and on the backstop poll (default **6h**,
+`poll_interval`), whose only jobs are to propagate a known-good pin to
+nodes that have not failed yet and to catch a dropped kick. It does not
+delay the scheduler: until the first pass completes the node runs what it
+has today, which is also what it would run with the subsystem off. Both the
+host daemon and the in-VM worker (`--containerd-only`) run it; the worker
+has no detector (no scheduler) but owns the Linux image path on
+Windows/macOS hosts.
 
 ```
                  ┌───────────────────────┐
@@ -338,11 +418,13 @@ did not exist. A manifest that fails signature verification is logged at
 error level and counted, and is also ignored. Only a verified manifest can
 change what runs.
 
-"Below floor with auto-upgrade off" cordons the scheduler rather than
-thrashing: provisioning runners that will be refused costs GitHub API
-quota, a JIT registration per attempt, a container per attempt, and
-produces no work. Cordon is what `ephemerd drain` already uses; a node in
-that state shows `cordoned=true` on `/healthz` and the alert says why.
+"Below floor with the fetch unavailable" (auto-upgrade off, or no GitHub
+credential on this daemon) logs at error level with the action and leaves
+the stop-the-thrash job to the zero-work breaker: the first three refused
+runners open it and provisioning pauses on their own evidence. An explicit
+cordon was considered and deferred — it would suspend every platform on
+the host, including ones whose runner is fine (a Windows host's Linux VM
+jobs are on the image path, not the host's win-x64 runner).
 
 ## Zero-work detector
 
@@ -366,11 +448,28 @@ A **zero-work runner** is one for which all of the following hold:
 `exit_code` is **not** an input. Runner `run.sh` exits 0 after a refused
 connection, after a completed job, and after a cancelled job alike.
 
-The detector needs the job-started signal to be *observable*. In
-polling mode (no webhooks) and for providers that do not report runner
-names (`providers.RunnerNameReporter` false) the detector is disabled for
-that provider's runners, the same restriction the orphan sweep already
-has — otherwise every short job would count as zero-work.
+The detector needs the job-started signal to be *observable*. For
+providers that do not report runner names (`providers.RunnerNameReporter`
+false) their runners are never registered with the detector, the same
+restriction the orphan sweep already has — otherwise every short job would
+count as zero-work. Two signals count as job-started: the `in_progress`
+event naming the runner (webhook, or the poll's per-cycle report — the
+scheduler binds on the first), and a **busy probe** that says Busy from any
+layer (`probeRunnerBusy`: local container/VM introspection, then the
+provider's busy flag). The second is what keeps a webhook outage from
+tripping the breaker on runners that are in fact working: the orphan sweep
+consults it for every unbound runner.
+
+Wiring (`pkg/scheduler`, `Config.RunnerHealth`): `Registered` from
+`trackRunning` with the dispatch class (`linux` for VM dispatch, `macos`
+for the per-job VM, else the host OS); `JobStarted` from `handleInProgress`
+and the busy probe; `Exited` from the three wait-goroutines with
+`killedByUs = jobCtx.Err() != nil` (timeout, drain, completed-event
+teardown, orphan sweep and shutdown all cancel the job context);
+`Allow(platform)` as the last gate in `admitDispatch`, after the cordon
+and satisfied/gone checks, so a job the breaker refuses is queued on the
+**retry ladder** (`errBreakerOpen`) and comes back on its own once the
+breaker closes rather than waiting for the 30-minute reconcile sweep.
 
 ### Corroboration
 
@@ -408,9 +507,11 @@ CLOSED ──(streak >= threshold)──▶ OPEN ──(cooldown elapsed)──�
   through as a probe. If it gets a job the breaker closes; if it is
   zero-work the breaker reopens.
 - On the CLOSED→OPEN transition the detector calls `OnDegraded(platform,
-  streak, reason)` once. The wiring (next increment) connects that to the
-  same alert channel the disk-full and token-rotation alerts use, and —
-  when `auto_upgrade` is on — to the upgrader.
+  streak, reason)` once, which the controller installs as a **kick**: the
+  verify/decide/act pass runs now (re-probe, fetch if needed, engage) rather
+  than at the next hourly poll. Engaging an override or swapping in a
+  fetched runner resets that platform's breaker so the next runner is
+  admitted immediately.
 
 Metrics: `ephemerd_runner_zero_work_total{platform}` increments on every
 verdict; `ephemerd_runner_breaker_open{platform}` is 1 while OPEN or
@@ -503,24 +604,27 @@ extractor) and the store:
 The selector does not *replace* `runner.Manager`; it sits in front of
 it. It governs the **mounted** paths only — custom images, Windows,
 macOS — and is the source of the override tree for the official-image
-path. The integration points are:
+path. The integration points, all wired in `cmd/ephemerd/selfheal.go`:
 
-1. the two `RunnerDir: rm.Dir()` call sites in `cmd/ephemerd/main.go`
-   (host scheduler and `--containerd-only` worker), which become
-   `sel.Dir()`;
-2. `runtime.Config.RunnerOverride`, set to the `*runnerversion.ImageOverride`
-   the self-heal controls (nil today);
-3. `Selector.ProbeImage`, set to `rt.ProbeImageRunner` bound to the
-   resolved default Linux image.
-
-None of the three is done in this increment.
+1. `runtime.Config.RunnerDir` stays the embedded tree (the floor, and the
+   parent of every per-job tree); `runtime.Config.RunnerOverride` is one
+   value (`runnerSource`) that implements both seams — the
+   `*ImageOverride` for official images and the selector's
+   `MountedRunnerDir()` (`runtime.MountedRunnerSource`) for the mounted
+   paths, consulted on every Create;
+2. `Selector.ProbeImage` is `rt.ProbeImageRunner` bound to the daemon's
+   Linux job image (`[runner] default_image`, else the runtime default;
+   `""` when that is not an official image or this daemon runs no Linux
+   containers);
+3. `Selector.BreakerOpen` reads the detector's `linux` breaker.
 
 ## Break-glass auto-upgrade
 
-`[runner.self_heal] auto_upgrade = true` (default `false`; requires
-`enabled = true`; host daemon only, never the job VM, never the runner
-container). When it is off, `Upgrader.Run` returns `ErrDisabled` before
-touching the network.
+`[runner.self_heal] auto_upgrade` (default **true**; meaningful only with
+`enabled`; runs in the ephemerd daemon — host or in-VM worker — never in a
+runner container). When it is off, or when the daemon has no GitHub
+credential for the cross-check, the controller logs that the fetch is
+unavailable and the override can still use the embedded tree.
 
 ### Trigger
 
@@ -555,6 +659,64 @@ Rules, in `pkg/runnerversion/upgrader.go`:
 
 Only a *verified* manifest can even be consulted. A node that cannot
 verify a manifest cannot auto-upgrade, by construction.
+
+### The break-glass exception: GitHub's latest, on GitHub's word alone
+
+Rule 1 has a hole in exactly the scenario the subsystem exists for: GitHub
+ships a new runner and raises its floor **before anyone re-signs the
+manifest**. The breaker opens (runners are refused), the kick fires, the
+upgrader resolves both sources — and refuses with `ErrSourcesDisagree`,
+because GitHub is ahead of the signed pin. The fleet sits protected but
+stuck until a human runs the manifest workflow.
+
+So there is ONE path where GitHub's REST API is the sole authority for a
+binary the fleet runs as root: `Upgrader.breakGlassEligible` →
+`breakGlass`. It is acceptable only because every one of these gates is
+hard, and the window is kept that narrow on purpose:
+
+| Gate | Why |
+|------|-----|
+| the zero-work **breaker for this runner's platform class is OPEN** (`BreakGlassOpen`, wired to the detector by the controller; nil on the VM worker, which has no detector) | the fleet is *empirically* dying on what it has. This never applies in steady state: sources disagreeing while the breaker is closed stay a refusal and an alert |
+| **roll-forward only**: GitHub's version is *strictly newer* than the signed manifest's | a GitHub that is equal (different hash) or behind our signed pin is a spoof or a regression, not a heal signal — refused with `ErrSourcesDisagree` even with the breaker open |
+| and strictly newer than the runner the node already has (cache or embedded) | fetching what we already run cannot help |
+| **one shot per breaker cooldown** (`BreakGlassCooldown`, the detector's cooldown; `ErrBreakGlassCooldown` otherwise) | a persistently open breaker must not hammer GitHub or re-download |
+| `auto_upgrade` on, `max_archive_mb`, `min_free_gb`, and the SHA pin — GitHub's `sha256_checksum`, verified over the whole stream before anything is extracted | the same `Fetcher`/`Store` invariants as the two-source path; nothing unverified is ever extracted |
+
+What it leaves behind is the audit trail, and it is deliberately loud:
+
+- the store **sidecar lists `github-runners-downloads` as the only source**
+  (`Sidecar.IsBreakGlass`); the manifest is *not* recorded as applied, so
+  the re-signed one that follows is not a replay;
+- `ephemerd_runner_version_info{source="github-breakglass"}` (the
+  selector reads the sidecar on every `Select`, so the label survives a
+  restart), `ephemerd_runner_breakglass_active = 1` and
+  `ephemerd_runner_breakglass_total`;
+- the fixed WARN line `self-heal fetched un-manifest-signed runner from
+  GitHub to clear an open breaker; re-sign the manifest (and rebuild the
+  image) to make this permanent`, repeated by every reconcile while the
+  node is on that runner.
+
+On the Linux image path the break-glass tree is mounted over the image:
+`DecideImageOverride` treats "breaker open AND the node holds a tree newer
+than the manifest's own version" as stale, because the manifest cannot
+vouch for a version it does not know and the breaker's evidence decides.
+A healthy image is still never masked on the breaker alone when the node
+holds nothing newer than the manifest. An override engaged on a
+break-glass tree is kept until a manifest covers it (the manifest cannot
+clear what it cannot vouch for).
+
+**Reverting to signed.** When a re-signed manifest arrives naming a version
+≥ the break-glass one, `Upgrader.alreadyCurrent` records the manifest as a
+second source on the same blob (same bytes, by hash — no download), the
+label reverts to `verified-cache`, the gauge drops to 0, and the normal
+rules apply again (the override then stays only if the image is below the
+raised floor). A manifest newer than the break-glass version is a normal
+two-source upgrade that replaces it. The controller triggers this
+catch-up itself on every reconcile while the selection is break-glass.
+
+Do NOT loosen the steady-state path to "fix" a disagreement: the
+disagreement *is* the signal; the breaker is what turns it into
+permission.
 
 ### After a swap
 
@@ -607,12 +769,14 @@ Declared in `pkg/metrics/runnerversion.go`:
 
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
-| `ephemerd_runner_version_info` | gauge (=1) | `version`, `source` (`embedded`, `verified-cache`, `embedded-below-floor`) | which runner this node serves and where it came from. Exactly one series is 1 at a time; `SetRunnerVersion` clears the previous one |
+| `ephemerd_runner_version_info` | gauge (=1) | `version`, `source` (`embedded`, `verified-cache`, `github-breakglass`, `embedded-below-floor`, `image-override`) | which runner this node serves and where it came from. Exactly one series is 1 at a time; `SetRunnerVersion` clears the previous one |
 | `ephemerd_runner_pin_age_seconds` | gauge | – | now − `published_at` of the **embedded** pin's `actions/runner` release. Alert at, say, 45 d: GitHub's floor has historically trailed the current release by a few minor versions |
 | `ephemerd_runner_zero_work_total` | counter | `platform` | zero-work verdicts |
 | `ephemerd_runner_breaker_open` | gauge | `platform` | 1 while the breaker is OPEN or HALF-OPEN |
 | `ephemerd_runner_image_version_info` | gauge (=1) | `image`, `version` | what the official Linux image's `/home/runner` ships, as probed |
 | `ephemerd_runner_image_override_active` | gauge | – | 1 while a verified tree is mounted over `/home/runner`; alert while 1 (image rebuild outstanding) |
+| `ephemerd_runner_breakglass_active` | gauge | – | 1 while the node serves (or mounts) a runner fetched on GitHub's word alone; alert while 1 (re-sign the manifest) |
+| `ephemerd_runner_breakglass_total` | counter | – | break-glass fetches that became current |
 
 **Known prerequisite.** mayfly never renders `[metrics] bind_addr` into
 the node config, so every node's metrics listener binds `127.0.0.1` and
@@ -624,27 +788,46 @@ here so nobody designs an alert on a series that is never scraped.
 
 ## Configuration
 
+Everything has a built-in default; a node with no `[runner.self_heal]`
+table (or an empty one) runs the full subsystem. The values below are the
+defaults.
+
 ```toml
 [runner.self_heal]
-enabled = false                # master switch; nothing below runs when false
-manifest_url = ""              # https URL of runner-manifest.json; ".minisig" is appended for the signature
-public_key = ""                # override the embedded minisign public key (base64 line); rotation/testing only
+enabled = true                 # THE KILL-SWITCH. false turns everything below off without a redeploy
+manifest_url = "https://github.com/ephpm/ephemerd/releases/download/runner-manifest/runner-manifest.json"
+                               # ".minisig" is appended for the signature
+public_key = ""                # override the compiled-in minisign public key (base64 line); rotation/testing only
 channel = "stable"             # "stable" | "canary"; manifests for the other channel are ignored
-poll_interval = "1h"           # manifest re-check cadence
+poll_interval = "6h"           # BACKSTOP re-check; a breaker trip re-checks immediately
 zero_work_window = "120s"      # registered→self-exit under this with no job-started = zero-work
 zero_work_threshold = 3        # consecutive zero-work runners per platform that open the breaker
 breaker_cooldown = "15m"       # OPEN → HALF-OPEN
-image_override = false         # Linux: mount a verified newer runner over the official image's /home/runner; requires enabled
-auto_upgrade = false           # break-glass fetch; requires enabled; host daemon only
+image_override = true          # Linux: mount a verified newer runner over a stale official image's /home/runner
+auto_upgrade = true            # break-glass two-source verified fetch
 max_archive_mb = 512           # refuse larger downloads
 min_free_gb = 5                # refuse to fetch below this much free space on the cache volume
-auto_upgrade_pr_repo = ""      # "ephpm/ephemerd"; empty disables the auto-PR
+auto_upgrade_pr_repo = ""      # "ephpm/ephemerd"; empty disables the auto-PR (not implemented yet)
 auto_upgrade_pr_deadline = "72h"
 ```
 
-Validation (`pkg/config/selfheal.go`): `auto_upgrade` without `enabled`
-is an error, `manifest_url` must be `https://`, durations must parse,
-`channel` must be one of the two values, threshold ≥ 1.
+**Why `*bool`.** TOML decodes a missing key as the zero value, and a plain
+`bool`'s zero value is `false`, which would make the product default off.
+`Enabled`, `AutoUpgrade` and `ImageOverride` are therefore `*bool` with
+`ResolvedEnabled()` / `ResolvedAutoUpgrade()` / `ResolvedImageOverride()`
+(nil → true, and the two sub-switches are false whenever the kill-switch
+is). This is the same convention `[vm.linux] enabled` and
+`[dind] allow_privileged` already use.
+
+**Validation** (`SelfHealToml.Validate`, called from `config.Load` so a bad
+table fails the daemon at start, not at the first poll): `auto_upgrade = true`
+or `image_override = true` with `enabled = false` is an error (the
+sub-switches are meaningful only when enabled); `manifest_url` must be
+`https://`; durations must parse and be positive; `channel` must be one of
+the two values; threshold/size fields non-negative. With `enabled = false`
+only the two "requires enabled" checks run, so a stray tuning key cannot
+keep an opted-out node from starting. An unparsable `public_key` fails at
+daemon start as well.
 
 ## Failure modes
 
@@ -653,7 +836,9 @@ is an error, `manifest_url` must be `https://`, durations must parse,
 | Manifest URL unreachable | log warn, `ephemerd_runner_manifest_errors_total{reason="fetch"}`; run on what verified; retry next poll |
 | Signature invalid / key mismatch / schema unknown | log **error**, counted `reason="signature"` / `"schema"`; manifest ignored entirely |
 | Manifest older than last applied | ignored (replay) |
-| GitHub `runners/downloads` disagrees with manifest | no fetch; alert "manifest stale or sources disagree"; breaker stays open |
+| GitHub `runners/downloads` disagrees with manifest, breaker CLOSED | no fetch; alert "manifest stale or sources disagree" (steady state is never loosened) |
+| GitHub `runners/downloads` is strictly AHEAD of the manifest, breaker OPEN | break-glass fetch of GitHub's runner on GitHub's checksum alone (one per cooldown); `source="github-breakglass"`, `ephemerd_runner_breakglass_active=1`, WARN until a re-signed manifest covers it |
+| GitHub is EQUAL (other hash) or BEHIND the manifest, breaker OPEN | refused; error log says to investigate before trusting GitHub (spoof/regression, not a heal signal) |
 | Download hash mismatch | archive deleted, counted, alert; no swap; next poll retries (a CDN serving a stale asset will keep failing and keep the alert up — correct) |
 | Disk below `min_free_gb` | fetch refused with a specific error; alert; existing runner keeps serving |
 | Crash during fetch/extract/swap | see crash safety above; worst case an unreferenced blob until the next Prune |
@@ -662,9 +847,12 @@ is an error, `manifest_url` must be `https://`, durations must parse,
 | Override engaged but the image's `runner` uid differs from the tree's owner | the probe's uid/gid is applied to the tree before engaging; if chown fails the override is refused with the error, not engaged broken |
 | Override engaged, then the image is rebuilt and re-pulled | next poll's probe reports ≥ floor → override clears, gauge → 0, alert resolves; the per-job overlay simply stops being added |
 | Windows-host Linux VM | the override tree is not visible in the VM; the override is not engaged there (documented gap, see "Which hosts") |
-| `in_progress` webhooks stop arriving (webhook outage) | every short runner looks zero-work → breaker opens → **false positive**. The alert text says "or webhook delivery is broken"; the half-open probe reopens it every cooldown. Mitigation (next increment): the detector also treats a provider busy-poll (`RunnerBusy`) as job-started, which the orphan sweep already consults |
-| Embedded key placeholder still empty | every verify fails closed; `enabled = true` logs an error at boot naming the missing key; nothing else changes |
-| `auto_upgrade` on, breaker open, no manifest at all | nothing happens except the alert — no manifest, no upgrade |
+| `in_progress` webhooks stop arriving (webhook outage) | a runner the busy probe sees working still counts as job-started (the orphan sweep probes every unbound runner), so working runners do not trip the breaker. Genuinely idle runners still do → breaker opens, alert says "or webhook delivery is broken", the half-open probe re-tests every cooldown, and jobs are queued on the retry ladder, not dropped. Worst case is recoverable by config: `enabled = false` |
+| Manifest unreachable AND breaker open (the sticky case) | the embedded tree, if newer than the image, is mounted over it on the breaker's evidence alone; that override is deliberately **kept** while no manifest can be verified and is **cleared the moment a verified manifest says the image is at/above the floor** — the alert cannot outlive a manifest outage |
+| Breaker open but a verified manifest says the image is healthy | no override (the manifest is authoritative); the log says to republish the manifest with a higher floor if GitHub raised its minimum (Runner manifest workflow, `floor` input), otherwise to check webhook delivery / GitHub status |
+| Manifest never published (secret not set, workflow never run) | every poll logs "manifest unavailable; no verified manifest yet (floor unknown)" at warn and counts `reason="fetch"`; the node runs exactly as with the subsystem off, plus the breaker and the breaker-driven override |
+| `auto_upgrade` on, breaker open, no manifest at all | no fetch (nothing verified to fetch); the override still engages the embedded tree when it is newer than the image |
+| Daemon has no GitHub credential (in-VM worker without a staged token; non-GitHub providers) | fetch unavailable, logged once at start; the override is limited to the embedded tree |
 
 ## How every path preserves SHA pinning
 
@@ -684,7 +872,12 @@ is an error, `manifest_url` must be `https://`, durations must parse,
   hash over the complete stream equals the hash that two independent
   sources agreed on; the temp file is deleted on any mismatch. The
   archive is addressed by that hash from then on, so a later swap cannot
-  pick up different bytes under the same name.
+  pick up different bytes under the same name. The break-glass fetch is
+  the one deliberate exception to "two sources": the hash is GitHub's
+  alone, still pinned before any byte is extracted, and only reachable
+  with the breaker open and GitHub strictly ahead of the signed pin (see
+  the break-glass section); it leaves `source="github-breakglass"` behind
+  until a signed manifest covers it.
 - **Extract**: only from a committed blob; path-traversal checks are the
   same ones `pkg/runner` uses.
 - **Select**: a candidate is only eligible if its on-disk archive
@@ -703,13 +896,105 @@ is an error, `manifest_url` must be `https://`, durations must parse,
 At no point does any path run a runner binary whose SHA-256 was not
 checked against a value ephemerd trusted before the bytes arrived.
 
-## What is implemented in this increment
+## Operating it
+
+Two one-time steps make the manifest exist; until then every node boots,
+logs "no verified manifest yet" hourly and self-heals on the breaker path
+only.
+
+1. **Add the signing secret.** The repository secret
+   `RUNNER_MANIFEST_MINISIGN_KEY` on `ephpm/ephemerd` is the contents of
+   the `runner-manifest.key` file that pairs with the compiled-in public
+   key (`CCFDB74C12C7F433`). It was generated off-repo; it is never
+   committed. If it is lost, rotate (see Signing).
+2. **Publish the manifest once.** Run the `Runner manifest` workflow
+   (`workflow_dispatch`, defaults) — or publish any ephemerd release, which
+   triggers it. It creates the rolling `runner-manifest` prerelease with
+   `runner-manifest.json` + `.minisig`. Nodes pick it up on their next
+   poll (hourly) or restart.
+
+Day-to-day:
+
+- **GitHub shipped a newer runner and refuses ours:** nothing to do for
+  the first hour — the breaker opens, the kick fires, and the break-glass
+  path fetches GitHub's latest on its checksum alone and mounts it. You
+  will see `ephemerd_runner_breakglass_active = 1` and the WARN line. Make
+  it permanent: bump `RunnerVersion`/`RunnerFloor` in
+  `mage/download/download.go`, cut a release (the manifest workflow
+  re-signs on publish) and rebuild `runner-ci-linux`; nodes revert to the
+  signed source on their next reconcile.
+- **GitHub refused a runner and only the floor is stale** (GitHub's latest
+  equals the pin): break-glass does not apply (nothing newer to fetch);
+  re-run the workflow with `floor` set to the lowest version GitHub still
+  accepts (and bump `RunnerFloor` in the same change so the next release
+  carries it). Nodes override/fetch within a poll or kick.
+- **False positive / want it off:** `[runner.self_heal] enabled = false`
+  and restart; everything (breaker included) is gone. `image_override =
+  false` or `auto_upgrade = false` turn off one mechanism each.
+- **Watch:** `runner image override engaged: IMAGE RUNNER IS STALE` and
+  `runner auto-upgraded: PIN IS STALE` are the two error-level, grep-able
+  lines; `ephemerd_runner_image_override_active`,
+  `ephemerd_runner_breaker_open{platform}` and
+  `ephemerd_runner_version_info{source}` are the gauges (see the metrics
+  prerequisite above about `bind_addr`).
+- **Make it permanent:** rebuild and push `runner-ci-linux` with a current
+  `actions/runner`, and merge a release that bumps the pin; the override
+  clears itself on the next probe of the rebuilt image and the cache entry
+  retires when the embedded version catches up.
+
+## What 0.3.0 wires
+
+- `pkg/runnerversion/controller.go` — `Controller`: manifest load (keeps
+  the last verified one across failures, ignores other channels),
+  `BootVerify` at boot / poll / breaker kick, mounted-path fetch when below
+  floor, image decision → `PrepareOverrideTree` + `Engage` / `Clear` /
+  fetch-then-engage, breaker reset on engage/swap, the verified-manifest
+  auto-clear.
+- `pkg/runnerversion/upgrader.go` — the break-glass GitHub-latest fetch
+  (`breakGlassEligible`/`breakGlass`: breaker open, roll-forward over both
+  the manifest and what the node has, one shot per cooldown, GitHub-only
+  sidecar, `github-breakglass` label + `ephemerd_runner_breakglass_active`)
+  and the catch-up that reverts to the signed source (`alreadyCurrent`).
+  The replay guard moved after the agreement check so an applied manifest
+  cannot block the break-glass evaluation.
+- `pkg/runnerversion/minisign_secret.go` — unencrypted minisign secret
+  keys (`GenerateKeypair`, `ParseSecretKey`, `Encode`, `Sign`), so CI signs
+  in pure Go and keys are generated by the code that verifies them.
+- `pkg/runnerversion/keys/runner-manifest.pub` — the real trust root.
+- `mage/manifest` + `mage/download.RunnerArtifacts/RunnerFloor` +
+  `.github/workflows/runner-manifest.yml` — build, sign, verify, publish.
+- `pkg/config/selfheal.go` — default-on `*bool` switches, built-in
+  manifest URL, `Validate` called from `Load`.
+- `pkg/runtime` — `MountedRunnerSource` seam (verified cache on the
+  mounted paths without restart), lease + boot sweep + namespace fix in
+  `ProbeImageRunner`, `matchTreeOwner` for the per-job upperdir.
+- `pkg/scheduler` — `Config.RunnerHealth`: `Registered`/`JobStarted`
+  (webhook + busy probe)/`Exited`/`Allow` with the breaker as a dispatch
+  gate that queues refused jobs for retry.
+- `cmd/ephemerd/selfheal.go` — assembly for both daemons; the kill-switch
+  leaves `RunnerOverride` and `RunnerHealth` nil.
+- `test/e2e/runner_override_test.go` — containerd e2e: a job on
+  `ghcr.io/actions/actions-runner:2.336.0` reports the image's runner
+  without the override and the host's newer runner with it, can write at
+  the top of `/home/runner` as uid 1001, the write lands in the per-job
+  upperdir under the runners dir and never in the shared tree, and the
+  probe leaks no view. Root-gated like the rest of the e2e suite; CI prints
+  its PASS or SKIP verbosely.
+
+**Still not implemented:** the auto-PR (`auto_upgrade_pr_repo` is parsed
+and otherwise ignored); `ephemerd_runner_pin_age_seconds` (needs the
+embedded pin's release date); surfacing the override/breaker state on
+`/healthz` and the Status RPC; host→VM blob push for Windows/macOS hosts
+(the VM fetches for itself when it has a token instead).
+
+## What #220 implemented (the engine)
 
 - `pkg/runnerversion/manifest.go` — `Manifest`, `Parse`, `Validate`,
   `PlatformKey`.
 - `pkg/runnerversion/minisign.go` — minisign public-key and signature
   parsing, `Verify` (Ed25519 + BLAKE2b-512 prehash, global signature,
-  key-ID check); `keys/runner-manifest.pub` placeholder + `EmbeddedPublicKey`.
+  key-ID check); `keys/runner-manifest.pub` + `EmbeddedPublicKey` (a
+  placeholder in #220, the real key since 0.3.0).
 - `pkg/runnerversion/store.go` — content-addressed store with sidecars,
   `current`/`previous` pointers, atomic `Swap`, `Rollback`, `Prune`,
   boot `Verify` (re-hash), temp cleanup.
@@ -742,13 +1027,7 @@ checked against a value ephemerd trusted before the bytes arrived.
 - `pkg/config/selfheal.go` — `[runner.self_heal]`, defaults, validation.
   One field added to `RunnerConfig`.
 
-Not wired: nothing in `cmd/ephemerd` or `pkg/scheduler` calls any of it,
-and `runtime.Config.RunnerOverride` is nil. The next increment is (1)
-`Selector` in front of the two `rm.Dir()` call sites, (2)
-`Config.RunnerOverride = imageOverride` and `Selector.ProbeImage =
-rt.ProbeImageRunner(defaultLinuxImage)`, (3) the boot/poll handler that
-turns `BootReport.Image` into `Engage`/`Clear`/fetch-then-engage, (4)
-`Detector.Registered/JobStarted/Exited` from `trackRunning`,
-`handleInProgress` and the two wait-goroutines, (5) `Allow(platform)` in
-`admitDispatch`, (6) the manifest poll loop and alert routing, (7) the
-auto-PR, (8) the Windows-host VM blob push.
+Of the eight follow-ups #220 listed, 0.3.0 does (2)–(6) as described
+above; (1) is done through the `MountedRunnerSource` seam instead of
+replacing `RunnerDir`; (7) the auto-PR and (8) the host→VM blob push
+remain open.

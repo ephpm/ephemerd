@@ -4,9 +4,9 @@
 // between the embedded runner and a verified cached one, and a detector
 // for runners that register and exit without ever receiving a job.
 //
-// See docs/arch/self-healing-runner.md. Everything here is inert until
-// [runner.self_heal] enabled = true, and nothing in this package is wired
-// into the daemon yet.
+// See docs/arch/self-healing-runner.md. The Controller drives it and
+// cmd/ephemerd/selfheal.go assembles it; it is on by default and
+// [runner.self_heal] enabled = false is the kill-switch.
 package runnerversion
 
 import (

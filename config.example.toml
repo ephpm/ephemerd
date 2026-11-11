@@ -311,6 +311,36 @@ shutdown_timeout = "5m"
 # enabled = true
 # grace   = "10m"
 
+# Self-healing runner version (docs/arch/self-healing-runner.md).
+#
+# ON BY DEFAULT with no keys required. At boot and hourly the daemon
+# verifies its runner against a signed manifest published by the
+# ephpm/ephemerd release pipeline (minisign public key compiled in),
+# probes the runner baked into the official Linux image, counts runners
+# that register and exit without ever receiving a job (three in a row per
+# platform opens a circuit breaker and pauses provisioning), masks a stale
+# image runner by mounting a verified newer tree over /home/runner, and —
+# when nothing on the node is new enough — downloads the current runner,
+# verified against BOTH the signed manifest and GitHub's own checksum,
+# before any job runs it.
+#
+# `enabled = false` is the operator kill-switch: it turns all of it off
+# without a redeploy (the breaker can only be a false positive if webhook
+# delivery breaks; disabling here recovers it). Everything else is tuning.
+# [runner.self_heal]
+# enabled = true
+# manifest_url = "https://github.com/ephpm/ephemerd/releases/download/runner-manifest/runner-manifest.json"
+# channel = "stable"             # "stable" | "canary"
+# poll_interval = "6h"            # backstop only; the zero-work breaker triggers an immediate re-check
+# zero_work_window = "120s"
+# zero_work_threshold = 3
+# breaker_cooldown = "15m"
+# image_override = true          # Linux: mount a verified newer runner over a stale image's /home/runner
+# auto_upgrade = true            # break-glass fetch of the manifest's runner (two-source verified)
+# max_archive_mb = 512
+# min_free_gb = 5
+# public_key = ""                # override the compiled-in minisign key (rotation/testing only)
+
 [vm.linux]
 # Enable a Linux VM for running Linux jobs on Windows/macOS hosts.
 # On Windows: boots a Hyper-V Linux VM through the Host Compute Service

@@ -352,10 +352,19 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 
 		imageGC := newImageGC(cfg, ctrdClient, configDir, log)
 
+		// Self-healing runner version (worker side: boot-verify, image
+		// probe/override, fetch when the staged config has a token; no
+		// detector — the scheduler is on the host). Nil when disabled.
+		heal, err := newSelfHeal(cfg, configDir, rm, false, log)
+		if err != nil {
+			return err
+		}
+
 		rt, err := runtime.New(runtime.Config{
 			Client:              ctrdClient,
 			RunnerDir:           rm.Dir(),
 			RunnerMount:         rm.ContainerDir(),
+			RunnerOverride:      heal.runnerOverride(),
 			LogDir:              joinPath(configDir, "logs"),
 			DataDir:             configDir,
 			DindEnabled:         cfg.Dind.Enabled,
@@ -382,6 +391,9 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		}
 		if err := rt.CleanOrphans(ctx); err != nil {
 			log.Warn("failed to clean orphan containers", "error", err)
+		}
+		if err := heal.start(ctx, rt, linuxJobImage(cfg, true), workerGitHubRunnerSource(cfg)); err != nil {
+			return err
 		}
 
 		// Periodic orphan sweep + disk-pressure image collection. Both
@@ -672,10 +684,21 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 	}
 	imageGC := newImageGC(cfg, ctrdClient, configDir, log)
 
+	// Self-healing runner version (host side: boot-verify, zero-work
+	// detector + breaker, image probe/override on Linux hosts, break-glass
+	// fetch). Built before the runtime because the runtime consults it on
+	// every Create; started after the providers because the fetch
+	// cross-checks GitHub. Nil when [runner.self_heal] enabled = false.
+	heal, err := newSelfHeal(cfg, configDir, rm, true, log)
+	if err != nil {
+		return err
+	}
+
 	rt, err := runtime.New(runtime.Config{
 		Client:              ctrdClient,
 		RunnerDir:           rm.Dir(),
 		RunnerMount:         rm.ContainerDir(),
+		RunnerOverride:      heal.runnerOverride(),
 		DefaultImage:        cfg.Runner.DefaultImage,
 		ImagesDir:           joinPath(configDir, "images"),
 		LogDir:              joinPath(configDir, "logs"),
@@ -737,6 +760,10 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		return fmt.Errorf("creating providers: %w", err)
 	}
 	defer providerCleanup()
+
+	if err := heal.start(ctx, rt, linuxJobImage(cfg, false), githubRunnerSource(activeProviders)); err != nil {
+		return err
+	}
 
 	// Import pre-downloaded OCI image tarballs in the background so the
 	// scheduler starts immediately. Large images like servercore take
@@ -887,6 +914,7 @@ func serve(ctx context.Context, configFile, imagesDirFlag string, containerdTCPP
 		Retry:                 retryCfg,
 		OrphanSweep:           orphanCfg,
 		ActionsCache:          actionsCache,
+		RunnerHealth:          heal.runnerHealth(),
 		Log:                   log,
 	})
 

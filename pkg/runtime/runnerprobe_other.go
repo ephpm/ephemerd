@@ -15,3 +15,6 @@ import (
 func (r *Runtime) ProbeImageRunner(context.Context, string) (runnerversion.TreeInfo, error) {
 	return runnerversion.TreeInfo{UID: -1, GID: -1}, errors.New("image runner probe is Linux-only")
 }
+
+// SweepRunnerProbeViews is a no-op where there are no probe views.
+func (r *Runtime) SweepRunnerProbeViews(context.Context) int { return 0 }

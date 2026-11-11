@@ -225,6 +225,44 @@ func (s *Store) Sidecar(sha string) (Sidecar, error) {
 	return sc, nil
 }
 
+// AddSidecarSource records that another party vouched for a blob's hash
+// (a re-signed manifest catching up with a break-glass fetch). No-op when
+// the source is already listed.
+func (s *Store) AddSidecarSource(sha, source string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sc, err := s.Sidecar(sha)
+	if err != nil {
+		return err
+	}
+	if sc.HasSource(source) {
+		return nil
+	}
+	sc.Sources = append(sc.Sources, source)
+	if err := writeJSONAtomic(s.sidecarPath(sha), sc); err != nil {
+		return fmt.Errorf("updating sidecar %s: %w", sha, err)
+	}
+	return nil
+}
+
+// IsBreakGlass reports whether GitHub's runners/downloads is the ONLY party
+// that vouched for this blob — the audit signature of the break-glass path
+// (Upgrader.breakGlass). It flips to false the moment a signed manifest is
+// recorded as a second source.
+func (sc Sidecar) IsBreakGlass() bool {
+	return len(sc.Sources) == 1 && sc.Sources[0] == SourceGitHubDownloads
+}
+
+// HasSource reports whether source vouched for this blob.
+func (sc Sidecar) HasSource(source string) bool {
+	for _, s := range sc.Sources {
+		if s == source {
+			return true
+		}
+	}
+	return false
+}
+
 // Extract unpacks a committed blob into extracted/<version>-<goos>. It is
 // a no-op when the marker already exists. The blob must have been
 // committed through Put (hash verified); Extract re-checks the sidecar

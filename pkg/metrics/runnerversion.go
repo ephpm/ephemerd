@@ -22,6 +22,13 @@ const (
 	// RunnerSourceImageOverride means a verified tree is mounted over an
 	// official image's /home/runner (the Linux self-heal).
 	RunnerSourceImageOverride = "image-override"
+	// RunnerSourceGitHubBreakGlass means the node serves a runner fetched
+	// from GitHub's runners/downloads with GitHub's checksum as the ONLY
+	// authority — no signed manifest vouched for it. Reached only through
+	// the break-glass path (breaker open, roll-forward). Alert while any
+	// series carries this label; it clears when a re-signed manifest
+	// covers the version.
+	RunnerSourceGitHubBreakGlass = "github-breakglass"
 )
 
 var (
@@ -70,6 +77,22 @@ var (
 		Help: "The actions/runner version baked into the official Linux runner image (1 = probed).",
 	}, []string{"image", "version"})
 
+	// RunnerBreakGlassActive is 1 while the runner this node serves (or
+	// mounts over the image) came from the break-glass GitHub-latest fetch
+	// and no signed manifest has covered it yet. Non-silenceable: the
+	// permanent fix is a re-signed manifest (and an image rebuild).
+	RunnerBreakGlassActive = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "ephemerd_runner_breakglass_active",
+		Help: "1 while the node runs a runner fetched from GitHub without a signed manifest (break-glass).",
+	})
+
+	// RunnerBreakGlassTotal counts break-glass fetches that swapped in a
+	// runner.
+	RunnerBreakGlassTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "ephemerd_runner_breakglass_total",
+		Help: "Break-glass fetches of GitHub's latest runner that became current.",
+	})
+
 	// RunnerManifestErrors counts manifest problems by reason
 	// ("fetch", "signature", "schema", "disagree", "checksum").
 	RunnerManifestErrors = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -82,6 +105,16 @@ var (
 func SetRunnerVersion(version, source string) {
 	RunnerVersionInfo.Reset()
 	RunnerVersionInfo.WithLabelValues(version, source).Set(1)
+}
+
+// SetRunnerImageVersion publishes the probed image runner, clearing any
+// previous series (a rebuilt image changes the version label).
+func SetRunnerImageVersion(image, version string) {
+	RunnerImageVersionInfo.Reset()
+	if version == "" {
+		return
+	}
+	RunnerImageVersionInfo.WithLabelValues(image, version).Set(1)
 }
 
 // SetRunnerPinPublishedAt sets RunnerPinAgeSeconds from the embedded pin's

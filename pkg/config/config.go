@@ -1639,7 +1639,8 @@ type RunnerConfig struct {
 	OrphanSweep OrphanSweepToml `toml:"orphan_sweep"`
 
 	// SelfHeal configures the self-healing runner version subsystem
-	// (docs/arch/self-healing-runner.md). Off by default; see SelfHealToml.
+	// (docs/arch/self-healing-runner.md). ON by default; `enabled = false`
+	// is the kill-switch. See SelfHealToml.
 	SelfHeal SelfHealToml `toml:"self_heal"`
 }
 
@@ -2110,6 +2111,12 @@ func (c *Config) validate() error {
 	}
 
 	if err := c.Runner.Linux.validate(); err != nil {
+		return err
+	}
+
+	// [runner.self_heal] is on by default; a malformed table must stop the
+	// daemon here, not at the first manifest poll an hour in.
+	if err := c.Runner.SelfHeal.Validate(); err != nil {
 		return err
 	}
 

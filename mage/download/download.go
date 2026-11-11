@@ -14,13 +14,26 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/magefile/mage/mg"
 )
 
 const (
-	RunnerVersion       = "2.338.2"
+	RunnerVersion = "2.338.2"
+
+	// RunnerFloor is the lowest actions/runner version GitHub still hands
+	// jobs to, AS FAR AS WE KNOW. GitHub does not publish it; it is learned
+	// the hard way (2.337.0 was refused fleet-wide on 2026-11-09 with
+	// "Runner version ... is deprecated and cannot receive messages") and
+	// recorded here. It is published in the signed runner manifest as
+	// `floor`: a node whose runner — embedded, cached, or baked into the
+	// official Linux image — is below it must not take work and self-heals
+	// (docs/arch/self-healing-runner.md). Never above RunnerVersion. Bump
+	// it in the same change as RunnerVersion when a refusal is observed.
+	RunnerFloor = "2.338.0"
+
 	CNIVersion          = "1.6.2"
 	ContainerdVersion   = "2.2.2"
 	RuncVersion         = "1.3.4"
@@ -102,6 +115,52 @@ var pinnedSHA256 = map[string]string{
 	"hugo_extended_0.160.1_linux-amd64.tar.gz": "133adf4932c1b626b6fe6aa28d56791555abe3ceff167e03be534e8324c9ed39",
 	"hugo_extended_0.160.1_linux-arm64.tar.gz": "be4203d99a5b91446cd89af1e788aeb3c6210cbe78fab380a26be135a3f4ec59",
 	"hugo_extended_0.160.1_windows-amd64.zip":  "f5e342de1c9b22dc03318c14689cbc81ac9afec0c6f2080e0cf5a3aa03edbf6d",
+}
+
+// RunnerArtifact is one actions/runner release archive from the pinned
+// table: the single source of truth the signed runner manifest is built
+// from (mage manifest:build). The manifest never carries a hash that is
+// not also what `mage download` refuses to embed without.
+type RunnerArtifact struct {
+	// Platform is the runner's own naming, "<linux|win|osx>-<x64|arm64>",
+	// which is also the manifest's platforms key.
+	Platform string
+	Filename string
+	URL      string
+	SHA256   string
+}
+
+// RunnerArtifacts returns every pinned archive for RunnerVersion, sorted by
+// platform. It derives the list from pinnedSHA256 so there is exactly one
+// place a runner hash lives.
+func RunnerArtifacts() []RunnerArtifact {
+	prefix := "actions-runner-"
+	var out []RunnerArtifact
+	for filename, sha := range pinnedSHA256 {
+		if !strings.HasPrefix(filename, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(filename, prefix) // "<os>-<arch>-<ver>.<ext>"
+		marker := "-" + RunnerVersion + "."
+		i := strings.Index(rest, marker)
+		if i < 0 {
+			continue // an archive for another version; not shipped
+		}
+		out = append(out, RunnerArtifact{
+			Platform: rest[:i],
+			Filename: filename,
+			URL:      RunnerArchiveURL(filename),
+			SHA256:   sha,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Platform < out[j].Platform })
+	return out
+}
+
+// RunnerArchiveURL is the upstream release asset URL for a pinned runner
+// archive filename (the same URL every Runner* download target uses).
+func RunnerArchiveURL(filename string) string {
+	return fmt.Sprintf("https://github.com/actions/runner/releases/download/v%s/%s", RunnerVersion, filename)
 }
 
 // pinnedFor returns the pinned SHA256 for the given release filename. The bool

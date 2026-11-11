@@ -65,3 +65,53 @@ func TestPlanRunnerMount(t *testing.T) {
 		t.Fatalf("custom with engaged source: %+v", p)
 	}
 }
+
+// fakeSource implements both seams: the official-image override and the
+// verified-cache redirect for mounted paths.
+type fakeSource struct {
+	fakeOverride
+	mounted string
+	mok     bool
+}
+
+func (f *fakeSource) MountedRunnerDir() (string, bool) { return f.mounted, f.mok }
+
+func TestPlanRunnerMount_MountedRunnerSource(t *testing.T) {
+	const cfgDir, cfgMount = "/data/runners/2.338.2-linux", "/actions-runner"
+	const cached = "/data/runners/verified/extracted/2.339.0-linux"
+	runnersRoot := filepath.Dir(cfgDir)
+
+	// Cache wins for a custom image and on Windows: the lowerdir / copy
+	// source is the cached tree, the per-job tree stays under the
+	// configured runners dir, and it is not an "override" (no alert).
+	src := &fakeSource{mounted: cached, mok: true}
+	for _, tc := range []struct {
+		name   string
+		custom bool
+		goos   string
+		image  string
+	}{
+		{"custom linux", true, "linux", "foo/bar:1"},
+		{"windows", false, "windows", "mcr.microsoft.com/windows/servercore:ltsc2022"},
+	} {
+		p := planRunnerMount(tc.custom, tc.goos, cfgDir, cfgMount, src, tc.image)
+		if !p.needsMount || p.dir != cached || p.mount != cfgMount || p.jobRoot != runnersRoot || p.override {
+			t.Fatalf("%s: %+v", tc.name, p)
+		}
+	}
+	// Embedded wins (ok=false): byte-for-byte the historical plan.
+	src.mok = false
+	if p := planRunnerMount(true, "linux", cfgDir, cfgMount, src, "foo/bar:1"); p.dir != cfgDir || p.jobRoot != runnersRoot {
+		t.Fatalf("embedded wins: %+v", p)
+	}
+	// A source without the optional interface changes nothing.
+	if p := planRunnerMount(true, "linux", cfgDir, cfgMount, &fakeOverride{}, "foo/bar:1"); p.dir != cfgDir {
+		t.Fatalf("plain source: %+v", p)
+	}
+	// The cache never masks an official image through THIS seam; that is
+	// the override's job (and it was not engaged here).
+	src.mok = true
+	if p := planRunnerMount(false, "linux", cfgDir, cfgMount, src, "ghcr.io/actions/actions-runner:latest"); p.needsMount {
+		t.Fatalf("official image with only a mounted source: %+v", p)
+	}
+}
