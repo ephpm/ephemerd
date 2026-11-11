@@ -1,6 +1,8 @@
 /ephemerd
 /ephemerd.exe
 /bin/
+# mage manifest:* output (runner-manifest.json + .minisig)
+/dist/
 config.toml
 *.log
 

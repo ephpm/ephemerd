@@ -1,0 +1,119 @@
+name: Runner manifest
+
+# Builds, signs and publishes the runner manifest the self-healing runner
+# subsystem verifies at boot (docs/arch/self-healing-runner.md).
+#
+# The manifest is derived from the pinned runner table in
+# mage/download/download.go (mage manifest:build), signed in pure Go with
+# the minisign secret key held in the RUNNER_MANIFEST_MINISIGN_KEY repository
+# secret (mage manifest:sign), and checked against the public key compiled
+# into ephemerd BEFORE anything is uploaded (mage manifest:verify) — so a
+# secret that does not match the trust root fails here, not on every node.
+#
+# It is published as two assets on a rolling prerelease whose tag never
+# changes, so the URL nodes carry by default is stable:
+#
+#   https://github.com/ephpm/ephemerd/releases/download/runner-manifest/runner-manifest.json
+#   https://github.com/ephpm/ephemerd/releases/download/runner-manifest/runner-manifest.json.minisig
+#
+# (the canary channel publishes under runner-manifest-canary). The release
+# is marked prerelease and never "latest" so it cannot steal the
+# releases/latest slot `ephemerd upgrade` follows.
+#
+# Runs on every published ephemerd release (a new pin ships a new manifest)
+# and on demand — e.g. to raise the floor after GitHub refused a runner,
+# without waiting for a release.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      floor:
+        description: "Override the floor (X.Y.Z, <= pinned RunnerVersion). Empty = mage/download RunnerFloor."
+        required: false
+        default: ""
+      channel:
+        description: "Manifest channel"
+        required: false
+        default: "stable"
+        type: choice
+        options: [stable, canary]
+      rollback:
+        description: "Mark as a deliberate downgrade (rollback = true)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Build, sign, publish
+    # The rolling manifest release is itself a release; publishing it must
+    # not re-trigger this workflow (GITHUB_TOKEN events do not cascade, but
+    # be explicit).
+    if: github.event_name == 'workflow_dispatch' || !startsWith(github.event.release.tag_name, 'runner-manifest')
+    runs-on: [self-hosted, linux, x64]
+    env:
+      RUNNER_MANIFEST_FLOOR: ${{ github.event.inputs.floor }}
+      RUNNER_MANIFEST_CHANNEL: ${{ github.event.inputs.channel || 'stable' }}
+      RUNNER_MANIFEST_ROLLBACK: ${{ github.event.inputs.rollback || 'false' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # Go and mage come from the runner-ci-linux image, same as ci.yml.
+      - name: Restore cached build deps
+        run: /opt/ephemerd-ci/entrypoint-cache.sh
+        continue-on-error: true
+
+      - name: Build manifest from the pinned runner table
+        run: mage manifest:build
+
+      - name: Sign manifest
+        env:
+          RUNNER_MANIFEST_MINISIGN_KEY: ${{ secrets.RUNNER_MANIFEST_MINISIGN_KEY }}
+        run: |
+          if [ -z "${RUNNER_MANIFEST_MINISIGN_KEY}" ]; then
+            echo "::error::RUNNER_MANIFEST_MINISIGN_KEY secret is not set on this repository; see docs/arch/self-healing-runner.md (Signing)"
+            exit 1
+          fi
+          mage manifest:sign
+
+      - name: Verify against the key compiled into ephemerd
+        run: mage manifest:verify
+
+      - name: Show
+        run: |
+          cat dist/runner-manifest.json
+          cat dist/runner-manifest.json.minisig
+
+      - name: Resolve release tag for channel
+        id: tag
+        run: |
+          if [ "${RUNNER_MANIFEST_CHANNEL}" = "canary" ]; then
+            echo "name=runner-manifest-canary" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=runner-manifest" >> "$GITHUB_OUTPUT"
+          fi
+
+      # softprops talks to the Releases API directly (no gh CLI on the
+      # runner image, same reasoning as release.yml). Existing assets with
+      # the same name are overwritten, which is what makes the URL stable.
+      - name: Publish rolling release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: "Runner manifest (${{ env.RUNNER_MANIFEST_CHANNEL }}, rolling)"
+          body: |
+            Signed `runner-manifest.json` for the self-healing runner subsystem.
+            This release is overwritten on every ephemerd release and on demand;
+            the asset URLs are stable. Verify with the minisign public key in
+            `pkg/runnerversion/keys/runner-manifest.pub`.
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          files: |
+            dist/runner-manifest.json
+            dist/runner-manifest.json.minisig
