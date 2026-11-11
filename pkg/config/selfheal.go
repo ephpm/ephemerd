@@ -48,7 +48,11 @@ type SelfHealToml struct {
 	// channel are ignored.
 	Channel string `toml:"channel"`
 
-	// PollInterval is how often the manifest is re-checked. Default "1h".
+	// PollInterval is how often the manifest is re-checked when nothing is
+	// failing. Default "6h". The poll is a BACKSTOP, not the trigger: the
+	// zero-work breaker kicks an immediate re-check the moment runners
+	// start dying, so the poll's only jobs are to propagate a known-good
+	// pin to nodes that have not failed yet and to catch a dropped kick.
 	PollInterval string `toml:"poll_interval"`
 
 	// ZeroWorkWindow: a runner that exits on its own sooner than this
@@ -106,7 +110,9 @@ const (
 	// no node config needs to name it.
 	DefaultSelfHealManifestURL = "https://github.com/ephpm/ephemerd/releases/download/runner-manifest/runner-manifest.json"
 
-	DefaultSelfHealPollInterval      = time.Hour
+	// DefaultSelfHealPollInterval is the backstop cadence; failure is the
+	// primary trigger (Detector.OnDegraded -> Controller.Kick).
+	DefaultSelfHealPollInterval      = 6 * time.Hour
 	DefaultSelfHealZeroWorkWindow    = 120 * time.Second
 	DefaultSelfHealZeroWorkThreshold = 3
 	DefaultSelfHealBreakerCooldown   = 15 * time.Minute

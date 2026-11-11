@@ -29,7 +29,7 @@ func TestSelfHealDefaultsOn(t *testing.T) {
 	if sh.ResolvedManifestURL() != DefaultSelfHealManifestURL {
 		t.Fatalf("manifest url default: %q", sh.ResolvedManifestURL())
 	}
-	if sh.ResolvedChannel() != "stable" || sh.ResolvedPollInterval() != time.Hour ||
+	if sh.ResolvedChannel() != "stable" || sh.ResolvedPollInterval() != 6*time.Hour ||
 		sh.ResolvedZeroWorkWindow() != 120*time.Second || sh.ResolvedZeroWorkThreshold() != 3 ||
 		sh.ResolvedBreakerCooldown() != 15*time.Minute || sh.ResolvedMaxArchiveBytes() != 512<<20 ||
 		sh.ResolvedMinFreeBytes() != 5<<30 || sh.ResolvedPRDeadline() != 72*time.Hour {
