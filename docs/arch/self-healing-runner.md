@@ -365,8 +365,11 @@ already be made to run anything.
 ## Boot-time verify flow
 
 Runs from `runnerversion.Controller.Run`, started by `cmd/ephemerd serve`
-in the background right after the runtime and providers exist, and again on
-every manifest poll (default hourly) and on every breaker trip. It does not
+in the background right after the runtime and providers exist, and again
+on every breaker trip (the **primary trigger**: `OnDegraded → Kick`
+reconciles at once) and on the backstop poll (default **6h**,
+`poll_interval`), whose only jobs are to propagate a known-good pin to
+nodes that have not failed yet and to catch a dropped kick. It does not
 delay the scheduler: until the first pass completes the node runs what it
 has today, which is also what it would run with the subsystem off. Both the
 host daemon and the in-VM worker (`--containerd-only`) run it; the worker
@@ -657,6 +660,64 @@ Rules, in `pkg/runnerversion/upgrader.go`:
 Only a *verified* manifest can even be consulted. A node that cannot
 verify a manifest cannot auto-upgrade, by construction.
 
+### The break-glass exception: GitHub's latest, on GitHub's word alone
+
+Rule 1 has a hole in exactly the scenario the subsystem exists for: GitHub
+ships a new runner and raises its floor **before anyone re-signs the
+manifest**. The breaker opens (runners are refused), the kick fires, the
+upgrader resolves both sources — and refuses with `ErrSourcesDisagree`,
+because GitHub is ahead of the signed pin. The fleet sits protected but
+stuck until a human runs the manifest workflow.
+
+So there is ONE path where GitHub's REST API is the sole authority for a
+binary the fleet runs as root: `Upgrader.breakGlassEligible` →
+`breakGlass`. It is acceptable only because every one of these gates is
+hard, and the window is kept that narrow on purpose:
+
+| Gate | Why |
+|------|-----|
+| the zero-work **breaker for this runner's platform class is OPEN** (`BreakGlassOpen`, wired to the detector by the controller; nil on the VM worker, which has no detector) | the fleet is *empirically* dying on what it has. This never applies in steady state: sources disagreeing while the breaker is closed stay a refusal and an alert |
+| **roll-forward only**: GitHub's version is *strictly newer* than the signed manifest's | a GitHub that is equal (different hash) or behind our signed pin is a spoof or a regression, not a heal signal — refused with `ErrSourcesDisagree` even with the breaker open |
+| and strictly newer than the runner the node already has (cache or embedded) | fetching what we already run cannot help |
+| **one shot per breaker cooldown** (`BreakGlassCooldown`, the detector's cooldown; `ErrBreakGlassCooldown` otherwise) | a persistently open breaker must not hammer GitHub or re-download |
+| `auto_upgrade` on, `max_archive_mb`, `min_free_gb`, and the SHA pin — GitHub's `sha256_checksum`, verified over the whole stream before anything is extracted | the same `Fetcher`/`Store` invariants as the two-source path; nothing unverified is ever extracted |
+
+What it leaves behind is the audit trail, and it is deliberately loud:
+
+- the store **sidecar lists `github-runners-downloads` as the only source**
+  (`Sidecar.IsBreakGlass`); the manifest is *not* recorded as applied, so
+  the re-signed one that follows is not a replay;
+- `ephemerd_runner_version_info{source="github-breakglass"}` (the
+  selector reads the sidecar on every `Select`, so the label survives a
+  restart), `ephemerd_runner_breakglass_active = 1` and
+  `ephemerd_runner_breakglass_total`;
+- the fixed WARN line `self-heal fetched un-manifest-signed runner from
+  GitHub to clear an open breaker; re-sign the manifest (and rebuild the
+  image) to make this permanent`, repeated by every reconcile while the
+  node is on that runner.
+
+On the Linux image path the break-glass tree is mounted over the image:
+`DecideImageOverride` treats "breaker open AND the node holds a tree newer
+than the manifest's own version" as stale, because the manifest cannot
+vouch for a version it does not know and the breaker's evidence decides.
+A healthy image is still never masked on the breaker alone when the node
+holds nothing newer than the manifest. An override engaged on a
+break-glass tree is kept until a manifest covers it (the manifest cannot
+clear what it cannot vouch for).
+
+**Reverting to signed.** When a re-signed manifest arrives naming a version
+≥ the break-glass one, `Upgrader.alreadyCurrent` records the manifest as a
+second source on the same blob (same bytes, by hash — no download), the
+label reverts to `verified-cache`, the gauge drops to 0, and the normal
+rules apply again (the override then stays only if the image is below the
+raised floor). A manifest newer than the break-glass version is a normal
+two-source upgrade that replaces it. The controller triggers this
+catch-up itself on every reconcile while the selection is break-glass.
+
+Do NOT loosen the steady-state path to "fix" a disagreement: the
+disagreement *is* the signal; the breaker is what turns it into
+permission.
+
 ### After a swap
 
 - Emit `ephemerd_runner_version_info{version="2.338.2",source="verified-cache"} 1`
@@ -708,12 +769,14 @@ Declared in `pkg/metrics/runnerversion.go`:
 
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
-| `ephemerd_runner_version_info` | gauge (=1) | `version`, `source` (`embedded`, `verified-cache`, `embedded-below-floor`) | which runner this node serves and where it came from. Exactly one series is 1 at a time; `SetRunnerVersion` clears the previous one |
+| `ephemerd_runner_version_info` | gauge (=1) | `version`, `source` (`embedded`, `verified-cache`, `github-breakglass`, `embedded-below-floor`, `image-override`) | which runner this node serves and where it came from. Exactly one series is 1 at a time; `SetRunnerVersion` clears the previous one |
 | `ephemerd_runner_pin_age_seconds` | gauge | – | now − `published_at` of the **embedded** pin's `actions/runner` release. Alert at, say, 45 d: GitHub's floor has historically trailed the current release by a few minor versions |
 | `ephemerd_runner_zero_work_total` | counter | `platform` | zero-work verdicts |
 | `ephemerd_runner_breaker_open` | gauge | `platform` | 1 while the breaker is OPEN or HALF-OPEN |
 | `ephemerd_runner_image_version_info` | gauge (=1) | `image`, `version` | what the official Linux image's `/home/runner` ships, as probed |
 | `ephemerd_runner_image_override_active` | gauge | – | 1 while a verified tree is mounted over `/home/runner`; alert while 1 (image rebuild outstanding) |
+| `ephemerd_runner_breakglass_active` | gauge | – | 1 while the node serves (or mounts) a runner fetched on GitHub's word alone; alert while 1 (re-sign the manifest) |
+| `ephemerd_runner_breakglass_total` | counter | – | break-glass fetches that became current |
 
 **Known prerequisite.** mayfly never renders `[metrics] bind_addr` into
 the node config, so every node's metrics listener binds `127.0.0.1` and
@@ -736,7 +799,7 @@ manifest_url = "https://github.com/ephpm/ephemerd/releases/download/runner-manif
                                # ".minisig" is appended for the signature
 public_key = ""                # override the compiled-in minisign public key (base64 line); rotation/testing only
 channel = "stable"             # "stable" | "canary"; manifests for the other channel are ignored
-poll_interval = "1h"           # manifest re-check cadence
+poll_interval = "6h"           # BACKSTOP re-check; a breaker trip re-checks immediately
 zero_work_window = "120s"      # registered→self-exit under this with no job-started = zero-work
 zero_work_threshold = 3        # consecutive zero-work runners per platform that open the breaker
 breaker_cooldown = "15m"       # OPEN → HALF-OPEN
@@ -773,7 +836,9 @@ daemon start as well.
 | Manifest URL unreachable | log warn, `ephemerd_runner_manifest_errors_total{reason="fetch"}`; run on what verified; retry next poll |
 | Signature invalid / key mismatch / schema unknown | log **error**, counted `reason="signature"` / `"schema"`; manifest ignored entirely |
 | Manifest older than last applied | ignored (replay) |
-| GitHub `runners/downloads` disagrees with manifest | no fetch; alert "manifest stale or sources disagree"; breaker stays open |
+| GitHub `runners/downloads` disagrees with manifest, breaker CLOSED | no fetch; alert "manifest stale or sources disagree" (steady state is never loosened) |
+| GitHub `runners/downloads` is strictly AHEAD of the manifest, breaker OPEN | break-glass fetch of GitHub's runner on GitHub's checksum alone (one per cooldown); `source="github-breakglass"`, `ephemerd_runner_breakglass_active=1`, WARN until a re-signed manifest covers it |
+| GitHub is EQUAL (other hash) or BEHIND the manifest, breaker OPEN | refused; error log says to investigate before trusting GitHub (spoof/regression, not a heal signal) |
 | Download hash mismatch | archive deleted, counted, alert; no swap; next poll retries (a CDN serving a stale asset will keep failing and keep the alert up — correct) |
 | Disk below `min_free_gb` | fetch refused with a specific error; alert; existing runner keeps serving |
 | Crash during fetch/extract/swap | see crash safety above; worst case an unreferenced blob until the next Prune |
@@ -807,7 +872,12 @@ daemon start as well.
   hash over the complete stream equals the hash that two independent
   sources agreed on; the temp file is deleted on any mismatch. The
   archive is addressed by that hash from then on, so a later swap cannot
-  pick up different bytes under the same name.
+  pick up different bytes under the same name. The break-glass fetch is
+  the one deliberate exception to "two sources": the hash is GitHub's
+  alone, still pinned before any byte is extracted, and only reachable
+  with the breaker open and GitHub strictly ahead of the signed pin (see
+  the break-glass section); it leaves `source="github-breakglass"` behind
+  until a signed manifest covers it.
 - **Extract**: only from a committed blob; path-traversal checks are the
   same ones `pkg/runner` uses.
 - **Select**: a candidate is only eligible if its on-disk archive
@@ -845,10 +915,19 @@ only.
 
 Day-to-day:
 
-- **GitHub refused a runner and the floor is stale:** re-run the workflow
-  with `floor` set to the lowest version GitHub still accepts (and bump
-  `RunnerFloor` in `mage/download/download.go` in the same change so the
-  next release carries it). Nodes override/fetch within a poll.
+- **GitHub shipped a newer runner and refuses ours:** nothing to do for
+  the first hour — the breaker opens, the kick fires, and the break-glass
+  path fetches GitHub's latest on its checksum alone and mounts it. You
+  will see `ephemerd_runner_breakglass_active = 1` and the WARN line. Make
+  it permanent: bump `RunnerVersion`/`RunnerFloor` in
+  `mage/download/download.go`, cut a release (the manifest workflow
+  re-signs on publish) and rebuild `runner-ci-linux`; nodes revert to the
+  signed source on their next reconcile.
+- **GitHub refused a runner and only the floor is stale** (GitHub's latest
+  equals the pin): break-glass does not apply (nothing newer to fetch);
+  re-run the workflow with `floor` set to the lowest version GitHub still
+  accepts (and bump `RunnerFloor` in the same change so the next release
+  carries it). Nodes override/fetch within a poll or kick.
 - **False positive / want it off:** `[runner.self_heal] enabled = false`
   and restart; everything (breaker included) is gone. `image_override =
   false` or `auto_upgrade = false` turn off one mechanism each.
@@ -871,6 +950,13 @@ Day-to-day:
   floor, image decision → `PrepareOverrideTree` + `Engage` / `Clear` /
   fetch-then-engage, breaker reset on engage/swap, the verified-manifest
   auto-clear.
+- `pkg/runnerversion/upgrader.go` — the break-glass GitHub-latest fetch
+  (`breakGlassEligible`/`breakGlass`: breaker open, roll-forward over both
+  the manifest and what the node has, one shot per cooldown, GitHub-only
+  sidecar, `github-breakglass` label + `ephemerd_runner_breakglass_active`)
+  and the catch-up that reverts to the signed source (`alreadyCurrent`).
+  The replay guard moved after the agreement check so an applied manifest
+  cannot block the break-glass evaluation.
 - `pkg/runnerversion/minisign_secret.go` — unencrypted minisign secret
   keys (`GenerateKeypair`, `ParseSecretKey`, `Encode`, `Sign`), so CI signs
   in pure Go and keys are generated by the code that verifies them.

@@ -3,6 +3,9 @@ package runnerversion
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -10,6 +13,7 @@ import (
 
 	gh "github.com/google/go-github/v72/github"
 
+	"github.com/ephpm/ephemerd/pkg/metrics"
 	"github.com/ephpm/ephemerd/pkg/runner"
 )
 
@@ -69,6 +73,12 @@ func newCtlFixture(t *testing.T, embedded, imageVer string) *ctlFixture {
 		image:    "ghcr.io/actions/actions-runner:test",
 		imageVer: imageVer,
 	}
+	// RV_TEST_LOG=1 streams the controller's log to stderr when debugging
+	// a scenario; the default discards it.
+	log := testLog()
+	if os.Getenv("RV_TEST_LOG") != "" {
+		log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	}
 	fx.sel = &Selector{
 		Embedded:     runner.New(t.TempDir(), testLog()),
 		Store:        fx.store,
@@ -92,7 +102,7 @@ func newCtlFixture(t *testing.T, embedded, imageVer string) *ctlFixture {
 			}
 			return imageTree(fx.imageVer), nil
 		},
-		Log: testLog(),
+		Log: log,
 	}
 	return fx
 }
@@ -292,6 +302,116 @@ func TestControllerFetchesThenEngages(t *testing.T) {
 	c.Reconcile(context.Background(), "poll")
 	if active, d2, _, _, _, _ := fx.ov.Status(); !active || d2 != cur.Dir {
 		t.Fatal("override must survive a replayed manifest")
+	}
+}
+
+// The break-glass loop end to end through the controller: manifest and
+// image agree (healthy per the manifest), GitHub has moved ahead, runners
+// are dying (breaker open) -> break-glass fetch of GitHub's latest ->
+// override engaged on it (reason says break-glass) -> alert gauge 1 ->
+// re-signed manifest catches up -> label reverts, alert clears, override
+// stays because the raised floor now says the image is stale.
+func TestControllerBreakGlassThenManifestCatchUp(t *testing.T) {
+	fx := newCtlFixture(t, "2.338.2", "2.338.2")
+	mData, mSHA := fakeArchive(t, "echo manifest")
+	gData, gSHA := fakeArchive(t, "echo github")
+	mux := http.NewServeMux()
+	mux.Handle("/"+ArchiveFilename("linux-x64", "2.338.2"), serveBytes(t, mData, nil))
+	mux.Handle("/"+ArchiveFilename("linux-x64", "2.339.0"), serveBytes(t, gData, nil))
+	srv, client := httpsTestServer(t, mux)
+	m := validManifest("2.338.2", "2.338.0", mSHA)
+	for k, a := range m.Platforms {
+		a.URL = srv.URL + "/" + ArchiveFilename(k, "2.338.2")
+		m.Platforms[k] = a
+	}
+	fx.loader.set(m, nil)
+	// The manifest lists the embedded version; its hash must be the
+	// embedded archive's or boot-verify (correctly) reports tampering.
+	fx.sel.HashEmbedded = func() (string, error) { return mSHA, nil }
+	ghVersion, ghSHA := "2.339.0", gSHA
+	fx.cfg.GitHub = &GitHubSource{list: func(context.Context) ([]*gh.RunnerApplicationDownload, error) {
+		return ghDownloadsAt(srv.URL, ghVersion, ghSHA), nil
+	}}
+	fx.cfg.Fetcher = &Fetcher{Store: fx.store, Client: client, DiskCheck: plentyOfDisk, Log: testLog()}
+	c := fx.controller(t)
+
+	// Steady state: nothing happens even though GitHub is ahead.
+	c.Reconcile(context.Background(), "boot")
+	if _, ok, _ := fx.store.Current(); ok {
+		t.Fatal("breaker closed: GitHub being ahead must not fetch")
+	}
+	if active, _, _, _, _, _ := fx.ov.Status(); active {
+		t.Fatal("nothing to override in steady state")
+	}
+
+	// Runners die -> breaker opens -> kick.
+	fx.tripBreaker()
+	c.Reconcile(context.Background(), "breaker")
+	cur, ok, _ := fx.store.Current()
+	if !ok || cur.Version != "2.339.0" || cur.SHA256 != gSHA {
+		t.Fatalf("break-glass fetch expected, store: %+v %v", cur, ok)
+	}
+	active, dir, ver, _, reason, _ := fx.ov.Status()
+	if !active || dir != cur.Dir || ver != "2.339.0" || !strings.Contains(reason, "break-glass") {
+		t.Fatalf("override: %v %s %s %q", active, dir, ver, reason)
+	}
+	rep, _, _ := c.Report()
+	if !rep.Selected.BreakGlass || rep.Selected.Source != metrics.RunnerSourceGitHubBreakGlass {
+		t.Fatalf("report selection: %+v", rep.Selected)
+	}
+	if breakGlassGauge(t) != 1 {
+		t.Fatal("break-glass alert gauge must be 1")
+	}
+	if st, _ := fx.det.State("linux"); st != BreakerClosed {
+		t.Fatal("engaging must reset the breaker")
+	}
+	// Another reconcile while still un-signed: idempotent, still engaged.
+	c.Reconcile(context.Background(), "poll")
+	if active, d2, _, _, _, _ := fx.ov.Status(); !active || d2 != cur.Dir {
+		t.Fatal("override must persist while the manifest has not caught up")
+	}
+
+	// The operator re-signs: 2.339.0, floor raised to 2.339.0.
+	m2 := validManifest("2.339.0", "2.339.0", gSHA)
+	for k, a := range m2.Platforms {
+		a.URL = srv.URL + "/" + ArchiveFilename(k, "2.339.0")
+		m2.Platforms[k] = a
+	}
+	m2.PublishedAt = m.PublishedAt.Add(time.Hour)
+	fx.loader.set(m2, nil)
+	c.Reconcile(context.Background(), "poll")
+	rep, _, _ = c.Report()
+	if rep.Selected.BreakGlass || rep.Selected.Source != metrics.RunnerSourceVerifiedCache || rep.Selected.Version != "2.339.0" {
+		t.Fatalf("after catch-up: %+v", rep.Selected)
+	}
+	if breakGlassGauge(t) != 0 {
+		t.Fatal("alert must clear once the manifest covers the version")
+	}
+	sc, _ := fx.store.Sidecar(gSHA)
+	if !sc.HasSource(SourceManifest) {
+		t.Fatalf("sidecar must now carry the manifest source: %v", sc.Sources)
+	}
+	// Image 2.338.2 is below the raised floor: the override stays (same
+	// tree, no re-alert), now on the normal below-floor reasoning.
+	if active, d3, _, _, _, _ := fx.ov.Status(); !active || d3 != cur.Dir {
+		t.Fatalf("override after catch-up: %v %s", active, d3)
+	}
+	if rep.Image == nil || !rep.Image.Override || !strings.Contains(rep.Image.Reason, "below manifest floor") {
+		t.Fatalf("decision after catch-up: %+v", rep.Image)
+	}
+
+	// And if the re-signed manifest had NOT raised the floor, the image
+	// would be healthy per the manifest and the override would clear.
+	m3 := validManifest("2.339.0", "2.338.0", gSHA)
+	for k, a := range m3.Platforms {
+		a.URL = srv.URL + "/" + ArchiveFilename(k, "2.339.0")
+		m3.Platforms[k] = a
+	}
+	m3.PublishedAt = m2.PublishedAt.Add(time.Hour)
+	fx.loader.set(m3, nil)
+	c.Reconcile(context.Background(), "poll")
+	if active, _, _, _, _, _ := fx.ov.Status(); active {
+		t.Fatal("manifest covering the tree with the image at/above floor must clear the override")
 	}
 }
 

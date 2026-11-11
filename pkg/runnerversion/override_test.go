@@ -36,8 +36,20 @@ func TestDecideImageOverride(t *testing.T) {
 		{"outage: cache lifts", tree("2.336.0"), sel("2.338.2"), m, false, true, false, "below manifest floor"},
 		// Image below floor, embedded is at the floor: mount embedded.
 		{"embedded at floor", tree("2.336.0"), sel("2.338.0"), m, false, true, false, "below manifest floor"},
-		// Healthy image is never masked, even if the node has something newer.
-		{"image healthy", tree("2.338.2"), sel("2.339.0"), m, true, false, false, "not stale"},
+		// Healthy image is never masked in steady state, even if the node has
+		// something newer.
+		{"image healthy", tree("2.338.2"), sel("2.339.0"), m, false, false, false, "not stale"},
+		// Breaker open, manifest current, node holds only the manifest's
+		// version: the manifest is authoritative, no override on the breaker.
+		{"breaker open, manifest current", tree("2.338.2"), sel("2.338.2"), m, true, false, false, "not stale"},
+		// Breaker open and the node holds a tree NEWER than the manifest's
+		// version (a break-glass fetch): the manifest cannot vouch for what
+		// it does not know; the breaker's evidence decides -> override.
+		{"breaker open, break-glass tree", tree("2.338.2"), sel("2.339.0"), m, true, true, false, "break-glass"},
+		// Same tree, breaker closed: nothing (steady state).
+		{"breaker closed, newer tree", tree("2.338.2"), sel("2.339.0"), m, false, false, false, "not stale"},
+		// Break-glass tree but the image is already newer than it: no override.
+		{"breaker open, image newer than break-glass tree", tree("2.339.1"), sel("2.339.0"), m, true, false, true, "no verified tree"},
 		// Image at floor exactly: healthy.
 		{"image at floor", tree("2.338.0"), sel("2.338.2"), m, false, false, false, "not stale"},
 		// No manifest, breaker open, embedded newer: mount embedded.

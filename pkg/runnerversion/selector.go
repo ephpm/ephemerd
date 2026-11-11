@@ -61,8 +61,15 @@ type Selection struct {
 	Dir     string
 	Version string
 	Parts   []int
-	// Source is metrics.RunnerSourceEmbedded or RunnerSourceVerifiedCache.
+	// Source is metrics.RunnerSourceEmbedded, RunnerSourceVerifiedCache or
+	// RunnerSourceGitHubBreakGlass.
 	Source string
+	// BreakGlass is true when the cache entry was fetched on GitHub's word
+	// alone and no signed manifest has covered it yet (its sidecar lists
+	// no manifest source). Read from the sidecar on every Select, so the
+	// label is right across restarts and clears the moment a manifest
+	// catches up.
+	BreakGlass bool
 }
 
 // Select picks the runner. It never returns an error: with no usable cache
@@ -99,7 +106,11 @@ func (s *Selector) Select() Selection {
 	if runner.CompareVersions(cparts, emb.Parts) <= 0 {
 		return emb
 	}
-	return Selection{Dir: cur.Dir, Version: cur.Version, Parts: cparts, Source: metrics.RunnerSourceVerifiedCache}
+	sel := Selection{Dir: cur.Dir, Version: cur.Version, Parts: cparts, Source: metrics.RunnerSourceVerifiedCache}
+	if sc, err := s.Store.Sidecar(cur.SHA256); err == nil && sc.IsBreakGlass() {
+		sel.Source, sel.BreakGlass = metrics.RunnerSourceGitHubBreakGlass, true
+	}
+	return sel
 }
 
 // Dir is Select().Dir and also publishes ephemerd_runner_version_info.
@@ -146,7 +157,7 @@ type BootReport struct {
 // pkg/runtime.MountedRunnerSource.
 func (s *Selector) MountedRunnerDir() (string, bool) {
 	sel := s.Select()
-	if sel.Source != metrics.RunnerSourceVerifiedCache {
+	if sel.Source == metrics.RunnerSourceEmbedded {
 		return "", false
 	}
 	return sel.Dir, true

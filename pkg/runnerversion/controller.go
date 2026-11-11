@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ephpm/ephemerd/pkg/metrics"
+	"github.com/ephpm/ephemerd/pkg/runner"
 )
 
 // Controller is the daemon-side driver of the subsystem: it loads the
@@ -27,6 +28,13 @@ import (
 // exists only for Linux jobs, whatever host they are dispatched from.
 const linuxPlatform = "linux"
 
+// DefaultPollInterval is the manifest re-check cadence when nothing is
+// failing. It is a BACKSTOP: the primary trigger is the zero-work
+// breaker's OnDegraded -> Kick, which reconciles immediately. The poll only
+// propagates a known-good pin to nodes that have not failed yet and
+// catches a dropped kick, so it can be slow.
+const DefaultPollInterval = 6 * time.Hour
+
 // ControllerConfig wires the controller.
 type ControllerConfig struct {
 	// Platform is PlatformKey(GOOS, GOARCH) of THIS daemon's runner — the
@@ -35,8 +43,14 @@ type ControllerConfig struct {
 	Platform string
 	// Channel is the node's manifest channel ("" = accept any).
 	Channel Channel
-	// PollInterval is the manifest re-check cadence. <= 0 = 1h.
+	// PollInterval is the backstop manifest re-check cadence. <= 0 =
+	// DefaultPollInterval (6h). Failure (a breaker trip) is the primary
+	// trigger and reconciles at once regardless of this.
 	PollInterval time.Duration
+	// BreakGlassCooldown bounds break-glass fetches to one per breaker
+	// cooldown. <= 0 = DefaultBreakerCooldown. Normally the detector's
+	// Cooldown.
+	BreakGlassCooldown time.Duration
 	// AutoUpgrade enables the break-glass fetch ([runner.self_heal]
 	// auto_upgrade).
 	AutoUpgrade bool
@@ -100,7 +114,7 @@ func NewController(cfg ControllerConfig) (*Controller, error) {
 		cfg.Now = time.Now
 	}
 	if cfg.PollInterval <= 0 {
-		cfg.PollInterval = time.Hour
+		cfg.PollInterval = DefaultPollInterval
 	}
 	c := &Controller{cfg: cfg, log: cfg.Log.With("component", "runner-self-heal"), now: cfg.Now, kick: make(chan string, 1)}
 	if c.canFetch() {
@@ -114,6 +128,11 @@ func NewController(cfg ControllerConfig) (*Controller, error) {
 			Store:       cfg.Store,
 			Log:         c.log,
 			Now:         cfg.Now,
+			// The break-glass window is the breaker of the platform class
+			// this daemon's runner serves (see hostPlatformClass); without
+			// a detector it never opens.
+			BreakGlassOpen:     c.hostBreakerOpen,
+			BreakGlassCooldown: cfg.BreakGlassCooldown,
 		}
 	}
 	if cfg.Detector != nil {
@@ -130,10 +149,20 @@ func (c *Controller) canFetch() bool {
 }
 
 func (c *Controller) linuxBreakerOpen() bool {
+	return c.breakerOpen(linuxPlatform)
+}
+
+// hostBreakerOpen is the break-glass window for the runner THIS daemon's
+// fetch would replace: the breaker of its own platform class.
+func (c *Controller) hostBreakerOpen() bool {
+	return c.breakerOpen(c.hostPlatformClass())
+}
+
+func (c *Controller) breakerOpen(platform string) bool {
 	if c.cfg.Detector == nil {
 		return false
 	}
-	st, _ := c.cfg.Detector.State(linuxPlatform)
+	st, _ := c.cfg.Detector.State(platform)
 	return st != BreakerClosed
 }
 
@@ -229,14 +258,42 @@ func (c *Controller) Reconcile(ctx context.Context, trigger string) {
 		"below_floor", rep.BelowFloor, "embedded_matches_manifest", rep.EmbeddedMatchesManifest,
 		"image_runner", rep.ImageInfo.Version, "image_probe_error", rep.ImageErr)
 
+	// The breaker is open for the runner this daemon serves: the fleet is
+	// dying on what it has. Try the upgrade NOW, whatever the manifest says
+	// about the floor — this is where the break-glass window is (GitHub
+	// strictly ahead of the signed manifest; see Upgrader.breakGlassEligible)
+	// and also where a manifest that merely says "healthy" gets its say
+	// (sources agree -> nothing to fetch, logged). A swap feeds the
+	// selection and the image decision below without a second probe.
+	if c.hostBreakerOpen() && c.canFetch() {
+		if res, uerr := c.upgradeLocked(ctx, log, "breaker open for "+c.hostPlatformClass()); uerr == nil && res.Swapped {
+			c.refreshSelectionLocked(&rep, m)
+		}
+	}
+
+	// A signed manifest has caught up with a break-glass runner (it now
+	// names a version >= the one GitHub alone vouched for): resume two-party
+	// verification. Same bytes by hash -> no download; a newer manifest ->
+	// a normal two-source upgrade replaces the break-glass tree.
+	if rep.Selected.BreakGlass && m != nil && c.canFetch() &&
+		runner.CompareVersions(m.VersionParts(), rep.Selected.Parts) >= 0 {
+		if _, uerr := c.upgradeLocked(ctx, log, "signed manifest "+m.Version+" caught up with break-glass runner "+rep.Selected.Version); uerr == nil {
+			c.refreshSelectionLocked(&rep, m)
+		}
+	}
+	if rep.Selected.BreakGlass {
+		// Non-silenceable while ephemerd_runner_breakglass_active is 1.
+		log.Warn("self-heal is serving an un-manifest-signed runner fetched from GitHub (break-glass); re-sign the manifest (and rebuild the image) to make this permanent",
+			"version", rep.Selected.Version, "dir", rep.Selected.Dir, "manifest", floor)
+		metrics.RunnerBreakGlassActive.Set(1)
+	}
+
 	// Mounted paths (custom images, Windows): the selected runner is what
 	// those jobs mount. Below the floor it must be replaced; the selector
 	// redirects the next job at the cache the moment a swap lands.
 	if rep.BelowFloor {
 		if res, uerr := c.upgradeLocked(ctx, log, "selected runner "+rep.Selected.Version+" is below manifest floor "+floor); uerr == nil && res.Swapped {
-			rep.Selected = c.cfg.Selector.Select()
-			rep.BelowFloor = m.BelowFloor(rep.Selected.Parts)
-			c.report = rep
+			c.refreshSelectionLocked(&rep, m)
 		} else if uerr != nil {
 			log.Error("runner below manifest floor and the break-glass fetch did not resolve it: jobs on the mounted runner paths will be refused by GitHub",
 				"selected", rep.Selected.Version, "floor", floor, "error", uerr,
@@ -261,6 +318,24 @@ func (c *Controller) Reconcile(ctx context.Context, trigger string) {
 	c.report = rep
 }
 
+// refreshSelectionLocked re-selects after a store change and re-derives
+// everything in the report that depends on the selection, reusing the
+// probe already taken this pass.
+func (c *Controller) refreshSelectionLocked(rep *BootReport, m *Manifest) {
+	rep.Selected = c.cfg.Selector.Select()
+	rep.BelowFloor = m != nil && m.BelowFloor(rep.Selected.Parts)
+	if rep.Image != nil {
+		d := DecideImageOverride(rep.ImageInfo, rep.Selected, m, c.linuxBreakerOpen())
+		rep.Image = &d
+	}
+	source := rep.Selected.Source
+	if rep.BelowFloor {
+		source = metrics.RunnerSourceBelowFloor
+	}
+	metrics.SetRunnerVersion(rep.Selected.Version, source)
+	c.report = *rep
+}
+
 // applyImageDecisionLocked turns the decision into Engage / Clear / fetch.
 func (c *Controller) applyImageDecisionLocked(ctx context.Context, log *slog.Logger, m *Manifest, rep *BootReport) {
 	d := *rep.Image
@@ -270,9 +345,8 @@ func (c *Controller) applyImageDecisionLocked(ctx context.Context, log *slog.Log
 	// same probe (no second mount) and the fresh selection.
 	if d.NeedFetch && c.canFetch() {
 		if res, err := c.upgradeLocked(ctx, log, d.Reason); err == nil && (res.Swapped || res.Dir != "") {
-			rep.Selected = c.cfg.Selector.Select()
-			d = DecideImageOverride(rep.ImageInfo, rep.Selected, m, c.linuxBreakerOpen())
-			rep.Image = &d
+			c.refreshSelectionLocked(rep, m)
+			d = *rep.Image
 		}
 	}
 
@@ -313,6 +387,14 @@ func (c *Controller) applyImageDecisionLocked(ctx context.Context, log *slog.Log
 		if m == nil || d.ImageVersion == "" {
 			return
 		}
+		if active && rep.Selected.BreakGlass {
+			// Engaged on a break-glass tree the manifest does not know
+			// about (and the breaker was reset by that very engage). The
+			// manifest cannot clear what it cannot vouch for; it clears
+			// this when it catches up (the selection stops being
+			// break-glass) and the normal rule then applies.
+			return
+		}
 		if active {
 			c.cfg.Override.Clear(fmt.Sprintf("verified manifest (floor %s) says image runner %s is not stale", m.Floor, d.ImageVersion))
 		}
@@ -338,7 +420,12 @@ func (c *Controller) upgradeLocked(ctx context.Context, log *slog.Logger, why st
 	switch {
 	case err == nil:
 		log.Info("runner break-glass fetch finished", "version", res.Version, "swapped", res.Swapped, "reason", res.Reason)
-		if res.Swapped && c.cfg.Detector != nil {
+		// A swap puts the new runner in front of the next job only on the
+		// MOUNTED paths (the selector redirects per Create). Where this
+		// daemon has an official-image path, jobs still run the image's
+		// runner until Engage mounts the tree over it — Engage resets the
+		// breaker then, and the decision below must still see it open.
+		if res.Swapped && c.cfg.Detector != nil && c.cfg.Image == "" {
 			c.cfg.Detector.Reset(c.hostPlatformClass())
 		}
 		return res, nil
@@ -348,6 +435,15 @@ func (c *Controller) upgradeLocked(ctx context.Context, log *slog.Logger, why st
 		if cerr == nil && ok {
 			return Result{Version: cur.Version, SHA256: cur.SHA256, Dir: cur.Dir, Reason: "already applied"}, nil
 		}
+		return Result{}, err
+	case errors.Is(err, ErrBreakGlassCooldown):
+		log.Info("runner break-glass fetch: one shot per breaker cooldown; not retrying yet", "error", err)
+		return Result{}, err
+	case errors.Is(err, ErrSourcesDisagree):
+		// Already logged with the reason by the upgrader (manifest stale
+		// vs GitHub, or GitHub behind the pin); this line is the action.
+		log.Error("runner break-glass fetch refused: sources disagree and the break-glass gates did not open",
+			"error", err, "action", "if GitHub moved on, re-sign the manifest (Runner manifest workflow); if GitHub is BEHIND the signed pin, investigate before trusting it")
 		return Result{}, err
 	default:
 		log.Error("runner break-glass fetch failed", "error", err)
