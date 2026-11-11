@@ -84,6 +84,21 @@ jobs:
             -run TestRunnerOverlay_JobCannotPoisonSharedTree \
             -v ./pkg/runtime/
 
+      # Same rationale again, for the self-healing runner's mount-over proof.
+      # TestE2E_RunnerOverride_MountsNewerRunnerOverStaleOfficialImage runs a
+      # job on an official image pinned to a stale runner (2.336.0, the exact
+      # version GitHub refused on 2026-11-10) with the ImageOverride engaged
+      # and asserts the process sees — and can write to — the host's newer
+      # runner overlaid on /home/runner. It needs root + containerd (the e2e
+      # TestMain gate), so on this unprivileged runner it prints its SKIP
+      # reason; on a privileged one it is the on-metal proof. Compiling the
+      # e2e tag here also keeps the test building.
+      - name: Privileged-test coverage report (self-heal runner override e2e)
+        run: |
+          go test -tags containers_image_openpgp,e2e,privileged -count=1 \
+            -run TestE2E_RunnerOverride_MountsNewerRunnerOverStaleOfficialImage \
+            -v ./test/e2e/
+
       - name: E2E — GitHub provider (fake server)
         run: mage e2egithub
 
